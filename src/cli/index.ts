@@ -49,9 +49,12 @@ if (!(verb in VERBS)) {
 }
 
 const json = process.argv.includes('--json');
+// NB: no taxonomy `class` here — work/env/infra classes describe failures of a
+// binding, and an agent branching on env-error would wrongly conclude a recycle
+// helps. Broker-level conditions carry a `code` instead.
 const payload = {
   ok: false,
-  error: { class: 'env-error', message: `verb '${verb}' is not implemented yet (milestone 0.1 in progress)` },
+  error: { code: 'NOT_IMPLEMENTED', message: `verb '${verb}' is not implemented yet (milestone 0.1 in progress)` },
 };
 if (json) {
   console.log(JSON.stringify(payload));
