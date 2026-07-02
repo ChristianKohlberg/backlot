@@ -1,0 +1,25 @@
+# yaml-language-server: $schema=../../schema/stack.schema.json
+name: hello-web
+
+services:
+  web:
+    run: node server.mjs
+    port: web
+    env:
+      PORT: "{{ports.web}}"
+      DB_PATH: "{{datastores.main.url}}"
+    ready: { http: /health, timeout: 30 }
+    fatal_logs: "Error:"
+
+datastores:
+  main:
+    driver: sqlite
+    create: node seed.mjs {{ns}} {{preset}}
+    presets: [dev, empty]
+    default_preset: { run: dev, session: dev }
+    template: true # sqlite templating = file copy
+
+checks:
+  smoke:
+    run: node smoke.test.mjs
+    env: { BASE_URL: "{{services.web.url}}" }

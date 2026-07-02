@@ -1,0 +1,28 @@
+# CI runs on BOTH macOS and Linux: agents live on Macs; a Linux-only-tested
+# process supervisor would betray the primary user.
+name: ci
+on:
+  push: { branches: [main] }
+  pull_request:
+jobs:
+  check:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 22 }
+      - run: corepack enable && pnpm install --frozen-lockfile || npm install
+      - run: npm run typecheck
+      - run: npm test
+      # The fixture must stay runnable raw (no infront) — it doubles as the docs.
+      - name: hello-web boots and serves seeded data
+        working-directory: examples/hello-web
+        run: |
+          node seed.mjs ./ci.db dev
+          DB_PATH=./ci.db PORT=3999 node server.mjs &
+          sleep 1
+          curl -sf http://localhost:3999/health
+          curl -sf http://localhost:3999/api/greetings | grep -q 'dev preset'

@@ -1,0 +1,168 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/infront-dev/infront/main/schema/stack.schema.json",
+  "title": "infront stack manifest (stack.yaml)",
+  "description": "What a repo declares so infront can broker environments for it. Everything {{...}} is injected by the engine (symbolic ports, datastore URLs, service URLs). Policy (pool sizes, TTLs, substrates) never lives here.",
+  "type": "object",
+  "required": ["name", "services"],
+  "additionalProperties": false,
+  "properties": {
+    "name": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9-]*$",
+      "description": "Stack identity; pools are keyed by repo + this name."
+    },
+    "services": {
+      "type": "object",
+      "minProperties": 1,
+      "additionalProperties": { "$ref": "#/$defs/service" },
+      "description": "Supervised shell commands, one per service. Commands, not containers."
+    },
+    "datastores": {
+      "type": "object",
+      "additionalProperties": { "$ref": "#/$defs/datastore" }
+    },
+    "caches": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Paths (globs allowed) preserved by the bind-time reset: node_modules, **/obj, .angular, ..."
+    },
+    "sync": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "keep": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Generated files preserved across binds even though tracked/derived."
+        },
+        "include": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Git-ignored files that must ride along with a binding (.env.local)."
+        }
+      }
+    },
+    "outputs": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Artifacts produced env-side but owned worktree-side (lockfiles, generated clients). Reported as outputs_changed; copied back only by explicit `infront pull`."
+    },
+    "upkeep": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/upkeepRule" },
+      "description": "Closed list of fingerprint->action rules, run at bind time in order (decision 0008)."
+    },
+    "auth": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "logins": {
+          "type": "object",
+          "required": ["user", "password"],
+          "additionalProperties": false,
+          "properties": {
+            "user": { "type": "string" },
+            "password": { "type": "string" }
+          },
+          "description": "A seeded login consumers may use. Dev-grade by definition."
+        },
+        "token": {
+          "type": "string",
+          "description": "Command minting an auth token; {{role}} available. Must print JSON."
+        }
+      }
+    },
+    "checks": {
+      "type": "object",
+      "additionalProperties": { "$ref": "#/$defs/check" },
+      "description": "Named runnable proofs (e2e, smoke). `infront run <name>`."
+    }
+  },
+  "$defs": {
+    "service": {
+      "type": "object",
+      "required": ["run"],
+      "additionalProperties": false,
+      "properties": {
+        "run": { "type": "string", "description": "The supervised process. Daemon is its parent." },
+        "build": { "type": "string", "description": "Run at bind when fingerprints demand; never during serve." },
+        "watch_run": { "type": "string", "description": "Hot-reload alternative to run:, used only by --watch session leases." },
+        "cwd": { "type": "string", "description": "Working directory relative to the repo root." },
+        "port": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9-]*$",
+          "description": "Symbolic port name; the engine allocates the number and injects {{ports.<name>}}. Omit for portless services (workers)."
+        },
+        "env": {
+          "type": "object",
+          "additionalProperties": { "type": "string" },
+          "description": "Injected environment; values may template {{ports.*}}, {{datastores.*.url}}, {{services.*.url}}."
+        },
+        "ready": { "$ref": "#/$defs/readiness" },
+        "fatal_logs": {
+          "type": "string",
+          "description": "ERE of log markers that fail a boot in seconds instead of polling readiness to timeout."
+        },
+        "depends_on": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Services that must be ready before this one starts."
+        }
+      }
+    },
+    "readiness": {
+      "type": "object",
+      "additionalProperties": false,
+      "minProperties": 1,
+      "properties": {
+        "http": { "type": "string", "description": "Path polled on the service's port until 200." },
+        "log": { "type": "string", "description": "ERE that must appear in the service log (portless services)." },
+        "cmd": { "type": "string", "description": "Command that must exit 0." },
+        "timeout": { "type": "number", "default": 120, "description": "Seconds before service-not-ready." }
+      }
+    },
+    "datastore": {
+      "type": "object",
+      "required": ["driver"],
+      "additionalProperties": false,
+      "properties": {
+        "driver": { "type": "string", "enum": ["sqlite", "postgres", "mssql", "mysql", "redis"] },
+        "server": { "type": "string", "enum": ["external"], "default": "external", "description": "infront never runs datastore servers; it probes them." },
+        "probe": { "type": "string", "description": "host:port (or file path for sqlite) checked before anything starts." },
+        "create": { "type": "string", "description": "Repo command that creates+seeds a namespace; {{ns}} and {{preset}} available." },
+        "presets": { "type": "array", "items": { "type": "string" }, "description": "Named seed states." },
+        "default_preset": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "run": { "type": "string" },
+            "session": { "type": "string" }
+          }
+        },
+        "template": { "type": "boolean", "default": false, "description": "Driver may bake a template per seed-content hash and restore instead of re-seeding." },
+        "ephemeral": { "type": "boolean", "default": false, "description": "No presets; reset-data = flush (Redis-class)." }
+      }
+    },
+    "upkeepRule": {
+      "type": "object",
+      "required": ["when", "run"],
+      "additionalProperties": false,
+      "properties": {
+        "when": { "type": "string", "description": "A file path or glob(...) whose content hash triggers the rule (direction-agnostic per-env ledger)." },
+        "run": { "type": "string", "description": "Repo command, or an engine built-in prefixed with @ (e.g. @rebake-template <datastore>)." }
+      }
+    },
+    "check": {
+      "type": "object",
+      "required": ["run"],
+      "additionalProperties": false,
+      "properties": {
+        "run": { "type": "string" },
+        "cwd": { "type": "string" },
+        "env": { "type": "object", "additionalProperties": { "type": "string" } },
+        "artifacts": { "type": "array", "items": { "type": "string" }, "description": "Globs collected into the verdict's artifacts dir." }
+      }
+    }
+  }
+}
