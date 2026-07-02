@@ -1,6 +1,6 @@
 {
   "name": "infront",
-  "version": "0.1.0",
+  "version": "0.4.0",
   "description": "The repo-aware environment broker: puts a working, seeded, provable instance of your web application in front of coding agents and humans — warm pools, leases, bind-by-sync. Brokers environments; never provides them.",
   "keywords": [
     "dev-environment",
@@ -17,7 +17,8 @@
     "node": ">=22.5.0"
   },
   "bin": {
-    "infront": "./dist/cli/index.js"
+    "infront": "./dist/cli/index.js",
+    "infront-mcp": "./dist/mcp/index.js"
   },
   "files": [
     "dist",

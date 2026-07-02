@@ -129,8 +129,11 @@
       "properties": {
         "driver": { "type": "string", "enum": ["sqlite", "postgres", "mssql", "mysql", "redis"] },
         "server": { "type": "string", "enum": ["external"], "default": "external", "description": "infront never runs datastore servers; it probes them." },
-        "probe": { "type": "string", "description": "host:port (or file path for sqlite) checked before anything starts." },
+        "probe": { "type": "string", "description": "host:port TCP-probed before anything starts (server drivers). Failure is an infra-error, never code blame." },
+        "url": { "type": "string", "description": "Connection-string template handed to services/checks; {{ns}} available. Required for server drivers; ignored for sqlite (the ns IS the file path)." },
         "create": { "type": "string", "description": "Repo command that creates+seeds a namespace; {{ns}} and {{preset}} available." },
+        "drop": { "type": "string", "description": "Repo command that drops a namespace; {{ns}} available. Best-effort (run before restore and on recycle)." },
+        "template_restore": { "type": "string", "description": "Repo command that clones a baked template namespace into a fresh one; {{template}} and {{ns}} available (e.g. postgres: createdb -T {{template}} {{ns}}). When present, `create` bakes once per seed-content hash and every bind restores in seconds." },
         "presets": { "type": "array", "items": { "type": "string" }, "description": "Named seed states." },
         "default_preset": {
           "type": "object",
@@ -140,7 +143,7 @@
             "session": { "type": "string" }
           }
         },
-        "template": { "type": "boolean", "default": false, "description": "Driver may bake a template per seed-content hash and restore instead of re-seeding." },
+        "template": { "type": "boolean", "default": false, "description": "sqlite only: bake a template file per seed-content hash and restore by copy. Server drivers use template_restore instead." },
         "ephemeral": { "type": "boolean", "default": false, "description": "No presets; reset-data = flush (Redis-class)." }
       }
     },

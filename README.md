@@ -6,11 +6,15 @@
 It brokers environments; it never provides them. Local processes today, your own cloud
 sandboxes (Morph, Sprites, SSH) tomorrow — same verbs, same model.
 
-> **Status: 0.1 — the local loop works.** Daemon, warm pool, leases, bind-by-sync,
-> sqlite datastores with template restore, checks with verdicts and artifacts, crash
-> recovery — all real and covered by 35 tests (unit + full-CLI integration). Not yet:
-> postgres/mssql drivers (0.2) and remote substrates (0.3). Design in
-> [docs/architecture.md](docs/architecture.md); decision log in [docs/decisions/](docs/decisions/).
+> **Status: 0.4-core.** The local loop is complete and battle-proven: daemon, warm
+> pool, leases, bind-by-sync, sqlite + server datastores (postgres/mssql/mysql) with
+> template restore, checks with verdicts/artifacts, detached submit-and-poll runs,
+> crash recovery, an MCP adapter (`infront-mcp`), and a foreign-runtime consumer
+> (Python) — 43 tests including live-Postgres and full-CLI integration. Proven on a
+> real .NET + Angular + MSSQL monorepo: a seeded, authenticated API vertical in ~50 s
+> per environment. Not yet: a live remote substrate driver (morph/ssh) and the npm
+> publish. Design in [docs/architecture.md](docs/architecture.md); decisions in
+> [docs/decisions/](docs/decisions/).
 
 ## Why
 

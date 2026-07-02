@@ -37,6 +37,15 @@ async function dispatch(verb: string, args: Record<string, unknown>): Promise<un
       });
     case 'run':
       return engine.run({ cwd, holder, check: String(args.check), hygiene: (args.hygiene as never) ?? undefined });
+    case 'run-detach': {
+      const jobId = engine.createJob(cwd, String(args.check));
+      // Chain the execution onto the serialized queue and return NOW — the
+      // verdict outlives the client (decision 0015).
+      enqueue(() => engine.executeJob(jobId, { cwd, holder, check: String(args.check), hygiene: (args.hygiene as never) ?? undefined }));
+      return { jobId, poll: `infront job ${jobId}` };
+    }
+    case 'job':
+      return engine.jobStatus(String(args.jobId));
     case 'ctx':
       return engine.ctx(cwd, holder);
     case 'sync':

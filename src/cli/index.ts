@@ -11,8 +11,10 @@ const USAGE = `infront — puts a working instance of a web application in front
 Usage:
   infront up [--watch] [--reset-data|--pristine] [--ttl <minutes>]
                           session lease: sync, upkeep, start services, print context
-  infront run <check> [--pristine] [--pull]
+  infront run <check> [--pristine] [--pull] [--detach]
                           run lease: bind -> execute the check -> verdict -> release
+                          --detach: submit-and-poll — returns a jobId immediately
+  infront job <jobId>     poll a detached run (pending|running|done + verdict)
   infront ctx             the consumer context blob (URLs, logins, conn strings)
   infront sync            project the worktree state into the current lease
   infront exec <cmd...>   run a command inside the leased environment
@@ -64,7 +66,7 @@ async function main(): Promise<void> {
     return;
   }
 
-  const known = ['up', 'run', 'ctx', 'sync', 'bind', 'exec', 'logs', 'reset-data', 'pull', 'release', 'status', 'pool', 'daemon'];
+  const known = ['up', 'run', 'job', 'ctx', 'sync', 'bind', 'exec', 'logs', 'reset-data', 'pull', 'release', 'status', 'pool', 'daemon'];
   if (!known.includes(verb)) {
     console.error(`infront: unknown verb '${verb}'\n\n${USAGE}`);
     process.exit(64);
@@ -87,8 +89,25 @@ async function main(): Promise<void> {
         console.error(`infront run: which check? (usage: infront run <check>)`);
         process.exit(64);
       }
-      res = await rpc('run', { cwd, holder, check, hygiene: hygiene() });
-      if (res.ok && flags.has('--pull')) await rpc('pull', { cwd, holder });
+      if (flags.has('--detach')) {
+        res = await rpc('run-detach', { cwd, holder, check, hygiene: hygiene() });
+        if (res.ok) {
+          out(res.data);
+          return;
+        }
+      } else {
+        res = await rpc('run', { cwd, holder, check, hygiene: hygiene() });
+        if (res.ok && flags.has('--pull')) await rpc('pull', { cwd, holder });
+      }
+      break;
+    }
+    case 'job': {
+      const jobId = positional[0];
+      if (!jobId) {
+        console.error('infront job: which job? (usage: infront job <jobId>)');
+        process.exit(64);
+      }
+      res = await rpc('job', { jobId });
       break;
     }
     case 'ctx':

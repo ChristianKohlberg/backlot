@@ -51,6 +51,10 @@ export class Journal {
         id TEXT PRIMARY KEY, env_id TEXT NOT NULL, kind TEXT NOT NULL,
         holder TEXT NOT NULL, hygiene TEXT NOT NULL, expires_at INTEGER NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS jobs (
+        id TEXT PRIMARY KEY, stack_cwd TEXT NOT NULL, check_name TEXT NOT NULL,
+        state TEXT NOT NULL, verdict TEXT, created_at INTEGER NOT NULL, finished_at INTEGER
+      );
     `);
   }
 
@@ -153,6 +157,28 @@ export class Journal {
 
   deleteLease(id: string): void {
     this.db.prepare('DELETE FROM leases WHERE id = ?').run(id);
+  }
+
+  saveJob(job: { id: string; stackCwd: string; check: string; state: string; verdict?: unknown; finishedAt?: number }): void {
+    this.db
+      .prepare(
+        `INSERT INTO jobs (id, stack_cwd, check_name, state, verdict, created_at, finished_at) VALUES (?,?,?,?,?,?,?)
+         ON CONFLICT(id) DO UPDATE SET state=excluded.state, verdict=excluded.verdict, finished_at=excluded.finished_at`,
+      )
+      .run(job.id, job.stackCwd, job.check, job.state, job.verdict ? JSON.stringify(job.verdict) : null, Date.now(), job.finishedAt ?? null);
+  }
+
+  getJob(id: string): { id: string; check: string; state: string; verdict: unknown; createdAt: number; finishedAt: number | null } | undefined {
+    const r = this.db.prepare('SELECT * FROM jobs WHERE id = ?').get(id) as Record<string, unknown> | undefined;
+    if (!r) return undefined;
+    return {
+      id: r.id as string,
+      check: r.check_name as string,
+      state: r.state as string,
+      verdict: r.verdict ? JSON.parse(r.verdict as string) : null,
+      createdAt: r.created_at as number,
+      finishedAt: (r.finished_at as number) ?? null,
+    };
   }
 
   /** Shift every deadline by `ms` — the sleep pardon (decision 0009). */

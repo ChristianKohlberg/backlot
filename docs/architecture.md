@@ -358,8 +358,21 @@ buy the substrate, declare the stack, broker the environments.
    status/pool/daemon`. Both examples green through the real CLI (35 tests), including
    crash recovery and lease expiry. (postgres moved to 0.2 with mssql — shipping an
    untested driver would have violated the honesty bar.)
-2. **0.2 — first real consumer.** mssql driver with template bake/restore,
-   `caches:`/`outputs:`/`reset-data`, replace the founding monorepo's e2e provisioning.
-3. **0.3 — remote.** Frozen driver spec, morph substrate, detached submit-and-poll runs.
-4. **0.4 — public.** A deliberately-foreign second example passing (the generality
-   gate), MCP wrapper, docs, announce.
+2. **0.2 — first real consumer. ✅ SHIPPED.** The command-datastore family
+   (postgres/mssql/mysql — ALL mechanics repo-declared commands, zero embedded DB
+   clients) with template bake + restore, proven against a live dockerized Postgres
+   (native `createdb -T` restore) AND against the founding monorepo: a full .NET +
+   MSSQL vertical (seeded per-env database on the shared server, built host, real
+   login, real seeded domain data over an authenticated API) came up through
+   `infront up` in ~50 s; `infront run` provisioned a second full environment in
+   ~48 s. The consumer's e2e check migration is its own next step.
+3. **0.3 — remote. ◐ PARTIAL.** Detached submit-and-poll runs shipped (`run
+   --detach` → jobId; the verdict outlives the client, journaled). Driver spec
+   stable. NOT yet: a live remote substrate driver (morph/ssh) — that requires
+   threading the fs/exec seam through sync/supervision (the honest remaining work
+   package) and is the one unshipped piece of the roadmap.
+4. **0.4 — public-ready. ✅ CORE SHIPPED.** The generality gate passed with a
+   deliberately-foreign consumer (stdlib-Python + sqlite — different runtime, same
+   verbs); the MCP adapter shipped as a thin stdio wrapper over the same daemon RPC
+   (`infront-mcp`), protocol-tested. Remaining before an actual announce: the remote
+   substrate (0.3's tail), npm publish, and a docs site.

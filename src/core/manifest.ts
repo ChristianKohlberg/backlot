@@ -28,7 +28,10 @@ export interface DatastoreSpec {
   driver: 'sqlite' | 'postgres' | 'mssql' | 'mysql' | 'redis';
   server?: 'external';
   probe?: string;
+  url?: string;
   create?: string;
+  drop?: string;
+  template_restore?: string;
   presets?: string[];
   default_preset?: { run?: string; session?: string };
   template?: boolean;

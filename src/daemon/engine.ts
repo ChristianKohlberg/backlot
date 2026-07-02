@@ -12,7 +12,7 @@ import { runUpkeep } from '../core/upkeep.js';
 import { freePort, probeFree } from '../core/ports.js';
 import { envsRoot, artifactsRoot } from '../core/paths.js';
 import { BrokerError, template, templateEnv, now, shortId, matchesAny } from '../core/util.js';
-import { makeDatastore } from '../drivers/datastore-sqlite.js';
+import { makeDatastore, type DsHandle } from '../drivers/datastores.js';
 import { EnvSupervisor, reapPids } from './supervisor.js';
 import type { Hygiene, LeaseKind } from '../core/types.js';
 
@@ -105,10 +105,12 @@ export class Engine {
     for (const [name, spec] of Object.entries(stack.manifest.services)) {
       if (spec.port) services[name] = { url: `http://localhost:${env.ports[spec.port]}` };
     }
-    const datastores: Record<string, { url: string }> = {};
+    const datastores: Record<string, { url: string; ns: string }> = {};
     const dirs = this.envDirs(env.id);
+    const h: DsHandle = { envId: env.id, envTree: dirs.tree, dataDir: dirs.data };
     for (const [name, spec] of Object.entries(stack.manifest.datastores ?? {})) {
-      datastores[name] = { url: makeDatastore(name, spec, stack.id).url(dirs.data) };
+      const ds = makeDatastore(name, spec, stack.id);
+      datastores[name] = { url: ds.url(h), ns: ds.ns(h) };
     }
     return { ports: env.ports, services, datastores };
   }
@@ -162,17 +164,17 @@ export class Engine {
     await this.supervisor(env).stopAll();
     this.supervisors.delete(env.id);
 
-    // Data state: create-or-restore per hygiene.
+    // Data state: create-or-restore per hygiene (probe first — infra-error, not code blame).
+    const dsHandle: DsHandle = { envId: env.id, envTree: dirs.tree, dataDir: dirs.data };
     for (const [name, spec] of Object.entries(stack.manifest.datastores ?? {})) {
       const ds = makeDatastore(name, spec, stack.id);
+      await ds.probe();
       const preset = defaultPreset(spec, kind);
-      const missing = !existsSync(ds.url(dirs.data));
-      const presetChanged = env.presets[name] !== preset;
-      if (missing || presetChanged || hygiene !== 'reuse' || upkeep.rebakeTemplates.includes(name)) {
-        const bound = await ds.create(dirs.tree, dirs.data, preset);
-        env.datastoreNs[name] = bound.url;
-        env.presets[name] = preset;
-      }
+      const exists = Boolean(env.datastoreNs[name]);
+      const force = env.presets[name] !== preset || hygiene !== 'reuse' || upkeep.rebakeTemplates.includes(name);
+      await ds.ensure(dsHandle, preset, force, exists);
+      env.datastoreNs[name] = ds.ns(dsHandle);
+      env.presets[name] = preset;
     }
 
     // Builds: only when the source actually changed (fingerprint '@source').
@@ -268,7 +270,7 @@ export class Engine {
       urls,
       logins: stack.manifest.auth?.logins ?? null,
       tokenCommand: stack.manifest.auth?.token ?? null,
-      datastores: Object.fromEntries(Object.entries(ctx.datastores).map(([n, d]) => [n, { url: d.url }])),
+      datastores: Object.fromEntries(Object.entries(ctx.datastores).map(([n, d]) => [n, { url: d.url, ns: d.ns }])),
       artifactsDir: join(artifactsRoot(), env.id),
       events: this.supervisors.get(env.id)?.events.slice(-20) ?? [],
     };
@@ -310,6 +312,34 @@ export class Engine {
       const lease = this.journal.leaseForHolder(holder, stack.id);
       if (lease) this.journal.deleteLease(lease.id); // env stays hot in the pool
     }
+  }
+
+  /**
+   * Detached submit-and-poll runs (decision 0015): the verdict outlives the
+   * client. Returns immediately with a jobId; the caller polls jobStatus.
+   * Execution is handed back to the daemon's serialized queue by the server.
+   */
+  createJob(cwd: string, check: string): string {
+    const id = `job-${shortId()}`;
+    this.journal.saveJob({ id, stackCwd: cwd, check, state: 'pending' });
+    return id;
+  }
+
+  async executeJob(id: string, opts: UpOptions & { check: string }): Promise<void> {
+    this.journal.saveJob({ id, stackCwd: opts.cwd, check: opts.check, state: 'running' });
+    try {
+      const verdict = await this.run(opts);
+      this.journal.saveJob({ id, stackCwd: opts.cwd, check: opts.check, state: 'done', verdict, finishedAt: now() });
+    } catch (err) {
+      const failure = err instanceof BrokerError ? err.toJSON() : { class: 'env-error', message: String((err as Error).message ?? err) };
+      this.journal.saveJob({ id, stackCwd: opts.cwd, check: opts.check, state: 'done', verdict: { check: opts.check, ok: false, exitCode: -1, failure }, finishedAt: now() });
+    }
+  }
+
+  jobStatus(id: string) {
+    const job = this.journal.getJob(id);
+    if (!job) throw new BrokerError('env-error', `no such job '${id}'`, 'job');
+    return job;
   }
 
   private collectArtifacts(envId: string, tree: string, patterns: string[]): string | null {
@@ -414,6 +444,17 @@ export class Engine {
       if (leased && !all) continue;
       await this.supervisor(env).stopAll();
       this.supervisors.delete(env.id);
+      // Drop server-side namespaces too (best effort — the manifest may be gone).
+      try {
+        const stack = loadStack(env.stackRoot);
+        const dirs = this.envDirs(env.id);
+        const h: DsHandle = { envId: env.id, envTree: dirs.tree, dataDir: dirs.data };
+        for (const [name, spec] of Object.entries(stack.manifest.datastores ?? {})) {
+          if (env.datastoreNs[name]) await makeDatastore(name, spec, stack.id).drop(h);
+        }
+      } catch {
+        /* stack unloadable — local files still go */
+      }
       rmSync(env.root, { recursive: true, force: true });
       this.journal.deleteEnv(env.id);
       recycled.push(env.id);

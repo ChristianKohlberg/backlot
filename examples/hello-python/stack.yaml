@@ -1,0 +1,24 @@
+# yaml-language-server: $schema=../../schema/stack.schema.json
+name: hello-python
+
+services:
+  web:
+    run: python3 server.py
+    port: web
+    env:
+      PORT: "{{ports.web}}"
+      DB_PATH: "{{datastores.main.url}}"
+    ready: { http: /health, timeout: 30 }
+    fatal_logs: "Traceback"
+
+datastores:
+  main:
+    driver: sqlite
+    create: python3 seed.py {{ns}} {{preset}}
+    presets: [dev, empty]
+    template: true
+
+checks:
+  smoke:
+    run: python3 smoke.py
+    env: { BASE_URL: "{{services.web.url}}" }
