@@ -20,6 +20,8 @@ export interface EnvRow {
   createdAt: number;
   lastUsedAt: number;
   servicePids: Record<string, number>;
+  /** Consecutive bind failures — >= 2 auto-escalates the next bind to pristine (decision 0007). */
+  failStreak: number;
 }
 
 export interface LeaseRow {
@@ -45,7 +47,8 @@ export class Journal {
         fingerprints TEXT NOT NULL DEFAULT '{}', presets TEXT NOT NULL DEFAULT '{}',
         bind_count INTEGER NOT NULL DEFAULT 0,
         created_at INTEGER NOT NULL, last_used_at INTEGER NOT NULL,
-        service_pids TEXT NOT NULL DEFAULT '{}'
+        service_pids TEXT NOT NULL DEFAULT '{}',
+        fail_streak INTEGER NOT NULL DEFAULT 0
       );
       CREATE TABLE IF NOT EXISTS leases (
         id TEXT PRIMARY KEY, env_id TEXT NOT NULL, kind TEXT NOT NULL,
@@ -56,6 +59,12 @@ export class Journal {
         state TEXT NOT NULL, verdict TEXT, created_at INTEGER NOT NULL, finished_at INTEGER
       );
     `);
+    // Migration for journals created before fail_streak existed.
+    try {
+      this.db.exec("ALTER TABLE envs ADD COLUMN fail_streak INTEGER NOT NULL DEFAULT 0");
+    } catch {
+      /* column already exists */
+    }
   }
 
   private rowToEnv(r: Record<string, unknown>): EnvRow {
@@ -73,23 +82,26 @@ export class Journal {
       createdAt: r.created_at as number,
       lastUsedAt: r.last_used_at as number,
       servicePids: JSON.parse(r.service_pids as string),
+      failStreak: (r.fail_streak as number) ?? 0,
     };
   }
 
   saveEnv(e: EnvRow): void {
     this.db
       .prepare(
-        `INSERT INTO envs (id, stack, stack_root, state, root, ports, datastore_ns, fingerprints, presets, bind_count, created_at, last_used_at, service_pids)
-         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+        `INSERT INTO envs (id, stack, stack_root, state, root, ports, datastore_ns, fingerprints, presets, bind_count, created_at, last_used_at, service_pids, fail_streak)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
          ON CONFLICT(id) DO UPDATE SET state=excluded.state, ports=excluded.ports,
            datastore_ns=excluded.datastore_ns, fingerprints=excluded.fingerprints,
            presets=excluded.presets, bind_count=excluded.bind_count,
-           last_used_at=excluded.last_used_at, service_pids=excluded.service_pids`,
+           last_used_at=excluded.last_used_at, service_pids=excluded.service_pids,
+           fail_streak=excluded.fail_streak`,
       )
       .run(
         e.id, e.stack, e.stackRoot, e.state, e.root,
         JSON.stringify(e.ports), JSON.stringify(e.datastoreNs), JSON.stringify(e.fingerprints),
         JSON.stringify(e.presets), e.bindCount, e.createdAt, e.lastUsedAt, JSON.stringify(e.servicePids),
+        e.failStreak,
       );
   }
 

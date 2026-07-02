@@ -12,15 +12,9 @@ import { Engine } from './engine.js';
 
 const engine = new Engine();
 engine.recover();
-
-// One request at a time: correctness first; concurrency belongs to environments,
-// not to the policy code mutating the journal.
-let chain: Promise<unknown> = Promise.resolve();
-const enqueue = <T>(fn: () => Promise<T>): Promise<T> => {
-  const next = chain.then(fn, fn);
-  chain = next.catch(() => undefined);
-  return next;
-};
+// Concurrency lives in the engine: a short pool lock for claim bookkeeping and
+// one lock per environment. Requests for different environments overlap; two
+// operations on one environment never do.
 
 async function dispatch(verb: string, args: Record<string, unknown>): Promise<unknown> {
   const cwd = String(args.cwd ?? process.cwd());
@@ -39,9 +33,9 @@ async function dispatch(verb: string, args: Record<string, unknown>): Promise<un
       return engine.run({ cwd, holder, check: String(args.check), hygiene: (args.hygiene as never) ?? undefined });
     case 'run-detach': {
       const jobId = engine.createJob(cwd, String(args.check));
-      // Chain the execution onto the serialized queue and return NOW — the
-      // verdict outlives the client (decision 0015).
-      enqueue(() => engine.executeJob(jobId, { cwd, holder, check: String(args.check), hygiene: (args.hygiene as never) ?? undefined }));
+      // Fire-and-forget — env/pool locks make it safe; the journaled verdict
+      // outlives the client (decision 0015).
+      void engine.executeJob(jobId, { cwd, holder, check: String(args.check), hygiene: (args.hygiene as never) ?? undefined });
       return { jobId, poll: `infront job ${jobId}` };
     }
     case 'job':
@@ -56,6 +50,8 @@ async function dispatch(verb: string, args: Record<string, unknown>): Promise<un
       return engine.exec(cwd, String(args.cmd), holder);
     case 'logs':
       return engine.logs(cwd, String(args.service), Number(args.lines ?? 40), holder);
+    case 'token':
+      return engine.token(cwd, String(args.role ?? 'admin'), holder);
     case 'pull':
       return engine.pull(cwd, holder);
     case 'release':
@@ -85,7 +81,7 @@ const server = createServer((req, res) => {
     void (async () => {
       try {
         const { verb, args } = JSON.parse(body || '{}');
-        const data = await enqueue(() => dispatch(verb, args ?? {}));
+        const data = await dispatch(verb, args ?? {});
         res.writeHead(200, { 'content-type': 'application/json' });
         res.end(JSON.stringify({ ok: true, data }));
       } catch (err) {

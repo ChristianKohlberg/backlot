@@ -120,6 +120,10 @@ class CommandDs implements DsDriver {
     }
   }
 
+  get capabilities(): { template: boolean; ephemeral: boolean } {
+    return { template: Boolean(this.spec.template_restore), ephemeral: this.spec.ephemeral === true };
+  }
+
   ns(h: DsHandle): string {
     return `infront_${h.envId}`.replace(/[^A-Za-z0-9_]/g, '_');
   }
@@ -156,6 +160,16 @@ class CommandDs implements DsDriver {
   }
 
   async ensure(h: DsHandle, preset: string, force: boolean, exists: boolean): Promise<void> {
+    const nsE = this.ns(h);
+    if (this.spec.ephemeral) {
+      // Ephemeral (redis-class): no presets, no templates — reset = the drop:
+      // command as a flush; create (optional) runs only on first bind.
+      if (force && exists && this.spec.drop) await shQuiet(template(this.spec.drop, { ns: nsE }), h.envTree);
+      if (!exists && this.spec.create) {
+        await sh(template(this.spec.create, { ns: nsE, preset }), h.envTree, `create failed for ephemeral '${this.name}'`);
+      }
+      return;
+    }
     if (exists && !force) return;
     if (!this.spec.create) throw new BrokerError('work-error', `datastore '${this.name}' has no create: command`, 'datastore');
     const ns = this.ns(h);

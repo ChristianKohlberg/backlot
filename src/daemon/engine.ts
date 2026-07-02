@@ -3,7 +3,7 @@
  * (drivers own transport/storage; the manifest owns repo knowledge).
  */
 import { execFile } from 'node:child_process';
-import { mkdirSync, rmSync, copyFileSync, readdirSync, statSync, existsSync, readFileSync } from 'node:fs';
+import { mkdirSync, rmSync, copyFileSync, readdirSync, statSync, existsSync, readFileSync, watch as fsWatch } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { Journal, type EnvRow } from '../core/journal.js';
 import { loadStack, defaultPreset, type Stack } from '../core/manifest.js';
@@ -36,6 +36,46 @@ export class Engine {
   private supervisors = new Map<string, EnvSupervisor>();
   private lastSweep = now();
 
+  // -------- concurrency: a short pool lock for claim/release bookkeeping and
+  // one lock per environment for bind/exec/reset. Two environments (or two
+  // stacks) proceed in parallel; one environment is never mutated twice at once.
+  private poolChain: Promise<unknown> = Promise.resolve();
+  private envChains = new Map<string, Promise<unknown>>();
+  /** Envs with an operation in flight — the sweeper must not expire/quiesce these. */
+  readonly busy = new Set<string>();
+  /** --watch: per-env worktree watchers ("verbs sync, watch streams", decision 0005). */
+  private watchers = new Map<string, { close: () => void }>();
+
+  private poolLocked<T>(fn: () => Promise<T> | T): Promise<T> {
+    const next = this.poolChain.then(fn, fn);
+    this.poolChain = next.catch(() => undefined);
+    return next;
+  }
+
+  private envLocked<T>(envId: string, fn: () => Promise<T>): Promise<T> {
+    const chain = this.envChains.get(envId) ?? Promise.resolve();
+    const next = chain.then(
+      async () => {
+        this.busy.add(envId);
+        try {
+          return await fn();
+        } finally {
+          this.busy.delete(envId);
+        }
+      },
+      async () => {
+        this.busy.add(envId);
+        try {
+          return await fn();
+        } finally {
+          this.busy.delete(envId);
+        }
+      },
+    );
+    this.envChains.set(envId, next.catch(() => undefined));
+    return next;
+  }
+
   /** Recovery (decision 0009): reap recorded PIDs from a previous daemon life; hot -> warm. */
   recover(): void {
     for (const env of this.journal.allEnvs()) {
@@ -66,33 +106,41 @@ export class Engine {
     const env: EnvRow = {
       id, stack: stack.id, stackRoot: stack.root, state: 'warm', root: dirs.root,
       ports, datastoreNs: {}, fingerprints: {}, presets: {},
-      bindCount: 0, createdAt: now(), lastUsedAt: now(), servicePids: {},
+      bindCount: 0, createdAt: now(), lastUsedAt: now(), servicePids: {}, failStreak: 0,
     };
     this.journal.saveEnv(env);
     return env;
   }
 
+  /** One atomic claim attempt — MUST run under the pool lock. */
+  private async tryClaim(stack: Stack, holder: string, kind: LeaseKind, hygiene: Hygiene, ttlMs: number): Promise<EnvRow | null> {
+    // A holder keeps its env: rebinding your own lease is the normal loop.
+    const mine = this.journal.leaseForHolder(holder, stack.id);
+    if (mine) {
+      this.journal.saveLease({ ...mine, hygiene, expiresAt: now() + ttlMs });
+      return this.journal.getEnv(mine.envId)!;
+    }
+    const envs = this.journal.envsForStack(stack.id);
+    const free = envs
+      .filter((e) => !this.journal.leaseForEnv(e.id) && e.state !== 'degraded' && e.state !== 'recycling')
+      .sort((a, b) => (a.state === 'hot' ? -1 : 1) - (b.state === 'hot' ? -1 : 1));
+    let env = free[0];
+    if (!env && envs.length < POOL_MAX()) env = await this.createEnv(stack);
+    if (env) {
+      this.journal.saveLease({ id: `l-${shortId()}`, envId: env.id, kind, holder, hygiene, expiresAt: now() + ttlMs });
+      return env;
+    }
+    return null;
+  }
+
+  /** Queue at capacity WITHOUT holding the pool lock while sleeping. */
   private async acquireEnv(stack: Stack, holder: string, kind: LeaseKind, hygiene: Hygiene, ttlMs: number): Promise<EnvRow> {
     const start = now();
     for (;;) {
-      // A holder keeps its env: rebinding your own lease is the normal loop.
-      const mine = this.journal.leaseForHolder(holder, stack.id);
-      if (mine) {
-        this.journal.saveLease({ ...mine, hygiene, expiresAt: now() + ttlMs });
-        return this.journal.getEnv(mine.envId)!;
-      }
-      const envs = this.journal.envsForStack(stack.id);
-      const free = envs
-        .filter((e) => !this.journal.leaseForEnv(e.id) && e.state !== 'degraded' && e.state !== 'recycling')
-        .sort((a, b) => (a.state === 'hot' ? -1 : 1) - (b.state === 'hot' ? -1 : 1));
-      let env = free[0];
-      if (!env && envs.length < POOL_MAX()) env = await this.createEnv(stack);
-      if (env) {
-        this.journal.saveLease({ id: `l-${shortId()}`, envId: env.id, kind, holder, hygiene, expiresAt: now() + ttlMs });
-        return env;
-      }
+      const env = await this.poolLocked(() => this.tryClaim(stack, holder, kind, hygiene, ttlMs));
+      if (env) return env;
       if (now() - start > WAIT_MS()) {
-        throw new BrokerError('env-error', `pool at capacity (${envs.length}/${POOL_MAX()}) — waited ${Math.round(WAIT_MS() / 1000)}s; release a lease or raise INFRONT_POOL_MAX`, 'pool');
+        throw new BrokerError('env-error', `pool at capacity (${POOL_MAX()}/${POOL_MAX()}) — waited ${Math.round(WAIT_MS() / 1000)}s; release a lease or raise INFRONT_POOL_MAX`, 'pool');
       }
       await new Promise((r) => setTimeout(r, 500));
     }
@@ -119,7 +167,15 @@ export class Engine {
     let sup = this.supervisors.get(env.id);
     if (!sup) {
       const dirs = this.envDirs(env.id);
-      sup = new EnvSupervisor(env.id, dirs.tree, dirs.logs);
+      sup = new EnvSupervisor(env.id, dirs.tree, dirs.logs, () => {
+        // Flapping service -> the environment is degraded: skipped by acquire,
+        // auto-reaped by the sweeper (decision 0007).
+        const fresh = this.journal.getEnv(env.id);
+        if (fresh && fresh.state !== 'recycling') {
+          fresh.state = 'degraded';
+          this.journal.saveEnv(fresh);
+        }
+      });
       this.supervisors.set(env.id, sup);
     }
     return sup;
@@ -206,7 +262,14 @@ export class Engine {
             throw new BrokerError('env-error', `port ${port} for service '${name}' is occupied by a foreign process — try 'infront pool recycle'`, name);
           }
         }
-        sup.start(name, spec, templateEnv(spec.env, ctx), watch);
+        // Template the COMMANDS too — ports/urls may ride in the run line itself
+        // (e.g. `ng serve --port {{ports.web}}`), not only in env:.
+        const resolved = {
+          ...spec,
+          run: template(spec.run, ctx),
+          ...(spec.watch_run ? { watch_run: template(spec.watch_run, ctx) } : {}),
+        };
+        sup.start(name, resolved, templateEnv(spec.env, ctx), watch);
         const url = spec.port ? `http://localhost:${env.ports[spec.port]}` : undefined;
         try {
           await sup.waitReady(name, spec, url, templateEnv(spec.env, ctx));
@@ -226,8 +289,49 @@ export class Engine {
     env.servicePids = sup.pids();
     env.bindCount += 1;
     env.lastUsedAt = now();
+    env.failStreak = 0; // a successful bind clears the escalation counter
     this.journal.saveEnv(env);
     return env;
+  }
+
+  // ---------------------------------------------------------------- watch
+
+  /**
+   * --watch: the daemon observes the CONSUMER's worktree (opt-in, per lease)
+   * and auto-syncs debounced. The environment's own dev servers then pick up
+   * the projected change — two-stage reload. Stopped on release/expiry/
+   * quiesce/recycle/shutdown.
+   */
+  private startWatch(envId: string, stackRoot: string, cwd: string, holder: string): void {
+    this.stopWatch(envId);
+    let timer: NodeJS.Timeout | null = null;
+    let watcher: ReturnType<typeof fsWatch>;
+    try {
+      watcher = fsWatch(stackRoot, { recursive: true }, (_event, filename) => {
+        const f = String(filename ?? '');
+        if (f.startsWith('.git') || f.includes('/.git/') || f.startsWith('.infront')) return;
+        if (timer) clearTimeout(timer);
+        timer = setTimeout(() => {
+          void this.up({ cwd, holder, kind: 'session', hygiene: 'reuse', watch: true }).catch(() => {
+            /* a broken edit is reported on the next explicit verb; keep watching */
+          });
+        }, 300);
+        timer.unref();
+      });
+    } catch {
+      return; // recursive fs.watch unavailable — --watch degrades to verbs-only
+    }
+    this.watchers.set(envId, {
+      close: () => {
+        if (timer) clearTimeout(timer);
+        watcher.close();
+      },
+    });
+  }
+
+  private stopWatch(envId: string): void {
+    this.watchers.get(envId)?.close();
+    this.watchers.delete(envId);
   }
 
   // ---------------------------------------------------------------- verbs
@@ -236,12 +340,23 @@ export class Engine {
     const stack = loadStack(opts.cwd);
     const holder = opts.holder ?? resolve(opts.cwd);
     const kind = opts.kind ?? 'session';
-    const hygiene = opts.hygiene ?? 'reuse';
+    let hygiene = opts.hygiene ?? 'reuse';
     const env = await this.acquireEnv(stack, holder, kind, hygiene, opts.ttlMs ?? LEASE_TTL(kind));
+    // Auto-escalation (decision 0007): two consecutive bind failures on this
+    // warm environment -> the next bind is pristine, whatever was asked.
+    if (hygiene !== 'pristine' && env.failStreak >= 2) hygiene = 'pristine';
     try {
-      const bound = await this.bindAndStart(stack, env, hygiene, kind, opts.watch ?? false);
+      const bound = await this.envLocked(env.id, () => this.bindAndStart(stack, env, hygiene, kind, opts.watch ?? false));
+      if (opts.watch && kind === 'session' && !this.watchers.has(bound.id)) {
+        this.startWatch(bound.id, stack.root, opts.cwd, holder);
+      }
       return this.ctx(opts.cwd, holder, bound.id);
     } catch (err) {
+      const fresh = this.journal.getEnv(env.id);
+      if (fresh) {
+        fresh.failStreak += 1;
+        this.journal.saveEnv(fresh);
+      }
       // A failed bind must not strand the lease for a run; sessions keep theirs to iterate.
       if (kind === 'run') {
         const lease = this.journal.leaseForHolder(holder, stack.id);
@@ -289,13 +404,17 @@ export class Engine {
     const dirs = this.envDirs(env.id);
     const ctx = this.templateCtx(stack, env);
     try {
-      const res = await new Promise<{ exitCode: number; output: string }>((resolvePromise) => {
-        execFile(
-          'sh', ['-c', template(check.run, ctx)],
-          { cwd: check.cwd ? join(dirs.tree, check.cwd) : dirs.tree, env: { ...process.env, ...templateEnv(check.env, ctx) }, maxBuffer: 32 * 1024 * 1024 },
-          (err, stdout, stderr) => resolvePromise({ exitCode: err ? ((err as { code?: number }).code ?? 1) : 0, output: `${stdout}${stderr}`.slice(-4000) }),
-        );
-      });
+      // envLocked: marks the env busy for the whole check so the sweeper can't
+      // expire the run lease mid-check and hand the env to someone else.
+      const res = await this.envLocked(env.id, () =>
+        new Promise<{ exitCode: number; output: string }>((resolvePromise) => {
+          execFile(
+            'sh', ['-c', template(check.run, ctx)],
+            { cwd: check.cwd ? join(dirs.tree, check.cwd) : dirs.tree, env: { ...process.env, ...templateEnv(check.env, ctx) }, maxBuffer: 32 * 1024 * 1024 },
+            (err, stdout, stderr) => resolvePromise({ exitCode: err ? ((err as { code?: number }).code ?? 1) : 0, output: `${stdout}${stderr}`.slice(-4000) }),
+          );
+        }),
+      );
       const artifactsDir = this.collectArtifacts(env.id, dirs.tree, check.artifacts ?? []);
       return {
         check: opts.check,
@@ -378,7 +497,7 @@ export class Engine {
     if (!lease) throw new BrokerError('env-error', `no active lease — run 'infront up' first`, 'lease');
     this.journal.saveLease({ ...lease, hygiene: 'reset-data', expiresAt: now() + LEASE_TTL(lease.kind) });
     const env = this.journal.getEnv(lease.envId)!;
-    await this.bindAndStart(stack, env, 'reset-data', lease.kind, false);
+    await this.envLocked(env.id, () => this.bindAndStart(stack, env, 'reset-data', lease.kind, false));
     return this.ctx(cwd, h);
   }
 
@@ -394,11 +513,33 @@ export class Engine {
     for (const [name, port] of Object.entries(env.ports)) extra[`INFRONT_PORT_${name.toUpperCase()}`] = String(port);
     for (const [name, s] of Object.entries(ctx.services)) extra[`INFRONT_URL_${name.toUpperCase()}`] = s.url;
     for (const [name, d] of Object.entries(ctx.datastores)) extra[`INFRONT_DS_${name.toUpperCase()}`] = d.url;
-    return new Promise((resolvePromise) => {
-      execFile('sh', ['-c', cmd], { cwd: dirs.tree, env: { ...process.env, ...extra }, maxBuffer: 32 * 1024 * 1024 }, (err, stdout, stderr) =>
-        resolvePromise({ exitCode: err ? ((err as { code?: number }).code ?? 1) : 0, stdout: String(stdout).slice(-8000), stderr: String(stderr).slice(-8000) }),
-      );
-    });
+    return this.envLocked(env.id, () =>
+      new Promise((resolvePromise) => {
+        execFile('sh', ['-c', cmd], { cwd: dirs.tree, env: { ...process.env, ...extra }, maxBuffer: 32 * 1024 * 1024 }, (err, stdout, stderr) =>
+          resolvePromise({ exitCode: err ? ((err as { code?: number }).code ?? 1) : 0, stdout: String(stdout).slice(-8000), stderr: String(stderr).slice(-8000) }),
+        );
+      }),
+    );
+  }
+
+  /** Resolve auth.token with {{role}} and run it in the env tree. */
+  async token(cwd: string, role: string, holder?: string) {
+    const stack = loadStack(cwd);
+    const spec = stack.manifest.auth?.token;
+    if (!spec) throw new BrokerError('work-error', `stack.yaml declares no auth.token command`, 'manifest');
+    const lease = this.journal.leaseForHolder(holder ?? resolve(cwd), stack.id);
+    if (!lease) throw new BrokerError('env-error', `no active lease — run 'infront up' first`, 'lease');
+    const env = this.journal.getEnv(lease.envId)!;
+    const dirs = this.envDirs(env.id);
+    const ctx = { ...this.templateCtx(stack, env), role };
+    return this.envLocked(env.id, () =>
+      new Promise((resolvePromise, reject) => {
+        execFile('sh', ['-c', template(spec, ctx)], { cwd: dirs.tree, maxBuffer: 1024 * 1024 }, (err, stdout, stderr) => {
+          if (err) reject(new BrokerError('work-error', `auth.token command failed`, 'auth', String(stderr).slice(0, 400)));
+          else resolvePromise({ token: String(stdout).trim(), role });
+        });
+      }),
+    );
   }
 
   logs(cwd: string, service: string, lines: number, holder?: string) {
@@ -425,6 +566,7 @@ export class Engine {
     const lease = this.journal.leaseForHolder(holder ?? resolve(cwd), stack.id);
     if (!lease) return { released: false };
     this.journal.deleteLease(lease.id);
+    this.stopWatch(lease.envId);
     return { released: true, envId: lease.envId };
   }
 
@@ -437,26 +579,31 @@ export class Engine {
     return { pid: process.pid, envs, poolMax: POOL_MAX() };
   }
 
+  private async recycleOne(env: EnvRow): Promise<void> {
+    this.stopWatch(env.id);
+    await this.supervisor(env).stopAll();
+    this.supervisors.delete(env.id);
+    // Drop server-side namespaces too (best effort — the manifest may be gone).
+    try {
+      const stack = loadStack(env.stackRoot);
+      const dirs = this.envDirs(env.id);
+      const h: DsHandle = { envId: env.id, envTree: dirs.tree, dataDir: dirs.data };
+      for (const [name, spec] of Object.entries(stack.manifest.datastores ?? {})) {
+        if (env.datastoreNs[name]) await makeDatastore(name, spec, stack.id).drop(h);
+      }
+    } catch {
+      /* stack unloadable — local files still go */
+    }
+    rmSync(env.root, { recursive: true, force: true });
+    this.journal.deleteEnv(env.id);
+  }
+
   async poolRecycle(all: boolean) {
     const recycled: string[] = [];
     for (const env of this.journal.allEnvs()) {
       const leased = this.journal.leaseForEnv(env.id);
-      if (leased && !all) continue;
-      await this.supervisor(env).stopAll();
-      this.supervisors.delete(env.id);
-      // Drop server-side namespaces too (best effort — the manifest may be gone).
-      try {
-        const stack = loadStack(env.stackRoot);
-        const dirs = this.envDirs(env.id);
-        const h: DsHandle = { envId: env.id, envTree: dirs.tree, dataDir: dirs.data };
-        for (const [name, spec] of Object.entries(stack.manifest.datastores ?? {})) {
-          if (env.datastoreNs[name]) await makeDatastore(name, spec, stack.id).drop(h);
-        }
-      } catch {
-        /* stack unloadable — local files still go */
-      }
-      rmSync(env.root, { recursive: true, force: true });
-      this.journal.deleteEnv(env.id);
+      if ((leased || this.busy.has(env.id)) && !all) continue;
+      await this.recycleOne(env);
       recycled.push(env.id);
     }
     return { recycled };
@@ -472,9 +619,19 @@ export class Engine {
     this.lastSweep = t;
 
     for (const lease of this.journal.allLeases()) {
-      if (lease.expiresAt < now()) this.journal.deleteLease(lease.id); // env returns to pool WARM-hot
+      // Never expire a lease whose env has an operation in flight (a long bind
+      // under a tiny TTL must not lose its env mid-bind).
+      if (lease.expiresAt < now() && !this.busy.has(lease.envId)) {
+        this.journal.deleteLease(lease.id);
+        this.stopWatch(lease.envId);
+      }
     }
     for (const env of this.journal.allEnvs()) {
+      if (this.busy.has(env.id)) continue;
+      if (env.state === 'degraded') {
+        await this.recycleOne(env); // degraded envs are dead — auto-reap (decision 0007)
+        continue;
+      }
       if (env.state === 'hot' && !this.journal.leaseForEnv(env.id) && now() - env.lastUsedAt > IDLE_TTL()) {
         await this.supervisor(env).stopAll();
         this.supervisors.delete(env.id);
@@ -486,6 +643,7 @@ export class Engine {
   }
 
   async shutdown(): Promise<void> {
+    for (const id of [...this.watchers.keys()]) this.stopWatch(id);
     for (const sup of this.supervisors.values()) await sup.stopAll();
     for (const env of this.journal.allEnvs()) {
       if (env.state === 'hot') {

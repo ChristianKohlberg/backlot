@@ -31,6 +31,8 @@ export class EnvSupervisor {
     readonly envId: string,
     private readonly envTree: string,
     private readonly logDir: string,
+    /** Fired when a service flaps past its restart budget (decision 0007/0010). */
+    private readonly onDegraded?: (service: string) => void,
   ) {
     mkdirSync(logDir, { recursive: true });
   }
@@ -91,6 +93,7 @@ export class EnvSupervisor {
           setTimeout(launch, 500 * running.restarts).unref();
         } else {
           this.note(name, 'flapping — giving up (environment degraded)');
+          this.onDegraded?.(name);
         }
       });
     };

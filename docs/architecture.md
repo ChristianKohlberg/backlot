@@ -116,6 +116,10 @@ Local pools are convergence all the way down. Same verbs above the driver line.
   pattern), speaking HTTP over a unix socket. The daemon exists because processes need
   a parent: someone must supervise services, watch readiness, expire leases, and
   quiesce idle environments while no CLI is running.
+- **Concurrency lives at the environment boundary**: a short pool lock serializes
+  claim/release bookkeeping; one lock per environment serializes bind/exec/reset on it.
+  Different environments (and different stacks) bind in parallel; the sweeper never
+  expires or quiesces an environment with an operation in flight.
 - **Local even when compute is remote.** A Morph environment is a pool entry whose
   driver executes over SSH. The consumer's machine is the brain; substrates are muscles.
 - **Disk is truth; daemon memory is a cache.** After a daemon crash or reboot, the next
@@ -142,8 +146,9 @@ local/remote abstraction**).
 - **Bindings are immutable snapshots.** A running check executes against the revision
   synced at start; edits mid-run cannot contaminate the verdict. New sync = new binding
   revision.
-- `--watch` sessions opt into a debounced worktree watcher that auto-syncs on save,
-  feeding the environment's own dev-server watchers. Two-stage reload, ~100 ms added.
+- `--watch` sessions opt into a daemon-side debounced worktree watcher that auto-syncs
+  on save, feeding the environment's own dev-server watchers. Two-stage reload;
+  stopped on release/expiry/quiesce/recycle. Watch activity refreshes the lease.
 - The environment-side reset before each bind restores tracked files hard and cleans
   untracked ones, **except** declared `caches:` (node_modules, obj/, …) and `sync.keep`
   paths. A poisoned env tree self-heals on next bind.
@@ -185,7 +190,8 @@ Datastore drivers expose `create(ns, preset)` / `drop(ns)` / `url(ns)` plus opti
 `template_bake` / `template_restore`. Re-seeding runs once per seed-content hash; after
 that, data states are restored from templates in seconds (Postgres: native
 `CREATE DATABASE … TEMPLATE`; MSSQL: backup/restore; SQLite: file copy; Redis-class
-stores: `ephemeral: true`, reset = flush).
+stores: `ephemeral: true` — `drop:` is the flush, run on reset; `create:` runs only on
+first bind; no presets or templates).
 
 **Hygiene levels** per bind:
 
@@ -195,10 +201,12 @@ stores: `ephemeral: true`, reset = flush).
 | `reset-data` | restore data template, keep all build caches | agent verify loops (default for runs) |
 | `pristine` | fresh environment | merge-grade verdicts; auto-escalation |
 
-Two consecutive failures of the same kind on the same warm environment auto-escalate to
-`pristine` — the standard defense against stale-cache heisenbugs. Environments also
-recycle mechanically (max bindings or age). **Warm is a cache, not a home**: the pool
-stays honest only while discarding any environment is cheap.
+Two consecutive bind failures on the same warm environment auto-escalate the next bind
+to `pristine` (a per-env `failStreak` in the journal, cleared by any successful bind) —
+the standard defense against stale-cache heisenbugs. A service that flaps past its
+restart budget marks its environment `degraded`: skipped by acquisition, auto-reaped by
+the sweeper. **Warm is a cache, not a home**: the pool stays honest only while
+discarding any environment is cheap.
 
 `reset-data` is also exposed mid-lease as a verb: replay your repro against pristine
 data after twenty minutes of debugging mutation.

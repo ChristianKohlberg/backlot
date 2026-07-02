@@ -6,15 +6,17 @@
 It brokers environments; it never provides them. Local processes today, your own cloud
 sandboxes (Morph, Sprites, SSH) tomorrow — same verbs, same model.
 
-> **Status: 0.4-core.** The local loop is complete and battle-proven: daemon, warm
-> pool, leases, bind-by-sync, sqlite + server datastores (postgres/mssql/mysql) with
-> template restore, checks with verdicts/artifacts, detached submit-and-poll runs,
-> crash recovery, an MCP adapter (`infront-mcp`), and a foreign-runtime consumer
-> (Python) — 43 tests including live-Postgres and full-CLI integration. Proven on a
-> real .NET + Angular + MSSQL monorepo: a seeded, authenticated API vertical in ~50 s
-> per environment. Not yet: a live remote substrate driver (morph/ssh) and the npm
-> publish. Design in [docs/architecture.md](docs/architecture.md); decisions in
-> [docs/decisions/](docs/decisions/).
+> **Status: 0.4-core, gap-closing batch landed.** The local loop is complete and
+> battle-proven: daemon with **per-environment concurrency**, warm pool, leases,
+> stat-gated bind-by-sync, **`--watch` streaming**, sqlite + server datastores
+> (postgres/mssql/mysql) with template restore and **ephemeral (flush) stores**,
+> checks with verdicts/artifacts, detached submit-and-poll runs, **hygiene
+> auto-escalation + degraded auto-reap**, idle quiesce, crash recovery, a `token`
+> verb, an MCP adapter (`infront-mcp`), and a foreign-runtime consumer (Python).
+> Proven on a real .NET + Angular + MSSQL monorepo end to end — including its
+> Playwright system-e2e suite running against infront-provisioned environments.
+> Not yet: a live remote substrate driver (morph/ssh) and the npm publish. Design in
+> [docs/architecture.md](docs/architecture.md); decisions in [docs/decisions/](docs/decisions/).
 
 ## Why
 

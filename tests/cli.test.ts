@@ -83,11 +83,6 @@ describe('the local loop (hello-web)', () => {
   });
 
   it('bind-by-sync: edit the worktree, sync, same URL serves the new code', async () => {
-    appendFileSync(
-      join(wt.dir, 'server.mjs'),
-      `\ncreateServer((q,s)=>{s.end('v2')}).listen(Number(process.env.PORT)+10000);\n`,
-    );
-    // Simpler, honest edit: change a served string instead.
     const src = readFileSync(join(wt.dir, 'server.mjs'), 'utf8').replace('<h1>hello-web</h1>', '<h1>hello-web EDITED</h1>');
     writeFileSync(join(wt.dir, 'server.mjs'), src);
     const res = await ctx.cli(['sync', '--json'], wt.dir);

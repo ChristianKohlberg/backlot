@@ -20,6 +20,7 @@ Usage:
   infront exec <cmd...>   run a command inside the leased environment
   infront logs <service> [--lines N]
   infront reset-data      restore the data template on the current lease
+  infront token --role <r>  mint an auth token via the stack's auth.token hook
   infront pull            copy declared outputs back into the worktree
   infront release         release the current lease (environment stays warm)
   infront status          daemon, pool, and lease overview
@@ -66,7 +67,7 @@ async function main(): Promise<void> {
     return;
   }
 
-  const known = ['up', 'run', 'job', 'ctx', 'sync', 'bind', 'exec', 'logs', 'reset-data', 'pull', 'release', 'status', 'pool', 'daemon'];
+  const known = ['up', 'run', 'job', 'ctx', 'sync', 'bind', 'exec', 'logs', 'token', 'reset-data', 'pull', 'release', 'status', 'pool', 'daemon'];
   if (!known.includes(verb)) {
     console.error(`infront: unknown verb '${verb}'\n\n${USAGE}`);
     process.exit(64);
@@ -150,6 +151,9 @@ async function main(): Promise<void> {
     }
     case 'reset-data':
       res = await rpc('reset-data', { cwd, holder });
+      break;
+    case 'token':
+      res = await rpc('token', { cwd, holder, role: flagValue('--role') ?? 'admin' });
       break;
     case 'pull':
       res = await rpc('pull', { cwd, holder });
