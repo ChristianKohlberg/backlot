@@ -41,7 +41,14 @@ Sequenced implementation:
   reuses the stat-gated hasher. The highest-value seeding fix.
 - [ ] **S3 · `snapshot` / `restore` verbs.** Rewind to a runtime-chosen point (the
   debugging loop) via the datastore's native clone (sqlite copy / postgres template /
-  MSSQL BACKUP-RESTORE). Note the restore-blips-connections caveat.
+  MSSQL BACKUP-RESTORE). Note the restore-blips-connections caveat. **Snapshots MUST
+  carry the current schema/migration fingerprint; `restore` refuses-or-warns on a
+  mismatch** (ADR-0016 §6 — restoring across a migration is unsafe).
+- [ ] **S3b · Migrations in place.** Document + support the `upkeep` rule keyed on the
+  migrations dir that advances a live env's schema (delta only, data preserved) while
+  fresh/reset binds rebuild from the rebaked template (ADR-0016 §6). Mostly mechanism
+  that already exists (fingerprint ledger); the work is the schema-fingerprint tagging
+  shared with S3 and the docs/example.
 - [ ] **S4 (later) · Composable/layered states** consuming the repo's existing per-layer
   hashes; **shared/"golden" states** across machines (coupled to the remote substrate).
 

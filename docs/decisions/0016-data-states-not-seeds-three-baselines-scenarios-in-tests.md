@@ -101,6 +101,48 @@ Honest limits: a snapshot's value is proportional to how much per-session state 
 running app (MSSQL restore kicks connections — the app reconnects or the service bounces);
 and it only accelerates stores with a clone primitive.
 
+### 6. A migration is an INPUT to a state, not a separate concept
+
+A schema migration changes how a state is *produced*, so it is an input to every state
+that shares the schema (`empty`/`dev`/`scaled` move together). Two paths, routed to the
+two mechanisms infront already has — infront decides *when*, the repo's migrate command
+does the work, infront never reads the migration:
+
+- **Fresh / `reset-data` / `pristine` (rebuild).** The migration is part of the state's
+  `build`, so its files are in the state's `inputs`. Adding a migration changes the input
+  hash → the template rebakes → new and reset environments get the migrated schema for
+  free (mechanism: S2 inputs-hash keying). For the founding monorepo this is already true:
+  migrations run inside `scripts/db seed apply` (the net-new `NNNN_*.sql` scripts), so a
+  new migration script is a changed seed input.
+
+- **Live environment you want to keep (advance in place).** On a `reuse` bind the
+  datastore already exists (no reseed), and an `upkeep` rule keyed on the migrations
+  directory applies the delta to the existing DB, preserving data. The per-env,
+  direction-agnostic fingerprint ledger (decision 0008) runs *all* migrations on a fresh
+  env and only the *new* one on a live env:
+
+  ```yaml
+  upkeep:
+    - { when: "glob(sherlock/database/migrations/**)", run: "scripts/db migrate --db {{ns}}" }
+  ```
+
+The elegance: the same migration change is handled correctly by whichever bind comes
+next — `reuse` migrates in place, `reset`/`pristine` rebuilds from the rebaked template —
+and both converge on the same schema. You pick a hygiene level, not a "migration mode".
+
+**Snapshots are schema-version-bound (the sharp consequence).** A snapshot taken at the
+old schema, restored after a migration, brings the OLD schema back under NEW code — an
+inconsistent state that fails confusingly. Therefore a snapshot MUST carry the current
+schema/migration fingerprint, and `restore` MUST refuse-or-warn when it does not match
+the environment's current fingerprint. This is a hard requirement the migration case adds
+to S3, not an optional nicety.
+
+Further honest edges: a *destructive* migration makes the in-place path (preserves rows
+minus the dropped column) and the from-scratch path (reseeds) diverge on data — not
+byte-identical after a lossy migration; and migrating a live DB carries the same
+connection/lock caveat as restore (transparent for additive/EF migrations, may need a
+service bounce for a heavy one).
+
 ## Consequences
 
 - Positive: the "how many presets?" question has a stable answer (three); test data has a
