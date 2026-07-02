@@ -373,7 +373,10 @@ buy the substrate, declare the stack, broker the environments.
    MSSQL vertical (seeded per-env database on the shared server, built host, real
    login, real seeded domain data over an authenticated API) came up through
    `infront up` in ~50 s; `infront run` provisioned a second full environment in
-   ~48 s. The consumer's e2e check migration is its own next step.
+   ~48 s. The consumer's Playwright system-e2e suite now runs as an infront check
+   (`infront run e2e`, ~58 s incl. provisioning via PLAYWRIGHT_REUSE against the
+   infront-provisioned servers) with verdict parity against the incumbent harness —
+   identical pass/fail results on the same suite.
 3. **0.3 — remote. ◐ PARTIAL.** Detached submit-and-poll runs shipped (`run
    --detach` → jobId; the verdict outlives the client, journaled). Driver spec
    stable. NOT yet: a live remote substrate driver (morph/ssh) — that requires
