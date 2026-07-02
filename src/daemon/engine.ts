@@ -27,6 +27,9 @@ const IDLE_TTL = () => policy().idleTtlMs;
 const WAIT_MS = () => policy().waitMs;
 const CHECK_TIMEOUT_S = 600;
 
+/** Streamed bind phases → human progress on stderr (never on the --json stdout). */
+export type Progress = (phase: string) => void;
+
 export interface UpOptions {
   cwd: string;
   holder?: string;
@@ -36,6 +39,8 @@ export interface UpOptions {
   ttlMs?: number;
   /** Bind from this directory instead of the worktree (bind --ref extraction). */
   sourceRoot?: string;
+  /** Set by the daemon per-request; emits progress frames back to the client. */
+  onProgress?: Progress;
 }
 
 /**
@@ -257,7 +262,8 @@ export class Engine {
     return sup;
   }
 
-  private async bindAndStart(stack: Stack, envSnapshot: EnvRow, hygiene: Hygiene, kind: LeaseKind, watch: boolean, sourceRoot?: string): Promise<EnvRow> {
+  private async bindAndStart(stack: Stack, envSnapshot: EnvRow, hygiene: Hygiene, kind: LeaseKind, watch: boolean, sourceRoot?: string, onProgress?: Progress): Promise<EnvRow> {
+    const say = onProgress ?? (() => undefined);
     // Re-read under the env lock: the snapshot captured during acquire may be
     // stale (a concurrent degrade/pid update landed). Everything below mutates
     // and saves THIS fresh row, so no epilogue can clobber another verb's write.
@@ -267,6 +273,7 @@ export class Engine {
     }
     const dirs = this.envDirs(env.id);
     if (hygiene === 'pristine') {
+      say('preparing a pristine environment');
       await this.supervisor(env).stopAll();
       this.supervisors.delete(env.id);
       rmSync(dirs.tree, { recursive: true, force: true });
@@ -277,8 +284,11 @@ export class Engine {
       env.presets = {};
     }
 
+    say('syncing worktree');
     const sync = syncIntoEnv(sourceRoot ?? stack.root, dirs.tree, stack.manifest);
+    say(`synced ${sync.files.length} files (${sync.copied} changed, ${sync.deleted} removed)`);
     const upkeep = await runUpkeep(dirs.tree, sync.files, stack.manifest, env.fingerprints);
+    for (const r of upkeep.ran) say(`upkeep: ${r.run}`);
     for (const dsName of upkeep.rebakeTemplates) {
       const spec = stack.manifest.datastores?.[dsName];
       if (spec) makeDatastore(dsName, spec, stack.id).rebake();
@@ -311,6 +321,7 @@ export class Engine {
       const preset = defaultPreset(spec, kind);
       const exists = Boolean(env.datastoreNs[name]);
       const force = env.presets[name] !== preset || hygiene !== 'reuse' || upkeep.rebakeTemplates.includes(name);
+      if (force || !exists) say(`preparing datastore '${name}' (${preset})`);
       await ds.ensure(dsHandle, preset, force, exists);
       env.datastoreNs[name] = ds.ns(dsHandle);
       env.presets[name] = preset;
@@ -321,12 +332,20 @@ export class Engine {
     if (env.fingerprints['@source'] !== sync.sourceHash) {
       for (const [name, spec] of Object.entries(stack.manifest.services)) {
         if (!spec.build) continue;
-        await new Promise<void>((resolvePromise, reject) => {
-          execFile('sh', ['-c', template(spec.build!, ctx)], { cwd: dirs.tree, maxBuffer: 32 * 1024 * 1024 }, (err, _o, stderr) => {
-            if (err) reject(new BrokerError('work-error', `build failed for service '${name}'`, name, String(stderr).slice(0, 800)));
-            else resolvePromise();
+        say(`building '${name}'`);
+        const buildStart = now();
+        const beat = setInterval(() => say(`building '${name}' … ${Math.round((now() - buildStart) / 1000)}s`), 5000);
+        beat.unref();
+        try {
+          await new Promise<void>((resolvePromise, reject) => {
+            execFile('sh', ['-c', template(spec.build!, ctx)], { cwd: dirs.tree, maxBuffer: 32 * 1024 * 1024 }, (err, _o, stderr) => {
+              if (err) reject(new BrokerError('work-error', `build failed for service '${name}'`, name, String(stderr).slice(0, 800)));
+              else resolvePromise();
+            });
           });
-        });
+        } finally {
+          clearInterval(beat);
+        }
       }
     }
     env.fingerprints['@source'] = sync.sourceHash;
@@ -354,9 +373,16 @@ export class Engine {
         };
         sup.start(name, resolved, templateEnv(spec.env, ctx), watch);
         const url = spec.port ? `http://localhost:${env.ports[spec.port]}` : undefined;
+        say(`starting '${name}', waiting until ready`);
+        const readyStart = now();
+        const beat = setInterval(() => say(`waiting for '${name}' … ${Math.round((now() - readyStart) / 1000)}s`), 3000);
+        beat.unref();
         try {
           await sup.waitReady(name, spec, url, templateEnv(spec.env, ctx));
+          clearInterval(beat);
+          say(`'${name}' ready`);
         } catch (err) {
+          clearInterval(beat);
           await sup.stopAll();
           this.supervisors.delete(env.id);
           env.state = 'warm';
@@ -424,12 +450,13 @@ export class Engine {
     const holder = opts.holder ?? resolve(opts.cwd);
     const kind = opts.kind ?? 'session';
     let hygiene = opts.hygiene ?? 'reuse';
+    opts.onProgress?.(`acquiring an environment (pool ${this.journal.envsForStack(stack.id).length}/${POOL_MAX()})`);
     const env = await this.acquireEnv(stack, holder, kind, hygiene, opts.ttlMs ?? LEASE_TTL(kind));
     // Auto-escalation (decision 0007): two consecutive bind failures on this
     // warm environment -> the next bind is pristine, whatever was asked.
     if (hygiene !== 'pristine' && env.failStreak >= 2) hygiene = 'pristine';
     try {
-      const bound = await this.envLocked(env.id, () => this.bindAndStart(stack, env, hygiene, kind, opts.watch ?? false, opts.sourceRoot));
+      const bound = await this.envLocked(env.id, () => this.bindAndStart(stack, env, hygiene, kind, opts.watch ?? false, opts.sourceRoot, opts.onProgress));
       if (opts.watch && kind === 'session' && !this.watchers.has(bound.id)) {
         this.startWatch(bound.id, stack.root, opts.cwd, holder);
       }
@@ -494,6 +521,10 @@ export class Engine {
       // expire the run lease mid-check and hand the env to someone else. The
       // process-group timeout bounds how long that hold can last.
       const timeoutS = check.timeout ?? CHECK_TIMEOUT_S;
+      opts.onProgress?.(`running check '${opts.check}'`);
+      const runStart = now();
+      const beat = setInterval(() => opts.onProgress?.(`running check '${opts.check}' … ${Math.round((now() - runStart) / 1000)}s`), 5000);
+      beat.unref();
       const res = await this.envLocked(env.id, () =>
         runGroupCmd(
           template(check.run, ctx),
@@ -501,7 +532,7 @@ export class Engine {
           { ...process.env, ...templateEnv(check.env, ctx) },
           timeoutS,
         ),
-      );
+      ).finally(() => clearInterval(beat));
       const artifactsDir = this.collectArtifacts(env.id, dirs.tree, check.artifacts ?? []);
       return {
         check: opts.check,
@@ -578,9 +609,9 @@ export class Engine {
     return dest;
   }
 
-  async syncLease(cwd: string, holder?: string) {
+  async syncLease(cwd: string, holder?: string, onProgress?: Progress) {
     // Rebind the existing lease with current hygiene = reuse semantics.
-    return this.up({ cwd, holder: holder ?? resolve(cwd), kind: 'session', hygiene: 'reuse' });
+    return this.up({ cwd, holder: holder ?? resolve(cwd), kind: 'session', hygiene: 'reuse', onProgress });
   }
 
   /** bind --ref: project a COMMITTED ref (not the worktree state) into the env. */
@@ -605,14 +636,14 @@ export class Engine {
     return { jobs: this.journal.listJobs(20) };
   }
 
-  async resetData(cwd: string, holder?: string) {
+  async resetData(cwd: string, holder?: string, onProgress?: Progress) {
     const stack = loadStack(cwd);
     const h = holder ?? resolve(cwd);
     const lease = this.journal.leaseForHolder(h, stack.id);
     if (!lease) throw new BrokerError('env-error', `no active lease — run 'infront up' first`, 'lease');
     this.journal.saveLease({ ...lease, hygiene: 'reset-data', expiresAt: now() + LEASE_TTL(lease.kind) });
     const env = this.journal.getEnv(lease.envId)!;
-    await this.envLocked(env.id, () => this.bindAndStart(stack, env, 'reset-data', lease.kind, false));
+    await this.envLocked(env.id, () => this.bindAndStart(stack, env, 'reset-data', lease.kind, false, undefined, onProgress));
     return this.ctx(cwd, h);
   }
 

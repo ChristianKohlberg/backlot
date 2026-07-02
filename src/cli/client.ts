@@ -19,20 +19,46 @@ export interface RpcError {
 
 export type RpcResponse = { ok: true; data: unknown } | { ok: false; error: RpcError };
 
-export function rpc(verb: string, args: Record<string, unknown>): Promise<RpcResponse> {
+/**
+ * The daemon streams newline-delimited frames: {type:'progress',phase} … then
+ * one {type:'result',ok,…}. `onProgress` (optional) sees each phase; the
+ * promise resolves on the result frame. Consumers that ignore progress (MCP,
+ * ping, most verbs) just don't pass it — the frames are consumed and dropped.
+ */
+export function rpc(
+  verb: string,
+  args: Record<string, unknown>,
+  onProgress?: (phase: string) => void,
+): Promise<RpcResponse> {
   return new Promise((resolve, reject) => {
     const req = request(
       { socketPath: socketPath(), path: '/rpc', method: 'POST', headers: { 'content-type': 'application/json' } },
       (res) => {
-        let body = '';
-        res.on('data', (d) => (body += d));
-        res.on('end', () => {
-          try {
-            resolve(JSON.parse(body) as RpcResponse);
-          } catch (err) {
-            reject(err);
+        let buf = '';
+        let result: RpcResponse | undefined;
+        res.on('data', (d) => {
+          buf += d;
+          let nl;
+          while ((nl = buf.indexOf('\n')) >= 0) {
+            const line = buf.slice(0, nl);
+            buf = buf.slice(nl + 1);
+            if (!line.trim()) continue;
+            let frame: { type?: string; phase?: string; ok?: boolean; data?: unknown; error?: RpcError };
+            try {
+              frame = JSON.parse(line);
+            } catch {
+              continue;
+            }
+            if (frame.type === 'progress') onProgress?.(String(frame.phase ?? ''));
+            else if (frame.type === 'result') {
+              result = frame.ok ? { ok: true, data: frame.data } : { ok: false, error: frame.error! };
+            } else {
+              // Back-compat: an un-typed object is a bare result.
+              result = frame as unknown as RpcResponse;
+            }
           }
         });
+        res.on('end', () => (result ? resolve(result) : reject(new Error('daemon closed the stream without a result frame'))));
       },
     );
     req.on('error', reject);

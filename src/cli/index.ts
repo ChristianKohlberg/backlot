@@ -27,7 +27,9 @@ Usage:
   infront pool ls|recycle [--all]
   infront daemon stop     stop the daemon (environments are recovered on next use)
 
-Every verb accepts --json. Exit codes: 0 ok · 1 work-error · 2 env-error · 3 infra-error · 64 usage.`;
+Every verb accepts --json. Long verbs (up/run/sync/bind/reset-data) show live progress
+on a terminal (stderr); force with --progress, silence with --quiet. stdout stays clean.
+Exit codes: 0 ok · 1 work-error · 2 env-error · 3 infra-error · 64 usage.`;
 
 const rawArgv = process.argv.slice(2);
 const verb = rawArgv[0];
@@ -37,7 +39,7 @@ const verb = rawArgv[0];
 // flags survive) — the F1 class of argv bugs. Everything after a lone `--`, and
 // EVERYTHING for `exec`, is treated as a raw passthrough command.
 const VALUE_FLAGS = new Set(['--holder', '--ttl', '--role', '--lines', '--ref', '--spec', '--preset']);
-const BOOL_FLAGS = new Set(['--json', '--watch', '--reset-data', '--pristine', '--pull', '--detach', '--all', '--raw']);
+const BOOL_FLAGS = new Set(['--json', '--watch', '--reset-data', '--pristine', '--pull', '--detach', '--all', '--raw', '--progress', '--quiet']);
 
 const flagVals = new Map<string, string>();
 const flags = new Set<string>();
@@ -95,6 +97,26 @@ function humanize(data: unknown): string {
   return JSON.stringify(data, null, 2);
 }
 
+// Progress -> stderr, shown for humans (a TTY) or on --progress; --quiet forces
+// off. Never touches stdout, so the --json payload stays clean for agents.
+const showProgress = flags.has('--progress') || (process.stderr.isTTY === true && !flags.has('--quiet') && !flags.has('--json'));
+let lastProgressLen = 0;
+const progress = showProgress
+  ? (phase: string) => {
+      const line = `  ⋯ ${phase}`;
+      // Redraw in place on a TTY so the phase log stays a single moving line.
+      if (process.stderr.isTTY) {
+        process.stderr.write(`\r${line}${' '.repeat(Math.max(0, lastProgressLen - line.length))}`);
+        lastProgressLen = line.length;
+      } else {
+        process.stderr.write(line + '\n');
+      }
+    }
+  : undefined;
+const endProgress = () => {
+  if (showProgress && process.stderr.isTTY && lastProgressLen) process.stderr.write('\r' + ' '.repeat(lastProgressLen) + '\r');
+};
+
 /** --ttl is in MINUTES; accepts a bare number or an explicit `<n>m`. Returns ms or undefined if invalid. */
 function parseTtlMinutes(v: string): number | undefined {
   const m = /^(\d+(?:\.\d+)?)m?$/.exec(v.trim());
@@ -138,7 +160,8 @@ async function main(): Promise<void> {
           process.exit(64);
         }
       }
-      res = await rpc('up', { cwd, holder, hygiene: hygiene(), watch: flags.has('--watch'), ttlMs });
+      res = await rpc('up', { cwd, holder, hygiene: hygiene(), watch: flags.has('--watch'), ttlMs }, progress);
+      endProgress();
       break;
     }
     case 'run': {
@@ -154,7 +177,8 @@ async function main(): Promise<void> {
           return;
         }
       } else {
-        res = await rpc('run', { cwd, holder, check, hygiene: hygiene() });
+        res = await rpc('run', { cwd, holder, check, hygiene: hygiene() }, progress);
+        endProgress();
         if (res.ok && flags.has('--pull')) await rpc('pull', { cwd, holder });
       }
       break;
@@ -172,11 +196,13 @@ async function main(): Promise<void> {
       res = await rpc('ctx', { cwd, holder });
       break;
     case 'sync':
-      res = await rpc('sync', { cwd, holder });
+      res = await rpc('sync', { cwd, holder }, progress);
+      endProgress();
       break;
     case 'bind': {
       const ref = flagValue('--ref');
-      res = ref ? await rpc('bind-ref', { cwd, holder, ref }) : await rpc('sync', { cwd, holder });
+      res = ref ? await rpc('bind-ref', { cwd, holder, ref }, progress) : await rpc('sync', { cwd, holder }, progress);
+      endProgress();
       break;
     }
     case 'exec': {
@@ -212,7 +238,8 @@ async function main(): Promise<void> {
       break;
     }
     case 'reset-data':
-      res = await rpc('reset-data', { cwd, holder });
+      res = await rpc('reset-data', { cwd, holder }, progress);
+      endProgress();
       break;
     case 'token':
       res = await rpc('token', { cwd, holder, role: flagValue('--role') ?? 'admin' });

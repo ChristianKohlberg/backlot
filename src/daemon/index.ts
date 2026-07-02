@@ -17,7 +17,7 @@ const engine = new Engine();
 // one lock per environment. Requests for different environments overlap; two
 // operations on one environment never do.
 
-async function dispatch(verb: string, args: Record<string, unknown>): Promise<unknown> {
+async function dispatch(verb: string, args: Record<string, unknown>, emit: (phase: string) => void): Promise<unknown> {
   const cwd = String(args.cwd ?? process.cwd());
   const holder = args.holder ? String(args.holder) : undefined;
   switch (verb) {
@@ -29,9 +29,10 @@ async function dispatch(verb: string, args: Record<string, unknown>): Promise<un
         hygiene: (args.hygiene as never) ?? undefined,
         watch: Boolean(args.watch),
         ttlMs: args.ttlMs ? Number(args.ttlMs) : undefined,
+        onProgress: emit,
       });
     case 'run':
-      return engine.run({ cwd, holder, check: String(args.check), hygiene: (args.hygiene as never) ?? undefined });
+      return engine.run({ cwd, holder, check: String(args.check), hygiene: (args.hygiene as never) ?? undefined, onProgress: emit });
     case 'run-detach': {
       const jobId = engine.createJob(cwd, String(args.check));
       // Fire-and-forget — env/pool locks make it safe; the journaled verdict
@@ -48,9 +49,9 @@ async function dispatch(verb: string, args: Record<string, unknown>): Promise<un
     case 'ctx':
       return engine.ctx(cwd, holder);
     case 'sync':
-      return engine.syncLease(cwd, holder);
+      return engine.syncLease(cwd, holder, emit);
     case 'reset-data':
-      return engine.resetData(cwd, holder);
+      return engine.resetData(cwd, holder, emit);
     case 'exec':
       return engine.exec(cwd, String(args.cmd), holder);
     case 'logs':
@@ -106,15 +107,24 @@ const server = createServer((req, res) => {
   req.on('data', (d) => (body += d));
   req.on('end', () => {
     void (async () => {
+      // Response is newline-delimited JSON: zero or more {type:'progress'}
+      // frames, then exactly one {type:'result'} frame. The CLI renders
+      // progress to stderr (TTY only) and the result to stdout.
+      res.writeHead(200, { 'content-type': 'application/x-ndjson' });
+      const emit = (phase: string) => {
+        try {
+          res.write(JSON.stringify({ type: 'progress', phase }) + '\n');
+        } catch {
+          /* client hung up mid-stream */
+        }
+      };
       try {
         const { verb, args } = JSON.parse(body || '{}');
-        const data = await dispatch(verb, args ?? {});
-        res.writeHead(200, { 'content-type': 'application/json' });
-        res.end(JSON.stringify({ ok: true, data }));
+        const data = await dispatch(verb, args ?? {}, emit);
+        res.end(JSON.stringify({ type: 'result', ok: true, data }) + '\n');
       } catch (err) {
         const e = err instanceof BrokerError ? err.toJSON() : { class: 'env-error', message: String((err as Error).message ?? err) };
-        res.writeHead(200, { 'content-type': 'application/json' });
-        res.end(JSON.stringify({ ok: false, error: e }));
+        res.end(JSON.stringify({ type: 'result', ok: false, error: e }) + '\n');
       }
     })();
   });

@@ -274,6 +274,14 @@ Every verb accepts `--json`. Exit codes: `0` ok · `1` work-error / failed check
 `{ok:false, error:{class,message,…}}`; a failed *check* under `run` is
 `{ok:false, exitCode, failure:{class,…}}`.
 
+**Progress.** The long verbs (`up`, `run`, `sync`, `bind`, `reset-data`) stream bind
+phases (acquire → sync → upkeep → datastore → build → start-and-ready, with an elapsed
+counter on builds and readiness waits). The daemon sends these as newline-delimited
+`{type:"progress"}` frames ahead of the single `{type:"result"}` frame; the CLI renders
+them **to stderr**, so the `--json` stdout stays one clean object. Shown for an
+interactive terminal (a TTY) or with `--progress`; silent for a non-TTY/pipe/agent or
+with `--quiet`. Agents are unaffected by default.
+
 `ctx` returns one blob with everything a consumer needs: service URLs (stable per
 environment), login credentials, a token-mint hook, datastore connection strings,
 artifact directory, hygiene state, and recent service events. An agent holding this
