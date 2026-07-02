@@ -353,9 +353,11 @@ buy the substrate, declare the stack, broker the environments.
 
 ## 15. Milestones
 
-1. **0.1 — the local loop.** Daemon, CLI, local substrate, sqlite + postgres drivers,
-   verbs `up/run/sync/ctx/exec/logs/release/pool`. `examples/hello-web` green on
-   macOS + Linux CI.
+1. **0.1 — the local loop. ✅ SHIPPED.** Daemon, CLI, local substrate, sqlite driver
+   with template restore, verbs `up/run/sync/ctx/exec/logs/reset-data/pull/release/
+   status/pool/daemon`. Both examples green through the real CLI (35 tests), including
+   crash recovery and lease expiry. (postgres moved to 0.2 with mssql — shipping an
+   untested driver would have violated the honesty bar.)
 2. **0.2 — first real consumer.** mssql driver with template bake/restore,
    `caches:`/`outputs:`/`reset-data`, replace the founding monorepo's e2e provisioning.
 3. **0.3 — remote.** Frozen driver spec, morph substrate, detached submit-and-poll runs.

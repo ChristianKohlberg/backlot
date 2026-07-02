@@ -6,10 +6,11 @@
 It brokers environments; it never provides them. Local processes today, your own cloud
 sandboxes (Morph, Sprites, SSH) tomorrow — same verbs, same model.
 
-> **Status: pre-0.1.** The design is complete and battle-derived
-> ([docs/architecture.md](docs/architecture.md), decision log in
-> [docs/decisions/](docs/decisions/)); the engine is being built against it.
-> The CLI surface below is frozen; implementations are landing.
+> **Status: 0.1 — the local loop works.** Daemon, warm pool, leases, bind-by-sync,
+> sqlite datastores with template restore, checks with verdicts and artifacts, crash
+> recovery — all real and covered by 35 tests (unit + full-CLI integration). Not yet:
+> postgres/mssql drivers (0.2) and remote substrates (0.3). Design in
+> [docs/architecture.md](docs/architecture.md); decision log in [docs/decisions/](docs/decisions/).
 
 ## Why
 
@@ -26,14 +27,19 @@ Binding your worktree to a warm environment is a git sync + fingerprint-gated up
 seconds, not minutes. Abandoning an environment is a non-event: your lease lapses and
 the environment returns to the pool with its heat intact. ([Why not checkpointing?](docs/decisions/0006-convergence-over-checkpointing.md))
 
-## Quickstart (the shape of it)
+## Quickstart
 
 ```bash
+npm install && npm run build && npm link   # once, until infront is on npm
 cd examples/hello-web
-npx infront up --json      # lease a warm env: sync, seed, start, print URLs+creds
-npx infront run smoke      # bind -> run the check -> JSON verdict -> release
-npx infront ctx --json     # everything an agent needs, in one blob
+infront up --json          # lease a warm env: sync, seed, start, print URLs + creds
+infront run smoke --json   # bind -> run the check -> JSON verdict -> release
+infront ctx --json         # everything an agent needs, in one blob
+infront release            # environment returns to the pool, warm
 ```
+
+Requires Node ≥ 22.5 and git. The daemon auto-spawns on first use (unix socket,
+per-machine state under `~/.local/state/infront`; isolate with `INFRONT_STATE_DIR`).
 
 A repo opts in with one file, `stack.yaml` ([schema](schema/stack.schema.json)):
 
