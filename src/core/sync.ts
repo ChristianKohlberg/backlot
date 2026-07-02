@@ -19,7 +19,7 @@ import {
   readdirSync, statSync, constants as fsConstants,
 } from 'node:fs';
 import { dirname, join } from 'node:path';
-import { fileHash, matchesAny, sha256, isFile } from './util.js';
+import { fileHash, matchesAny, sha256, isFile, safeJoin } from './util.js';
 import type { Manifest } from './manifest.js';
 
 export interface SyncResult {
@@ -54,6 +54,7 @@ function enumerate(stackRoot: string, manifest: Manifest): string[] {
   }
   const include = manifest.sync?.include ?? [];
   for (const inc of include) {
+    safeJoin(stackRoot, inc, 'sync.include'); // reject ../ or absolute before use
     if (isFile(join(stackRoot, inc)) && !listed.includes(inc)) listed.push(inc);
   }
   // Tracked-but-deleted files still appear in ls-files --cached.
@@ -100,8 +101,10 @@ export function syncIntoEnv(stackRoot: string, envTree: string, manifest: Manife
 
   let copied = 0;
   for (const rel of files) {
+    // git ls-files can't emit ../ but the sync.include path can — belt-and-suspenders
+    // so neither the copy nor the deletion-mirror below can ever leave envTree.
+    const dst = safeJoin(envTree, rel, 'synced file');
     const src = join(stackRoot, rel);
-    const dst = join(envTree, rel);
     const cached = prev[rel];
     const srcStat = statOf(src)!;
 
@@ -134,8 +137,15 @@ export function syncIntoEnv(stackRoot: string, envTree: string, manifest: Manife
   // Mirror deletions relative to the PREVIOUS binding, never touching caches/keep.
   let deleted = 0;
   for (const rel of Object.keys(prev)) {
-    if (!next[rel] && !matchesAny(rel, protectedPatterns) && existsSync(join(envTree, rel))) {
-      rmSync(join(envTree, rel), { force: true });
+    if (next[rel] || matchesAny(rel, protectedPatterns)) continue;
+    let victim: string;
+    try {
+      victim = safeJoin(envTree, rel, 'synced file'); // never rm outside the env tree
+    } catch {
+      continue; // a poisoned cache entry can't make us delete outside envTree
+    }
+    if (existsSync(victim)) {
+      rmSync(victim, { force: true });
       deleted++;
     }
   }
@@ -159,8 +169,12 @@ export function changedOutputs(stackRoot: string, envTree: string, manifest: Man
 export function pullOutputs(stackRoot: string, envTree: string, manifest: Manifest): string[] {
   const changed = changedOutputs(stackRoot, envTree, manifest);
   for (const rel of changed) {
-    mkdirSync(dirname(join(stackRoot, rel)), { recursive: true });
-    copyFileSync(join(envTree, rel), join(stackRoot, rel), fsConstants.COPYFILE_FICLONE);
+    // outputs write BACK into the worktree — must never escape it (a rogue
+    // '../../.bashrc' output would otherwise be overwritten from env content).
+    const dst = safeJoin(stackRoot, rel, 'outputs');
+    const src = safeJoin(envTree, rel, 'outputs');
+    mkdirSync(dirname(dst), { recursive: true });
+    copyFileSync(src, dst, fsConstants.COPYFILE_FICLONE);
   }
   return changed;
 }

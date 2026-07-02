@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
 import { readFileSync, existsSync, statSync } from 'node:fs';
+import * as pathMod from 'node:path';
 
 export const sha256 = (data: string | Buffer): string =>
   createHash('sha256').update(data).digest('hex');
@@ -78,6 +79,24 @@ export class BrokerError extends Error {
   toJSON() {
     return { class: this.klass, message: this.message, source: this.source, logExcerpt: this.logExcerpt };
   }
+}
+
+/**
+ * A manifest-supplied relative path (sync.include, outputs, a datastore key)
+ * must stay INSIDE its base after resolution — never escape via `..` or an
+ * absolute path. Returns the safe joined absolute path, or throws work-error.
+ * This is the guard that keeps file ops from leaving infront's own dirs even
+ * on an honest `../shared/.env` typo, not only a malicious manifest.
+ */
+export function safeJoin(base: string, rel: string, what: string): string {
+  const { join, resolve, isAbsolute } = pathMod;
+  if (isAbsolute(rel)) throw new BrokerError('work-error', `${what} must be a relative path, got absolute '${rel}'`, 'manifest');
+  const abs = resolve(base, rel);
+  const baseResolved = resolve(base);
+  if (abs !== baseResolved && !abs.startsWith(baseResolved + pathMod.sep)) {
+    throw new BrokerError('work-error', `${what} '${rel}' escapes its directory — path traversal is not allowed`, 'manifest');
+  }
+  return abs;
 }
 
 export const now = (): number => Date.now();

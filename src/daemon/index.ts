@@ -5,7 +5,7 @@
  * requests through a simple queue — policy code stays race-free.
  */
 import { createServer } from 'node:http';
-import { existsSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, rmSync, writeFileSync, chmodSync } from 'node:fs';
 import { socketPath, pidPath } from '../core/paths.js';
 import { BrokerError } from '../core/util.js';
 import { Engine } from './engine.js';
@@ -98,6 +98,15 @@ const server = createServer((req, res) => {
 });
 
 server.listen(sock, () => {
+  // The socket has no RPC auth and exposes arbitrary-shell verbs (exec/token),
+  // so it must be owner-only. On macOS the socket-file mode is what actually
+  // gates connect() (the dir traversal isn't enough), so this chmod is the
+  // real boundary, not just belt-and-suspenders.
+  try {
+    chmodSync(sock, 0o600);
+  } catch {
+    /* best-effort; the 0700 state dir is the backstop */
+  }
   writeFileSync(pidPath(), String(process.pid));
   // Detach from the spawning CLI's lifetime.
   if (process.send) process.send('ready');

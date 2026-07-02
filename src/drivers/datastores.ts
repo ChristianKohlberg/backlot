@@ -66,6 +66,12 @@ class SqliteDs implements DsDriver {
   ) {}
 
   ns(h: DsHandle): string {
+    // The datastore KEY becomes a filename; a key with `/` or `..` must not
+    // escape dataDir (the command-family sibling already sanitizes — this
+    // closes the same hole here). Reject rather than mangle so a bad key is loud.
+    if (/[/\\]|\.\./.test(this.name)) {
+      throw new BrokerError('work-error', `sqlite datastore key '${this.name}' must not contain '/', '\\', or '..'`, 'manifest');
+    }
     return join(h.dataDir, `${this.name}.db`);
   }
   url(h: DsHandle): string {

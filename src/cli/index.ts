@@ -29,16 +29,56 @@ Usage:
 
 Every verb accepts --json. Exit codes: 0 ok · 1 work-error · 2 env-error · 3 infra-error · 64 usage.`;
 
-const argv = process.argv.slice(2);
-const verb = argv[0];
-const json = argv.includes('--json');
-const flags = new Set(argv.filter((a) => a.startsWith('--')));
-const positional = argv.slice(1).filter((a) => !a.startsWith('--'));
+const rawArgv = process.argv.slice(2);
+const verb = rawArgv[0];
 
-const flagValue = (name: string): string | undefined => {
-  const i = argv.indexOf(name);
-  return i >= 0 && argv[i + 1] && !argv[i + 1]!.startsWith('--') ? argv[i + 1] : undefined;
-};
+// Known flags and whether each takes a value. A proper single-pass parser so a
+// flag's value is never mis-bound as a positional (and an inner command's own
+// flags survive) — the F1 class of argv bugs. Everything after a lone `--`, and
+// EVERYTHING for `exec`, is treated as a raw passthrough command.
+const VALUE_FLAGS = new Set(['--holder', '--ttl', '--role', '--lines', '--ref', '--spec', '--preset']);
+const BOOL_FLAGS = new Set(['--json', '--watch', '--reset-data', '--pristine', '--pull', '--detach', '--all', '--raw']);
+
+const flagVals = new Map<string, string>();
+const flags = new Set<string>();
+const positional: string[] = [];
+let passthrough: string[] | null = null; // for `exec` / after `--`
+
+{
+  const body = rawArgv.slice(1);
+  for (let i = 0; i < body.length; i++) {
+    const a = body[i]!;
+    // `exec` consumes the entire remainder verbatim (its own flags included),
+    // except a leading `--json` which is ours; `--` also opens passthrough.
+    if (verb === 'exec' && passthrough === null && a !== '--json' && !a.startsWith('--')) {
+      passthrough = body.slice(i);
+      break;
+    }
+    if (a === '--') {
+      passthrough = body.slice(i + 1);
+      break;
+    }
+    if (VALUE_FLAGS.has(a)) {
+      const v = body[i + 1];
+      if (v === undefined) {
+        console.error(`infront: ${a} needs a value`);
+        process.exit(64);
+      }
+      flagVals.set(a, v);
+      i++;
+    } else if (BOOL_FLAGS.has(a)) {
+      flags.add(a);
+    } else if (a.startsWith('--')) {
+      console.error(`infront: unknown flag '${a}'`);
+      process.exit(64);
+    } else {
+      positional.push(a);
+    }
+  }
+}
+
+const json = flags.has('--json');
+const flagValue = (name: string): string | undefined => flagVals.get(name);
 
 const out = (data: unknown) => console.log(json ? JSON.stringify(data, null, json ? 0 : 2) : humanize(data));
 const errExit = (e: RpcError): never => {
@@ -53,6 +93,15 @@ const errExit = (e: RpcError): never => {
 
 function humanize(data: unknown): string {
   return JSON.stringify(data, null, 2);
+}
+
+/** --ttl is in MINUTES; accepts a bare number or an explicit `<n>m`. Returns ms or undefined if invalid. */
+function parseTtlMinutes(v: string): number | undefined {
+  const m = /^(\d+(?:\.\d+)?)m?$/.exec(v.trim());
+  if (!m) return undefined;
+  const mins = Number(m[1]);
+  if (!Number.isFinite(mins) || mins <= 0) return undefined;
+  return mins * 60_000;
 }
 
 function hygiene(): string | undefined {
@@ -81,7 +130,15 @@ async function main(): Promise<void> {
   switch (verb) {
     case 'up': {
       const ttl = flagValue('--ttl');
-      res = await rpc('up', { cwd, holder, hygiene: hygiene(), watch: flags.has('--watch'), ttlMs: ttl ? Number(ttl) * 60_000 : undefined });
+      let ttlMs: number | undefined;
+      if (ttl !== undefined) {
+        ttlMs = parseTtlMinutes(ttl);
+        if (ttlMs === undefined) {
+          console.error(`infront: --ttl expects minutes (a positive number), got '${ttl}'`);
+          process.exit(64);
+        }
+      }
+      res = await rpc('up', { cwd, holder, hygiene: hygiene(), watch: flags.has('--watch'), ttlMs });
       break;
     }
     case 'run': {
@@ -123,7 +180,8 @@ async function main(): Promise<void> {
       break;
     }
     case 'exec': {
-      const cmd = positional.join(' ');
+      // The whole passthrough is the command, verbatim — its own --flags intact.
+      const cmd = (passthrough ?? positional).join(' ');
       if (!cmd) {
         console.error('infront exec: no command given');
         process.exit(64);
