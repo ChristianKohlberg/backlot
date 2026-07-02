@@ -26,6 +26,25 @@ Each item notes severity and where it was found.
   silent service has no `.log` file yet, so `logs` returns `no logs for service` (a
   false env-error). Should return an empty log, not fail. Trivial.
 
+## Data states / seeding (ADR-0016)
+
+The seeding philosophy is decided in [ADR-0016](docs/decisions/0016-data-states-not-seeds-three-baselines-scenarios-in-tests.md).
+Sequenced implementation:
+
+- [ ] **S1 · `--state` selection + per-check `state:`.** Expose the presets already
+  declared (today only `default_preset` is reachable — every other preset is dead
+  weight). Runtime `infront up --state <name>`; a check declares its state
+  (`checks.e2e.state: dev`). Small; unlocks the states that already exist.
+- [ ] **S2 · `states:` with declared `inputs` → content-hash template keying.** Replaces
+  command-string keying (decision 0008) for states, so editing a seed auto-rebakes
+  instead of silently serving a stale template. `inputs` are declared globs; infront
+  reuses the stat-gated hasher. The highest-value seeding fix.
+- [ ] **S3 · `snapshot` / `restore` verbs.** Rewind to a runtime-chosen point (the
+  debugging loop) via the datastore's native clone (sqlite copy / postgres template /
+  MSSQL BACKUP-RESTORE). Note the restore-blips-connections caveat.
+- [ ] **S4 (later) · Composable/layered states** consuming the repo's existing per-layer
+  hashes; **shared/"golden" states** across machines (coupled to the remote substrate).
+
 ## Roadmap (from the design + reviews)
 
 - [ ] **Remote substrate driver (0.3).** The one big rock. A `morph`/`ssh` substrate:
