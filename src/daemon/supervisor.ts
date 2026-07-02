@@ -21,6 +21,8 @@ interface Running {
   buf: string;
   restarts: number;
   expectedExit: boolean;
+  /** Pending restart timer — must be cancellable by stopAll so it can't orphan. */
+  restartTimer: NodeJS.Timeout | null;
 }
 
 export class EnvSupervisor {
@@ -33,6 +35,10 @@ export class EnvSupervisor {
     private readonly logDir: string,
     /** Fired when a service flaps past its restart budget (decision 0007/0010). */
     private readonly onDegraded?: (service: string) => void,
+    /** Fired whenever a service's pid changes (start/restart) so the journal
+     * stays truthful for recovery — a stale pid gets an innocent SIGTERM and
+     * misses the real orphan holding the port. */
+    private readonly onPidsChanged?: () => void,
   ) {
     mkdirSync(logDir, { recursive: true });
   }
@@ -63,8 +69,11 @@ export class EnvSupervisor {
   start(name: string, spec: ServiceSpec, env: Record<string, string>, watchMode: boolean): void {
     const cmd = watchMode && spec.watch_run ? spec.watch_run : spec.run;
     const cwd = spec.cwd ? join(this.envTree, spec.cwd) : this.envTree;
-    const running: Running = { proc: null as unknown as ChildProcess, buf: '', restarts: 0, expectedExit: false };
+    const running: Running = { proc: null as unknown as ChildProcess, buf: '', restarts: 0, expectedExit: false, restartTimer: null };
     const launch = () => {
+      running.restartTimer = null;
+      // A teardown that landed while this restart was pending: do not respawn.
+      if (running.expectedExit) return;
       const proc = spawn('sh', ['-c', cmd], {
         cwd,
         env: { ...process.env, ...env },
@@ -72,6 +81,7 @@ export class EnvSupervisor {
         detached: false,
       });
       running.proc = proc;
+      this.onPidsChanged?.();
       const sink = (d: Buffer) => {
         const s = d.toString();
         running.buf = (running.buf + s).slice(-64_000);
@@ -83,14 +93,21 @@ export class EnvSupervisor {
       };
       proc.stdout!.on('data', sink);
       proc.stderr!.on('data', sink);
+      // A spawn failure (EAGAIN/EMFILE under fleet load) emits 'error'; with no
+      // listener it becomes an uncaught exception that kills the whole daemon.
+      proc.on('error', (err) => {
+        this.note(name, `spawn error: ${err.message}`);
+      });
       proc.on('exit', (code) => {
         if (running.expectedExit) return;
         this.note(name, `exited (${code})`);
+        this.onPidsChanged?.(); // the dead pid must leave the journal
         // Bounded restart for long-lived services (decision 0010).
         if (running.restarts < 3) {
           running.restarts++;
           this.note(name, `restarting (attempt ${running.restarts})`);
-          setTimeout(launch, 500 * running.restarts).unref();
+          running.restartTimer = setTimeout(launch, 500 * running.restarts);
+          running.restartTimer.unref();
         } else {
           this.note(name, 'flapping — giving up (environment degraded)');
           this.onDegraded?.(name);
@@ -145,7 +162,13 @@ export class EnvSupervisor {
   async stopAll(): Promise<void> {
     for (const [name, r] of this.services) {
       r.expectedExit = true;
-      if (r.proc.exitCode === null) {
+      // Cancel any pending restart BEFORE it can fire — otherwise launch()
+      // respawns an untracked process that squats the port after teardown.
+      if (r.restartTimer) {
+        clearTimeout(r.restartTimer);
+        r.restartTimer = null;
+      }
+      if (r.proc && r.proc.exitCode === null) {
         await new Promise<void>((resolve) => {
           r.proc.once('exit', () => resolve());
           r.proc.kill();

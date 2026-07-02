@@ -116,7 +116,7 @@ async function main(): Promise<void> {
     return;
   }
 
-  const known = ['up', 'run', 'job', 'ctx', 'sync', 'bind', 'exec', 'logs', 'token', 'reset-data', 'pull', 'release', 'status', 'pool', 'daemon'];
+  const known = ['up', 'run', 'job', 'ctx', 'sync', 'bind', 'exec', 'logs', 'token', 'reset-data', 'pull', 'release', 'status', 'doctor', 'pool', 'daemon'];
   if (!known.includes(verb)) {
     console.error(`infront: unknown verb '${verb}'\n\n${USAGE}`);
     process.exit(64);
@@ -226,12 +226,17 @@ async function main(): Promise<void> {
     case 'status':
       res = await rpc('status', {});
       break;
+    case 'doctor':
+      res = await rpc('doctor', {});
+      break;
     case 'pool': {
       const sub = positional[0] ?? 'ls';
       if (sub === 'ls') res = await rpc('status', {});
       else if (sub === 'recycle') res = await rpc('pool-recycle', { all: flags.has('--all') });
+      else if (sub === 'reconcile') res = await rpc('pool-reconcile', {});
+      else if (sub === 'doctor') res = await rpc('doctor', {});
       else {
-        console.error(`infront pool: unknown subcommand '${sub}' (ls | recycle)`);
+        console.error(`infront pool: unknown subcommand '${sub}' (ls | recycle | reconcile | doctor)`);
         process.exit(64);
       }
       break;

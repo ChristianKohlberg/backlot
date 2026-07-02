@@ -58,6 +58,9 @@ export class Journal {
         id TEXT PRIMARY KEY, stack_cwd TEXT NOT NULL, check_name TEXT NOT NULL,
         state TEXT NOT NULL, verdict TEXT, created_at INTEGER NOT NULL, finished_at INTEGER
       );
+      CREATE TABLE IF NOT EXISTS counters (
+        stack TEXT PRIMARY KEY, next_env INTEGER NOT NULL DEFAULT 1
+      );
     `);
     // Migration for journals created before fail_streak existed.
     try {
@@ -125,6 +128,24 @@ export class Journal {
   deleteEnv(id: string): void {
     this.db.prepare('DELETE FROM envs WHERE id = ?').run(id);
     this.db.prepare('DELETE FROM leases WHERE env_id = ?').run(id);
+  }
+
+  /**
+   * A per-stack env sequence that NEVER reuses a number, even after envs are
+   * reaped — so a recycled env's id can't collide with a live one. Monotonic
+   * in the journal, survives daemon restarts.
+   */
+  nextEnvSeq(stack: string): number {
+    this.db.prepare('INSERT INTO counters (stack, next_env) VALUES (?, 1) ON CONFLICT(stack) DO NOTHING').run(stack);
+    const row = this.db.prepare('SELECT next_env FROM counters WHERE stack = ?').get(stack) as { next_env: number };
+    const seq = row.next_env;
+    this.db.prepare('UPDATE counters SET next_env = next_env + 1 WHERE stack = ?').run(stack);
+    return seq;
+  }
+
+  /** Update just the recorded service pids (auto-restart keeps recovery honest). */
+  updateServicePids(id: string, pids: Record<string, number>): void {
+    this.db.prepare('UPDATE envs SET service_pids = ? WHERE id = ?').run(JSON.stringify(pids), id);
   }
 
   saveLease(l: LeaseRow): void {
@@ -202,6 +223,19 @@ export class Journal {
       createdAt: r.created_at as number,
       finishedAt: (r.finished_at as number) ?? null,
     }));
+  }
+
+  /** Recovery: a job left 'running'/'pending' by a dead daemon can never finish. */
+  failStaleJobs(): number {
+    const stale = this.db.prepare("SELECT id, check_name, stack_cwd FROM jobs WHERE state != 'done'").all() as Array<{ id: string; check_name: string; stack_cwd: string }>;
+    for (const j of stale) {
+      this.saveJob({
+        id: j.id, stackCwd: j.stack_cwd, check: j.check_name, state: 'done',
+        verdict: { check: j.check_name, ok: false, exitCode: -1, failure: { class: 'env-error', message: 'daemon restarted while this run was in flight — result lost' } },
+        finishedAt: Date.now(),
+      });
+    }
+    return stale.length;
   }
 
   /** Retention: done jobs finished before the cutoff leave the journal. */

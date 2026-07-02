@@ -4,14 +4,15 @@
  * (decision 0009). One RPC endpoint; the CLI is a thin client. Serializes
  * requests through a simple queue — policy code stays race-free.
  */
-import { createServer } from 'node:http';
+import { createServer, request } from 'node:http';
 import { existsSync, rmSync, writeFileSync, chmodSync } from 'node:fs';
 import { socketPath, pidPath } from '../core/paths.js';
 import { BrokerError } from '../core/util.js';
 import { Engine } from './engine.js';
 
+// Singleton guard: recover() and listen happen only AFTER we win the socket,
+// so a losing daemon never reaps the winner's children or mutates the journal.
 const engine = new Engine();
-engine.recover();
 // Concurrency lives in the engine: a short pool lock for claim bookkeeping and
 // one lock per environment. Requests for different environments overlap; two
 // operations on one environment never do.
@@ -62,8 +63,13 @@ async function dispatch(verb: string, args: Record<string, unknown>): Promise<un
       return engine.release(cwd, holder);
     case 'status':
       return engine.status();
+    case 'doctor':
+      return engine.doctor();
     case 'pool-recycle':
       return engine.poolRecycle(Boolean(args.all));
+    case 'pool-reconcile':
+      // Local substrate: reconcile = doctor + reap anything degraded/stuck.
+      return engine.poolReconcile();
     case 'shutdown':
       setTimeout(async () => {
         await engine.shutdown();
@@ -76,7 +82,24 @@ async function dispatch(verb: string, args: Record<string, unknown>): Promise<un
 }
 
 const sock = socketPath();
-if (existsSync(sock)) rmSync(sock, { force: true }); // stale socket from a dead daemon
+let ownsSocket = false;
+
+/** Is a LIVE daemon already answering on the socket? (vs. a stale socket file) */
+function pingExisting(): Promise<boolean> {
+  return new Promise((resolve) => {
+    if (!existsSync(sock)) return resolve(false);
+    const req = request({ socketPath: sock, path: '/', method: 'POST', timeout: 1500 }, (res) => {
+      res.resume();
+      resolve(res.statusCode === 200);
+    });
+    req.on('error', () => resolve(false)); // ECONNREFUSED = stale socket
+    req.on('timeout', () => {
+      req.destroy();
+      resolve(false);
+    });
+    req.end(JSON.stringify({ verb: 'ping', args: {} }));
+  });
+}
 
 const server = createServer((req, res) => {
   let body = '';
@@ -97,29 +120,53 @@ const server = createServer((req, res) => {
   });
 });
 
-server.listen(sock, () => {
-  // The socket has no RPC auth and exposes arbitrary-shell verbs (exec/token),
-  // so it must be owner-only. On macOS the socket-file mode is what actually
-  // gates connect() (the dir traversal isn't enough), so this chmod is the
-  // real boundary, not just belt-and-suspenders.
-  try {
-    chmodSync(sock, 0o600);
-  } catch {
-    /* best-effort; the 0700 state dir is the backstop */
+// EADDRINUSE means another daemon won the listen race between our ping and our
+// bind — concede cleanly rather than clobber it.
+server.on('error', (err: NodeJS.ErrnoException) => {
+  if (err.code === 'EADDRINUSE') {
+    if (process.send) process.send('ready'); // a live daemon exists; the client can proceed
+    process.exit(0);
   }
-  writeFileSync(pidPath(), String(process.pid));
-  // Detach from the spawning CLI's lifetime.
-  if (process.send) process.send('ready');
+  throw err;
 });
 
-const sweepMs = Number(process.env.INFRONT_SWEEP_MS ?? 15_000);
-setInterval(() => void engine.sweep(), sweepMs).unref();
-// The server keeps the loop alive; the sweeper must not.
+async function start(): Promise<void> {
+  if (await pingExisting()) {
+    // A healthy daemon already owns the socket — do NOT recover() or listen.
+    if (process.send) process.send('ready');
+    process.exit(0);
+  }
+  if (existsSync(sock)) rmSync(sock, { force: true }); // stale socket from a dead daemon
+
+  server.listen(sock, () => {
+    ownsSocket = true;
+    // The socket has no RPC auth and exposes arbitrary-shell verbs (exec/token),
+    // so it must be owner-only. On macOS the socket-file mode is what actually
+    // gates connect() (the dir traversal isn't enough), so this chmod is the
+    // real boundary, not just belt-and-suspenders.
+    try {
+      chmodSync(sock, 0o600);
+    } catch {
+      /* best-effort; the 0700 state dir is the backstop */
+    }
+    writeFileSync(pidPath(), String(process.pid));
+    // Only NOW, as the sole owner, reconcile prior daemon state.
+    engine.recover();
+    const sweepMs = Number(process.env.INFRONT_SWEEP_MS ?? 15_000);
+    setInterval(() => void engine.sweep(), sweepMs).unref();
+    // Detach from the spawning CLI's lifetime.
+    if (process.send) process.send('ready');
+  });
+}
+
+void start();
 
 for (const sig of ['SIGINT', 'SIGTERM'] as const) {
   process.on(sig, () => {
     void engine.shutdown().then(() => {
-      rmSync(sock, { force: true });
+      // Only remove the socket if WE own it — a losing/duplicate daemon must
+      // never delete the healthy daemon's socket.
+      if (ownsSocket) rmSync(sock, { force: true });
       process.exit(0);
     });
   });
