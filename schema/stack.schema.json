@@ -164,7 +164,8 @@
         "run": { "type": "string" },
         "cwd": { "type": "string" },
         "env": { "type": "object", "additionalProperties": { "type": "string" } },
-        "artifacts": { "type": "array", "items": { "type": "string" }, "description": "Globs collected into the verdict's artifacts dir." }
+        "artifacts": { "type": "array", "items": { "type": "string" }, "description": "Globs collected into the verdict's artifacts dir." },
+        "timeout": { "type": "number", "default": 600, "description": "Seconds before the check's whole process group is killed — a hung check must never hold its environment forever." }
       }
     }
   }

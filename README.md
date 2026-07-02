@@ -84,6 +84,23 @@ externally run — infront probes it and classifies its absence honestly
 
 Read [docs/architecture.md](docs/architecture.md) — it's short, and it *is* the product.
 
+## Security model
+
+Be clear-eyed about what running infront means:
+
+- **`stack.yaml` commands execute with your privileges.** Services, seeds, upkeep
+  rules, and checks are shell commands from the repo — exactly like `make`, npm
+  scripts, or a Justfile. Cloning an untrusted repo and running `infront up` runs
+  that repo's commands as you. Review manifests you didn't write.
+- **The daemon has no network surface.** It listens on a unix socket in your
+  per-user state dir (filesystem permissions are the auth) — no TCP, no remote
+  callers. Future remote substrates run the same model *on the remote box*, reached
+  over your own SSH/provider credentials.
+- **Environments are projections, not sandboxes.** Isolation between environments
+  is namespacing (ports, directories, database namespaces), not a security
+  boundary — code in an environment runs as you, on your machine. For untrusted
+  code, put the *substrate* in a sandbox (a VM, a cloud box), not your laptop.
+
 ## License
 
 Apache-2.0.

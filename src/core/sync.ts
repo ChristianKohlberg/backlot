@@ -16,7 +16,7 @@
 import { execFileSync } from 'node:child_process';
 import {
   copyFileSync, mkdirSync, rmSync, existsSync, readFileSync, writeFileSync,
-  readdirSync, statSync,
+  readdirSync, statSync, constants as fsConstants,
 } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileHash, matchesAny, sha256, isFile } from './util.js';
@@ -124,7 +124,7 @@ export function syncIntoEnv(stackRoot: string, envTree: string, manifest: Manife
 
     if (dstHash !== srcHash) {
       mkdirSync(dirname(dst), { recursive: true });
-      copyFileSync(src, dst);
+      copyFileSync(src, dst, fsConstants.COPYFILE_FICLONE); // CoW clone on APFS/reflink fs; falls back to copy
       copied++;
     }
     const newDstStat = dstHash !== srcHash ? statOf(dst)! : dstStat!;
@@ -160,7 +160,7 @@ export function pullOutputs(stackRoot: string, envTree: string, manifest: Manife
   const changed = changedOutputs(stackRoot, envTree, manifest);
   for (const rel of changed) {
     mkdirSync(dirname(join(stackRoot, rel)), { recursive: true });
-    copyFileSync(join(envTree, rel), join(stackRoot, rel));
+    copyFileSync(join(envTree, rel), join(stackRoot, rel), fsConstants.COPYFILE_FICLONE);
   }
   return changed;
 }

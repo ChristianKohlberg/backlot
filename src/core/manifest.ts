@@ -43,6 +43,8 @@ export interface CheckSpec {
   cwd?: string;
   env?: Record<string, string>;
   artifacts?: string[];
+  /** Hard kill (whole process group) after this many seconds. Default 600. */
+  timeout?: number;
 }
 
 export interface UpkeepRule {

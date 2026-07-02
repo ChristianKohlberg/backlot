@@ -13,7 +13,7 @@
  * backup/restore script). Templates are machine-global and immutable-keyed
  * (decision 0006/0008).
  */
-import { copyFileSync, mkdirSync, rmSync, existsSync, writeFileSync } from 'node:fs';
+import { copyFileSync, mkdirSync, rmSync, existsSync, writeFileSync, constants as fsConstants } from 'node:fs';
 import { join } from 'node:path';
 import { execFile } from 'node:child_process';
 import { connect } from 'node:net';
@@ -93,7 +93,7 @@ class SqliteDs implements DsDriver {
     if (this.spec.template === true) {
       const tpl = this.tplPath(preset);
       if (!existsSync(tpl)) await this.runCreate(h.envTree, tpl, preset); // bake once
-      copyFileSync(tpl, dbPath); // restore = file copy
+      copyFileSync(tpl, dbPath, fsConstants.COPYFILE_FICLONE); // restore = CoW clone where the fs supports it
     } else {
       await this.runCreate(h.envTree, dbPath, preset);
     }

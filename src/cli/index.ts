@@ -105,19 +105,23 @@ async function main(): Promise<void> {
     case 'job': {
       const jobId = positional[0];
       if (!jobId) {
-        console.error('infront job: which job? (usage: infront job <jobId>)');
+        console.error('infront job: which job? (usage: infront job <jobId> | infront job ls)');
         process.exit(64);
       }
-      res = await rpc('job', { jobId });
+      res = jobId === 'ls' ? await rpc('job-ls', {}) : await rpc('job', { jobId });
       break;
     }
     case 'ctx':
       res = await rpc('ctx', { cwd, holder });
       break;
     case 'sync':
-    case 'bind':
       res = await rpc('sync', { cwd, holder });
       break;
+    case 'bind': {
+      const ref = flagValue('--ref');
+      res = ref ? await rpc('bind-ref', { cwd, holder, ref }) : await rpc('sync', { cwd, holder });
+      break;
+    }
     case 'exec': {
       const cmd = positional.join(' ');
       if (!cmd) {

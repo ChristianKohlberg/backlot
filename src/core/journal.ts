@@ -193,6 +193,23 @@ export class Journal {
     };
   }
 
+  listJobs(limit = 20): Array<{ id: string; check: string; state: string; ok: boolean | null; createdAt: number; finishedAt: number | null }> {
+    return (this.db.prepare('SELECT * FROM jobs ORDER BY created_at DESC LIMIT ?').all(limit) as Record<string, unknown>[]).map((r) => ({
+      id: r.id as string,
+      check: r.check_name as string,
+      state: r.state as string,
+      ok: r.verdict ? Boolean((JSON.parse(r.verdict as string) as { ok?: boolean }).ok) : null,
+      createdAt: r.created_at as number,
+      finishedAt: (r.finished_at as number) ?? null,
+    }));
+  }
+
+  /** Retention: done jobs finished before the cutoff leave the journal. */
+  pruneJobs(cutoffMs: number): number {
+    const res = this.db.prepare("DELETE FROM jobs WHERE state = 'done' AND finished_at IS NOT NULL AND finished_at < ?").run(cutoffMs);
+    return Number(res.changes ?? 0);
+  }
+
   /** Shift every deadline by `ms` — the sleep pardon (decision 0009). */
   pardon(ms: number): void {
     this.db.prepare('UPDATE leases SET expires_at = expires_at + ?').run(ms);

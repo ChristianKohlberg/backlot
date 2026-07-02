@@ -40,6 +40,10 @@ async function dispatch(verb: string, args: Record<string, unknown>): Promise<un
     }
     case 'job':
       return engine.jobStatus(String(args.jobId));
+    case 'job-ls':
+      return engine.jobList();
+    case 'bind-ref':
+      return engine.bindRef(cwd, String(args.ref), holder);
     case 'ctx':
       return engine.ctx(cwd, holder);
     case 'sync':

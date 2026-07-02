@@ -2,8 +2,10 @@
  * The engine: pool + lease + bind + run orchestration, owning all policy
  * (drivers own transport/storage; the manifest owns repo knowledge).
  */
-import { execFile } from 'node:child_process';
-import { mkdirSync, rmSync, copyFileSync, readdirSync, statSync, existsSync, readFileSync, watch as fsWatch } from 'node:fs';
+import { execFile, execFileSync, spawn } from 'node:child_process';
+import { mkdtempSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { mkdirSync, rmSync, copyFileSync, readdirSync, statSync, existsSync, readFileSync, watch as fsWatch, constants as fsConstants } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { Journal, type EnvRow } from '../core/journal.js';
 import { loadStack, defaultPreset, type Stack } from '../core/manifest.js';
@@ -14,13 +16,15 @@ import { envsRoot, artifactsRoot } from '../core/paths.js';
 import { BrokerError, template, templateEnv, now, shortId, matchesAny } from '../core/util.js';
 import { makeDatastore, type DsHandle } from '../drivers/datastores.js';
 import { EnvSupervisor, reapPids } from './supervisor.js';
+import { policy } from '../core/policy.js';
+import { retentionSweep } from '../core/retention.js';
 import type { Hygiene, LeaseKind } from '../core/types.js';
 
-const POOL_MAX = () => Number(process.env.INFRONT_POOL_MAX ?? 3);
-const LEASE_TTL = (kind: LeaseKind) =>
-  Number(process.env.INFRONT_LEASE_TTL_MS ?? (kind === 'session' ? 30 * 60_000 : 10 * 60_000));
-const IDLE_TTL = () => Number(process.env.INFRONT_IDLE_TTL_MS ?? 30 * 60_000);
-const WAIT_MS = () => Number(process.env.INFRONT_WAIT_MS ?? 60_000);
+const POOL_MAX = () => policy().poolMax;
+const LEASE_TTL = (kind: LeaseKind) => (kind === 'session' ? policy().sessionTtlMs : policy().runTtlMs);
+const IDLE_TTL = () => policy().idleTtlMs;
+const WAIT_MS = () => policy().waitMs;
+const CHECK_TIMEOUT_S = 600;
 
 export interface UpOptions {
   cwd: string;
@@ -29,12 +33,48 @@ export interface UpOptions {
   kind?: LeaseKind;
   watch?: boolean;
   ttlMs?: number;
+  /** Bind from this directory instead of the worktree (bind --ref extraction). */
+  sourceRoot?: string;
+}
+
+/**
+ * Run a check/exec command as a PROCESS GROUP with a hard timeout — killing
+ * only the `sh` wrapper would orphan grandchildren (a hung Playwright would
+ * hold the environment busy forever).
+ */
+function runGroupCmd(
+  cmd: string,
+  cwd: string,
+  envVars: NodeJS.ProcessEnv,
+  timeoutS: number,
+): Promise<{ exitCode: number; output: string; timedOut: boolean }> {
+  return new Promise((resolvePromise) => {
+    const proc = spawn('sh', ['-c', cmd], { cwd, env: envVars, stdio: ['ignore', 'pipe', 'pipe'], detached: true });
+    let out = '';
+    proc.stdout!.on('data', (d) => (out = (out + d.toString()).slice(-8000)));
+    proc.stderr!.on('data', (d) => (out = (out + d.toString()).slice(-8000)));
+    let timedOut = false;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      try {
+        process.kill(-proc.pid!, 'SIGKILL'); // the whole group
+      } catch {
+        proc.kill('SIGKILL');
+      }
+    }, timeoutS * 1000);
+    timer.unref();
+    proc.on('exit', (code) => {
+      clearTimeout(timer);
+      resolvePromise({ exitCode: code ?? 1, output: out.slice(-4000), timedOut });
+    });
+  });
 }
 
 export class Engine {
   readonly journal = new Journal();
   private supervisors = new Map<string, EnvSupervisor>();
   private lastSweep = now();
+  private lastRetention = now();
 
   // -------- concurrency: a short pool lock for claim/release bookkeeping and
   // one lock per environment for bind/exec/reset. Two environments (or two
@@ -181,7 +221,7 @@ export class Engine {
     return sup;
   }
 
-  private async bindAndStart(stack: Stack, env: EnvRow, hygiene: Hygiene, kind: LeaseKind, watch: boolean): Promise<EnvRow> {
+  private async bindAndStart(stack: Stack, env: EnvRow, hygiene: Hygiene, kind: LeaseKind, watch: boolean, sourceRoot?: string): Promise<EnvRow> {
     const dirs = this.envDirs(env.id);
     if (hygiene === 'pristine') {
       await this.supervisor(env).stopAll();
@@ -194,7 +234,7 @@ export class Engine {
       env.presets = {};
     }
 
-    const sync = syncIntoEnv(stack.root, dirs.tree, stack.manifest);
+    const sync = syncIntoEnv(sourceRoot ?? stack.root, dirs.tree, stack.manifest);
     const upkeep = await runUpkeep(dirs.tree, sync.files, stack.manifest, env.fingerprints);
     for (const dsName of upkeep.rebakeTemplates) {
       const spec = stack.manifest.datastores?.[dsName];
@@ -346,7 +386,7 @@ export class Engine {
     // warm environment -> the next bind is pristine, whatever was asked.
     if (hygiene !== 'pristine' && env.failStreak >= 2) hygiene = 'pristine';
     try {
-      const bound = await this.envLocked(env.id, () => this.bindAndStart(stack, env, hygiene, kind, opts.watch ?? false));
+      const bound = await this.envLocked(env.id, () => this.bindAndStart(stack, env, hygiene, kind, opts.watch ?? false, opts.sourceRoot));
       if (opts.watch && kind === 'session' && !this.watchers.has(bound.id)) {
         this.startWatch(bound.id, stack.root, opts.cwd, holder);
       }
@@ -405,22 +445,28 @@ export class Engine {
     const ctx = this.templateCtx(stack, env);
     try {
       // envLocked: marks the env busy for the whole check so the sweeper can't
-      // expire the run lease mid-check and hand the env to someone else.
+      // expire the run lease mid-check and hand the env to someone else. The
+      // process-group timeout bounds how long that hold can last.
+      const timeoutS = check.timeout ?? CHECK_TIMEOUT_S;
       const res = await this.envLocked(env.id, () =>
-        new Promise<{ exitCode: number; output: string }>((resolvePromise) => {
-          execFile(
-            'sh', ['-c', template(check.run, ctx)],
-            { cwd: check.cwd ? join(dirs.tree, check.cwd) : dirs.tree, env: { ...process.env, ...templateEnv(check.env, ctx) }, maxBuffer: 32 * 1024 * 1024 },
-            (err, stdout, stderr) => resolvePromise({ exitCode: err ? ((err as { code?: number }).code ?? 1) : 0, output: `${stdout}${stderr}`.slice(-4000) }),
-          );
-        }),
+        runGroupCmd(
+          template(check.run, ctx),
+          check.cwd ? join(dirs.tree, check.cwd) : dirs.tree,
+          { ...process.env, ...templateEnv(check.env, ctx) },
+          timeoutS,
+        ),
       );
       const artifactsDir = this.collectArtifacts(env.id, dirs.tree, check.artifacts ?? []);
       return {
         check: opts.check,
-        ok: res.exitCode === 0,
-        exitCode: res.exitCode,
-        failure: res.exitCode === 0 ? null : { class: 'work-error', message: `check '${opts.check}' failed (exit ${res.exitCode})`, logExcerpt: res.output.slice(-800) },
+        ok: res.exitCode === 0 && !res.timedOut,
+        exitCode: res.timedOut ? -1 : res.exitCode,
+        failure:
+          res.exitCode === 0 && !res.timedOut
+            ? null
+            : res.timedOut
+              ? { class: 'work-error', message: `check '${opts.check}' timed out after ${timeoutS}s (process group killed; raise checks.${opts.check}.timeout if legitimate)`, logExcerpt: res.output.slice(-800) }
+              : { class: 'work-error', message: `check '${opts.check}' failed (exit ${res.exitCode})`, logExcerpt: res.output.slice(-800) },
         output: res.output,
         artifactsDir,
         outputsChanged: changedOutputs(stack.root, dirs.tree, stack.manifest),
@@ -480,7 +526,7 @@ export class Engine {
     for (const rel of matched) {
       const dst = join(dest, rel);
       mkdirSync(join(dst, '..'), { recursive: true });
-      copyFileSync(join(tree, rel), dst);
+      copyFileSync(join(tree, rel), dst, fsConstants.COPYFILE_FICLONE);
     }
     return dest;
   }
@@ -488,6 +534,28 @@ export class Engine {
   async syncLease(cwd: string, holder?: string) {
     // Rebind the existing lease with current hygiene = reuse semantics.
     return this.up({ cwd, holder: holder ?? resolve(cwd), kind: 'session', hygiene: 'reuse' });
+  }
+
+  /** bind --ref: project a COMMITTED ref (not the worktree state) into the env. */
+  async bindRef(cwd: string, ref: string, holder?: string) {
+    const stack = loadStack(cwd);
+    let sha: string;
+    try {
+      sha = execFileSync('git', ['-C', stack.root, 'rev-parse', '--verify', `${ref}^{commit}`], { encoding: 'utf8' }).trim();
+    } catch {
+      throw new BrokerError('work-error', `'${ref}' is not a commit in this repository`, 'bind');
+    }
+    const tmp = mkdtempSync(join(tmpdir(), 'infront-ref-'));
+    try {
+      execFileSync('sh', ['-c', `git -C "${stack.root}" archive ${sha} | tar -x -C "${tmp}"`]);
+      return await this.up({ cwd, holder: holder ?? resolve(cwd), kind: 'session', hygiene: 'reuse', sourceRoot: tmp });
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  }
+
+  jobList() {
+    return { jobs: this.journal.listJobs(20) };
   }
 
   async resetData(cwd: string, holder?: string) {
@@ -617,6 +685,16 @@ export class Engine {
     const interval = Number(process.env.INFRONT_SWEEP_MS ?? 15_000);
     if (gap > 3 * interval) this.journal.pardon(gap - interval); // sleep pardon (decision 0009)
     this.lastSweep = t;
+
+    // Disk retention (~10 min cadence): nothing infront writes grows forever.
+    if (t - this.lastRetention > Number(process.env.INFRONT_RETENTION_MS ?? 10 * 60_000)) {
+      this.lastRetention = t;
+      try {
+        retentionSweep(this.journal, policy());
+      } catch {
+        /* best-effort */
+      }
+    }
 
     for (const lease of this.journal.allLeases()) {
       // Never expire a lease whose env has an operation in flight (a long bind
