@@ -1,0 +1,50 @@
+# yaml-language-server: $schema=../../schema/stack.schema.json
+#
+# The multi-service variant fixture: everything hello-web deliberately doesn't
+# exercise — two HTTP services wired by {{services.*.url}}, depends_on ordering,
+# a PORTLESS worker with log-marker readiness, fatal_logs fail-fast, three
+# presets, an upkeep rule with an engine built-in, and artifact collection.
+name: hello-multi
+
+services:
+  api:
+    run: node api.mjs
+    port: api
+    env:
+      PORT: "{{ports.api}}"
+      DB_PATH: "{{datastores.main.url}}"
+    ready: { http: /health, timeout: 30 }
+    fatal_logs: "Error:"
+  web:
+    run: node web.mjs
+    port: web
+    depends_on: [api]
+    env:
+      PORT: "{{ports.web}}"
+      API_URL: "{{services.api.url}}"
+    ready: { http: /health, timeout: 30 }
+    fatal_logs: "Error:"
+  worker:
+    run: node worker.mjs
+    env:
+      DB_PATH: "{{datastores.main.url}}"
+    ready: { log: "worker ready", timeout: 30 }
+
+datastores:
+  main:
+    driver: sqlite
+    create: node seed.mjs {{ns}} {{preset}}
+    presets: [dev, demo, empty]
+    default_preset: { run: dev, session: demo }
+    template: true
+
+upkeep:
+  - { when: seed.mjs, run: "@rebake-template main" }
+
+checks:
+  smoke:
+    run: node smoke.test.mjs
+    env:
+      API_URL: "{{services.api.url}}"
+      WEB_URL: "{{services.web.url}}"
+    artifacts: [smoke-report.json]
