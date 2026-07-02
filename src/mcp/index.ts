@@ -17,7 +17,6 @@ interface Tool {
   description: string;
   inputSchema: Record<string, unknown>;
   verb: string;
-  map?: (args: Record<string, unknown>) => Record<string, unknown>;
 }
 
 const cwdProp = {
@@ -68,6 +67,18 @@ const TOOLS: Tool[] = [
     verb: 'reset-data',
   },
   {
+    name: 'infront_pull',
+    description: 'Copy the environment\'s changed declared outputs (regenerated lockfiles, generated clients) back into the worktree — the only sanctioned write-back.',
+    inputSchema: { type: 'object', properties: { ...cwdProp }, required: ['cwd'] },
+    verb: 'pull',
+  },
+  {
+    name: 'infront_token',
+    description: 'Mint an auth token via the stack\'s auth.token hook (resolves {{role}}). Returns {token, role}.',
+    inputSchema: { type: 'object', properties: { ...cwdProp, role: { type: 'string', description: 'Role to mint for (default admin).' } }, required: ['cwd'] },
+    verb: 'token',
+  },
+  {
     name: 'infront_release',
     description: 'Release the current lease; the environment returns to the pool warm.',
     inputSchema: { type: 'object', properties: { ...cwdProp }, required: ['cwd'] },
@@ -75,9 +86,15 @@ const TOOLS: Tool[] = [
   },
   {
     name: 'infront_status',
-    description: 'Pool overview: environments, states, leases.',
+    description: 'Pool overview: environments, states, leases, recent daemon events.',
     inputSchema: { type: 'object', properties: {} },
     verb: 'status',
+  },
+  {
+    name: 'infront_doctor',
+    description: 'Active health check of the pool: pid divergence, stuck-recycling envs, plus recent events.',
+    inputSchema: { type: 'object', properties: {} },
+    verb: 'doctor',
   },
 ];
 

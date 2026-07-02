@@ -1,12 +1,15 @@
 # Driver spec
 
-infront has exactly two extension seams. Thinness is deliberate — it is what
-"never own compute" looks like in code. The authoritative shapes live in
-[`../src/drivers/types.ts`](../src/drivers/types.ts); this document is the prose
-contract a driver author reads first.
+infront has two extension seams. Thinness is deliberate — it is what "never own
+compute" looks like in code.
 
-Drivers are in-tree TypeScript modules in v1. The interfaces below are the freeze
-candidates for 0.3, after which external drivers become supportable.
+**Status (v0.4):** only the **datastore** seam is live, and its authoritative shape is
+[`../src/drivers/datastores.ts`](../src/drivers/datastores.ts) (`DsDriver`) — described
+below. The **substrate** seam is designed but not yet implemented: the engine currently
+hardcodes local process supervision, and no `SubstrateDriver` type is wired. The
+substrate interface freezes for 0.3 (the remote-substrate milestone); the sketch at the
+end of this doc is a design target, not a callable contract. Drivers are in-tree
+TypeScript modules; external drivers become supportable once the seams freeze.
 
 ## Substrate driver
 
@@ -32,21 +35,27 @@ Optional capabilities (declared, engine degrades gracefully):
 
 What gives an environment its data state.
 
-| Verb | Contract |
+The real interface is `DsDriver` (`src/drivers/datastores.ts`) — a handle-based shape,
+because the sqlite driver's namespace is a file path derived from the environment:
+
+| Method | Contract |
 | --- | --- |
-| `create(ns, preset)` | Create + seed the namespace (runs the manifest's `create:` command with `{{ns}}`/`{{preset}}` resolved). |
-| `drop(ns)` | Remove the namespace. Must refuse anything outside infront's namespace pattern (belt-and-suspenders against config errors). |
-| `url(ns)` | The connection string consumers receive. |
-| `probe()` | Is the external server reachable? Failure is an `infra-error`, never a code blame. |
+| `ns(h)` | The namespace for an environment (sqlite: a file path under the env's data dir; server drivers: a SQL-safe db name). Rejects path-escaping keys. |
+| `url(h)` | The connection string consumers receive (server drivers template `url:` with `{{ns}}`). |
+| `probe()` | Is the external server reachable? Failure is `infra-error`, never code blame. sqlite is a no-op. |
+| `ensure(h, preset, force, exists)` | Create/restore the namespace at `preset`. `force` recreates; `exists` short-circuits an already-present ns on a `reuse` bind. Runs the manifest's `create:` / `template_restore:` / `drop:` commands with `{{ns}}`/`{{preset}}`/`{{template}}` resolved. |
+| `drop(h)` | Best-effort removal (recycle) — the manifest's `drop:` command, or `rm` for sqlite. |
+| `rebake()` | Invalidate baked templates (the `@rebake-template` upkeep built-in). |
 
-Optional capabilities:
+Template behavior (via `template_restore:` for server drivers, `template: true` for
+sqlite): bake once, keyed by the **`create:` command string** (not seed content — see
+architecture §7), then restore per environment. `ephemeral: true` (Redis-class): no
+presets/templates; `drop:` is the flush on reset, `create:` runs only on first bind.
 
-- `templateBake(preset, seedHash)` / `templateRestore(ns, preset, seedHash)` — bake
-  once per seed-content hash, restore in seconds thereafter. Postgres: native
-  `CREATE DATABASE … TEMPLATE`; MSSQL: backup/restore; SQLite: file copy. Templates
-  are machine-global and immutable-keyed; baking a new hash alongside an old one is
-  the only sanctioned background work (decision 0008).
-- `ephemeral: true` — no presets; `reset-data` = flush (Redis-class stores).
+**Namespace-drop safety:** the sqlite driver rejects keys containing `/`, `\`, or `..`,
+and the command family sanitizes the ns to `[A-Za-z0-9_]` — but a server driver's
+`drop:` command is repo-authored and runs verbatim, so its blast radius is the
+manifest author's responsibility (the general trust model, README §Security).
 
 ## What drivers never do
 

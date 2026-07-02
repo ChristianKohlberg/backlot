@@ -1,5 +1,10 @@
 /**
- * The two extension seams of infront (see docs/driver-spec.md).
+ * DESIGN TARGET — NOT YET WIRED. These are the FROZEN-FOR-0.3 shapes for the
+ * remote SUBSTRATE seam, which the engine does not yet call (v0.4 hardcodes
+ * local process supervision). The LIVE datastore seam is `DsDriver` in
+ * ./datastores.ts, not this file. Do not import these types expecting the
+ * engine to honor them; they exist so the substrate interface is designed
+ * before it is built (see docs/driver-spec.md).
  *
  * Drivers own TRANSPORT and STORAGE mechanics; the engine owns all POLICY
  * (pooling, leases, hygiene, upkeep, sync, error taxonomy). A driver that

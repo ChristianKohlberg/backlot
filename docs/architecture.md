@@ -137,11 +137,13 @@ pristine ≈ full provision (bounded by templates and shared caches, below).
 ## 6. Sync — "verbs sync, watch streams"
 
 Nothing observes the consumer's worktree by default. Every action verb (`run`, `up`,
-`sync`, `bind`) begins by capturing the worktree — ref + dirty diff + untracked files —
-and projecting it into the environment: git fetch from the worktree path + patch
-application. Git is the transport (deletes, renames, modes handled; object store shared;
-works identically over SSH to a remote substrate — **the sync boundary is the
-local/remote abstraction**).
+`sync`, `bind`) begins by capturing the worktree — the file set from `git ls-files`
+(tracked + untracked-unignored, plus `sync.include`) — and projecting it into the
+environment with **stat-gated, hash-verified copies**: a warm rebind stats instead of
+re-hashing, only changed files copy (CoW clone where the filesystem supports it), and
+deletions are mirrored from the previous binding. (The `git fetch` + patch transport is
+the planned *remote-substrate* path for 0.3, where the sync boundary becomes the
+local/remote abstraction; the local substrate is enumerate-and-copy.)
 
 - **Bindings are immutable snapshots.** A running check executes against the revision
   synced at start; edits mid-run cannot contaminate the verdict. New sync = new binding
@@ -177,9 +179,12 @@ before build/start:
   staleness is bounded by one upkeep pass at next use. Machine-global package stores
   (pnpm store, NuGet cache) make the Nth environment's install mostly hard-linking.
 - **No background mutation of environments** (v1): lazy is predictable, and
-  predictability is what agents need. The one sanctioned proactive act is **background
-  template baking**: DB templates are machine-global and immutable-keyed
-  (`preset@seed-hash`), so a new hash can be baked alongside the old with no races.
+  predictability is what agents need.
+- **Data templates are keyed by the `create:` command string, not by seed *content***
+  (v1's honest limitation): editing a seed script does not auto-invalidate the template.
+  Declare an `@rebake-template <datastore>` upkeep rule triggered on the seed files to
+  invalidate it (see `examples/hello-multi/stack.yaml`). Content-hash keying is planned;
+  until then that upkeep rule is the mechanism.
 - Toolchain-level bumps (global.json, .nvmrc) are env-recycle events, not upkeep —
   unless the repo manages toolchains declaratively (mise/asdf) via its own rule.
   infront never installs SDKs on its own initiative.
@@ -232,8 +237,9 @@ Every failure is classified — the field an agent branches on mechanically:
 
 - **Sleep is a coherent pause** locally: daemon, services, and backing containers freeze
   and thaw together. On wake the daemon detects the clock jump and **pardons the gap**
-  (every lease/idle deadline shifts by the sleep duration) and applies a **wake grace**
-  before any health probe may declare degradation.
+  (every lease/idle deadline shifts by the sleep duration). There is no separate wake
+  grace because degradation is judged only by a service's restart budget, not by a
+  post-boot health poll — a slept service simply resumes.
 - **Leases need no heartbeat daemon** because losing a lease is designed to be
   worthless: any CLI touch refreshes the TTL; expiry returns the env warm; the source
   of truth never left the worktree. Agents that vanish cost nothing.
@@ -249,15 +255,24 @@ Every failure is classified — the field an agent branches on mechanically:
 The CLI **is** the API: every verb takes `--json`; stdout is data, stderr is human.
 
 ```
-infront up [--watch] [--reset-data] [--ttl 4h]   # session lease: sync, upkeep, start, context
-infront run <check> [--pristine] [--pull]        # run lease: bind → execute → verdict → release
-infront ctx --json                               # the context blob (below)
-infront sync · bind --ref <sha>                  # project new work into the current lease
-infront exec <cmd>                               # run anything inside the leased env
-infront logs <service> [--since 2m]              # supervised service logs
-infront reset-data · pull · release
-infront status · pool ls|recycle|reconcile|doctor
+infront up [--watch] [--reset-data|--pristine] [--ttl <minutes>]  # session lease
+infront run <check> [--pristine] [--pull] [--detach]   # run lease → verdict → release
+infront job <id> | job ls                        # poll / list detached runs
+infront ctx                                      # the context blob (below)
+infront sync | bind --ref <sha>                  # project worktree | a committed ref
+infront exec <cmd...>                            # run anything inside the leased env
+infront logs <service> [--lines N]               # supervised service logs
+infront token --role <r>                         # mint a token via auth.token
+infront reset-data | pull | release
+infront status | doctor                          # pool state | active health check
+infront pool ls|recycle [--all]|reconcile|doctor
+infront daemon stop
 ```
+
+Every verb accepts `--json`. Exit codes: `0` ok · `1` work-error / failed check ·
+`2` env-error · `3` infra-error · `64` usage. On a failure the `--json` body is
+`{ok:false, error:{class,message,…}}`; a failed *check* under `run` is
+`{ok:false, exitCode, failure:{class,…}}`.
 
 `ctx` returns one blob with everything a consumer needs: service URLs (stable per
 environment), login credentials, a token-mint hook, datastore connection strings,
@@ -267,8 +282,30 @@ blob needs nothing else from infront.
 **Division of labor** (the bug-fix loop): the agent thinks, edits, greps, and commits
 in its own worktree with its own harness — infront is where the code *runs*, never
 where the agent *works*. Fast unit tests that need no system don't pay the broker tax
-at all. An MCP wrapper ships after the verbs stabilize (v1.1); it is a thin adapter
-over the same daemon socket.
+at all. The MCP adapter (`infront-mcp`) is a thin stdio wrapper over the same daemon
+socket — the same verbs as tools, never a second implementation.
+
+### Configuration
+
+Policy lives in the engine, never the manifest. Precedence per knob: environment
+variable > `$STATE_DIR/config.json` > built-in default.
+
+| Env var | config.json key | Default |
+| --- | --- | --- |
+| `INFRONT_STATE_DIR` | — | `$XDG_STATE_HOME/infront` (the per-machine root; 0700) |
+| `INFRONT_POOL_MAX` | `poolMax` | `min(cores/2, memGB/4)`, clamped [1,8] |
+| `INFRONT_LEASE_TTL_MS` | `sessionTtlMs` / `runTtlMs` | 30 min / 10 min |
+| `INFRONT_IDLE_TTL_MS` | `idleTtlMs` | 30 min |
+| `INFRONT_WAIT_MS` | `waitMs` | 60 s (queue-at-capacity timeout) |
+| `INFRONT_ARTIFACT_DAYS` | `artifactDays` | 7 |
+| `INFRONT_JOB_DAYS` | `jobDays` | 7 |
+| `INFRONT_LOG_CAP_BYTES` | `logCapBytes` | 5 MB |
+| `INFRONT_TEMPLATES_KEEP` | `templatesKeep` | 4 per stack |
+| `INFRONT_SWEEP_MS` | — | 15 s (lease/idle sweep cadence) |
+| `INFRONT_RETENTION_MS` | — | 10 min (disk retention cadence) |
+
+The daemon writes a structured event log (`$STATE_DIR/events.jsonl`, size-capped)
+surfaced by `status` and `doctor`.
 
 ## 12. The manifest
 
