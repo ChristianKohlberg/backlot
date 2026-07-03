@@ -15,7 +15,7 @@ sandboxes (Morph, Sprites, SSH) tomorrow — same verbs, same model.
 > verb, an MCP adapter (`backlot-mcp`), and a foreign-runtime consumer (Python).
 > Proven on a real .NET + Angular + MSSQL monorepo end to end — including its
 > Playwright system-e2e suite running against backlot-provisioned environments.
-> Not yet: a live remote substrate driver (morph/ssh) and the npm publish. Design in
+> Published: [`npm i -g backlot`](https://www.npmjs.com/package/backlot). Not yet: a live remote substrate driver (morph/ssh). Design in
 > [docs/architecture.md](docs/architecture.md); decisions in [docs/decisions/](docs/decisions/).
 
 ## Why
@@ -36,7 +36,7 @@ the environment returns to the pool with its heat intact. ([Why not checkpointin
 ## Quickstart
 
 ```bash
-npm install && npm run build && npm link   # once, until backlot is on npm
+npm i -g backlot                           # or from a checkout: npm install && npm run build && npm link
 cd examples/hello-web
 backlot up --json          # lease a warm env: sync, seed, start, print URLs + creds
 backlot run smoke --json   # bind -> run the check -> JSON verdict -> release
