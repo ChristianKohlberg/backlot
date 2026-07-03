@@ -1,31 +1,31 @@
 #!/usr/bin/env node
 /**
- * infront CLI. Contract: every verb accepts --json (stdout = data, stderr =
+ * backlot CLI. Contract: every verb accepts --json (stdout = data, stderr =
  * human); exit codes are contractual — 0 ok, 1 work-error, 2 env-error,
  * 3 infra-error, 64 usage. See docs/architecture.md §11.
  */
 import { ensureDaemon, rpc, type RpcError } from './client.js';
 
-const USAGE = `infront — puts a working instance of a web application in front of you.
+const USAGE = `backlot — puts a working instance of a web application in front of you.
 
 Usage:
-  infront up [--watch] [--reset-data|--pristine] [--ttl <minutes>]
+  backlot up [--watch] [--reset-data|--pristine] [--ttl <minutes>]
                           session lease: sync, upkeep, start services, print context
-  infront run <check> [--pristine] [--pull] [--detach]
+  backlot run <check> [--pristine] [--pull] [--detach]
                           run lease: bind -> execute the check -> verdict -> release
                           --detach: submit-and-poll — returns a jobId immediately
-  infront job <jobId>     poll a detached run (pending|running|done + verdict)
-  infront ctx             the consumer context blob (URLs, logins, conn strings)
-  infront sync            project the worktree state into the current lease
-  infront exec <cmd...>   run a command inside the leased environment
-  infront logs <service> [--lines N]
-  infront reset-data      restore the data template on the current lease
-  infront token --role <r>  mint an auth token via the stack's auth.token hook
-  infront pull            copy declared outputs back into the worktree
-  infront release         release the current lease (environment stays warm)
-  infront status          daemon, pool, and lease overview
-  infront pool ls|recycle [--all]
-  infront daemon stop     stop the daemon (environments are recovered on next use)
+  backlot job <jobId>     poll a detached run (pending|running|done + verdict)
+  backlot ctx             the consumer context blob (URLs, logins, conn strings)
+  backlot sync            project the worktree state into the current lease
+  backlot exec <cmd...>   run a command inside the leased environment
+  backlot logs <service> [--lines N]
+  backlot reset-data      restore the data template on the current lease
+  backlot token --role <r>  mint an auth token via the stack's auth.token hook
+  backlot pull            copy declared outputs back into the worktree
+  backlot release         release the current lease (environment stays warm)
+  backlot status          daemon, pool, and lease overview
+  backlot pool ls|recycle [--all]
+  backlot daemon stop     stop the daemon (environments are recovered on next use)
 
 Every verb accepts --json. Long verbs (up/run/sync/bind/reset-data) show live progress
 on a terminal (stderr); force with --progress, silence with --quiet. stdout stays clean.
@@ -63,7 +63,7 @@ let passthrough: string[] | null = null; // for `exec` / after `--`
     if (VALUE_FLAGS.has(a)) {
       const v = body[i + 1];
       if (v === undefined) {
-        console.error(`infront: ${a} needs a value`);
+        console.error(`backlot: ${a} needs a value`);
         process.exit(64);
       }
       flagVals.set(a, v);
@@ -71,7 +71,7 @@ let passthrough: string[] | null = null; // for `exec` / after `--`
     } else if (BOOL_FLAGS.has(a)) {
       flags.add(a);
     } else if (a.startsWith('--')) {
-      console.error(`infront: unknown flag '${a}'`);
+      console.error(`backlot: unknown flag '${a}'`);
       process.exit(64);
     } else {
       positional.push(a);
@@ -87,7 +87,7 @@ const errExit = (e: RpcError): never => {
   const code = e.class === 'work-error' ? 1 : e.class === 'infra-error' ? 3 : 2;
   if (json) console.log(JSON.stringify({ ok: false, error: e }));
   else {
-    console.error(`infront: [${e.class ?? e.code ?? 'error'}] ${e.message}${e.source ? ` (${e.source})` : ''}`);
+    console.error(`backlot: [${e.class ?? e.code ?? 'error'}] ${e.message}${e.source ? ` (${e.source})` : ''}`);
     if (e.logExcerpt) console.error(`--- log excerpt ---\n${e.logExcerpt}`);
   }
   process.exit(code);
@@ -140,7 +140,7 @@ async function main(): Promise<void> {
 
   const known = ['up', 'run', 'job', 'ctx', 'sync', 'bind', 'exec', 'logs', 'token', 'reset-data', 'pull', 'release', 'status', 'doctor', 'pool', 'daemon'];
   if (!known.includes(verb)) {
-    console.error(`infront: unknown verb '${verb}'\n\n${USAGE}`);
+    console.error(`backlot: unknown verb '${verb}'\n\n${USAGE}`);
     process.exit(64);
   }
 
@@ -156,7 +156,7 @@ async function main(): Promise<void> {
       if (ttl !== undefined) {
         ttlMs = parseTtlMinutes(ttl);
         if (ttlMs === undefined) {
-          console.error(`infront: --ttl expects minutes (a positive number), got '${ttl}'`);
+          console.error(`backlot: --ttl expects minutes (a positive number), got '${ttl}'`);
           process.exit(64);
         }
       }
@@ -167,7 +167,7 @@ async function main(): Promise<void> {
     case 'run': {
       const check = positional[0];
       if (!check) {
-        console.error(`infront run: which check? (usage: infront run <check>)`);
+        console.error(`backlot run: which check? (usage: backlot run <check>)`);
         process.exit(64);
       }
       if (flags.has('--detach')) {
@@ -186,7 +186,7 @@ async function main(): Promise<void> {
     case 'job': {
       const jobId = positional[0];
       if (!jobId) {
-        console.error('infront job: which job? (usage: infront job <jobId> | infront job ls)');
+        console.error('backlot job: which job? (usage: backlot job <jobId> | backlot job ls)');
         process.exit(64);
       }
       res = jobId === 'ls' ? await rpc('job-ls', {}) : await rpc('job', { jobId });
@@ -209,7 +209,7 @@ async function main(): Promise<void> {
       // The whole passthrough is the command, verbatim — its own --flags intact.
       const cmd = (passthrough ?? positional).join(' ');
       if (!cmd) {
-        console.error('infront exec: no command given');
+        console.error('backlot exec: no command given');
         process.exit(64);
       }
       res = await rpc('exec', { cwd, holder, cmd });
@@ -227,7 +227,7 @@ async function main(): Promise<void> {
     case 'logs': {
       const service = positional[0];
       if (!service) {
-        console.error('infront logs: which service?');
+        console.error('backlot logs: which service?');
         process.exit(64);
       }
       res = await rpc('logs', { cwd, holder, service, lines: Number(flagValue('--lines') ?? 40) });
@@ -263,14 +263,14 @@ async function main(): Promise<void> {
       else if (sub === 'reconcile') res = await rpc('pool-reconcile', {});
       else if (sub === 'doctor') res = await rpc('doctor', {});
       else {
-        console.error(`infront pool: unknown subcommand '${sub}' (ls | recycle | reconcile | doctor)`);
+        console.error(`backlot pool: unknown subcommand '${sub}' (ls | recycle | reconcile | doctor)`);
         process.exit(64);
       }
       break;
     }
     case 'daemon': {
       if (positional[0] !== 'stop') {
-        console.error('infront daemon: only `stop` is supported');
+        console.error('backlot daemon: only `stop` is supported');
         process.exit(64);
       }
       res = await rpc('shutdown', {});
@@ -296,6 +296,6 @@ async function main(): Promise<void> {
 main().catch((err) => {
   const msg = String((err as Error).message ?? err);
   if (json) console.log(JSON.stringify({ ok: false, error: { class: 'env-error', message: msg } }));
-  else console.error(`infront: ${msg}`);
+  else console.error(`backlot: ${msg}`);
   process.exit(2);
 });

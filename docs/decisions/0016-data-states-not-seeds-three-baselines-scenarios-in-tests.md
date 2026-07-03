@@ -9,23 +9,23 @@ string on a datastore, and real repos (the founding .NET+MSSQL monorepo) kept gr
 per-scenario presets — `admin-allbranches`, `leerpackung-erfasser`, `leerpackung-locked`
 — a preset per test situation. That path leads to a large, fragile, silently-rotting
 shared blob and a recurring "which preset do I use?" question. We need a principled
-answer to: does infront own seeding, what is a seed, how many variations exist, which
+answer to: does backlot own seeding, what is a seed, how many variations exist, which
 one a test uses, and where scenario-specific data belongs.
 
 ## Decision
 
-### 1. A "seed" is a named, restorable data STATE — infront owns the lifecycle, not the content
+### 1. A "seed" is a named, restorable data STATE — backlot owns the lifecycle, not the content
 
-The *production* of data (SQL, seed scripts) belongs to the repo and infront never reads
-or understands it (the anti-scope: never a data framework, decision 0001). What infront
+The *production* of data (SQL, seed scripts) belongs to the repo and backlot never reads
+or understands it (the anti-scope: never a data framework, decision 0001). What backlot
 owns is the **state lifecycle**: naming, selecting, restoring, and jumping between states
 — because it already owns `reset-data`, hygiene levels, and template restore. A seed, in
-infront's model, is the entry point to a named state, not the insertion logic.
+backlot's model, is the entry point to a named state, not the insertion logic.
 
 The two axes, and where each belongs:
 
-- **Content axis** (what the data means, schema, layers) → the repo. Not infront.
-- **Lifecycle axis** (when/whether a state is built, cached, selected, restored) → infront.
+- **Content axis** (what the data means, schema, layers) → the repo. Not backlot.
+- **Lifecycle axis** (when/whether a state is built, cached, selected, restored) → backlot.
 
 ### 2. Three baselines, roughly constant forever
 
@@ -70,7 +70,7 @@ checks:
 ```
 
 A datastore declares its states with a delegated `build` command and declared `inputs`
-(globs infront hashes) so template invalidation is automatic and states are selectable:
+(globs backlot hashes) so template invalidation is automatic and states are selectable:
 
 ```yaml
 datastores:
@@ -85,7 +85,7 @@ datastores:
 
 `inputs`-hash keying replaces the command-string keying of decision 0008 for states
 (editing a seed auto-rebakes; no manual `@rebake-template`). Runtime selection:
-`infront up --state <name>`.
+`backlot up --state <name>`.
 
 ### 5. Snapshots serve the expensive middle: test-local state that is costly to build
 
@@ -105,8 +105,8 @@ and it only accelerates stores with a clone primitive.
 
 A schema migration changes how a state is *produced*, so it is an input to every state
 that shares the schema (`empty`/`dev`/`scaled` move together). Two paths, routed to the
-two mechanisms infront already has — infront decides *when*, the repo's migrate command
-does the work, infront never reads the migration:
+two mechanisms backlot already has — backlot decides *when*, the repo's migrate command
+does the work, backlot never reads the migration:
 
 - **Fresh / `reset-data` / `pristine` (rebuild).** The migration is part of the state's
   `build`, so its files are in the state's `inputs`. Adding a migration changes the input
@@ -150,10 +150,10 @@ service bounce for a heavy one).
   answered by the check, not a human; editing a seed no longer silently serves stale data;
   the debugging loop gets fast time-travel without re-seeding.
 - Negative / trade-offs: `dev` must be *disciplined* to stay a baseline rather than grow
-  into a dumping ground; `inputs` must be declared (infront won't discover a command's
+  into a dumping ground; `inputs` must be declared (backlot won't discover a command's
   file reads); snapshot/restore adds a per-datastore-driver capability and the
   connection-blip caveat.
-- Doctrine held: infront never produces or understands data — it names, selects, caches,
+- Doctrine held: backlot never produces or understands data — it names, selects, caches,
   restores. Every mechanism here is lifecycle, not content.
 
 ## Follow-ups (sequenced)
@@ -170,5 +170,5 @@ service bounce for a heavy one).
   selection, command-string template keying serves stale seeds silently, no introspection.
 - **A rich library of per-scenario baked presets.** Rejected: proliferation, staleness,
   and "which one?" — the exact mess this ADR routes around by pushing scenarios into tests.
-- **infront understands seed structure (layers, schemas).** Rejected: violates the
+- **backlot understands seed structure (layers, schemas).** Rejected: violates the
   anti-scope; a worse copy of the repo's own seed spine.

@@ -68,7 +68,7 @@ export interface Verdict {
   durationMs: number;
 }
 
-/** What `infront ctx --json` returns — the consumer's entire interface. */
+/** What `backlot ctx --json` returns — the consumer's entire interface. */
 export interface Context {
   stack: string;
   envId: string;

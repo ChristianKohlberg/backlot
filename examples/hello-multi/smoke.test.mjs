@@ -6,7 +6,7 @@ import { writeFileSync } from 'node:fs';
 const api = process.env.API_URL;
 const web = process.env.WEB_URL;
 if (!api || !web) {
-  console.error('API_URL / WEB_URL not set — run through `infront run smoke`');
+  console.error('API_URL / WEB_URL not set — run through `backlot run smoke`');
   process.exit(2);
 }
 

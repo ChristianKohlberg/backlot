@@ -1,5 +1,5 @@
 /**
- * Disk retention: nothing infront writes may grow forever. Called from the
+ * Disk retention: nothing backlot writes may grow forever. Called from the
  * daemon sweeper (~10 min cadence); every function is idempotent, best-effort,
  * and unit-testable in isolation.
  */
@@ -50,7 +50,7 @@ export function truncateLogs(p: Policy, root = envsRoot()): number {
         if (statSync(full).size > p.logCapBytes) {
           const content = readFileSync(full, 'utf8');
           const keep = content.slice(-Math.floor(p.logCapBytes / 4));
-          writeFileSync(full, `[infront: truncated by retention sweep]\n${keep}`);
+          writeFileSync(full, `[backlot: truncated by retention sweep]\n${keep}`);
           truncated++;
         }
       } catch {

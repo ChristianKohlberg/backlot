@@ -1,6 +1,6 @@
 # Contributing
 
-Thanks for looking at infront. A few ground rules keep this project what it is:
+Thanks for looking at backlot. A few ground rules keep this project what it is:
 
 - **Read [docs/architecture.md](docs/architecture.md) first.** It is short and it is
   the product. PRs that fight the anti-scope (decision 0001) will be declined kindly:

@@ -17,7 +17,7 @@ export interface Service {
 }
 
 export function tempDir(prefix: string): { dir: string; cleanup: () => void } {
-  const dir = mkdtempSync(join(tmpdir(), `infront-${prefix}-`));
+  const dir = mkdtempSync(join(tmpdir(), `backlot-${prefix}-`));
   return { dir, cleanup: () => rmSync(dir, { recursive: true, force: true }) };
 }
 

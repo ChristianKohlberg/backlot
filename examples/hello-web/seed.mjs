@@ -1,5 +1,5 @@
 // Seed script for hello-web: `node seed.mjs <db-path> <preset>`.
-// This is the manifest's `create:` command — infront resolves {{ns}}/{{preset}}
+// This is the manifest's `create:` command — backlot resolves {{ns}}/{{preset}}
 // and invokes it; the sqlite driver's template capability is just a file copy.
 import { DatabaseSync } from 'node:sqlite';
 

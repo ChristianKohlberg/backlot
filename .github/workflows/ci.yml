@@ -17,7 +17,7 @@ jobs:
       - run: corepack enable && pnpm install --frozen-lockfile || npm install
       - run: npm run typecheck
       - run: npm test
-      # The fixture must stay runnable raw (no infront) — it doubles as the docs.
+      # The fixture must stay runnable raw (no backlot) — it doubles as the docs.
       - name: hello-web boots and serves seeded data
         working-directory: examples/hello-web
         run: |

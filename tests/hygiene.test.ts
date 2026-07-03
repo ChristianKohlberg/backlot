@@ -14,8 +14,8 @@ const repo = join(import.meta.dirname, '..');
 const CLI = join(repo, 'dist', 'cli', 'index.js');
 
 function makeContext(extraEnv: Record<string, string> = {}) {
-  const stateDir = mkdtempSync(join(tmpdir(), 'infront-hyg-'));
-  const env = { ...process.env, INFRONT_STATE_DIR: stateDir, INFRONT_SWEEP_MS: '300', ...extraEnv };
+  const stateDir = mkdtempSync(join(tmpdir(), 'backlot-hyg-'));
+  const env = { ...process.env, BACKLOT_STATE_DIR: stateDir, BACKLOT_SWEEP_MS: '300', ...extraEnv };
   const cli = (args: string[], cwd: string): Promise<{ exitCode: number; json?: Record<string, unknown> }> =>
     new Promise((resolve) => {
       execFile(process.execPath, [CLI, ...args], { cwd, env, maxBuffer: 16 * 1024 * 1024 }, (err, stdout) => {
@@ -44,7 +44,7 @@ const envsOf = async (ctx: ReturnType<typeof makeContext>, cwd: string) =>
 
 describe('auto-escalation: two failures -> pristine bind heals a poisoned cache', () => {
   const ctx = makeContext();
-  const wt = mkdtempSync(join(tmpdir(), 'infront-esc-'));
+  const wt = mkdtempSync(join(tmpdir(), 'backlot-esc-'));
   afterAll(() => {
     ctx.cleanup();
     rmSync(wt, { recursive: true, force: true });
@@ -93,7 +93,7 @@ caches: [poison.txt]
 
 describe('degraded marking + auto-reap for a flapping service', () => {
   const ctx = makeContext();
-  const wt = mkdtempSync(join(tmpdir(), 'infront-flap-'));
+  const wt = mkdtempSync(join(tmpdir(), 'backlot-flap-'));
   afterAll(() => {
     ctx.cleanup();
     rmSync(wt, { recursive: true, force: true });
@@ -129,8 +129,8 @@ services:
 });
 
 describe('idle quiesce (hot -> warm) and rebind', () => {
-  const ctx = makeContext({ INFRONT_IDLE_TTL_MS: '800', INFRONT_LEASE_TTL_MS: '600' });
-  const wt = mkdtempSync(join(tmpdir(), 'infront-idle-'));
+  const ctx = makeContext({ BACKLOT_IDLE_TTL_MS: '800', BACKLOT_LEASE_TTL_MS: '600' });
+  const wt = mkdtempSync(join(tmpdir(), 'backlot-idle-'));
   afterAll(() => {
     ctx.cleanup();
     rmSync(wt, { recursive: true, force: true });
@@ -174,7 +174,7 @@ services:
 
 describe('sleep pardon (journal level)', () => {
   it('pardon shifts every lease deadline and idle timestamp by the gap', () => {
-    const dir = mkdtempSync(join(tmpdir(), 'infront-pardon-'));
+    const dir = mkdtempSync(join(tmpdir(), 'backlot-pardon-'));
     const j = new Journal(join(dir, 'j.db'));
     const base = Date.now();
     j.saveEnv({

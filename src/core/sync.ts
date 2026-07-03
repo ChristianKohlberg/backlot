@@ -72,7 +72,7 @@ function walkAll(root: string, prefix = ''): string[] {
   return out;
 }
 
-const cachePath = (envRoot: string) => join(envRoot, '.infront-synced.json');
+const cachePath = (envRoot: string) => join(envRoot, '.backlot-synced.json');
 
 function loadCache(envTree: string): SyncCache {
   try {

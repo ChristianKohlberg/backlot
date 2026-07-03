@@ -85,7 +85,7 @@ export class BrokerError extends Error {
  * A manifest-supplied relative path (sync.include, outputs, a datastore key)
  * must stay INSIDE its base after resolution — never escape via `..` or an
  * absolute path. Returns the safe joined absolute path, or throws work-error.
- * This is the guard that keeps file ops from leaving infront's own dirs even
+ * This is the guard that keeps file ops from leaving backlot's own dirs even
  * on an honest `../shared/.env` typo, not only a malicious manifest.
  */
 export function safeJoin(base: string, rel: string, what: string): string {

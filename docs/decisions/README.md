@@ -21,3 +21,4 @@ supersedes it and update this index — never edit a decision in place.
 | [0014](0014-cli-json-api-mcp-later.md) | CLI with --json is the v1 agent API; MCP later |
 | [0015](0015-remote-submit-and-poll.md) | Remote runs are submit-and-poll; provider TTLs mandatory |
 | [0016](0016-data-states-not-seeds-three-baselines-scenarios-in-tests.md) | Data states not seeds: three baselines, scenarios in tests, snapshots for the expensive middle |
+| [0017](0017-rename-infront-to-backlot.md) | Rename: infront → backlot — the standing-sets metaphor, collision-free, real word |

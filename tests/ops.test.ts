@@ -12,8 +12,8 @@ const repo = join(import.meta.dirname, '..');
 const CLI = join(repo, 'dist', 'cli', 'index.js');
 
 function makeContext() {
-  const stateDir = mkdtempSync(join(tmpdir(), 'infront-ops-'));
-  const env = { ...process.env, INFRONT_STATE_DIR: stateDir, INFRONT_SWEEP_MS: '500' };
+  const stateDir = mkdtempSync(join(tmpdir(), 'backlot-ops-'));
+  const env = { ...process.env, BACKLOT_STATE_DIR: stateDir, BACKLOT_SWEEP_MS: '500' };
   const cli = (args: string[], cwd: string): Promise<{ exitCode: number; json?: Record<string, unknown> }> =>
     new Promise((resolve) => {
       execFile(process.execPath, [CLI, ...args], { cwd, env, maxBuffer: 16 * 1024 * 1024 }, (err, stdout) => {
@@ -52,7 +52,7 @@ checks:
 
 describe('check timeouts and job ls', () => {
   const ctx = makeContext();
-  const wt = mkdtempSync(join(tmpdir(), 'infront-ops-wt-'));
+  const wt = mkdtempSync(join(tmpdir(), 'backlot-ops-wt-'));
   afterAll(() => {
     ctx.cleanup();
     rmSync(wt, { recursive: true, force: true });
@@ -107,18 +107,18 @@ describe('check timeouts and job ls', () => {
 });
 
 describe('pool policy precedence (unit)', () => {
-  const dir = mkdtempSync(join(tmpdir(), 'infront-pol-'));
-  const saved = { state: process.env.INFRONT_STATE_DIR, pool: process.env.INFRONT_POOL_MAX };
+  const dir = mkdtempSync(join(tmpdir(), 'backlot-pol-'));
+  const saved = { state: process.env.BACKLOT_STATE_DIR, pool: process.env.BACKLOT_POOL_MAX };
   afterEach(() => {
-    process.env.INFRONT_STATE_DIR = saved.state;
-    if (saved.pool === undefined) delete process.env.INFRONT_POOL_MAX;
-    else process.env.INFRONT_POOL_MAX = saved.pool;
+    process.env.BACKLOT_STATE_DIR = saved.state;
+    if (saved.pool === undefined) delete process.env.BACKLOT_POOL_MAX;
+    else process.env.BACKLOT_POOL_MAX = saved.pool;
   });
   afterAll(() => rmSync(dir, { recursive: true, force: true }));
 
   it('env var > config.json > heuristic', async () => {
-    process.env.INFRONT_STATE_DIR = dir;
-    delete process.env.INFRONT_POOL_MAX;
+    process.env.BACKLOT_STATE_DIR = dir;
+    delete process.env.BACKLOT_POOL_MAX;
     const { policy, poolMaxHeuristic } = await import('../src/core/policy.js');
 
     const h = poolMaxHeuristic();
@@ -130,15 +130,15 @@ describe('pool policy precedence (unit)', () => {
     expect(policy().poolMax).toBe(5); // config file wins over heuristic
     expect(policy().idleTtlMs).toBe(123);
 
-    process.env.INFRONT_POOL_MAX = '2';
+    process.env.BACKLOT_POOL_MAX = '2';
     expect(policy().poolMax).toBe(2); // env var wins over config
   });
 });
 
 describe('retention sweep (unit)', () => {
   it('prunes old artifacts, truncates fat logs, keeps newest templates', async () => {
-    const dir = mkdtempSync(join(tmpdir(), 'infront-ret-'));
-    process.env.INFRONT_STATE_DIR = dir;
+    const dir = mkdtempSync(join(tmpdir(), 'backlot-ret-'));
+    process.env.BACKLOT_STATE_DIR = dir;
     const { pruneArtifacts, truncateLogs, pruneTemplates } = await import('../src/core/retention.js');
     const { policy } = await import('../src/core/policy.js');
     const p = { ...policy(), artifactDays: 1, logCapBytes: 1000, templatesKeep: 2 };

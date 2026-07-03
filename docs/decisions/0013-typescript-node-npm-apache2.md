@@ -6,7 +6,7 @@
 
 - Implementation: TypeScript, Node ≥ 22 (built-in `node:sqlite` → zero native deps;
   stdlib process supervision, unix-socket HTTP, fetch probes).
-- Distribution: **one** published npm package (`infront`), `npx infront up` as the
+- Distribution: **one** published npm package (`backlot`), `npx backlot up` as the
   install story. Package splits only when a third-party driver appears. Single-binary
   packaging (bun compile) is a later option, not an architecture fork.
 - Manifest: YAML + published JSON Schema (editor autocomplete via `$schema`).

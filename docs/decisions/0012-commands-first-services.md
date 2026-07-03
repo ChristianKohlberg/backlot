@@ -7,7 +7,7 @@
 A service in `stack.yaml` is a shell command supervised by the daemon (`build:`,
 `run:`, optional `watch_run:`), with symbolic ports and templated env injection.
 Backing infrastructure (database servers, message brokers) is **externally run** —
-typically the repo's own docker compose — and declared with a `probe:` so infront can
+typically the repo's own docker compose — and declared with a `probe:` so backlot can
 fail with `infra-error` instead of blaming code. Portless services (workers) declare
 readiness by log marker or command. Containers may arrive later as a *substrate*
 option, never as a service concept.

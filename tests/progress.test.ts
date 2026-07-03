@@ -12,10 +12,10 @@ import { join } from 'node:path';
 const repo = join(import.meta.dirname, '..');
 const CLI = join(repo, 'dist', 'cli', 'index.js');
 
-const stateDir = mkdtempSync(join(tmpdir(), 'infront-prog-'));
-const env = { ...process.env, INFRONT_STATE_DIR: stateDir, INFRONT_SWEEP_MS: '500' };
+const stateDir = mkdtempSync(join(tmpdir(), 'backlot-prog-'));
+const env = { ...process.env, BACKLOT_STATE_DIR: stateDir, BACKLOT_SWEEP_MS: '500' };
 
-const wt = mkdtempSync(join(tmpdir(), 'infront-prog-wt-'));
+const wt = mkdtempSync(join(tmpdir(), 'backlot-prog-wt-'));
 writeFileSync(
   join(wt, 'server.mjs'),
   `import { createServer } from 'node:http';

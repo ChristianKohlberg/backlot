@@ -17,7 +17,7 @@ never touched; pool divergence is normal, bounded by one upkeep pass at next use
 
 Failed upkeep defaults to `work-error` (the binding changed the trigger). Toolchain
 bumps (global.json, .nvmrc) are env-recycle events unless the repo declares its own
-toolchain rule (mise/asdf); infront never installs SDKs on its own initiative.
+toolchain rule (mise/asdf); backlot never installs SDKs on its own initiative.
 
 ## Rationale
 

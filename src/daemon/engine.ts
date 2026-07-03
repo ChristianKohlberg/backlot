@@ -211,7 +211,7 @@ export class Engine {
       const env = await this.poolLocked(() => this.tryClaim(stack, holder, kind, hygiene, ttlMs));
       if (env) return env;
       if (now() - start > WAIT_MS()) {
-        throw new BrokerError('env-error', `pool at capacity (${POOL_MAX()}/${POOL_MAX()}) — waited ${Math.round(WAIT_MS() / 1000)}s; release a lease or raise INFRONT_POOL_MAX`, 'pool');
+        throw new BrokerError('env-error', `pool at capacity (${POOL_MAX()}/${POOL_MAX()}) — waited ${Math.round(WAIT_MS() / 1000)}s; release a lease or raise BACKLOT_POOL_MAX`, 'pool');
       }
       await new Promise((r) => setTimeout(r, 500));
     }
@@ -361,7 +361,7 @@ export class Engine {
         if (spec.port) {
           const port = env.ports[spec.port]!;
           if (!(await probeFree(port))) {
-            throw new BrokerError('env-error', `port ${port} for service '${name}' is occupied by a foreign process — try 'infront pool recycle'`, name);
+            throw new BrokerError('env-error', `port ${port} for service '${name}' is occupied by a foreign process — try 'backlot pool recycle'`, name);
           }
         }
         // Template the COMMANDS too — ports/urls may ride in the run line itself
@@ -418,7 +418,7 @@ export class Engine {
     try {
       watcher = fsWatch(stackRoot, { recursive: true }, (_event, filename) => {
         const f = String(filename ?? '');
-        if (f.startsWith('.git') || f.includes('/.git/') || f.startsWith('.infront')) return;
+        if (f.startsWith('.git') || f.includes('/.git/') || f.startsWith('.backlot')) return;
         if (timer) clearTimeout(timer);
         timer = setTimeout(() => {
           void this.up({ cwd, holder, kind: 'session', hygiene: 'reuse', watch: true }).catch(() => {
@@ -481,7 +481,7 @@ export class Engine {
     const h = holder ?? resolve(cwd);
     const lease = this.journal.leaseForHolder(h, stack.id);
     if (!lease && !envId) {
-      throw new BrokerError('env-error', `no active lease for this worktree — run 'infront up' first`, 'lease');
+      throw new BrokerError('env-error', `no active lease for this worktree — run 'backlot up' first`, 'lease');
     }
     const env = this.journal.getEnv(envId ?? lease!.envId)!;
     const ctx = this.templateCtx(stack, env);
@@ -623,7 +623,7 @@ export class Engine {
     } catch {
       throw new BrokerError('work-error', `'${ref}' is not a commit in this repository`, 'bind');
     }
-    const tmp = mkdtempSync(join(tmpdir(), 'infront-ref-'));
+    const tmp = mkdtempSync(join(tmpdir(), 'backlot-ref-'));
     try {
       execFileSync('sh', ['-c', `git -C "${stack.root}" archive ${sha} | tar -x -C "${tmp}"`]);
       return await this.up({ cwd, holder: holder ?? resolve(cwd), kind: 'session', hygiene: 'reuse', sourceRoot: tmp });
@@ -640,7 +640,7 @@ export class Engine {
     const stack = loadStack(cwd);
     const h = holder ?? resolve(cwd);
     const lease = this.journal.leaseForHolder(h, stack.id);
-    if (!lease) throw new BrokerError('env-error', `no active lease — run 'infront up' first`, 'lease');
+    if (!lease) throw new BrokerError('env-error', `no active lease — run 'backlot up' first`, 'lease');
     this.journal.saveLease({ ...lease, hygiene: 'reset-data', expiresAt: now() + LEASE_TTL(lease.kind) });
     const env = this.journal.getEnv(lease.envId)!;
     await this.envLocked(env.id, () => this.bindAndStart(stack, env, 'reset-data', lease.kind, false, undefined, onProgress));
@@ -651,14 +651,14 @@ export class Engine {
     const stack = loadStack(cwd);
     const h = holder ?? resolve(cwd);
     const lease = this.journal.leaseForHolder(h, stack.id);
-    if (!lease) throw new BrokerError('env-error', `no active lease — run 'infront up' first`, 'lease');
+    if (!lease) throw new BrokerError('env-error', `no active lease — run 'backlot up' first`, 'lease');
     const env = this.journal.getEnv(lease.envId)!;
     const dirs = this.envDirs(env.id);
     const ctx = this.templateCtx(stack, env);
-    const extra: Record<string, string> = { INFRONT_ENV_ID: env.id };
-    for (const [name, port] of Object.entries(env.ports)) extra[`INFRONT_PORT_${name.toUpperCase()}`] = String(port);
-    for (const [name, s] of Object.entries(ctx.services)) extra[`INFRONT_URL_${name.toUpperCase()}`] = s.url;
-    for (const [name, d] of Object.entries(ctx.datastores)) extra[`INFRONT_DS_${name.toUpperCase()}`] = d.url;
+    const extra: Record<string, string> = { BACKLOT_ENV_ID: env.id };
+    for (const [name, port] of Object.entries(env.ports)) extra[`BACKLOT_PORT_${name.toUpperCase()}`] = String(port);
+    for (const [name, s] of Object.entries(ctx.services)) extra[`BACKLOT_URL_${name.toUpperCase()}`] = s.url;
+    for (const [name, d] of Object.entries(ctx.datastores)) extra[`BACKLOT_DS_${name.toUpperCase()}`] = d.url;
     return this.envLocked(env.id, () =>
       new Promise((resolvePromise) => {
         execFile('sh', ['-c', cmd], { cwd: dirs.tree, env: { ...process.env, ...extra }, maxBuffer: 32 * 1024 * 1024 }, (err, stdout, stderr) =>
@@ -674,7 +674,7 @@ export class Engine {
     const spec = stack.manifest.auth?.token;
     if (!spec) throw new BrokerError('work-error', `stack.yaml declares no auth.token command`, 'manifest');
     const lease = this.journal.leaseForHolder(holder ?? resolve(cwd), stack.id);
-    if (!lease) throw new BrokerError('env-error', `no active lease — run 'infront up' first`, 'lease');
+    if (!lease) throw new BrokerError('env-error', `no active lease — run 'backlot up' first`, 'lease');
     const env = this.journal.getEnv(lease.envId)!;
     const dirs = this.envDirs(env.id);
     const ctx = { ...this.templateCtx(stack, env), role };
@@ -691,7 +691,7 @@ export class Engine {
   logs(cwd: string, service: string, lines: number, holder?: string) {
     const stack = loadStack(cwd);
     const lease = this.journal.leaseForHolder(holder ?? resolve(cwd), stack.id);
-    if (!lease) throw new BrokerError('env-error', `no active lease — run 'infront up' first`, 'lease');
+    if (!lease) throw new BrokerError('env-error', `no active lease — run 'backlot up' first`, 'lease');
     const env = this.journal.getEnv(lease.envId)!;
     const logFile = join(this.envDirs(env.id).logs, `${service}.log`);
     if (!existsSync(logFile)) throw new BrokerError('env-error', `no logs for service '${service}'`, service);
@@ -702,7 +702,7 @@ export class Engine {
   pull(cwd: string, holder?: string) {
     const stack = loadStack(cwd);
     const lease = this.journal.leaseForHolder(holder ?? resolve(cwd), stack.id);
-    if (!lease) throw new BrokerError('env-error', `no active lease — run 'infront up' first`, 'lease');
+    if (!lease) throw new BrokerError('env-error', `no active lease — run 'backlot up' first`, 'lease');
     const env = this.journal.getEnv(lease.envId)!;
     return { pulled: pullOutputs(stack.root, this.envDirs(env.id).tree, stack.manifest) };
   }
@@ -824,12 +824,12 @@ export class Engine {
   async sweep(): Promise<void> {
     const t = now();
     const gap = t - this.lastSweep;
-    const interval = Number(process.env.INFRONT_SWEEP_MS ?? 15_000);
+    const interval = Number(process.env.BACKLOT_SWEEP_MS ?? 15_000);
     if (gap > 3 * interval) this.journal.pardon(gap - interval); // sleep pardon (decision 0009)
     this.lastSweep = t;
 
-    // Disk retention (~10 min cadence): nothing infront writes grows forever.
-    if (t - this.lastRetention > Number(process.env.INFRONT_RETENTION_MS ?? 10 * 60_000)) {
+    // Disk retention (~10 min cadence): nothing backlot writes grows forever.
+    if (t - this.lastRetention > Number(process.env.BACKLOT_RETENTION_MS ?? 10 * 60_000)) {
       this.lastRetention = t;
       try {
         retentionSweep(this.journal, policy());

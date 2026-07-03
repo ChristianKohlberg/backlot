@@ -1,6 +1,6 @@
 # Driver spec
 
-infront has two extension seams. Thinness is deliberate — it is what "never own
+backlot has two extension seams. Thinness is deliberate — it is what "never own
 compute" looks like in code.
 
 **Status (v0.4):** only the **datastore** seam is live, and its authoritative shape is

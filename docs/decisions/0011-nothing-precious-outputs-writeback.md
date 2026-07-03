@@ -12,9 +12,9 @@ therefore safe by construction.
 The one sanctioned reverse flow: manifest-declared `outputs:` (regenerated lockfiles,
 generated API clients — artifacts produced env-side but owned worktree-side) are
 reported in the verdict (`outputs_changed`) and copied to the worktree **only** by an
-explicit `infront pull` (or `--pull`). infront never silently writes to a worktree.
+explicit `backlot pull` (or `--pull`). backlot never silently writes to a worktree.
 
-`infront exec` may produce anything inside the environment (dependency updates run
+`backlot exec` may produce anything inside the environment (dependency updates run
 there when the consumer lacks the toolchain); the bind-time reset bounds the blast
 radius, and `outputs:` is how its useful products come home.
 

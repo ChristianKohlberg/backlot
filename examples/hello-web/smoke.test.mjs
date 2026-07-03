@@ -1,8 +1,8 @@
 // The `smoke` check for hello-web: proves the whole vertical (HTTP -> sqlite)
-// against whatever BASE_URL infront injected. Exit code = the verdict.
+// against whatever BASE_URL backlot injected. Exit code = the verdict.
 const base = process.env.BASE_URL;
 if (!base) {
-  console.error('BASE_URL not set — run through `infront run smoke`');
+  console.error('BASE_URL not set — run through `backlot run smoke`');
   process.exit(2);
 }
 

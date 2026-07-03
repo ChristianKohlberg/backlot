@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * The infront daemon: HTTP over a unix socket, auto-spawned by the CLI
+ * The backlot daemon: HTTP over a unix socket, auto-spawned by the CLI
  * (decision 0009). One RPC endpoint; the CLI is a thin client. Serializes
  * requests through a simple queue — policy code stays race-free.
  */
@@ -38,7 +38,7 @@ async function dispatch(verb: string, args: Record<string, unknown>, emit: (phas
       // Fire-and-forget — env/pool locks make it safe; the journaled verdict
       // outlives the client (decision 0015).
       void engine.executeJob(jobId, { cwd, holder, check: String(args.check), hygiene: (args.hygiene as never) ?? undefined });
-      return { jobId, poll: `infront job ${jobId}` };
+      return { jobId, poll: `backlot job ${jobId}` };
     }
     case 'job':
       return engine.jobStatus(String(args.jobId));
@@ -162,7 +162,7 @@ async function start(): Promise<void> {
     writeFileSync(pidPath(), String(process.pid));
     // Only NOW, as the sole owner, reconcile prior daemon state.
     engine.recover();
-    const sweepMs = Number(process.env.INFRONT_SWEEP_MS ?? 15_000);
+    const sweepMs = Number(process.env.BACKLOT_SWEEP_MS ?? 15_000);
     setInterval(() => void engine.sweep(), sweepMs).unref();
     // Detach from the spawning CLI's lifetime.
     if (process.send) process.send('ready');

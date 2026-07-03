@@ -11,8 +11,8 @@ import { join } from 'node:path';
 import { syncIntoEnv } from '../src/core/sync.js';
 import type { Manifest } from '../src/core/manifest.js';
 
-const src = mkdtempSync(join(tmpdir(), 'infront-sync-src-'));
-const env = mkdtempSync(join(tmpdir(), 'infront-sync-env-'));
+const src = mkdtempSync(join(tmpdir(), 'backlot-sync-src-'));
+const env = mkdtempSync(join(tmpdir(), 'backlot-sync-env-'));
 afterAll(() => {
   rmSync(src, { recursive: true, force: true });
   rmSync(env, { recursive: true, force: true });

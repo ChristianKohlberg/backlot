@@ -4,12 +4,12 @@
 
 ## Decision
 
-Every failure infront reports carries a class, in JSON:
+Every failure backlot reports carries a class, in JSON:
 
 - `work-error` — the synced code is at fault (compile error, upkeep failure triggered
   by the binding's own change, failing check). The consumer fixes and re-syncs.
 - `env-error` — the environment is at fault (stale cache, missing toolchain, flapping
-  service). infront auto-remediates by recycling.
+  service). backlot auto-remediates by recycling.
 - `infra-error` — something external (backing DB unreachable, registry down). An
   actionable message; nobody's code is blamed, nothing is recycled.
 

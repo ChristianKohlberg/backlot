@@ -74,7 +74,7 @@ export interface DatastoreDriver {
   /** infra-error (never code blame) when the external server is unreachable. */
   probe(): Promise<void>;
   create(ns: string, preset: string): Promise<void>;
-  /** Must refuse namespaces outside infront's own pattern. */
+  /** Must refuse namespaces outside backlot's own pattern. */
   drop(ns: string): Promise<void>;
   url(ns: string): string;
 

@@ -12,8 +12,8 @@ const repo = join(import.meta.dirname, '..');
 const CLI = join(repo, 'dist', 'cli', 'index.js');
 
 function makeContext() {
-  const stateDir = mkdtempSync(join(tmpdir(), 'infront-wet-'));
-  const env = { ...process.env, INFRONT_STATE_DIR: stateDir, INFRONT_SWEEP_MS: '500' };
+  const stateDir = mkdtempSync(join(tmpdir(), 'backlot-wet-'));
+  const env = { ...process.env, BACKLOT_STATE_DIR: stateDir, BACKLOT_SWEEP_MS: '500' };
   const cli = (args: string[], cwd: string): Promise<{ exitCode: number; json?: Record<string, unknown>; out: string }> =>
     new Promise((resolve) => {
       execFile(process.execPath, [CLI, ...args], { cwd, env, maxBuffer: 16 * 1024 * 1024 }, (err, stdout) => {
@@ -50,7 +50,7 @@ createServer((q, s) => s.end(readFileSync('./message.txt', 'utf8'))).listen(Numb
 
 describe('--watch: save in the worktree, served without calling sync', () => {
   const ctx = makeContext();
-  const wt = mkdtempSync(join(tmpdir(), 'infront-watch-'));
+  const wt = mkdtempSync(join(tmpdir(), 'backlot-watch-'));
   afterAll(() => {
     ctx.cleanup();
     rmSync(wt, { recursive: true, force: true });
@@ -87,7 +87,7 @@ services:
 
 describe('ephemeral datastores: reset = flush, create once', () => {
   const ctx = makeContext();
-  const wt = mkdtempSync(join(tmpdir(), 'infront-eph-'));
+  const wt = mkdtempSync(join(tmpdir(), 'backlot-eph-'));
   afterAll(() => {
     ctx.cleanup();
     rmSync(wt, { recursive: true, force: true });
@@ -125,7 +125,7 @@ datastores:
 
 describe('the token verb', () => {
   const ctx = makeContext();
-  const wt = mkdtempSync(join(tmpdir(), 'infront-tok-'));
+  const wt = mkdtempSync(join(tmpdir(), 'backlot-tok-'));
   afterAll(() => {
     ctx.cleanup();
     rmSync(wt, { recursive: true, force: true });

@@ -1,4 +1,4 @@
-# infront backlog
+# backlot backlog
 
 Known work, roughly prioritized. Committed to the repo so it survives sessions.
 Each item notes severity and where it was found.
@@ -20,7 +20,7 @@ Each item notes severity and where it was found.
   loser's *client* can occasionally fail its ping window instead of falling through to
   the winner. Fix: in `cli/client.ts ensureDaemon`, if our spawned daemon loses the
   race, ping again for the winner before giving up. Also document "warm the daemon
-  with a cheap `infront status` before parallelizing" for fleets. Small.
+  with a cheap `backlot status` before parallelizing" for fleets. Small.
 
 - [ ] **P3 · `logs <service>` on a service that has produced no output errors.** A
   silent service has no `.log` file yet, so `logs` returns `no logs for service` (a
@@ -33,11 +33,11 @@ Sequenced implementation:
 
 - [ ] **S1 · `--state` selection + per-check `state:`.** Expose the presets already
   declared (today only `default_preset` is reachable — every other preset is dead
-  weight). Runtime `infront up --state <name>`; a check declares its state
+  weight). Runtime `backlot up --state <name>`; a check declares its state
   (`checks.e2e.state: dev`). Small; unlocks the states that already exist.
 - [ ] **S2 · `states:` with declared `inputs` → content-hash template keying.** Replaces
   command-string keying (decision 0008) for states, so editing a seed auto-rebakes
-  instead of silently serving a stale template. `inputs` are declared globs; infront
+  instead of silently serving a stale template. `inputs` are declared globs; backlot
   reuses the stat-gated hasher. The highest-value seeding fix.
 - [ ] **S3 · `snapshot` / `restore` verbs.** Rewind to a runtime-chosen point (the
   debugging loop) via the datastore's native clone (sqlite copy / postgres template /
@@ -78,7 +78,7 @@ Sequenced implementation:
 
 - [ ] Create the GitHub repo + push (currently local-only on the captain's machine).
 - [ ] First CI run (the workflow exists but has executed zero times).
-- [ ] `npm publish` (name `infront` is free; package is publish-shaped).
+- [ ] `npm publish` (name `backlot` is free; package is publish-shaped).
 
 ## Revamp adoption (in the Revamp repo, not here)
 

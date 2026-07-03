@@ -1,6 +1,6 @@
-# infront — architecture
+# backlot — architecture
 
-> **Thesis:** infront puts a working instance of a web application *in front of* a coding
+> **Thesis:** backlot puts a working instance of a web application *in front of* a coding
 > agent (or a human) — running, seeded, authenticated, provable — as a cheap, repeatable
 > act. It brokers environments; it never provides them.
 
@@ -33,14 +33,14 @@ is not a discipline failure; it is the rational response to expensive provisioni
 
 ## 2. Non-goals (hard boundaries)
 
-These are where tools like this die of scope creep. infront:
+These are where tools like this die of scope creep. backlot:
 
 - **Never owns compute.** Local processes and BYO cloud sandboxes (Morph, Sprites, E2B,
   plain SSH) via drivers. No fleet, no billing, no scheduler.
 - **Is never a build system.** It *invokes* the repo's commands; it never understands
   them. There is no plugin that knows what Angular is.
-- **Is never CI.** CI may call infront; never the reverse.
-- **Is never the agent.** No LLM calls, no browser driving, no test authoring. infront
+- **Is never CI.** CI may call backlot; never the reverse.
+- **Is never the agent.** No LLM calls, no browser driving, no test authoring. backlot
   guarantees URLs, credentials, data states, and verdicts; what the consumer does with
   them is its business.
 
@@ -84,9 +84,9 @@ worktree-hosted harnesses, where teardown must agonize over unlanded work.)
 
 ## 4. Convergence, not checkpointing
 
-infront gets the checkpointing dividend **by convergence rather than restoration**. A
+backlot gets the checkpointing dividend **by convergence rather than restoration**. A
 checkpoint (Morph, Sprites, CRIU) freezes opaque bytes and gives back *that exact
-moment*. infront keeps live environments plus layered, individually-keyed caches — the
+moment*. backlot keeps live environments plus layered, individually-keyed caches — the
 fingerprint ledger, machine-global package stores, baked DB templates, the compiler's
 own incremental state — and on each bind *converges* what's there to what was asked for.
 
@@ -162,7 +162,7 @@ local/remote abstraction; the local substrate is enumerate-and-copy.)
 Some artifacts are produced env-side but owned worktree-side (a regenerated lockfile, a
 generated API client). Default remains "never touch the worktree"; the exception is
 explicit: manifest-declared `outputs:` are reported in the verdict
-(`outputs_changed: [...]`) and copied back **only** by `infront pull` (or `--pull`).
+(`outputs_changed: [...]`) and copied back **only** by `backlot pull` (or `--pull`).
 The environment may *offer* artifacts; it never silently writes.
 
 ## 7. Upkeep — the fingerprint ledger
@@ -187,7 +187,7 @@ before build/start:
   until then that upkeep rule is the mechanism.
 - Toolchain-level bumps (global.json, .nvmrc) are env-recycle events, not upkeep —
   unless the repo manages toolchains declaratively (mise/asdf) via its own rule.
-  infront never installs SDKs on its own initiative.
+  backlot never installs SDKs on its own initiative.
 
 ## 8. Data — presets, templates, hygiene
 
@@ -230,7 +230,7 @@ Every failure is classified — the field an agent branches on mechanically:
 | Class | Meaning | Who acts |
 | --- | --- | --- |
 | `work-error` | the synced code is at fault (compile error, failing upkeep triggered by your change, test failure) | the consumer fixes and re-syncs |
-| `env-error` | the environment is at fault (stale cache, missing toolchain, flapping service) | infront auto-remediates by recycling |
+| `env-error` | the environment is at fault (stale cache, missing toolchain, flapping service) | backlot auto-remediates by recycling |
 | `infra-error` | something external (backing DB down, registry unreachable) | actionable message; nobody's code is blamed |
 
 ## 10. Laptop reality
@@ -255,18 +255,18 @@ Every failure is classified — the field an agent branches on mechanically:
 The CLI **is** the API: every verb takes `--json`; stdout is data, stderr is human.
 
 ```
-infront up [--watch] [--reset-data|--pristine] [--ttl <minutes>]  # session lease
-infront run <check> [--pristine] [--pull] [--detach]   # run lease → verdict → release
-infront job <id> | job ls                        # poll / list detached runs
-infront ctx                                      # the context blob (below)
-infront sync | bind --ref <sha>                  # project worktree | a committed ref
-infront exec <cmd...>                            # run anything inside the leased env
-infront logs <service> [--lines N]               # supervised service logs
-infront token --role <r>                         # mint a token via auth.token
-infront reset-data | pull | release
-infront status | doctor                          # pool state | active health check
-infront pool ls|recycle [--all]|reconcile|doctor
-infront daemon stop
+backlot up [--watch] [--reset-data|--pristine] [--ttl <minutes>]  # session lease
+backlot run <check> [--pristine] [--pull] [--detach]   # run lease → verdict → release
+backlot job <id> | job ls                        # poll / list detached runs
+backlot ctx                                      # the context blob (below)
+backlot sync | bind --ref <sha>                  # project worktree | a committed ref
+backlot exec <cmd...>                            # run anything inside the leased env
+backlot logs <service> [--lines N]               # supervised service logs
+backlot token --role <r>                         # mint a token via auth.token
+backlot reset-data | pull | release
+backlot status | doctor                          # pool state | active health check
+backlot pool ls|recycle [--all]|reconcile|doctor
+backlot daemon stop
 ```
 
 Every verb accepts `--json`. Exit codes: `0` ok · `1` work-error / failed check ·
@@ -285,12 +285,12 @@ with `--quiet`. Agents are unaffected by default.
 `ctx` returns one blob with everything a consumer needs: service URLs (stable per
 environment), login credentials, a token-mint hook, datastore connection strings,
 artifact directory, hygiene state, and recent service events. An agent holding this
-blob needs nothing else from infront.
+blob needs nothing else from backlot.
 
 **Division of labor** (the bug-fix loop): the agent thinks, edits, greps, and commits
-in its own worktree with its own harness — infront is where the code *runs*, never
+in its own worktree with its own harness — backlot is where the code *runs*, never
 where the agent *works*. Fast unit tests that need no system don't pay the broker tax
-at all. The MCP adapter (`infront-mcp`) is a thin stdio wrapper over the same daemon
+at all. The MCP adapter (`backlot-mcp`) is a thin stdio wrapper over the same daemon
 socket — the same verbs as tools, never a second implementation.
 
 ### Configuration
@@ -300,17 +300,17 @@ variable > `$STATE_DIR/config.json` > built-in default.
 
 | Env var | config.json key | Default |
 | --- | --- | --- |
-| `INFRONT_STATE_DIR` | — | `$XDG_STATE_HOME/infront` (the per-machine root; 0700) |
-| `INFRONT_POOL_MAX` | `poolMax` | `min(cores/2, memGB/4)`, clamped [1,8] |
-| `INFRONT_LEASE_TTL_MS` | `sessionTtlMs` / `runTtlMs` | 30 min / 10 min |
-| `INFRONT_IDLE_TTL_MS` | `idleTtlMs` | 30 min |
-| `INFRONT_WAIT_MS` | `waitMs` | 60 s (queue-at-capacity timeout) |
-| `INFRONT_ARTIFACT_DAYS` | `artifactDays` | 7 |
-| `INFRONT_JOB_DAYS` | `jobDays` | 7 |
-| `INFRONT_LOG_CAP_BYTES` | `logCapBytes` | 5 MB |
-| `INFRONT_TEMPLATES_KEEP` | `templatesKeep` | 4 per stack |
-| `INFRONT_SWEEP_MS` | — | 15 s (lease/idle sweep cadence) |
-| `INFRONT_RETENTION_MS` | — | 10 min (disk retention cadence) |
+| `BACKLOT_STATE_DIR` | — | `$XDG_STATE_HOME/backlot` (the per-machine root; 0700) |
+| `BACKLOT_POOL_MAX` | `poolMax` | `min(cores/2, memGB/4)`, clamped [1,8] |
+| `BACKLOT_LEASE_TTL_MS` | `sessionTtlMs` / `runTtlMs` | 30 min / 10 min |
+| `BACKLOT_IDLE_TTL_MS` | `idleTtlMs` | 30 min |
+| `BACKLOT_WAIT_MS` | `waitMs` | 60 s (queue-at-capacity timeout) |
+| `BACKLOT_ARTIFACT_DAYS` | `artifactDays` | 7 |
+| `BACKLOT_JOB_DAYS` | `jobDays` | 7 |
+| `BACKLOT_LOG_CAP_BYTES` | `logCapBytes` | 5 MB |
+| `BACKLOT_TEMPLATES_KEEP` | `templatesKeep` | 4 per stack |
+| `BACKLOT_SWEEP_MS` | — | 15 s (lease/idle sweep cadence) |
+| `BACKLOT_RETENTION_MS` | — | 10 min (disk retention cadence) |
 
 The daemon writes a structured event log (`$STATE_DIR/events.jsonl`, size-capped)
 surfaced by `status` and `doctor`.
@@ -401,7 +401,7 @@ Dagger's container-use is the nearest OSS neighbor (branch+worktree+container pe
 agent, git as sync) but is per-task-ephemeral, local-only, and has no data/verdict
 layer.
 
-infront is the unowned layer between them: **the repo-aware environment broker** —
+backlot is the unowned layer between them: **the repo-aware environment broker** —
 buy the substrate, declare the stack, broker the environments.
 
 ## 15. Milestones
@@ -417,10 +417,10 @@ buy the substrate, declare the stack, broker the environments.
    (native `createdb -T` restore) AND against the founding monorepo: a full .NET +
    MSSQL vertical (seeded per-env database on the shared server, built host, real
    login, real seeded domain data over an authenticated API) came up through
-   `infront up` in ~50 s; `infront run` provisioned a second full environment in
-   ~48 s. The consumer's Playwright system-e2e suite now runs as an infront check
-   (`infront run e2e`, ~58 s incl. provisioning via PLAYWRIGHT_REUSE against the
-   infront-provisioned servers) with verdict parity against the incumbent harness —
+   `backlot up` in ~50 s; `backlot run` provisioned a second full environment in
+   ~48 s. The consumer's Playwright system-e2e suite now runs as an backlot check
+   (`backlot run e2e`, ~58 s incl. provisioning via PLAYWRIGHT_REUSE against the
+   backlot-provisioned servers) with verdict parity against the incumbent harness —
    identical pass/fail results on the same suite.
 3. **0.3 — remote. ◐ PARTIAL.** Detached submit-and-poll runs shipped (`run
    --detach` → jobId; the verdict outlives the client, journaled). Driver spec
@@ -430,5 +430,5 @@ buy the substrate, declare the stack, broker the environments.
 4. **0.4 — public-ready. ✅ CORE SHIPPED.** The generality gate passed with a
    deliberately-foreign consumer (stdlib-Python + sqlite — different runtime, same
    verbs); the MCP adapter shipped as a thin stdio wrapper over the same daemon RPC
-   (`infront-mcp`), protocol-tested. Remaining before an actual announce: the remote
+   (`backlot-mcp`), protocol-tested. Remaining before an actual announce: the remote
    substrate (0.3's tail), npm publish, and a docs site.

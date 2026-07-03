@@ -3,7 +3,7 @@
  * Minimal MCP (Model Context Protocol) server over stdio — a THIN adapter on
  * the same daemon RPC the CLI uses (decision 0014: never a second
  * implementation). Newline-delimited JSON-RPC 2.0; implements initialize,
- * tools/list, tools/call. Start with:  infront-mcp  (or node dist/mcp/index.js)
+ * tools/list, tools/call. Start with:  backlot-mcp  (or node dist/mcp/index.js)
  *
  * Every tool result is the same JSON the CLI's --json emits, as text content.
  */
@@ -25,73 +25,73 @@ const cwdProp = {
 
 const TOOLS: Tool[] = [
   {
-    name: 'infront_up',
+    name: 'backlot_up',
     description: 'Lease a warm environment for this worktree: sync, upkeep, seed, start services. Returns the context blob (URLs, logins, connection strings).',
     inputSchema: { type: 'object', properties: { ...cwdProp, hygiene: { type: 'string', enum: ['reuse', 'reset-data', 'pristine'] } }, required: ['cwd'] },
     verb: 'up',
   },
   {
-    name: 'infront_run',
+    name: 'backlot_run',
     description: 'Run a named check from stack.yaml against a fresh binding: verdict with ok/exitCode/failure taxonomy (work-error = your code, env-error = environment, infra-error = external), artifacts dir, outputs_changed.',
     inputSchema: { type: 'object', properties: { ...cwdProp, check: { type: 'string' }, hygiene: { type: 'string', enum: ['reuse', 'reset-data', 'pristine'] } }, required: ['cwd', 'check'] },
     verb: 'run',
   },
   {
-    name: 'infront_ctx',
+    name: 'backlot_ctx',
     description: 'The current lease context: service URLs, logins, token command, datastore connection strings, artifacts dir, recent service events.',
     inputSchema: { type: 'object', properties: { ...cwdProp }, required: ['cwd'] },
     verb: 'ctx',
   },
   {
-    name: 'infront_sync',
+    name: 'backlot_sync',
     description: 'Project the worktree state (including dirty/untracked files) into the leased environment; services restart only if the source changed.',
     inputSchema: { type: 'object', properties: { ...cwdProp }, required: ['cwd'] },
     verb: 'sync',
   },
   {
-    name: 'infront_exec',
-    description: 'Run a shell command inside the leased environment tree (INFRONT_URL_*/INFRONT_DS_* env injected).',
+    name: 'backlot_exec',
+    description: 'Run a shell command inside the leased environment tree (BACKLOT_URL_*/BACKLOT_DS_* env injected).',
     inputSchema: { type: 'object', properties: { ...cwdProp, cmd: { type: 'string' } }, required: ['cwd', 'cmd'] },
     verb: 'exec',
   },
   {
-    name: 'infront_logs',
+    name: 'backlot_logs',
     description: 'Tail a supervised service log from the leased environment.',
     inputSchema: { type: 'object', properties: { ...cwdProp, service: { type: 'string' }, lines: { type: 'number' } }, required: ['cwd', 'service'] },
     verb: 'logs',
   },
   {
-    name: 'infront_reset_data',
+    name: 'backlot_reset_data',
     description: 'Restore the data template on the current lease (replay a repro against pristine data). URLs stay stable.',
     inputSchema: { type: 'object', properties: { ...cwdProp }, required: ['cwd'] },
     verb: 'reset-data',
   },
   {
-    name: 'infront_pull',
+    name: 'backlot_pull',
     description: 'Copy the environment\'s changed declared outputs (regenerated lockfiles, generated clients) back into the worktree — the only sanctioned write-back.',
     inputSchema: { type: 'object', properties: { ...cwdProp }, required: ['cwd'] },
     verb: 'pull',
   },
   {
-    name: 'infront_token',
+    name: 'backlot_token',
     description: 'Mint an auth token via the stack\'s auth.token hook (resolves {{role}}). Returns {token, role}.',
     inputSchema: { type: 'object', properties: { ...cwdProp, role: { type: 'string', description: 'Role to mint for (default admin).' } }, required: ['cwd'] },
     verb: 'token',
   },
   {
-    name: 'infront_release',
+    name: 'backlot_release',
     description: 'Release the current lease; the environment returns to the pool warm.',
     inputSchema: { type: 'object', properties: { ...cwdProp }, required: ['cwd'] },
     verb: 'release',
   },
   {
-    name: 'infront_status',
+    name: 'backlot_status',
     description: 'Pool overview: environments, states, leases, recent daemon events.',
     inputSchema: { type: 'object', properties: {} },
     verb: 'status',
   },
   {
-    name: 'infront_doctor',
+    name: 'backlot_doctor',
     description: 'Active health check of the pool: pid divergence, stuck-recycling envs, plus recent events.',
     inputSchema: { type: 'object', properties: {} },
     verb: 'doctor',
@@ -122,7 +122,7 @@ rl.on('line', (line) => {
           return respond(id, {
             protocolVersion: PROTOCOL,
             capabilities: { tools: {} },
-            serverInfo: { name: 'infront', version: '0.4.0' },
+            serverInfo: { name: 'backlot', version: '0.4.0' },
           });
         case 'notifications/initialized':
           return; // notification — no response

@@ -22,14 +22,14 @@ const hasDocker = (() => {
   }
 })();
 
-const CONTAINER = `infront-pg-test-${Math.random().toString(36).slice(2, 8)}`;
+const CONTAINER = `backlot-pg-test-${Math.random().toString(36).slice(2, 8)}`;
 const pg = (args: string) =>
   execFileSync('sh', ['-c', `docker exec ${CONTAINER} ${args}`], { encoding: 'utf8', timeout: 30_000 });
 
 describe.skipIf(!hasDocker)('postgres datastore (docker-gated)', () => {
-  const stateDir = mkdtempSync(join(tmpdir(), 'infront-pg-'));
-  const wt = mkdtempSync(join(tmpdir(), 'infront-pg-wt-'));
-  const env = { ...process.env, INFRONT_STATE_DIR: stateDir, INFRONT_SWEEP_MS: '500' };
+  const stateDir = mkdtempSync(join(tmpdir(), 'backlot-pg-'));
+  const wt = mkdtempSync(join(tmpdir(), 'backlot-pg-wt-'));
+  const env = { ...process.env, BACKLOT_STATE_DIR: stateDir, BACKLOT_SWEEP_MS: '500' };
   const cli = (args: string[]): Promise<{ exitCode: number; json?: Record<string, unknown>; out: string }> =>
     new Promise((resolve) => {
       execFile(process.execPath, [CLI, ...args], { cwd: wt, env, maxBuffer: 16 * 1024 * 1024 }, (err, stdout) => {
@@ -101,7 +101,7 @@ checks:
     expect(res.exitCode).toBe(0);
     const ds = (res.json!.datastores as Record<string, { url: string; ns: string }>).main;
     ns = ds.ns;
-    expect(ns).toMatch(/^infront_/);
+    expect(ns).toMatch(/^backlot_/);
     expect(ds.url).toBe(`postgres://postgres:pw@localhost:5432/${ns}`);
     expect(pg(`psql -U postgres -d ${ns} -tAc "select count(*) from items"`).trim()).toBe('3');
     // The template was baked once, machine-global, immutable-keyed.

@@ -5,7 +5,7 @@
 ## Decision
 
 Every verb supports `--json`; stdout is data, stderr is human narration; exit codes are
-contractual. `infront ctx --json` returns the complete consumer context in one blob:
+contractual. `backlot ctx --json` returns the complete consumer context in one blob:
 service URLs, logins, token-mint hook, connection strings, artifact dir, hygiene state,
 recent service events. An MCP server ships after the verbs stabilize, as a thin adapter
 over the same daemon socket — never a second implementation.
@@ -14,5 +14,5 @@ over the same daemon socket — never a second implementation.
 
 Agents shell out today; a machine-readable CLI is immediately usable by every harness.
 Freezing MCP tool shapes before the verbs survive a second consumer would lock the
-wrong things early. The division of labor stays: infront is where code *runs*, the
+wrong things early. The division of labor stays: backlot is where code *runs*, the
 worktree is where the agent *works* — fast unit tests never pay the broker tax.

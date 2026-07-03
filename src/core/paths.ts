@@ -3,7 +3,7 @@ import { join } from 'node:path';
 import { mkdirSync, chmodSync } from 'node:fs';
 
 /**
- * Per-machine state root (decision 0009). INFRONT_STATE_DIR overrides — the
+ * Per-machine state root (decision 0009). BACKLOT_STATE_DIR overrides — the
  * isolation knob every integration test uses.
  *
  * Created 0700 and chmod-enforced every call: the daemon socket lives here and
@@ -14,8 +14,8 @@ import { mkdirSync, chmodSync } from 'node:fs';
  */
 export function stateRoot(): string {
   const root =
-    process.env.INFRONT_STATE_DIR ??
-    join(process.env.XDG_STATE_HOME ?? join(homedir(), '.local', 'state'), 'infront');
+    process.env.BACKLOT_STATE_DIR ??
+    join(process.env.XDG_STATE_HOME ?? join(homedir(), '.local', 'state'), 'backlot');
   mkdirSync(root, { recursive: true, mode: 0o700 });
   try {
     chmodSync(root, 0o700);

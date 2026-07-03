@@ -1,5 +1,5 @@
-// hello-web — the smallest stack infront can broker: one HTTP service + one
-// sqlite datastore. This app is infront's front door AND its integration-test
+// hello-web — the smallest stack backlot can broker: one HTTP service + one
+// sqlite datastore. This app is backlot's front door AND its integration-test
 // fixture: every engine property (lease, warm rebind, upkeep, reset-data) is
 // exercised against it in CI, on macOS and Linux, with no Docker and no
 // external database.

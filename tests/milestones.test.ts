@@ -22,8 +22,8 @@ const hasPython = (() => {
 })();
 
 function makeContext() {
-  const stateDir = mkdtempSync(join(tmpdir(), 'infront-m34-'));
-  const env = { ...process.env, INFRONT_STATE_DIR: stateDir, INFRONT_SWEEP_MS: '400' };
+  const stateDir = mkdtempSync(join(tmpdir(), 'backlot-m34-'));
+  const env = { ...process.env, BACKLOT_STATE_DIR: stateDir, BACKLOT_SWEEP_MS: '400' };
   const cli = (args: string[], cwd: string): Promise<{ exitCode: number; json?: Record<string, unknown>; out: string }> =>
     new Promise((resolve) => {
       execFile(process.execPath, [CLI, ...args], { cwd, env, maxBuffer: 16 * 1024 * 1024 }, (err, stdout) => {
@@ -48,7 +48,7 @@ function makeContext() {
 }
 
 function makeWorktree(example: string): { dir: string; drop: () => void } {
-  const dir = mkdtempSync(join(tmpdir(), `infront-wt-${example}-`));
+  const dir = mkdtempSync(join(tmpdir(), `backlot-wt-${example}-`));
   cpSync(join(repo, 'examples', example), dir, { recursive: true });
   execFileSync('git', ['init', '-q'], { cwd: dir });
   execFileSync('git', ['add', '-A'], { cwd: dir });
@@ -121,7 +121,7 @@ describe('MCP adapter (thin, over the same daemon)', () => {
     wt.drop();
   });
 
-  it('initialize -> tools/list -> tools/call infront_up + infront_release', async () => {
+  it('initialize -> tools/list -> tools/call backlot_up + backlot_release', async () => {
     const proc = spawn(process.execPath, [MCP], { env: ctx.env, stdio: ['pipe', 'pipe', 'pipe'] });
     const responses: Record<string, unknown>[] = [];
     let buf = '';
@@ -146,15 +146,15 @@ describe('MCP adapter (thin, over the same daemon)', () => {
 
     send({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2025-06-18', capabilities: {} } });
     const init = await waitFor(1);
-    expect((init.result as { serverInfo: { name: string } }).serverInfo.name).toBe('infront');
+    expect((init.result as { serverInfo: { name: string } }).serverInfo.name).toBe('backlot');
 
     send({ jsonrpc: '2.0', id: 2, method: 'tools/list' });
     const list = await waitFor(2);
     const tools = (list.result as { tools: Array<{ name: string }> }).tools;
-    expect(tools.map((t) => t.name)).toContain('infront_up');
-    expect(tools.map((t) => t.name)).toContain('infront_run');
+    expect(tools.map((t) => t.name)).toContain('backlot_up');
+    expect(tools.map((t) => t.name)).toContain('backlot_run');
 
-    send({ jsonrpc: '2.0', id: 3, method: 'tools/call', params: { name: 'infront_up', arguments: { cwd: wt.dir } } });
+    send({ jsonrpc: '2.0', id: 3, method: 'tools/call', params: { name: 'backlot_up', arguments: { cwd: wt.dir } } });
     const up = await waitFor(3);
     const content = (up.result as { content: Array<{ text: string }>; isError: boolean });
     expect(content.isError).toBe(false);
@@ -165,7 +165,7 @@ describe('MCP adapter (thin, over the same daemon)', () => {
     const greetings = (await (await fetch(`${blob.urls.web}/api/greetings`)).json()) as unknown[];
     expect(greetings.length).toBe(3);
 
-    send({ jsonrpc: '2.0', id: 4, method: 'tools/call', params: { name: 'infront_release', arguments: { cwd: wt.dir } } });
+    send({ jsonrpc: '2.0', id: 4, method: 'tools/call', params: { name: 'backlot_release', arguments: { cwd: wt.dir } } });
     const rel = await waitFor(4);
     expect(JSON.parse((rel.result as { content: Array<{ text: string }> }).content[0]!.text).released).toBe(true);
 

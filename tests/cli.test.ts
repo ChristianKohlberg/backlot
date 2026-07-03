@@ -21,8 +21,8 @@ interface CliResult {
 }
 
 function makeContext(extraEnv: Record<string, string> = {}) {
-  const stateDir = mkdtempSync(join(tmpdir(), 'infront-it-'));
-  const env = { ...process.env, INFRONT_STATE_DIR: stateDir, INFRONT_SWEEP_MS: '400', ...extraEnv };
+  const stateDir = mkdtempSync(join(tmpdir(), 'backlot-it-'));
+  const env = { ...process.env, BACKLOT_STATE_DIR: stateDir, BACKLOT_SWEEP_MS: '400', ...extraEnv };
   const cli = (args: string[], cwd: string): Promise<CliResult> =>
     new Promise((resolve) => {
       execFile(process.execPath, [CLI, ...args], { cwd, env, maxBuffer: 16 * 1024 * 1024 }, (err, stdout, stderr) => {
@@ -49,7 +49,7 @@ function makeContext(extraEnv: Record<string, string> = {}) {
 
 /** A consumer worktree: a git-initialized copy of an example (agents edit HERE). */
 function makeWorktree(example: string): { dir: string; drop: () => void } {
-  const dir = mkdtempSync(join(tmpdir(), `infront-wt-${example}-`));
+  const dir = mkdtempSync(join(tmpdir(), `backlot-wt-${example}-`));
   cpSync(join(repo, 'examples', example), dir, { recursive: true });
   execFileSync('git', ['init', '-q'], { cwd: dir });
   execFileSync('git', ['add', '-A'], { cwd: dir });
@@ -100,7 +100,7 @@ describe('the local loop (hello-web)', () => {
 
   it('reset-data restores the template; the URL stays stable', async () => {
     await ctx.cli(
-      ['exec', `node -e 'const{DatabaseSync}=require("node:sqlite");new DatabaseSync(process.env.INFRONT_DS_MAIN).prepare("INSERT INTO greetings (message) VALUES (?)").run("mutation")'`],
+      ['exec', `node -e 'const{DatabaseSync}=require("node:sqlite");new DatabaseSync(process.env.BACKLOT_DS_MAIN).prepare("INSERT INTO greetings (message) VALUES (?)").run("mutation")'`],
       wt.dir,
     );
     expect(((await fetchJson(`${url}/api/greetings`)) as unknown[]).length).toBe(4);
@@ -183,7 +183,7 @@ describe('verdicts, outputs, and the error taxonomy', () => {
     const bare = makeWorktree('hello-web');
     const res = await ctx.cli(['ctx', '--json'], bare.dir);
     expect(res.exitCode).toBe(2);
-    expect((res.json!.error as { message: string }).message).toContain("infront up");
+    expect((res.json!.error as { message: string }).message).toContain("backlot up");
     bare.drop();
   });
 });
@@ -191,7 +191,7 @@ describe('verdicts, outputs, and the error taxonomy', () => {
 // ---------------------------------------------------------------------------
 
 describe('lease expiry (disposable leases, durable environments)', () => {
-  const ctx = makeContext({ INFRONT_LEASE_TTL_MS: '1200', INFRONT_SWEEP_MS: '300' });
+  const ctx = makeContext({ BACKLOT_LEASE_TTL_MS: '1200', BACKLOT_SWEEP_MS: '300' });
   const wt = makeWorktree('hello-web');
   afterAll(async () => {
     await ctx.cleanup();

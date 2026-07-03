@@ -4,7 +4,7 @@
  * Two families:
  *  - sqlite: fully engine-native — the ns IS a file; template restore is a copy.
  *  - command (postgres/mssql/mysql/redis): ALL mechanics are repo-declared
- *    commands ({{ns}}/{{preset}}/{{template}} resolved by the engine). infront
+ *    commands ({{ns}}/{{preset}}/{{template}} resolved by the engine). backlot
  *    embeds no database clients — the anti-scope ("orchestrate, don't
  *    reimplement") applied to data.
  *
@@ -131,7 +131,7 @@ class CommandDs implements DsDriver {
   }
 
   ns(h: DsHandle): string {
-    return `infront_${h.envId}`.replace(/[^A-Za-z0-9_]/g, '_');
+    return `backlot_${h.envId}`.replace(/[^A-Za-z0-9_]/g, '_');
   }
   url(h: DsHandle): string {
     return template(this.spec.url!, { ns: this.ns(h) });
@@ -157,7 +157,7 @@ class CommandDs implements DsDriver {
   }
 
   private templateNs(preset: string): string {
-    return `infront_tpl_${this.stackId}_${preset}_${sha256(this.spec.create ?? '').slice(0, 8)}`.replace(/[^A-Za-z0-9_]/g, '_');
+    return `backlot_tpl_${this.stackId}_${preset}_${sha256(this.spec.create ?? '').slice(0, 8)}`.replace(/[^A-Za-z0-9_]/g, '_');
   }
   private bakedMarker(preset: string): string {
     const dir = join(templatesRoot(), this.stackId);

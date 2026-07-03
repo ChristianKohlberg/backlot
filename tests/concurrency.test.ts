@@ -12,11 +12,11 @@ import { join } from 'node:path';
 const repo = join(import.meta.dirname, '..');
 const CLI = join(repo, 'dist', 'cli', 'index.js');
 
-const stateDir = mkdtempSync(join(tmpdir(), 'infront-conc-'));
-const env = { ...process.env, INFRONT_STATE_DIR: stateDir, INFRONT_SWEEP_MS: '500' };
+const stateDir = mkdtempSync(join(tmpdir(), 'backlot-conc-'));
+const env = { ...process.env, BACKLOT_STATE_DIR: stateDir, BACKLOT_SWEEP_MS: '500' };
 
 function makeSlowWorktree(name: string): string {
-  const dir = mkdtempSync(join(tmpdir(), `infront-conc-${name}-`));
+  const dir = mkdtempSync(join(tmpdir(), `backlot-conc-${name}-`));
   // A service that takes ~1.5s to become ready — long enough that two
   // serialized binds (>3s) are clearly distinguishable from two parallel ones.
   writeFileSync(

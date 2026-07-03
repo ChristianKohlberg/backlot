@@ -1,6 +1,6 @@
-# infront
+# backlot
 
-**infront puts a working instance of your web application in front of a coding agent
+**backlot puts a working instance of your web application in front of a coding agent
 (or a human) — running, seeded, authenticated, provable — as a cheap, repeatable act.**
 
 It brokers environments; it never provides them. Local processes today, your own cloud
@@ -12,9 +12,9 @@ sandboxes (Morph, Sprites, SSH) tomorrow — same verbs, same model.
 > (postgres/mssql/mysql) with template restore and **ephemeral (flush) stores**,
 > checks with verdicts/artifacts, detached submit-and-poll runs, **hygiene
 > auto-escalation + degraded auto-reap**, idle quiesce, crash recovery, a `token`
-> verb, an MCP adapter (`infront-mcp`), and a foreign-runtime consumer (Python).
+> verb, an MCP adapter (`backlot-mcp`), and a foreign-runtime consumer (Python).
 > Proven on a real .NET + Angular + MSSQL monorepo end to end — including its
-> Playwright system-e2e suite running against infront-provisioned environments.
+> Playwright system-e2e suite running against backlot-provisioned environments.
 > Not yet: a live remote substrate driver (morph/ssh) and the npm publish. Design in
 > [docs/architecture.md](docs/architecture.md); decisions in [docs/decisions/](docs/decisions/).
 
@@ -25,7 +25,7 @@ seeded instance to **inspect**, a deterministic environment to **prove** changes
 (e2e, with a machine-readable verdict), and a seconds-fast **iterate** loop — all for
 *uncommitted worktree state*, which CI can never serve. Hand-rolled harnesses converge
 on the same machinery in every repo (port allocation, DB namespacing, capacity gating,
-zombie reaping) and stay welded to that repo. infront is that machinery, extracted,
+zombie reaping) and stay welded to that repo. backlot is that machinery, extracted,
 with the repo-specific knowledge moved into one declarative file.
 
 The core trick: **environments are pooled, durable, and warm; work visits them.**
@@ -36,16 +36,16 @@ the environment returns to the pool with its heat intact. ([Why not checkpointin
 ## Quickstart
 
 ```bash
-npm install && npm run build && npm link   # once, until infront is on npm
+npm install && npm run build && npm link   # once, until backlot is on npm
 cd examples/hello-web
-infront up --json          # lease a warm env: sync, seed, start, print URLs + creds
-infront run smoke --json   # bind -> run the check -> JSON verdict -> release
-infront ctx --json         # everything an agent needs, in one blob
-infront release            # environment returns to the pool, warm
+backlot up --json          # lease a warm env: sync, seed, start, print URLs + creds
+backlot run smoke --json   # bind -> run the check -> JSON verdict -> release
+backlot ctx --json         # everything an agent needs, in one blob
+backlot release            # environment returns to the pool, warm
 ```
 
 Requires Node ≥ 22.5 and git. The daemon auto-spawns on first use (unix socket,
-per-machine state under `~/.local/state/infront`; isolate with `INFRONT_STATE_DIR`).
+per-machine state under `~/.local/state/backlot`; isolate with `BACKLOT_STATE_DIR`).
 
 A repo opts in with one file, `stack.yaml` ([schema](schema/stack.schema.json)):
 
@@ -70,27 +70,27 @@ checks:
 ```
 
 Services are commands, not containers. Backing infrastructure (your DB server) stays
-externally run — infront probes it and classifies its absence honestly
+externally run — backlot probes it and classifies its absence honestly
 (`infra-error`, never blaming your code).
 
 ## What it is / is not
 
-| infront is | infront is not |
+| backlot is | backlot is not |
 | --- | --- |
 | a warm pool of leased, isolated environments | a compute provider (bring your own, local or cloud) |
 | bind-by-sync: your dirty worktree, in front, in seconds | a build system (it invokes your commands, never understands them) |
-| seeded, template-restored data states | CI (CI may call infront; never the reverse) |
+| seeded, template-restored data states | CI (CI may call backlot; never the reverse) |
 | machine verdicts with a work/env/infra error taxonomy | an agent (no LLM calls, no browser driving) |
 
 Read [docs/architecture.md](docs/architecture.md) — it's short, and it *is* the product.
 
 ## Security model
 
-Be clear-eyed about what running infront means:
+Be clear-eyed about what running backlot means:
 
 - **`stack.yaml` commands execute with your privileges.** Services, seeds, upkeep
   rules, and checks are shell commands from the repo — exactly like `make`, npm
-  scripts, or a Justfile. Cloning an untrusted repo and running `infront up` runs
+  scripts, or a Justfile. Cloning an untrusted repo and running `backlot up` runs
   that repo's commands as you. Review manifests you didn't write.
 - **The daemon has no network surface.** It listens on a unix socket in your
   per-user state dir (filesystem permissions are the auth) — no TCP, no remote

@@ -14,8 +14,8 @@ const repo = join(import.meta.dirname, '..');
 const CLI = join(repo, 'dist', 'cli', 'index.js');
 
 function makeContext(extra: Record<string, string> = {}) {
-  const stateDir = mkdtempSync(join(tmpdir(), 'infront-cfx-'));
-  const env = { ...process.env, INFRONT_STATE_DIR: stateDir, INFRONT_SWEEP_MS: '300', ...extra };
+  const stateDir = mkdtempSync(join(tmpdir(), 'backlot-cfx-'));
+  const env = { ...process.env, BACKLOT_STATE_DIR: stateDir, BACKLOT_SWEEP_MS: '300', ...extra };
   const cli = (args: string[], cwd: string): Promise<{ exitCode: number; json?: Record<string, unknown> }> =>
     new Promise((resolve) => {
       execFile(process.execPath, [CLI, ...args], { cwd, env, maxBuffer: 16 * 1024 * 1024 }, (err, stdout) => {
@@ -44,7 +44,7 @@ console.log('up');
 createServer((q, s) => s.end('ok')).listen(Number(process.env.PORT));
 `;
 function makeWt(name: string, extra = ''): string {
-  const dir = mkdtempSync(join(tmpdir(), `infront-cfx-${name}-`));
+  const dir = mkdtempSync(join(tmpdir(), `backlot-cfx-${name}-`));
   writeFileSync(join(dir, 'server.mjs'), SERVE);
   writeFileSync(
     join(dir, 'stack.yaml'),
@@ -61,7 +61,7 @@ ${extra}`,
 
 describe('#17 env-id never reused after a reap (monotonic counter)', () => {
   it('a recycled env id does not collide with a later-created env', () => {
-    const dir = mkdtempSync(join(tmpdir(), 'infront-seq-'));
+    const dir = mkdtempSync(join(tmpdir(), 'backlot-seq-'));
     const j = new Journal(join(dir, 'j.db'));
     const s1 = j.nextEnvSeq('stackA');
     const s2 = j.nextEnvSeq('stackA');
@@ -148,7 +148,7 @@ describe('#23 doctor + reconcile surface', () => {
 
 describe('stale-job recovery (#9)', () => {
   it('a job left running by a dead daemon is failed on recovery', () => {
-    const dir = mkdtempSync(join(tmpdir(), 'infront-job-'));
+    const dir = mkdtempSync(join(tmpdir(), 'backlot-job-'));
     const j = new Journal(join(dir, 'j.db'));
     j.saveJob({ id: 'job-x', stackCwd: '/x', check: 'e2e', state: 'running' });
     expect(j.failStaleJobs()).toBe(1);

@@ -6,7 +6,7 @@ import urllib.request
 
 base = os.environ.get("BASE_URL")
 if not base:
-    print("BASE_URL not set — run through `infront run smoke`", file=sys.stderr)
+    print("BASE_URL not set — run through `backlot run smoke`", file=sys.stderr)
     sys.exit(2)
 
 health = json.load(urllib.request.urlopen(f"{base}/health"))

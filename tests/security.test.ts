@@ -14,8 +14,8 @@ const repo = join(import.meta.dirname, '..');
 const CLI = join(repo, 'dist', 'cli', 'index.js');
 
 function makeContext() {
-  const stateDir = mkdtempSync(join(tmpdir(), 'infront-sec-'));
-  const env = { ...process.env, INFRONT_STATE_DIR: stateDir, INFRONT_SWEEP_MS: '500' };
+  const stateDir = mkdtempSync(join(tmpdir(), 'backlot-sec-'));
+  const env = { ...process.env, BACKLOT_STATE_DIR: stateDir, BACKLOT_SWEEP_MS: '500' };
   const cli = (args: string[], cwd: string): Promise<{ exitCode: number; json?: Record<string, unknown>; out: string }> =>
     new Promise((resolve) => {
       execFile(process.execPath, [CLI, ...args], { cwd, env, maxBuffer: 16 * 1024 * 1024 }, (err, stdout) => {
@@ -49,7 +49,7 @@ services:
 ${extra}`;
 
 function makeWt(stackYaml: string): string {
-  const dir = mkdtempSync(join(tmpdir(), 'infront-sec-wt-'));
+  const dir = mkdtempSync(join(tmpdir(), 'backlot-sec-wt-'));
   writeFileSync(join(dir, 'server.mjs'), SERVE);
   writeFileSync(join(dir, 'stack.yaml'), stackYaml);
   execFileSync('git', ['init', '-q'], { cwd: dir });

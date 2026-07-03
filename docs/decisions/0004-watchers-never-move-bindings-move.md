@@ -16,4 +16,4 @@ Watcher identity is path-bound: incremental caches, pid files, proxies, generate
 artifacts. "Moving" a watcher is really killing it and starting cold elsewhere —
 nothing warm carries over. Inverting ownership makes rebinds incremental (caches
 survive), keeps ports and URLs stable for an environment's lifetime, and guarantees the
-consumer's worktree is never touched by infront.
+consumer's worktree is never touched by backlot.

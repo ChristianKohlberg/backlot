@@ -6,7 +6,7 @@
 
 Warm state is maintained **live and layered** (fingerprint ledger, machine-global
 package stores, baked data templates, compiler incrementality) and each bind
-**converges** the environment to the requested source/data state — infront never
+**converges** the environment to the requested source/data state — backlot never
 freezes or restores opaque machine images itself. Where a substrate offers true
 checkpointing (Morph, Sprites), the driver uses it as a provisioning accelerator:
 checkpoint for the base, convergence for the delta.

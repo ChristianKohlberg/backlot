@@ -1,8 +1,8 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://raw.githubusercontent.com/infront-dev/infront/main/schema/stack.schema.json",
-  "title": "infront stack manifest (stack.yaml)",
-  "description": "What a repo declares so infront can broker environments for it. Everything {{...}} is injected by the engine (symbolic ports, datastore URLs, service URLs). Policy (pool sizes, TTLs, substrates) never lives here.",
+  "$id": "https://raw.githubusercontent.com/backlot-dev/backlot/main/schema/stack.schema.json",
+  "title": "backlot stack manifest (stack.yaml)",
+  "description": "What a repo declares so backlot can broker environments for it. Everything {{...}} is injected by the engine (symbolic ports, datastore URLs, service URLs). Policy (pool sizes, TTLs, substrates) never lives here.",
   "type": "object",
   "required": ["name", "services"],
   "additionalProperties": false,
@@ -46,7 +46,7 @@
     "outputs": {
       "type": "array",
       "items": { "type": "string" },
-      "description": "Artifacts produced env-side but owned worktree-side (lockfiles, generated clients). Reported as outputs_changed; copied back only by explicit `infront pull`."
+      "description": "Artifacts produced env-side but owned worktree-side (lockfiles, generated clients). Reported as outputs_changed; copied back only by explicit `backlot pull`."
     },
     "upkeep": {
       "type": "array",
@@ -76,7 +76,7 @@
     "checks": {
       "type": "object",
       "additionalProperties": { "$ref": "#/$defs/check" },
-      "description": "Named runnable proofs (e2e, smoke). `infront run <name>`."
+      "description": "Named runnable proofs (e2e, smoke). `backlot run <name>`."
     }
   },
   "$defs": {
@@ -128,7 +128,7 @@
       "additionalProperties": false,
       "properties": {
         "driver": { "type": "string", "enum": ["sqlite", "postgres", "mssql", "mysql", "redis"] },
-        "server": { "type": "string", "enum": ["external"], "default": "external", "description": "infront never runs datastore servers; it probes them." },
+        "server": { "type": "string", "enum": ["external"], "default": "external", "description": "backlot never runs datastore servers; it probes them." },
         "probe": { "type": "string", "description": "host:port TCP-probed before anything starts (server drivers). Failure is an infra-error, never code blame." },
         "url": { "type": "string", "description": "Connection-string template handed to services/checks; {{ns}} available. Required for server drivers; ignored for sqlite (the ns IS the file path)." },
         "create": { "type": "string", "description": "Repo command that creates+seeds a namespace; {{ns}} and {{preset}} available." },
