@@ -3,6 +3,23 @@
 Known work, roughly prioritized. Committed to the repo so it survives sessions.
 Each item notes severity and where it was found.
 
+## CI — diagnosed during the template-identity work (2026-07-11)
+
+- [ ] **P1 · Linux rebind race: "port … occupied by a foreign process".** The
+  dominant CI failure (red on main since 2026-07-03, both runners): every
+  rebind-to-the-same-port flow — `sync`, `reset-data`, crash recovery, quiesce
+  → rebind, ephemeral reset — fails on Linux with an env-error from the
+  pre-start `probeFree` check, while the same suite is green on macOS.
+  Teardown *does* await the service process's `exit` event and the spawn/kill
+  chain looks correct, so the actual port holder at probe time needs live
+  socket forensics. Repro (fails deterministically in a stock container):
+  `docker run --rm -v $PWD:/src:ro node:22 bash -c "cp -r /src /work && cd /work && npm ci && npx vitest run tests/cli.test.ts"`
+  → instrument with `ss -ltnp` at the failure instant. Any fix lands in the
+  supervisor/port-broker core (process groups? probe retry window?), where
+  crash recovery, watchers, and restart timers interact — treat as its own
+  session, with both-platform verification. Until fixed, CI is red for every
+  PR and cannot gate merges.
+
 ## Polish — found during live Revamp/parallel testing (2026-07-03)
 
 - [ ] **P1 · Progress while queued behind a busy env.** A verb (`up`/`run`/…) that
