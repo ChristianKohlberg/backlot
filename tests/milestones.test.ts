@@ -67,7 +67,7 @@ describe('detached runs (submit-and-poll, decision 0015)', () => {
 
   it('run --detach returns a jobId immediately; the verdict outlives the client', async () => {
     const submit = await ctx.cli(['run', 'smoke', '--detach', '--json'], wt.dir);
-    expect(submit.exitCode).toBe(0);
+    expect(submit.exitCode, `output: ${(submit as { output?: string }).output ?? ''}${submit.stdout ?? ''}${submit.stderr ?? ''}`).toBe(0);
     const jobId = submit.json!.jobId as string;
     expect(jobId).toMatch(/^job-/);
 
@@ -84,7 +84,7 @@ describe('detached runs (submit-and-poll, decision 0015)', () => {
 
   it('polling an unknown job is an env-error', async () => {
     const res = await ctx.cli(['job', 'job-nope', '--json'], wt.dir);
-    expect(res.exitCode).toBe(2);
+    expect(res.exitCode, `output: ${(res as { output?: string }).output ?? ''}${res.stdout ?? ''}${res.stderr ?? ''}`).toBe(2);
   });
 });
 
@@ -100,13 +100,13 @@ describe.skipIf(!hasPython)('the foreign consumer (hello-python)', () => {
 
   it('a stdlib-Python stack gets the identical broker loop', async () => {
     const up = await ctx.cli(['up', '--json'], wt.dir);
-    expect(up.exitCode).toBe(0);
+    expect(up.exitCode, `output: ${(up as { output?: string }).output ?? ''}${up.stdout ?? ''}${up.stderr ?? ''}`).toBe(0);
     const url = (up.json!.urls as Record<string, string>).web!;
     const facts = (await (await fetch(`${url}/api/facts`)).json()) as unknown[];
     expect(facts.length).toBe(3);
 
     const run = await ctx.cli(['run', 'smoke', '--json'], wt.dir);
-    expect(run.exitCode).toBe(0);
+    expect(run.exitCode, `output: ${(run as { output?: string }).output ?? ''}${run.stdout ?? ''}${run.stderr ?? ''}`).toBe(0);
     expect(run.json!.ok).toBe(true);
   });
 });

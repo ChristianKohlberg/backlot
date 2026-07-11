@@ -80,8 +80,8 @@ describe('per-environment concurrency', () => {
       return { ...res, start, end: Date.now() };
     };
     const [a, b] = await Promise.all([timed(wtA), timed(wtB)]);
-    expect(a.exitCode).toBe(0);
-    expect(b.exitCode).toBe(0);
+    expect(a.exitCode, `output: ${(a as { output?: string }).output ?? ''}${a.stdout ?? ''}${a.stderr ?? ''}`).toBe(0);
+    expect(b.exitCode, `output: ${(b as { output?: string }).output ?? ''}${b.stdout ?? ''}${b.stderr ?? ''}`).toBe(0);
     const overlap = Math.min(a.end, b.end) - Math.max(a.start, b.start);
     expect(overlap).toBeGreaterThan(1000); // serialized binds cannot overlap >= the ready-wait
     expect((a.json!.urls as Record<string, string>).web).not.toBe((b.json!.urls as Record<string, string>).web);

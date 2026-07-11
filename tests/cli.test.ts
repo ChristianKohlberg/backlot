@@ -72,7 +72,7 @@ describe('the local loop (hello-web)', () => {
 
   it('up: leases, seeds, starts, serves — and the ctx blob is complete', async () => {
     const res = await ctx.cli(['up', '--json'], wt.dir);
-    expect(res.exitCode).toBe(0);
+    expect(res.exitCode, `output: ${(res as { output?: string }).output ?? ''}${res.stdout ?? ''}${res.stderr ?? ''}`).toBe(0);
     const c = res.json!;
     expect(c.state).toBe('hot');
     url = (c.urls as Record<string, string>).web!;
@@ -86,7 +86,7 @@ describe('the local loop (hello-web)', () => {
     const src = readFileSync(join(wt.dir, 'server.mjs'), 'utf8').replace('<h1>hello-web</h1>', '<h1>hello-web EDITED</h1>');
     writeFileSync(join(wt.dir, 'server.mjs'), src);
     const res = await ctx.cli(['sync', '--json'], wt.dir);
-    expect(res.exitCode).toBe(0);
+    expect(res.exitCode, `output: ${(res as { output?: string }).output ?? ''}${res.stdout ?? ''}${res.stderr ?? ''}`).toBe(0);
     const page = await (await fetch(url)).text(); // SAME url — the watcher never moved
     expect(page).toContain('hello-web EDITED');
   });
@@ -105,14 +105,14 @@ describe('the local loop (hello-web)', () => {
     );
     expect(((await fetchJson(`${url}/api/greetings`)) as unknown[]).length).toBe(4);
     const res = await ctx.cli(['reset-data', '--json'], wt.dir);
-    expect(res.exitCode).toBe(0);
+    expect(res.exitCode, `output: ${(res as { output?: string }).output ?? ''}${res.stdout ?? ''}${res.stderr ?? ''}`).toBe(0);
     expect((res.json!.urls as Record<string, string>).web).toBe(url);
     expect(((await fetchJson(`${url}/api/greetings`)) as unknown[]).length).toBe(3);
   });
 
   it('run smoke: second env from the pool, green verdict, lease auto-released', async () => {
     const res = await ctx.cli(['run', 'smoke', '--json'], wt.dir);
-    expect(res.exitCode).toBe(0);
+    expect(res.exitCode, `output: ${(res as { output?: string }).output ?? ''}${res.stdout ?? ''}${res.stderr ?? ''}`).toBe(0);
     const v = res.json!;
     expect(v.ok).toBe(true);
     expect(v.envId).not.toBe(''); // ran somewhere real
@@ -156,16 +156,16 @@ describe('verdicts, outputs, and the error taxonomy', () => {
       `  fail:\n    run: node -e 'console.error("boom"); process.exit(3)'\n`,
     );
     const res = await ctx.cli(['run', 'fail', '--json'], wt.dir);
-    expect(res.exitCode).toBe(1); // CLI contract: failed run exits 1
+    expect(res.exitCode, `output: ${(res as { output?: string }).output ?? ''}${res.stdout ?? ''}${res.stderr ?? ''}`).toBe(1); // CLI contract: failed run exits 1
     const v = res.json!;
     expect(v.ok).toBe(false);
-    expect(v.exitCode).toBe(3);
+    expect(v.exitCode, `output: ${(v as { output?: string }).output ?? ''}${v.stdout ?? ''}${v.stderr ?? ''}`).toBe(3);
     expect((v.failure as { class: string }).class).toBe('work-error');
   });
 
   it('an unknown check is a work-error naming the available checks', async () => {
     const res = await ctx.cli(['run', 'nope', '--json'], wt.dir);
-    expect(res.exitCode).toBe(1);
+    expect(res.exitCode, `output: ${(res as { output?: string }).output ?? ''}${res.stdout ?? ''}${res.stderr ?? ''}`).toBe(1);
     expect((res.json!.error as { message: string }).message).toContain('smoke');
   });
 
@@ -182,7 +182,7 @@ describe('verdicts, outputs, and the error taxonomy', () => {
   it('ctx without a lease is an env-error telling you the fix', async () => {
     const bare = makeWorktree('hello-web');
     const res = await ctx.cli(['ctx', '--json'], bare.dir);
-    expect(res.exitCode).toBe(2);
+    expect(res.exitCode, `output: ${(res as { output?: string }).output ?? ''}${res.stdout ?? ''}${res.stderr ?? ''}`).toBe(2);
     expect((res.json!.error as { message: string }).message).toContain("backlot up");
     bare.drop();
   });
@@ -223,7 +223,7 @@ describe('the multi-service topology (hello-multi)', () => {
 
   it('up brings api + web + portless worker to ready, in dependency order', async () => {
     const res = await ctx.cli(['up', '--json'], wt.dir);
-    expect(res.exitCode).toBe(0);
+    expect(res.exitCode, `output: ${(res as { output?: string }).output ?? ''}${res.stdout ?? ''}${res.stderr ?? ''}`).toBe(0);
     const urls = res.json!.urls as Record<string, string>;
     expect(urls.api).toBeDefined();
     expect(urls.web).toBeDefined();
@@ -235,7 +235,7 @@ describe('the multi-service topology (hello-multi)', () => {
 
   it('run smoke uses the run preset (dev), collects the artifact, verdict green', async () => {
     const res = await ctx.cli(['run', 'smoke', '--json'], wt.dir);
-    expect(res.exitCode).toBe(0);
+    expect(res.exitCode, `output: ${(res as { output?: string }).output ?? ''}${res.stdout ?? ''}${res.stderr ?? ''}`).toBe(0);
     const v = res.json!;
     expect(v.ok).toBe(true);
     expect(v.artifactsDir).toBeTruthy();

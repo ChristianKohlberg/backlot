@@ -374,7 +374,14 @@ export class Engine {
       for (const [name, spec] of ready) {
         if (spec.port) {
           const port = env.ports[spec.port]!;
-          if (!(await probeFree(port))) {
+          // Grace window: the previous holder may be this env's own just-
+          // signalled service still tearing down (SIGTERM handlers, FD
+          // flushes). Only after the window is the port genuinely foreign.
+          let free = false;
+          for (let attempt = 0; attempt < 10 && !(free = await probeFree(port)); attempt++) {
+            await new Promise((r) => setTimeout(r, 150));
+          }
+          if (!free) {
             throw new BrokerError('env-error', `port ${port} for service '${name}' is occupied by a foreign process — try 'backlot pool recycle'`, name);
           }
         }

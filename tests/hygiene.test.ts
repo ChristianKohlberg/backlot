@@ -86,7 +86,7 @@ caches: [poison.txt]
     expect((await ctx.cli(['sync', '--json'], wt)).exitCode).toBe(1); // strike 2
 
     const third = await ctx.cli(['sync', '--json'], wt); // auto-escalated to pristine
-    expect(third.exitCode).toBe(0);
+    expect(third.exitCode, `output: ${(third as { output?: string }).output ?? ''}${third.stdout ?? ''}${third.stderr ?? ''}`).toBe(0);
     expect(third.json!.state).toBe('hot');
   }, 60_000);
 });

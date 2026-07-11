@@ -78,7 +78,14 @@ export class EnvSupervisor {
         cwd,
         env: { ...process.env, ...env },
         stdio: ['ignore', 'pipe', 'pipe'],
-        detached: false,
+        // Own process group, so signals reach the service and not just the
+        // sh -c wrapper. On Linux (dash) the wrapper forks instead of
+        // exec-ing, so killing only proc.pid orphaned the actual server —
+        // it kept the port and every rebind-to-same-port flow failed with
+        // "occupied by a foreign process" (BACKLOG P1, 2026-07-11).
+        // Services still survive a daemon crash (crash-recovery contract):
+        // nothing signals the group when the daemon itself dies.
+        detached: true,
       });
       running.proc = proc;
       this.onPidsChanged?.();
@@ -171,9 +178,9 @@ export class EnvSupervisor {
       if (r.proc && r.proc.exitCode === null) {
         await new Promise<void>((resolve) => {
           r.proc.once('exit', () => resolve());
-          r.proc.kill();
+          killGroup(r.proc);
           setTimeout(() => {
-            r.proc.kill('SIGKILL');
+            killGroup(r.proc, 'SIGKILL');
             resolve();
           }, 2000).unref();
         });
@@ -186,13 +193,33 @@ export class EnvSupervisor {
 
 const tail = (s: string, n = 600): string => s.slice(-n);
 
+/** Signal a service's whole process group; fall back to the leader alone. */
+function killGroup(proc: ChildProcess, signal: NodeJS.Signals = 'SIGTERM'): void {
+  if (!proc.pid) return;
+  try {
+    process.kill(-proc.pid, signal); // detached spawn => pid is the group leader
+  } catch {
+    try {
+      proc.kill(signal);
+    } catch {
+      /* already gone */
+    }
+  }
+}
+
 /** Kill PIDs recorded by a previous daemon life (recovery, decision 0009). */
 export function reapPids(pids: Record<string, number>): void {
   for (const pid of Object.values(pids)) {
+    // Recorded pids are group leaders (services spawn detached) — signal the
+    // group so the actual server dies too, not just the sh -c wrapper.
     try {
-      process.kill(pid);
+      process.kill(-pid);
     } catch {
-      /* already gone */
+      try {
+        process.kill(pid);
+      } catch {
+        /* already gone */
+      }
     }
   }
 }

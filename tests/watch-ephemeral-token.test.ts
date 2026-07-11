@@ -66,7 +66,7 @@ services:
       { 'server.mjs': SERVE, 'message.txt': 'v1' },
     );
     const up = await ctx.cli(['up', '--watch', '--json'], wt);
-    expect(up.exitCode).toBe(0);
+    expect(up.exitCode, `output: ${(up as { output?: string }).output ?? ''}${up.stdout ?? ''}${up.stderr ?? ''}`).toBe(0);
     const url = (up.json!.urls as Record<string, string>).web!;
     expect(await (await fetch(url)).text()).toBe('v1');
 
@@ -144,7 +144,7 @@ auth:
     );
     await ctx.cli(['up'], wt);
     const res = await ctx.cli(['token', '--role', 'detektiv', '--json'], wt);
-    expect(res.exitCode).toBe(0);
+    expect(res.exitCode, `output: ${(res as { output?: string }).output ?? ''}${res.stdout ?? ''}${res.stderr ?? ''}`).toBe(0);
     expect(res.json!.token).toMatch(/^fake-jwt-for-detektiv-on-\d+$/);
     expect(res.json!.role).toBe('detektiv');
   }, 60_000);

@@ -87,9 +87,9 @@ describe('argv parser (F1/F4)', () => {
     // `logs --lines 5 web`: `web` is the service, `5` is the flag value — not swapped.
     await ctx.cli(['up'], wt);
     const good = await ctx.cli(['logs', '--lines', '5', 'web'], wt);
-    expect(good.exitCode).toBe(0); // service resolved to 'web', logs exist
+    expect(good.exitCode, `output: ${(good as { output?: string }).output ?? ''}${good.stdout ?? ''}${good.stderr ?? ''}`).toBe(0); // service resolved to 'web', logs exist
     const bad = await ctx.cli(['logs', '--lines', '5', 'nosuch'], wt);
-    expect(bad.exitCode).toBe(2); // proves the positional really was the last token
+    expect(bad.exitCode, `output: ${(bad as { output?: string }).output ?? ''}${bad.stdout ?? ''}${bad.stderr ?? ''}`).toBe(2); // proves the positional really was the last token
   });
 
   it('rejects an unknown flag and a bad --ttl instead of silently misbehaving', async () => {
@@ -106,7 +106,7 @@ describe('path-escape guards (sec 2/3/4)', () => {
   it('sync.include with .. is rejected, not projected/deleted', async () => {
     const wt = makeWt(stackWith('sync:\n  include: ["../../../etc/hosts"]'));
     const res = await ctx.cli(['up', '--json'], wt);
-    expect(res.exitCode).toBe(1);
+    expect(res.exitCode, `output: ${(res as { output?: string }).output ?? ''}${res.stdout ?? ''}${res.stderr ?? ''}`).toBe(1);
     expect((res.json!.error as { message: string }).message).toMatch(/sync\.include|escapes/);
     rmSync(wt, { recursive: true, force: true });
   });
@@ -114,7 +114,7 @@ describe('path-escape guards (sec 2/3/4)', () => {
   it('a sqlite datastore key with .. is rejected', async () => {
     const wt = makeWt(stackWith('datastores:\n  "../../../evil":\n    driver: sqlite\n    create: "true"\n    presets: [dev]'));
     const res = await ctx.cli(['up', '--json'], wt);
-    expect(res.exitCode).toBe(1);
+    expect(res.exitCode, `output: ${(res as { output?: string }).output ?? ''}${res.stdout ?? ''}${res.stderr ?? ''}`).toBe(1);
     expect((res.json!.error as { message: string }).message).toMatch(/must not contain/);
     rmSync(wt, { recursive: true, force: true });
   });

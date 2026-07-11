@@ -55,7 +55,7 @@ describe('hello-multi fixture', () => {
       env: { API_URL: apiUrl, WEB_URL: webUrl },
     });
     expect(res.output).toContain('smoke ok');
-    expect(res.exitCode).toBe(0);
+    expect(res.exitCode, `output: ${(res as { output?: string }).output ?? ''}${res.stdout ?? ''}${res.stderr ?? ''}`).toBe(0);
 
     // The manifest declares artifacts: [smoke-report.json] — it must exist and be honest.
     const reportPath = join(example, 'smoke-report.json');

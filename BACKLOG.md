@@ -3,22 +3,21 @@
 Known work, roughly prioritized. Committed to the repo so it survives sessions.
 Each item notes severity and where it was found.
 
-## CI — diagnosed during the template-identity work (2026-07-11)
+## CI — remaining macOS-runner failures (2026-07-11, post port-race fix)
 
-- [ ] **P1 · Linux rebind race: "port … occupied by a foreign process".** The
-  dominant CI failure (red on main since 2026-07-03, both runners): every
-  rebind-to-the-same-port flow — `sync`, `reset-data`, crash recovery, quiesce
-  → rebind, ephemeral reset — fails on Linux with an env-error from the
-  pre-start `probeFree` check, while the same suite is green on macOS.
-  Teardown *does* await the service process's `exit` event and the spawn/kill
-  chain looks correct, so the actual port holder at probe time needs live
-  socket forensics. Repro (fails deterministically in a stock container):
-  `docker run --rm -v $PWD:/src:ro node:22 bash -c "cp -r /src /work && cd /work && npm ci && npx vitest run tests/cli.test.ts"`
-  → instrument with `ss -ltnp` at the failure instant. Any fix lands in the
-  supervisor/port-broker core (process groups? probe retry window?), where
-  crash recovery, watchers, and restart timers interact — treat as its own
-  session, with both-platform verification. Until fixed, CI is red for every
-  PR and cannot gate merges.
+- [ ] **P2 · macOS runners: `run`-flow tests die on "pool at capacity (1/1) —
+  waited 60s".** With the Linux rebind race fixed (services now own their
+  process group) the ubuntu leg is green; 4 macOS-leg tests still fail — all
+  flows needing a *second* env (`run smoke` x2, #21d shared-holder run,
+  hello-python). The exit-code asserts now surface the CLI error:
+  `env-error: pool at capacity (1/1) — waited 60s; release a lease or raise
+  BACKLOT_POOL_MAX`. Passes on real Macs; on slow shared runners the first
+  env apparently isn't released/quiesced within the 60s capacity wait.
+  Pre-existing (baseline probe on main-equivalent code fails identically —
+  the legs were fail-fast-cancelled for months, so it was never visible).
+  Open question is test intent: raise BACKLOT_POOL_MAX in those contexts,
+  lengthen the capacity wait under CI, or fix a release/sweeper timing bug —
+  needs a look at what the pool tests are meant to prove.
 
 ## Polish — found during live Revamp/parallel testing (2026-07-03)
 
