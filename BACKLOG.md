@@ -3,6 +3,22 @@
 Known work, roughly prioritized. Committed to the repo so it survives sessions.
 Each item notes severity and where it was found.
 
+## CI — remaining macOS-runner failures (2026-07-11, post port-race fix)
+
+- [ ] **P2 · macOS runners: `run`-flow tests die on "pool at capacity (1/1) —
+  waited 60s".** With the Linux rebind race fixed (services now own their
+  process group) the ubuntu leg is green; 4 macOS-leg tests still fail — all
+  flows needing a *second* env (`run smoke` x2, #21d shared-holder run,
+  hello-python). The exit-code asserts now surface the CLI error:
+  `env-error: pool at capacity (1/1) — waited 60s; release a lease or raise
+  BACKLOT_POOL_MAX`. Passes on real Macs; on slow shared runners the first
+  env apparently isn't released/quiesced within the 60s capacity wait.
+  Pre-existing (baseline probe on main-equivalent code fails identically —
+  the legs were fail-fast-cancelled for months, so it was never visible).
+  Open question is test intent: raise BACKLOT_POOL_MAX in those contexts,
+  lengthen the capacity wait under CI, or fix a release/sweeper timing bug —
+  needs a look at what the pool tests are meant to prove.
+
 ## Polish — found during live Revamp/parallel testing (2026-07-03)
 
 - [ ] **P1 · Progress while queued behind a busy env.** A verb (`up`/`run`/…) that
