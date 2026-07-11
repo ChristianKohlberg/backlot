@@ -1,9 +1,16 @@
 import { createHash } from 'node:crypto';
+import { execFile } from 'node:child_process';
 import { readFileSync, existsSync, statSync } from 'node:fs';
 import * as pathMod from 'node:path';
 
 export const sha256 = (data: string | Buffer): string =>
   createHash('sha256').update(data).digest('hex');
+
+/** Run a shell command, swallowing failures (best-effort cleanup paths). */
+export const runQuiet = (cmd: string, cwd: string): Promise<void> =>
+  new Promise((resolve) => {
+    execFile('sh', ['-c', cmd], { cwd, maxBuffer: 16 * 1024 * 1024 }, () => resolve());
+  });
 
 export const fileHash = (path: string): string | null => {
   try {

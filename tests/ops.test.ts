@@ -166,7 +166,7 @@ describe('retention sweep (unit)', () => {
       const t = new Date(Date.now() - (4 - i) * 3600 * 1000);
       utimesSync(join(tpl, `t${i}.db`), t, t);
     }
-    expect(pruneTemplates(p)).toBe(2);
+    expect(await pruneTemplates(p)).toBe(2);
     rmSync(dir, { recursive: true, force: true });
   });
 });
