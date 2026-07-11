@@ -7,6 +7,9 @@ on:
 jobs:
   check:
     strategy:
+      # Independent leg signal: a Linux failure must not cancel the macOS leg
+      # (fail-fast cancellations hid the macOS state for months).
+      fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
