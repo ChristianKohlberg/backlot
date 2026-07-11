@@ -38,6 +38,19 @@ export interface DatastoreSpec {
   ephemeral?: boolean;
 }
 
+export interface ApplianceSpec {
+  /** host:port whose reachability IS the appliance's identity. */
+  probe: string;
+  /** Daemonizing command run once (machine-wide) when the probe fails. */
+  start?: string;
+  /** Command for the explicit stop verb; never run automatically. */
+  stop?: string;
+  /** Optional readiness gate polled after TCP accepts (exit 0 = ready). */
+  ready?: string;
+  /** Seconds to wait after start for probe+ready. Default 60. */
+  timeout?: number;
+}
+
 export interface CheckSpec {
   run: string;
   cwd?: string;
@@ -55,6 +68,7 @@ export interface UpkeepRule {
 export interface Manifest {
   name: string;
   services: Record<string, ServiceSpec>;
+  appliances?: Record<string, ApplianceSpec>;
   datastores?: Record<string, DatastoreSpec>;
   caches?: string[];
   sync?: { keep?: string[]; include?: string[] };

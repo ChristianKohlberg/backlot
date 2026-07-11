@@ -4,7 +4,10 @@
   "title": "backlot stack manifest (stack.yaml)",
   "description": "What a repo declares so backlot can broker environments for it. Everything {{...}} is injected by the engine (symbolic ports, datastore URLs, service URLs). Policy (pool sizes, TTLs, substrates) never lives here.",
   "type": "object",
-  "required": ["name", "services"],
+  "required": [
+    "name",
+    "services"
+  ],
   "additionalProperties": false,
   "properties": {
     "name": {
@@ -15,16 +18,29 @@
     "services": {
       "type": "object",
       "minProperties": 1,
-      "additionalProperties": { "$ref": "#/$defs/service" },
+      "additionalProperties": {
+        "$ref": "#/$defs/service"
+      },
       "description": "Supervised shell commands, one per service. Commands, not containers."
+    },
+    "appliances": {
+      "type": "object",
+      "description": "Singular, machine-shared backing services (a Postgres server, a Redis) that environments point at but never own. Ensured (probe -> start once machine-wide -> wait), never supervised, never stopped automatically.",
+      "additionalProperties": {
+        "$ref": "#/$defs/appliance"
+      }
     },
     "datastores": {
       "type": "object",
-      "additionalProperties": { "$ref": "#/$defs/datastore" }
+      "additionalProperties": {
+        "$ref": "#/$defs/datastore"
+      }
     },
     "caches": {
       "type": "array",
-      "items": { "type": "string" },
+      "items": {
+        "type": "string"
+      },
       "description": "Paths (globs allowed) preserved by the bind-time reset: node_modules, **/obj, .angular, ..."
     },
     "sync": {
@@ -33,24 +49,32 @@
       "properties": {
         "keep": {
           "type": "array",
-          "items": { "type": "string" },
+          "items": {
+            "type": "string"
+          },
           "description": "Generated files preserved across binds even though tracked/derived."
         },
         "include": {
           "type": "array",
-          "items": { "type": "string" },
+          "items": {
+            "type": "string"
+          },
           "description": "Git-ignored files that must ride along with a binding (.env.local)."
         }
       }
     },
     "outputs": {
       "type": "array",
-      "items": { "type": "string" },
+      "items": {
+        "type": "string"
+      },
       "description": "Artifacts produced env-side but owned worktree-side (lockfiles, generated clients). Reported as outputs_changed; copied back only by explicit `backlot pull`."
     },
     "upkeep": {
       "type": "array",
-      "items": { "$ref": "#/$defs/upkeepRule" },
+      "items": {
+        "$ref": "#/$defs/upkeepRule"
+      },
       "description": "Closed list of fingerprint->action rules, run at bind time in order (decision 0008)."
     },
     "auth": {
@@ -59,11 +83,18 @@
       "properties": {
         "logins": {
           "type": "object",
-          "required": ["user", "password"],
+          "required": [
+            "user",
+            "password"
+          ],
           "additionalProperties": false,
           "properties": {
-            "user": { "type": "string" },
-            "password": { "type": "string" }
+            "user": {
+              "type": "string"
+            },
+            "password": {
+              "type": "string"
+            }
           },
           "description": "A seeded login consumers may use. Dev-grade by definition."
         },
@@ -75,20 +106,36 @@
     },
     "checks": {
       "type": "object",
-      "additionalProperties": { "$ref": "#/$defs/check" },
+      "additionalProperties": {
+        "$ref": "#/$defs/check"
+      },
       "description": "Named runnable proofs (e2e, smoke). `backlot run <name>`."
     }
   },
   "$defs": {
     "service": {
       "type": "object",
-      "required": ["run"],
+      "required": [
+        "run"
+      ],
       "additionalProperties": false,
       "properties": {
-        "run": { "type": "string", "description": "The supervised process. Daemon is its parent." },
-        "build": { "type": "string", "description": "Run at bind when fingerprints demand; never during serve." },
-        "watch_run": { "type": "string", "description": "Hot-reload alternative to run:, used only by --watch session leases." },
-        "cwd": { "type": "string", "description": "Working directory relative to the repo root." },
+        "run": {
+          "type": "string",
+          "description": "The supervised process. Daemon is its parent."
+        },
+        "build": {
+          "type": "string",
+          "description": "Run at bind when fingerprints demand; never during serve."
+        },
+        "watch_run": {
+          "type": "string",
+          "description": "Hot-reload alternative to run:, used only by --watch session leases."
+        },
+        "cwd": {
+          "type": "string",
+          "description": "Working directory relative to the repo root."
+        },
         "port": {
           "type": "string",
           "pattern": "^[a-z][a-z0-9-]*$",
@@ -96,17 +143,23 @@
         },
         "env": {
           "type": "object",
-          "additionalProperties": { "type": "string" },
+          "additionalProperties": {
+            "type": "string"
+          },
           "description": "Injected environment; values may template {{ports.*}}, {{datastores.*.url}}, {{services.*.url}}."
         },
-        "ready": { "$ref": "#/$defs/readiness" },
+        "ready": {
+          "$ref": "#/$defs/readiness"
+        },
         "fatal_logs": {
           "type": "string",
           "description": "ERE of log markers that fail a boot in seconds instead of polling readiness to timeout."
         },
         "depends_on": {
           "type": "array",
-          "items": { "type": "string" },
+          "items": {
+            "type": "string"
+          },
           "description": "Services that must be ready before this one starts."
         }
       }
@@ -116,56 +169,180 @@
       "additionalProperties": false,
       "minProperties": 1,
       "properties": {
-        "http": { "type": "string", "description": "Path polled on the service's port until 200." },
-        "log": { "type": "string", "description": "ERE that must appear in the service log (portless services)." },
-        "cmd": { "type": "string", "description": "Command that must exit 0." },
-        "timeout": { "type": "number", "default": 120, "description": "Seconds before service-not-ready." }
+        "http": {
+          "type": "string",
+          "description": "Path polled on the service's port until 200."
+        },
+        "log": {
+          "type": "string",
+          "description": "ERE that must appear in the service log (portless services)."
+        },
+        "cmd": {
+          "type": "string",
+          "description": "Command that must exit 0."
+        },
+        "timeout": {
+          "type": "number",
+          "default": 120,
+          "description": "Seconds before service-not-ready."
+        }
       }
     },
     "datastore": {
       "type": "object",
-      "required": ["driver"],
+      "required": [
+        "driver"
+      ],
       "additionalProperties": false,
       "properties": {
-        "driver": { "type": "string", "enum": ["sqlite", "postgres", "mssql", "mysql", "redis"] },
-        "server": { "type": "string", "enum": ["external"], "default": "external", "description": "backlot never runs datastore servers; it probes them." },
-        "probe": { "type": "string", "description": "host:port TCP-probed before anything starts (server drivers). Failure is an infra-error, never code blame." },
-        "url": { "type": "string", "description": "Connection-string template handed to services/checks; {{ns}} available. Required for server drivers; ignored for sqlite (the ns IS the file path)." },
-        "create": { "type": "string", "description": "Repo command that creates+seeds a namespace; {{ns}} and {{preset}} available." },
-        "drop": { "type": "string", "description": "Repo command that drops a namespace; {{ns}} available. Best-effort (run before restore and on recycle)." },
-        "template_restore": { "type": "string", "description": "Repo command that clones a baked template namespace into a fresh one; {{template}} and {{ns}} available (e.g. postgres: createdb -T {{template}} {{ns}}). When present, `create` bakes once per seed-content hash and every bind restores in seconds." },
-        "presets": { "type": "array", "items": { "type": "string" }, "description": "Named seed states." },
+        "driver": {
+          "type": "string",
+          "enum": [
+            "sqlite",
+            "postgres",
+            "mssql",
+            "mysql",
+            "redis"
+          ]
+        },
+        "server": {
+          "type": "string",
+          "enum": [
+            "external"
+          ],
+          "default": "external",
+          "description": "backlot never runs datastore servers; it probes them."
+        },
+        "probe": {
+          "type": "string",
+          "description": "host:port TCP-probed before anything starts (server drivers). Failure is an infra-error, never code blame."
+        },
+        "url": {
+          "type": "string",
+          "description": "Connection-string template handed to services/checks; {{ns}} available. Required for server drivers; ignored for sqlite (the ns IS the file path)."
+        },
+        "create": {
+          "type": "string",
+          "description": "Repo command that creates+seeds a namespace; {{ns}} and {{preset}} available."
+        },
+        "drop": {
+          "type": "string",
+          "description": "Repo command that drops a namespace; {{ns}} available. Best-effort (run before restore and on recycle)."
+        },
+        "template_restore": {
+          "type": "string",
+          "description": "Repo command that clones a baked template namespace into a fresh one; {{template}} and {{ns}} available (e.g. postgres: createdb -T {{template}} {{ns}}). When present, `create` bakes once per seed-content hash and every bind restores in seconds."
+        },
+        "presets": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Named seed states."
+        },
         "default_preset": {
           "type": "object",
           "additionalProperties": false,
           "properties": {
-            "run": { "type": "string" },
-            "session": { "type": "string" }
+            "run": {
+              "type": "string"
+            },
+            "session": {
+              "type": "string"
+            }
           }
         },
-        "template": { "type": "boolean", "default": false, "description": "sqlite only: bake a template file per seed-content hash and restore by copy. Server drivers use template_restore instead." },
-        "ephemeral": { "type": "boolean", "default": false, "description": "No presets; reset-data = flush (Redis-class)." }
+        "template": {
+          "type": "boolean",
+          "default": false,
+          "description": "sqlite only: bake a template file per seed-content hash and restore by copy. Server drivers use template_restore instead."
+        },
+        "ephemeral": {
+          "type": "boolean",
+          "default": false,
+          "description": "No presets; reset-data = flush (Redis-class)."
+        }
       }
     },
     "upkeepRule": {
       "type": "object",
-      "required": ["when", "run"],
+      "required": [
+        "when",
+        "run"
+      ],
       "additionalProperties": false,
       "properties": {
-        "when": { "type": "string", "description": "A file path or glob(...) whose content hash triggers the rule (direction-agnostic per-env ledger)." },
-        "run": { "type": "string", "description": "Repo command, or an engine built-in prefixed with @ (e.g. @rebake-template <datastore>)." }
+        "when": {
+          "type": "string",
+          "description": "A file path or glob(...) whose content hash triggers the rule (direction-agnostic per-env ledger)."
+        },
+        "run": {
+          "type": "string",
+          "description": "Repo command, or an engine built-in prefixed with @ (e.g. @rebake-template <datastore>)."
+        }
       }
     },
     "check": {
       "type": "object",
-      "required": ["run"],
+      "required": [
+        "run"
+      ],
       "additionalProperties": false,
       "properties": {
-        "run": { "type": "string" },
-        "cwd": { "type": "string" },
-        "env": { "type": "object", "additionalProperties": { "type": "string" } },
-        "artifacts": { "type": "array", "items": { "type": "string" }, "description": "Globs collected into the verdict's artifacts dir." },
-        "timeout": { "type": "number", "default": 600, "description": "Seconds before the check's whole process group is killed — a hung check must never hold its environment forever." }
+        "run": {
+          "type": "string"
+        },
+        "cwd": {
+          "type": "string"
+        },
+        "env": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "artifacts": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Globs collected into the verdict's artifacts dir."
+        },
+        "timeout": {
+          "type": "number",
+          "default": 600,
+          "description": "Seconds before the check's whole process group is killed \u2014 a hung check must never hold its environment forever."
+        }
+      }
+    },
+    "appliance": {
+      "type": "object",
+      "required": [
+        "probe"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "probe": {
+          "type": "string",
+          "description": "host:port TCP-probed; reachability IS the appliance's identity \u2014 whoever answers is the appliance, no matter who started it."
+        },
+        "start": {
+          "type": "string",
+          "description": "Daemonizing repo command (e.g. docker run -d ...) run ONCE machine-wide when the probe fails. Absent = today's behavior: unreachable is an infra-error you resolve yourself."
+        },
+        "stop": {
+          "type": "string",
+          "description": "Repo command for the explicit `backlot appliance stop` verb. Never run automatically \u2014 appliances are durable; heat is the point."
+        },
+        "ready": {
+          "type": "string",
+          "description": "Optional readiness gate polled after TCP accepts (exit 0 = ready), e.g. pg_isready \u2014 TCP-accept alone can precede real readiness."
+        },
+        "timeout": {
+          "type": "number",
+          "default": 60,
+          "description": "Seconds to wait after start for probe (and ready:) to pass before infra-error."
+        }
       }
     }
   }

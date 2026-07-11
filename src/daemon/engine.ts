@@ -15,6 +15,7 @@ import { freePort, probeFree } from '../core/ports.js';
 import { envsRoot, artifactsRoot } from '../core/paths.js';
 import { BrokerError, template, templateEnv, now, shortId, matchesAny } from '../core/util.js';
 import { makeDatastore, type DsHandle } from '../drivers/datastores.js';
+import { ensureAppliance, stopAppliance, probeTcp } from '../drivers/appliances.js';
 import { EnvSupervisor, reapPids } from './supervisor.js';
 import { policy } from '../core/policy.js';
 import { retentionSweep } from '../core/retention.js';
@@ -282,6 +283,14 @@ export class Engine {
       mkdirSync(dirs.data, { recursive: true });
       env.fingerprints = {};
       env.presets = {};
+    }
+
+    // Appliances first: shared backing servers must answer before anything
+    // else is worth doing. Milliseconds when they're up; a one-time start
+    // when they're not (decision 0018). Failures here are infra-errors.
+    for (const [name, spec] of Object.entries(stack.manifest.appliances ?? {})) {
+      const state = await ensureAppliance(name, spec, stack.root, say);
+      if (state !== 'up') logEvent({ level: 'info', kind: 'appliance', detail: `'${name}' ${state} (${spec.probe})` });
     }
 
     say('syncing worktree');
@@ -714,6 +723,46 @@ export class Engine {
     this.journal.deleteLease(lease.id);
     this.stopWatch(lease.envId);
     return { released: true, envId: lease.envId };
+  }
+
+  /** Live-probed appliance overview for the stack at cwd. */
+  async applianceLs(cwd: string) {
+    const stack = loadStack(cwd);
+    const appliances: Record<string, { probe: string; up: boolean; startable: boolean; stoppable: boolean }> = {};
+    for (const [name, spec] of Object.entries(stack.manifest.appliances ?? {})) {
+      appliances[name] = {
+        probe: spec.probe,
+        up: await probeTcp(spec.probe),
+        startable: Boolean(spec.start),
+        stoppable: Boolean(spec.stop),
+      };
+    }
+    return { stack: stack.manifest.name, appliances };
+  }
+
+  /** Ensure one appliance (or all of them) — the same path a bind takes. */
+  async applianceStart(cwd: string, name?: string) {
+    const stack = loadStack(cwd);
+    const specs = Object.entries(stack.manifest.appliances ?? {}).filter(([n]) => !name || n === name);
+    if (name && specs.length === 0) {
+      throw new BrokerError('work-error', `no appliance '${name}' in stack.yaml`, 'appliance');
+    }
+    const results: Record<string, string> = {};
+    for (const [n, spec] of specs) {
+      results[n] = await ensureAppliance(n, spec, stack.root, () => undefined);
+      if (results[n] !== 'up') logEvent({ level: 'info', kind: 'appliance', detail: `'${n}' ${results[n]} (${spec.probe})` });
+    }
+    return { results };
+  }
+
+  /** Explicit stop — the only path that ever stops an appliance. */
+  async applianceStop(cwd: string, name: string) {
+    const stack = loadStack(cwd);
+    const spec = stack.manifest.appliances?.[name];
+    if (!spec) throw new BrokerError('work-error', `no appliance '${name}' in stack.yaml`, 'appliance');
+    await stopAppliance(name, spec, stack.root);
+    logEvent({ level: 'info', kind: 'appliance', detail: `'${name}' stopped (${spec.probe})` });
+    return { stopped: name };
   }
 
   status() {

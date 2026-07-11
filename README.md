@@ -73,6 +73,23 @@ Services are commands, not containers. Backing infrastructure (your DB server) s
 externally run — backlot probes it and classifies its absence honestly
 (`infra-error`, never blaming your code).
 
+When the repo has one blessed way to bring that infrastructure up, declare it as an
+**appliance** and backlot will *ensure* it — probe, start once machine-wide if dead,
+wait for readiness — while still never owning it (no supervision, no automatic stop;
+whatever answers the probe is adopted, no matter who started it):
+
+```yaml
+appliances:
+  postgres:
+    probe: localhost:5433
+    start: docker run -d --name dev-postgres -p 5433:5432 -e POSTGRES_PASSWORD=postgres pgvector/pgvector:pg16
+    ready: docker exec dev-postgres pg_isready -U postgres
+    stop: docker rm -f dev-postgres   # used only by `backlot appliance stop`
+```
+
+`backlot appliance ls|start|stop` manages them explicitly; binds ensure them
+implicitly. See [decision 0018](docs/decisions/0018-appliances-ensured-not-owned.md).
+
 ## What it is / is not
 
 | backlot is | backlot is not |

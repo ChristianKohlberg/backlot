@@ -24,6 +24,8 @@ Usage:
   backlot pull            copy declared outputs back into the worktree
   backlot release         release the current lease (environment stays warm)
   backlot status          daemon, pool, and lease overview
+  backlot appliance ls|start|stop [name]
+                          shared backing servers: probe, ensure up, explicit stop
   backlot pool ls|recycle [--all]
   backlot daemon stop     stop the daemon (environments are recovered on next use)
 
@@ -256,6 +258,23 @@ async function main(): Promise<void> {
     case 'doctor':
       res = await rpc('doctor', {});
       break;
+    case 'appliance': {
+      const sub = positional[0] ?? 'ls';
+      const name = positional[1];
+      if (sub === 'ls') res = await rpc('appliance-ls', { cwd });
+      else if (sub === 'start') res = await rpc('appliance-start', { cwd, name });
+      else if (sub === 'stop') {
+        if (!name) {
+          console.error('backlot appliance stop: a name is required (stopping everything is never implicit)');
+          process.exit(64);
+        }
+        res = await rpc('appliance-stop', { cwd, name });
+      } else {
+        console.error(`backlot appliance: unknown subcommand '${sub}' (ls | start | stop)`);
+        process.exit(64);
+      }
+      break;
+    }
     case 'pool': {
       const sub = positional[0] ?? 'ls';
       if (sub === 'ls') res = await rpc('status', {});
