@@ -140,7 +140,7 @@ async function main(): Promise<void> {
     return;
   }
 
-  const known = ['up', 'run', 'job', 'ctx', 'sync', 'bind', 'exec', 'logs', 'token', 'reset-data', 'pull', 'release', 'status', 'doctor', 'pool', 'daemon'];
+  const known = ['up', 'run', 'job', 'ctx', 'sync', 'bind', 'exec', 'logs', 'token', 'reset-data', 'pull', 'release', 'status', 'doctor', 'appliance', 'pool', 'daemon'];
   if (!known.includes(verb)) {
     console.error(`backlot: unknown verb '${verb}'\n\n${USAGE}`);
     process.exit(64);
