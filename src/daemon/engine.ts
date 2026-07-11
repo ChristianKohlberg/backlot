@@ -10,7 +10,7 @@ import { join, resolve } from 'node:path';
 import { Journal, type EnvRow } from '../core/journal.js';
 import { loadStack, defaultPreset, type Stack } from '../core/manifest.js';
 import { syncIntoEnv, changedOutputs, pullOutputs } from '../core/sync.js';
-import { runUpkeep } from '../core/upkeep.js';
+import { runUpkeep, templateBakeKeys } from '../core/upkeep.js';
 import { freePort, probeFree } from '../core/ports.js';
 import { envsRoot, artifactsRoot } from '../core/paths.js';
 import { BrokerError, template, templateEnv, now, shortId, matchesAny } from '../core/util.js';
@@ -297,10 +297,15 @@ export class Engine {
     const sync = syncIntoEnv(sourceRoot ?? stack.root, dirs.tree, stack.manifest);
     say(`synced ${sync.files.length} files (${sync.copied} changed, ${sync.deleted} removed)`);
     const upkeep = await runUpkeep(dirs.tree, sync.files, stack.manifest, env.fingerprints);
+    // Content-derived template identity (vetbill-1i49): divergent
+    // migrations/seeds in this tree yield a different bake key and thus a
+    // disjoint template name — two envs of the same stack can no longer
+    // silently share a template with the wrong schema.
+    const bakeKeys = templateBakeKeys(stack.manifest, dirs.tree, sync.files);
     for (const r of upkeep.ran) say(`upkeep: ${r.run}`);
     for (const dsName of upkeep.rebakeTemplates) {
       const spec = stack.manifest.datastores?.[dsName];
-      if (spec) makeDatastore(dsName, spec, stack.id).rebake();
+      if (spec) await makeDatastore(dsName, spec, stack.id, bakeKeys[dsName]).rebake();
     }
 
     // Fast path: identical source, services healthy, data untouched -> reuse as-is.
@@ -325,7 +330,7 @@ export class Engine {
     // Data state: create-or-restore per hygiene (probe first — infra-error, not code blame).
     const dsHandle: DsHandle = { envId: env.id, envTree: dirs.tree, dataDir: dirs.data };
     for (const [name, spec] of Object.entries(stack.manifest.datastores ?? {})) {
-      const ds = makeDatastore(name, spec, stack.id);
+      const ds = makeDatastore(name, spec, stack.id, bakeKeys[name]);
       await ds.probe();
       const preset = defaultPreset(spec, kind);
       const exists = Boolean(env.datastoreNs[name]);
@@ -881,7 +886,7 @@ export class Engine {
     if (t - this.lastRetention > Number(process.env.BACKLOT_RETENTION_MS ?? 10 * 60_000)) {
       this.lastRetention = t;
       try {
-        retentionSweep(this.journal, policy());
+        await retentionSweep(this.journal, policy());
       } catch {
         /* best-effort */
       }

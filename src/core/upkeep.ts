@@ -15,10 +15,37 @@ export interface UpkeepOutcome {
   rebakeTemplates: string[];
 }
 
-function triggerHash(envTree: string, files: string[], when: string): string {
+export function triggerHash(envTree: string, files: string[], when: string): string {
   const re = globToRegex(when);
   const matching = files.filter((f) => re.test(f)).sort();
   return sha256(matching.map((f) => `${f}:${fileHash(join(envTree, f)) ?? 'gone'}`).join('\n'));
+}
+
+/**
+ * Content-derived bake key per datastore (vetbill-1i49).
+ *
+ * The baked-template identity used to hash only the static `create:` command
+ * string — identical for every branch — so two environments of the same stack
+ * whose trees carry *different* migrations/seeds could silently share one
+ * template with the wrong schema. The @rebake-template rules already declare
+ * exactly which files define a datastore's baked content; hashing those
+ * files' current contents into the template name makes divergent content
+ * yield disjoint templates by construction (rebake becomes cleanup, not the
+ * only line of defense).
+ *
+ * Datastores with no @rebake-template rule get no key (undefined) and keep
+ * their historical template names — existing bakes stay valid.
+ */
+export function templateBakeKeys(manifest: Manifest, envTree: string, files: string[]): Record<string, string> {
+  const perDs: Record<string, string[]> = {};
+  for (const rule of manifest.upkeep ?? []) {
+    if (!rule.run.startsWith('@rebake-template')) continue;
+    const target = rule.run.slice('@rebake-template'.length).trim() || 'main';
+    (perDs[target] ??= []).push(triggerHash(envTree, files, rule.when));
+  }
+  return Object.fromEntries(
+    Object.entries(perDs).map(([ds, hashes]) => [ds, sha256(hashes.sort().join('\n')).slice(0, 12)]),
+  );
 }
 
 export async function runUpkeep(

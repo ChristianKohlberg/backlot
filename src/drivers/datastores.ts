@@ -13,12 +13,21 @@
  * backup/restore script). Templates are machine-global and immutable-keyed
  * (decision 0006/0008).
  */
-import { copyFileSync, mkdirSync, rmSync, existsSync, writeFileSync, constants as fsConstants } from 'node:fs';
+import {
+  copyFileSync,
+  mkdirSync,
+  rmSync,
+  existsSync,
+  readdirSync,
+  readFileSync,
+  writeFileSync,
+  constants as fsConstants,
+} from 'node:fs';
 import { join } from 'node:path';
 import { execFile } from 'node:child_process';
 import { connect } from 'node:net';
 import { templatesRoot } from '../core/paths.js';
-import { sha256, template, BrokerError } from '../core/util.js';
+import { sha256, template, runQuiet, BrokerError } from '../core/util.js';
 import type { DatastoreSpec } from '../core/manifest.js';
 
 export interface DsHandle {
@@ -39,8 +48,8 @@ export interface DsDriver {
   ensure(h: DsHandle, preset: string, force: boolean, exists: boolean): Promise<void>;
   /** Best-effort removal (recycle). */
   drop(h: DsHandle): Promise<void>;
-  /** @rebake-template: invalidate baked templates. */
-  rebake(): void;
+  /** @rebake-template: invalidate baked templates (and drop their server-side DBs). */
+  rebake(): void | Promise<void>;
 }
 
 const sh = (cmd: string, cwd: string, errCtx: string): Promise<void> =>
@@ -51,10 +60,74 @@ const sh = (cmd: string, cwd: string, errCtx: string): Promise<void> =>
     });
   });
 
-const shQuiet = (cmd: string, cwd: string): Promise<void> =>
-  new Promise((resolve) => {
-    execFile('sh', ['-c', cmd], { cwd, maxBuffer: 16 * 1024 * 1024 }, () => resolve());
-  });
+const shQuiet = runQuiet;
+
+/**
+ * In-process bake serialization (vetbill-1i49). All binds flow through the
+ * single daemon, so a keyed promise chain is a complete lock: two envs of the
+ * same stack binding concurrently used to race the marker check and bake the
+ * shared template twice (raw "being accessed by other users" errors, or the
+ * loser restoring the winner's half-baked schema).
+ */
+const bakeLocks = new Map<string, Promise<unknown>>();
+export async function withBakeLock<T>(key: string, fn: () => Promise<T>): Promise<T> {
+  const prev = bakeLocks.get(key) ?? Promise.resolve();
+  const run = prev.then(fn, fn); // run after predecessor, success or failure
+  bakeLocks.set(key, run);
+  try {
+    return await run;
+  } finally {
+    if (bakeLocks.get(key) === run) bakeLocks.delete(key);
+  }
+}
+
+/**
+ * Baked-template markers are self-describing (vetbill-1i49): they carry the
+ * server-side template ns AND the already-templated drop command, so
+ * retention/rebake can DROP the actual database when the marker is pruned —
+ * previously only the marker file was deleted and `backlot_tpl_*` databases
+ * leaked on the appliance forever. Legacy markers (bare ns string) still
+ * parse; they just can't be dropped server-side.
+ */
+export interface BakedMarker {
+  v: 1;
+  ns: string;
+  drop: string | null;
+}
+
+export function parseBakedMarker(content: string): BakedMarker {
+  try {
+    const parsed = JSON.parse(content) as BakedMarker;
+    if (parsed && parsed.v === 1 && typeof parsed.ns === 'string') return parsed;
+  } catch {
+    /* legacy: bare ns string */
+  }
+  return { v: 1, ns: content.trim(), drop: null };
+}
+
+/** Drop every marker's server-side template DB in `dir`, best-effort. */
+export async function dropBakedTemplates(dir: string, cwd: string): Promise<number> {
+  let dropped = 0;
+  let entries: string[] = [];
+  try {
+    entries = readdirSync(dir);
+  } catch {
+    return 0;
+  }
+  for (const f of entries) {
+    if (!f.endsWith('.baked')) continue;
+    try {
+      const marker = parseBakedMarker(readFileSync(join(dir, f), 'utf8'));
+      if (marker.drop) {
+        await runQuiet(marker.drop, cwd);
+        dropped++;
+      }
+    } catch {
+      /* unreadable marker — file prune below still applies */
+    }
+  }
+  return dropped;
+}
 
 // ---------------------------------------------------------------- sqlite
 
@@ -63,7 +136,14 @@ class SqliteDs implements DsDriver {
     readonly name: string,
     private readonly spec: DatastoreSpec,
     private readonly stackId: string,
+    private readonly bakeKey?: string,
   ) {}
+
+  /** Template identity: create command + content bake key (vetbill-1i49). */
+  private contentKey(): string {
+    const base = this.spec.create ?? '';
+    return sha256(this.bakeKey ? `${base}\n@bake:${this.bakeKey}` : base);
+  }
 
   ns(h: DsHandle): string {
     // The datastore KEY becomes a filename; a key with `/` or `..` must not
@@ -84,7 +164,7 @@ class SqliteDs implements DsDriver {
   private tplPath(preset: string): string {
     const dir = join(templatesRoot(), this.stackId);
     mkdirSync(dir, { recursive: true });
-    return join(dir, `${this.name}-${preset}@${sha256(this.spec.create ?? '').slice(0, 12)}.db`);
+    return join(dir, `${this.name}-${preset}@${this.contentKey().slice(0, 12)}.db`);
   }
 
   private async runCreate(envTree: string, ns: string, preset: string): Promise<void> {
@@ -98,7 +178,11 @@ class SqliteDs implements DsDriver {
     if (exists && !force && existsSync(dbPath)) return;
     if (this.spec.template === true) {
       const tpl = this.tplPath(preset);
-      if (!existsSync(tpl)) await this.runCreate(h.envTree, tpl, preset); // bake once
+      // Serialize the bake: concurrent binds must not both run create against
+      // the same template file (vetbill-1i49).
+      await withBakeLock(tpl, async () => {
+        if (!existsSync(tpl)) await this.runCreate(h.envTree, tpl, preset); // bake once
+      });
       copyFileSync(tpl, dbPath, fsConstants.COPYFILE_FICLONE); // restore = CoW clone where the fs supports it
     } else {
       await this.runCreate(h.envTree, dbPath, preset);
@@ -120,6 +204,7 @@ class CommandDs implements DsDriver {
     readonly name: string,
     private readonly spec: DatastoreSpec,
     private readonly stackId: string,
+    private readonly bakeKey?: string,
   ) {
     if (!spec.url) {
       throw new BrokerError('work-error', `datastore '${name}' (driver ${spec.driver}) needs a url: template with {{ns}}`, 'manifest');
@@ -156,13 +241,22 @@ class CommandDs implements DsDriver {
     });
   }
 
+  /**
+   * Template identity: create command + content bake key (vetbill-1i49).
+   * Without a bake key (no @rebake-template rule) names match the historical
+   * scheme, so existing baked templates stay valid.
+   */
+  private contentKey(): string {
+    const base = this.spec.create ?? '';
+    return sha256(this.bakeKey ? `${base}\n@bake:${this.bakeKey}` : base);
+  }
   private templateNs(preset: string): string {
-    return `backlot_tpl_${this.stackId}_${preset}_${sha256(this.spec.create ?? '').slice(0, 8)}`.replace(/[^A-Za-z0-9_]/g, '_');
+    return `backlot_tpl_${this.stackId}_${preset}_${this.contentKey().slice(0, 8)}`.replace(/[^A-Za-z0-9_]/g, '_');
   }
   private bakedMarker(preset: string): string {
     const dir = join(templatesRoot(), this.stackId);
     mkdirSync(dir, { recursive: true });
-    return join(dir, `${this.name}-${preset}@${sha256(this.spec.create ?? '').slice(0, 12)}.baked`);
+    return join(dir, `${this.name}-${preset}@${this.contentKey().slice(0, 12)}.baked`);
   }
 
   async ensure(h: DsHandle, preset: string, force: boolean, exists: boolean): Promise<void> {
@@ -178,15 +272,25 @@ class CommandDs implements DsDriver {
     }
     if (exists && !force) return;
     if (!this.spec.create) throw new BrokerError('work-error', `datastore '${this.name}' has no create: command`, 'datastore');
+    const create = this.spec.create; // narrowed copy for the closure below
     const ns = this.ns(h);
     if (this.spec.drop) await shQuiet(template(this.spec.drop, { ns }), h.envTree); // clean slate, best-effort
     if (this.spec.template_restore) {
       const tpl = this.templateNs(preset);
-      if (!existsSync(this.bakedMarker(preset))) {
+      // Serialize bake-check + bake + mark per template (vetbill-1i49):
+      // concurrent binds used to race the marker and bake the shared
+      // template twice; the loser could restore a half-baked schema.
+      await withBakeLock(tpl, async () => {
+        if (existsSync(this.bakedMarker(preset))) return;
         await shQuiet(this.spec.drop ? template(this.spec.drop, { ns: tpl }) : 'true', h.envTree);
-        await sh(template(this.spec.create, { ns: tpl, preset }), h.envTree, `template bake failed for '${this.name}' preset '${preset}'`);
-        writeFileSync(this.bakedMarker(preset), tpl);
-      }
+        await sh(template(create, { ns: tpl, preset }), h.envTree, `template bake failed for '${this.name}' preset '${preset}'`);
+        const marker: BakedMarker = {
+          v: 1,
+          ns: tpl,
+          drop: this.spec.drop ? template(this.spec.drop, { ns: tpl }) : null,
+        };
+        writeFileSync(this.bakedMarker(preset), JSON.stringify(marker));
+      });
       await sh(template(this.spec.template_restore, { template: tpl, ns }), h.envTree, `template restore failed for '${this.name}' preset '${preset}'`);
     } else {
       await sh(template(this.spec.create, { ns, preset }), h.envTree, `seed failed for '${this.name}' preset '${preset}'`);
@@ -196,22 +300,27 @@ class CommandDs implements DsDriver {
   async drop(h: DsHandle): Promise<void> {
     if (this.spec.drop) await shQuiet(template(this.spec.drop, { ns: this.ns(h) }), h.envTree);
   }
-  rebake(): void {
-    rmSync(join(templatesRoot(), this.stackId), { recursive: true, force: true });
+  async rebake(): Promise<void> {
+    // Drop the server-side template DBs recorded in the markers before
+    // deleting the marker dir — otherwise `backlot_tpl_*` databases leak on
+    // the appliance forever (vetbill-1i49).
+    const dir = join(templatesRoot(), this.stackId);
+    await dropBakedTemplates(dir, templatesRoot());
+    rmSync(dir, { recursive: true, force: true });
   }
 }
 
 // ---------------------------------------------------------------- factory
 
-export function makeDatastore(name: string, spec: DatastoreSpec, stackId: string): DsDriver {
+export function makeDatastore(name: string, spec: DatastoreSpec, stackId: string, bakeKey?: string): DsDriver {
   switch (spec.driver) {
     case 'sqlite':
-      return new SqliteDs(name, spec, stackId);
+      return new SqliteDs(name, spec, stackId, bakeKey);
     case 'postgres':
     case 'mssql':
     case 'mysql':
     case 'redis':
-      return new CommandDs(name, spec, stackId);
+      return new CommandDs(name, spec, stackId, bakeKey);
     default:
       throw new BrokerError('work-error', `unknown datastore driver '${(spec as { driver: string }).driver}'`, 'manifest');
   }

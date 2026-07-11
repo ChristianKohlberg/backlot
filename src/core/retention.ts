@@ -6,6 +6,8 @@
 import { readdirSync, statSync, rmSync, readFileSync, writeFileSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { artifactsRoot, templatesRoot, envsRoot } from './paths.js';
+import { runQuiet } from './util.js';
+import { parseBakedMarker } from '../drivers/datastores.js';
 import type { Journal } from './journal.js';
 import type { Policy } from './policy.js';
 
@@ -69,8 +71,14 @@ export function pruneJobs(journal: Journal, p: Policy): number {
 /**
  * Templates: keep the newest M per stack (a template whose seed-hash key is
  * still current keeps being touched by binds; stale keys age out naturally).
+ *
+ * For the command family the marker is a sentinel for a server-side
+ * `backlot_tpl_*` database; markers are self-describing (they carry their
+ * drop command — see BakedMarker in drivers/datastores.ts), so pruning a
+ * marker also DROPs the database instead of leaking it on the appliance
+ * forever (vetbill-1i49). Legacy bare-string markers prune file-only.
  */
-export function pruneTemplates(p: Policy, root = templatesRoot()): number {
+export async function pruneTemplates(p: Policy, root = templatesRoot()): Promise<number> {
   let pruned = 0;
   for (const stackDir of entriesOf(root)) {
     const dir = join(root, stackDir);
@@ -86,18 +94,30 @@ export function pruneTemplates(p: Policy, root = templatesRoot()): number {
       .filter((x): x is { f: string; mtime: number } => x !== null)
       .sort((a, b) => b.mtime - a.mtime);
     for (const { f } of files.slice(p.templatesKeep)) {
-      rmSync(join(dir, f), { force: true });
+      const full = join(dir, f);
+      if (f.endsWith('.baked')) {
+        try {
+          const marker = parseBakedMarker(readFileSync(full, 'utf8'));
+          if (marker.drop) await runQuiet(marker.drop, root);
+        } catch {
+          /* unreadable marker — still prune the file */
+        }
+      }
+      rmSync(full, { force: true });
       pruned++;
     }
   }
   return pruned;
 }
 
-export function retentionSweep(journal: Journal, p: Policy): { artifacts: number; logs: number; jobs: number; templates: number } {
+export async function retentionSweep(
+  journal: Journal,
+  p: Policy,
+): Promise<{ artifacts: number; logs: number; jobs: number; templates: number }> {
   return {
     artifacts: pruneArtifacts(p),
     logs: truncateLogs(p),
     jobs: pruneJobs(journal, p),
-    templates: pruneTemplates(p),
+    templates: await pruneTemplates(p),
   };
 }
