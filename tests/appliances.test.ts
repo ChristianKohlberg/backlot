@@ -96,8 +96,16 @@ describe('ensureAppliance', () => {
     // Second ensure: adopt, do not start twice.
     expect(await ensureAppliance('fake', { probe: `127.0.0.1:${port}`, start: 'false', timeout: 5 }, work.dir, silent)).toBe('up');
     // Cleanup the detached listener.
-    const { execSync } = await import('node:child_process');
-    execSync(`pkill -f "${script}" || true`);
+    const { execFileSync } = await import('node:child_process');
+    // execFile, not `sh -c 'pkill -f … || true'`: on Linux, pkill -f matches
+    // the sh wrapper's own cmdline (it contains the pattern) and SIGTERMs it
+    // before `|| true` applies — execSync then throws "Command failed".
+    // pkill never matches its own pid, so calling it directly is safe.
+    try {
+      execFileSync('pkill', ['-f', script]);
+    } catch {
+      /* no survivors to kill — pkill exits 1 */
+    }
     work.cleanup();
   });
 
@@ -158,8 +166,16 @@ describe('ensureAppliance', () => {
     // Exactly one starter; the other waited and adopted (or found it up).
     expect([a, b].sort()).toContain('started');
     expect([a, b].filter((r) => r === 'started').length).toBe(1);
-    const { execSync } = await import('node:child_process');
-    execSync(`pkill -f "${script}" || true`);
+    const { execFileSync } = await import('node:child_process');
+    // execFile, not `sh -c 'pkill -f … || true'`: on Linux, pkill -f matches
+    // the sh wrapper's own cmdline (it contains the pattern) and SIGTERMs it
+    // before `|| true` applies — execSync then throws "Command failed".
+    // pkill never matches its own pid, so calling it directly is safe.
+    try {
+      execFileSync('pkill', ['-f', script]);
+    } catch {
+      /* no survivors to kill — pkill exits 1 */
+    }
     work.cleanup();
   });
 });
