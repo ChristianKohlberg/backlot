@@ -67,7 +67,7 @@ describe('check timeouts and job ls', () => {
     const start = Date.now();
     const res = await ctx.cli(['run', 'hang', '--json'], wt);
     expect(Date.now() - start).toBeLessThan(30_000); // 2s timeout + bind, nowhere near 300s
-    expect(res.exitCode).toBe(1);
+    expect(res.exitCode, `output: ${(res as { output?: string }).output ?? ''}${res.stdout ?? ''}${res.stderr ?? ''}`).toBe(1);
     const v = res.json!;
     expect(v.ok).toBe(false);
     expect((v.failure as { message: string }).message).toContain('timed out after 2s');
@@ -94,7 +94,7 @@ describe('check timeouts and job ls', () => {
     writeFileSync(join(wt, 'message.txt'), 'v2-dirty');
 
     const bound = await ctx.cli(['bind', '--ref', 'HEAD', '--json'], wt);
-    expect(bound.exitCode).toBe(0);
+    expect(bound.exitCode, `output: ${(bound as { output?: string }).output ?? ''}${bound.stdout ?? ''}${bound.stderr ?? ''}`).toBe(0);
     const url = (bound.json!.urls as Record<string, string>).web!;
     expect(await (await fetch(url)).text()).toBe('v1'); // the COMMIT, not the dirty tree
 
@@ -102,7 +102,7 @@ describe('check timeouts and job ls', () => {
     expect(await (await fetch(url)).text()).toBe('v2-dirty'); // back to worktree state
 
     const bad = await ctx.cli(['bind', '--ref', 'nope-branch', '--json'], wt);
-    expect(bad.exitCode).toBe(1); // work-error: not a commit
+    expect(bad.exitCode, `output: ${(bad as { output?: string }).output ?? ''}${bad.stdout ?? ''}${bad.stderr ?? ''}`).toBe(1); // work-error: not a commit
   }, 60_000);
 });
 
