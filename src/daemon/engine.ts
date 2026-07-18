@@ -243,9 +243,20 @@ export class Engine {
     const dirs = this.envDirs(id);
     mkdirSync(dirs.tree, { recursive: true });
     mkdirSync(dirs.data, { recursive: true });
+    // freePort asks the OS for an unused port and immediately closes the
+    // listener, so nothing stops the SAME port being handed to the next
+    // environment moments later — two warm envs would then collide the first
+    // time both went hot. Exclude everything already recorded pool-wide.
+    const taken = new Set<number>();
+    for (const e of this.journal.allEnvs()) for (const p of Object.values(e.ports)) taken.add(p);
     const ports: Record<string, number> = {};
     for (const [, spec] of Object.entries(stack.manifest.services)) {
-      if (spec.port && !(spec.port in ports)) ports[spec.port] = await freePort();
+      if (spec.port && !(spec.port in ports)) {
+        let port = await freePort();
+        for (let attempt = 0; attempt < 50 && taken.has(port); attempt++) port = await freePort();
+        taken.add(port);
+        ports[spec.port] = port;
+      }
     }
     const env: EnvRow = {
       id, stack: stack.id, stackRoot: stack.root, state: 'warm', root: dirs.root,
@@ -386,6 +397,24 @@ export class Engine {
       throw new BrokerError('env-error', `environment ${env.id} is being recycled — retry`, 'pool');
     }
     const dirs = this.envDirs(env.id);
+    // Ports are allocated once at createEnv (decision 0004: stable for the
+    // environment's lifetime). A service ADDED to the manifest afterwards had
+    // no port, so every bind of an existing environment failed on the
+    // undefined lookup — permanently, for envs created before the edit.
+    // Existing keys are never reassigned, so stability holds.
+    let addedPort = false;
+    const takenPorts = new Set<number>();
+    for (const e of this.journal.allEnvs()) for (const p of Object.values(e.ports)) takenPorts.add(p);
+    for (const spec of Object.values(stack.manifest.services)) {
+      if (spec.port && !(spec.port in env.ports)) {
+        let port = await freePort();
+        for (let attempt = 0; attempt < 50 && takenPorts.has(port); attempt++) port = await freePort();
+        takenPorts.add(port);
+        env.ports[spec.port] = port;
+        addedPort = true;
+      }
+    }
+    if (addedPort) this.journal.saveEnv(env);
     if (hygiene === 'pristine') {
       say('preparing a pristine environment');
       await this.supervisor(env).stopAll();
@@ -396,6 +425,12 @@ export class Engine {
       mkdirSync(dirs.data, { recursive: true });
       env.fingerprints = {};
       env.presets = {};
+      // Persist the cleared ledger NOW, not at the end of the bind. Appliances,
+      // sync and upkeep all run before the epilogue, and a crash in any of them
+      // used to leave the journal asserting fingerprints and presets for state
+      // that no longer exists on disk — so the next bind skipped work it had to
+      // redo.
+      this.journal.saveEnv(env);
     }
 
     // Appliances first: shared backing servers must answer before anything
@@ -574,7 +609,10 @@ export class Engine {
     try {
       watcher = fsWatch(stackRoot, { recursive: true }, (_event, filename) => {
         const f = String(filename ?? '');
-        if (f.startsWith('.git') || f.includes('/.git/') || f.startsWith('.backlot')) return;
+        // `.startsWith('.git')` also matched .github/, .gitignore and
+        // .gitlab-ci.yml, so edits to CI config and ignore rules never synced
+        // under --watch. Match the .git DIRECTORY, not the prefix.
+        if (f === '.git' || f.startsWith('.git/') || f.includes('/.git/') || f.startsWith('.backlot')) return;
         if (timer) clearTimeout(timer);
         timer = setTimeout(() => {
           void this.up({ cwd, holder, kind: 'session', hygiene: 'reuse', watch: true }).catch(() => {

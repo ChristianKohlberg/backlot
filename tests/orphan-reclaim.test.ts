@@ -400,8 +400,11 @@ describe('supervisor restart budget', () => {
           process.kill(pid, 'SIGKILL');
         }
       }
-      await waitFor(() => servers(ctx.stateDir).length > 0, 15_000);
-      await settle(700); // stay up past the stability threshold
+      // Under parallel test load a restart can take a while; wait generously
+      // rather than encode this machine's speed into the assertion.
+      const back = await waitFor(() => servers(ctx.stateDir).length > 0, 30_000);
+      expect(back, `service did not restart after kill ${i + 1}`).toBe(true);
+      await settle(900); // stay up past the 400ms stability threshold
     }
 
     const ls = await ctx.cli(['pool', 'ls', '--json'], wt);
@@ -412,5 +415,5 @@ describe('supervisor restart budget', () => {
     expect(envs.length, 'the environment was degraded and reaped').toBeGreaterThan(0);
     expect(envs.every((e) => e.state !== 'degraded')).toBe(true);
     expect(servers(ctx.stateDir).length, 'the service should still be supervised').toBeGreaterThan(0);
-  }, 90_000);
+  }, 180_000);
 });

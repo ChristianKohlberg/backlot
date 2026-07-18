@@ -16,7 +16,7 @@
 import { execFileSync } from 'node:child_process';
 import {
   copyFileSync, mkdirSync, rmSync, existsSync, readFileSync, writeFileSync,
-  readdirSync, statSync, lstatSync, chmodSync, constants as fsConstants,
+  readdirSync, statSync, lstatSync, chmodSync, renameSync, rmdirSync, constants as fsConstants,
 } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileHash, matchesAny, sha256, isFile, safeJoin } from './util.js';
@@ -143,6 +143,24 @@ const statOf = (p: string): { size: number; mtime: number; mode: number } | null
  * So it runs only when the caller asked for a clean slate (reset-data or
  * pristine); a plain `reuse` bind stays fast and keeps its droppings.
  */
+/**
+ * Remove directories left empty by a deletion, up to (never including) the env
+ * tree root. A rename that moves a file out of a directory otherwise leaves the
+ * empty directory behind forever, and tools that glob directories see a layout
+ * the worktree no longer has.
+ */
+function pruneEmptyParents(envTree: string, removed: string): void {
+  let dir = dirname(removed);
+  while (dir.startsWith(envTree) && dir !== envTree) {
+    try {
+      rmdirSync(dir); // throws ENOTEMPTY unless it is genuinely empty
+    } catch {
+      return;
+    }
+    dir = dirname(dir);
+  }
+}
+
 export function syncIntoEnv(
   stackRoot: string,
   envTree: string,
@@ -161,13 +179,21 @@ export function syncIntoEnv(
   const next: SyncCache = {};
 
   let copied = 0;
+  const vanished = new Set<string>();
   for (const rel of files) {
     // git ls-files can't emit ../ but the sync.include path can — belt-and-suspenders
     // so neither the copy nor the deletion-mirror below can ever leave envTree.
     const dst = safeJoin(envTree, rel, 'synced file');
     const src = join(stackRoot, rel);
     const cached = prev[rel];
-    const srcStat = statOf(src)!;
+    // A worktree is LIVE: a branch switch or a build can delete a file between
+    // enumeration and this read. Asserting non-null crashed the bind with an
+    // unclassified TypeError instead of simply syncing what is there.
+    const srcStat = statOf(src);
+    if (!srcStat) {
+      vanished.add(rel);
+      continue;
+    }
 
     // Source hash: stat-gated.
     const trustSrcStat =
@@ -175,7 +201,11 @@ export function syncIntoEnv(
       cached.srcSize === srcStat.size &&
       cached.srcMtime === srcStat.mtime &&
       cached.srcMtime < racyFrom; // strictly older than the last write: safe
-    const srcHash = trustSrcStat ? cached.hash : fileHash(src)!;
+    const srcHash = trustSrcStat ? cached.hash : fileHash(src);
+    if (srcHash === null) {
+      vanished.add(rel); // disappeared between the stat and the hash
+      continue;
+    }
 
     // Env-side hash: stat-gated too (this is the reset guarantee — a mutated
     // tracked file in the env has a drifted stat or hash and gets overwritten).
@@ -228,6 +258,7 @@ export function syncIntoEnv(
     }
     if (existsSync(victim)) {
       rmSync(victim, { force: true });
+      pruneEmptyParents(envTree, victim);
       deleted++;
     }
   }
@@ -241,7 +272,9 @@ export function syncIntoEnv(
     for (const rel of walkAll(envTree)) {
       if (next[rel] || rel === CACHE_FILE || matchesAny(rel, protectedPatterns)) continue;
       try {
-        rmSync(safeJoin(envTree, rel, 'env dropping'), { force: true });
+        const target = safeJoin(envTree, rel, 'env dropping');
+        rmSync(target, { force: true });
+        pruneEmptyParents(envTree, target);
         deleted++;
       } catch {
         /* outside the tree or unreadable — leave it */
@@ -249,10 +282,16 @@ export function syncIntoEnv(
     }
   }
 
-  writeFileSync(cachePath(envTree), JSON.stringify({ syncedAt: Date.now(), entries: next } satisfies CacheFile));
+  // Atomic: a torn cache file silently disables deletion mirroring on the next
+  // bind (loadCache swallows the parse error and returns empty), so stale files
+  // would linger with no signal at all.
+  const tmp = `${cachePath(envTree)}.tmp`;
+  writeFileSync(tmp, JSON.stringify({ syncedAt: Date.now(), entries: next } satisfies CacheFile));
+  renameSync(tmp, cachePath(envTree));
 
-  const sourceHash = sha256(files.map((f) => `${f}:${next[f]!.hash}`).join('\n'));
-  return { copied, deleted, files, sourceHash };
+  const present = files.filter((f) => !vanished.has(f));
+  const sourceHash = sha256(present.map((f) => `${f}:${next[f]!.hash}`).join('\n'));
+  return { copied, deleted, files: present, sourceHash };
 }
 
 /**

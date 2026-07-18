@@ -15,7 +15,7 @@ marked as they are resolved or refuted.
 | 2 | high | bug | ~~CLI hangs forever if the daemon dies mid-request; the 15-min RPC timeout is inert~~ **FIXED** | `src/cli/client.ts:65` |
 | 3 | high | bug | ~~Daemon-unreachable and all client-side crashes exit 2 (env-error) instead of 3 (infra-error)~~ **FIXED** | `src/cli/index.ts:320` |
 | 4 | high | bug | ~~Teardown runs outside the env lock; exec/token/check never re-check 'recycling'~~ **FIXED** | `src/daemon/engine.ts:920` |
-| 5 | high | bug | Pristine wipe destroys tree/data before journal invalidation; crash leaves fingerprints asserting state that no longer exists | `src/daemon/engine.ts:350` |
+| 5 | high | bug | ~~Pristine wipe destroys tree/data before journal invalidation; crash leaves fingerprints asserting state that no longer exists~~ **FIXED** | `src/daemon/engine.ts:350` |
 | 6 | high | bug | ~~macOS recovery reap signals unverifiable pids — pid reuse kills innocent process groups~~ **FIXED** (`1dd7144`) | `src/daemon/supervisor.ts:244` |
 | 7 | high | bug | ~~macOS group-liveness fallback checks only the leader~~ **FIXED** (`kill(-pgid,0)`, `1dd7144`) | `src/core/procscan.ts:89` |
 | 8 | high | bug | ~~macOS CI 'pool at capacity (1/1)' is deterministic: poolMaxHeuristic=1 on 3-core/7GB arm runners plus run's ephemeral holder~~ **FIXED** (fail-fast diagnosis + CI pin; heuristic floor left as an owner decision) | `src/core/policy.ts:44` |
@@ -60,9 +60,9 @@ marked as they are resolved or refuted.
 | 47 | medium | bug | Adapter never validates required args; missing cwd silently falls back to the daemon's own cwd | `src/daemon/index.ts:22` |
 | 48 | medium | shortcoming | No holder identity over MCP: concurrent agents on one worktree silently share and clobber one lease | `src/mcp/index.ts:22` |
 | 49 | medium | shortcoming | After daemon restart a leased 'warm' env yields misleading work-errors from token/exec with no recovery hint | `src/daemon/engine.ts:775` |
-| 50 | medium | bug | Recorded env ports are never reserved — a warm env's port can be handed to a second env or lost to any process | `src/daemon/engine.ts:240` |
-| 51 | medium | bug | truncateLogs reads whole file as one utf8 string — logs past ~512 MiB become permanently untrimmable | `src/core/retention.ts:53` |
-| 52 | medium | bug | env.ports is fixed at createEnv — a manifest that adds a service port permanently breaks existing envs | `src/daemon/engine.ts:446` |
+| 50 | medium | bug | ~~Recorded env ports are never reserved — a warm env's port can be handed to a second env or lost to any process~~ **FIXED** | `src/daemon/engine.ts:240` |
+| 51 | medium | bug | ~~truncateLogs reads whole file as one utf8 string — logs past ~512 MiB become permanently untrimmable~~ **FIXED** | `src/core/retention.ts:53` |
+| 52 | medium | bug | ~~env.ports is fixed at createEnv — a manifest that adds a service port permanently breaks existing envs~~ **FIXED** | `src/daemon/engine.ts:446` |
 | 53 | medium | bug | ~~A service flapping to degraded during a later service's boot is clobbered back to hot~~ **FIXED** | `/home/christian/factory/firstmate/projects/backlot/src/daemon/engine.ts:488` |
 | 54 | medium | bug | ~~Runtime teardown and bind ignore journal-recorded survivor pids; fresh-supervisor stopAll is a silent no-op~~ **FIXED** | `/home/christian/factory/firstmate/projects/backlot/src/daemon/engine.ts:922` |
 | 55 | medium | bug | Fast-path saveEnv clobbers concurrent updateServicePids writes with stale pids | `/home/christian/factory/firstmate/projects/backlot/src/daemon/engine.ts:392` |
@@ -74,7 +74,7 @@ marked as they are resolved or refuted.
 | 61 | medium | bug | ~~File mode changes (chmod +x) never propagate into the env tree~~ **FIXED** | `src/core/sync.ts:128` |
 | 62 | medium | shortcoming | changedOutputs reports worktree-side edits as env changes; pull then clobbers newer worktree state | `src/core/sync.ts:162` |
 | 63 | medium | shortcoming | Submodule and nested-repo contents are silently absent from the env tree | `src/core/sync.ts:47` |
-| 64 | medium | bug | Pristine wipes tree and ledger on disk but persists the journal only at bind end | `src/daemon/engine.ts:346` |
+| 64 | medium | bug | ~~Pristine wipes tree and ledger on disk but persists the journal only at bind end~~ **FIXED** | `src/daemon/engine.ts:346` |
 | 65 | medium | bug | SIGTERM-ignorer recycle test lacks the procScan guard and deterministically fails on the macOS CI leg | `tests/orphan-reclaim.test.ts:173` |
 | 66 | medium | shortcoming | Issue-#5 suite silently reports green on macOS: bare `return` inside it() instead of skip | `tests/orphan-reclaim.test.ts:156` |
 | 67 | medium | shortcoming | Hung-check timeout test asserts verdict text, never the process table — group-kill regression and grandchild leak undetectable | `tests/ops.test.ts:61` |
@@ -100,10 +100,10 @@ marked as they are resolved or refuted.
 | 87 | low | shortcoming | ~~Restart budget never resets after stable operation — three lifetime crashes degrade a long-lived env~~ **FIXED** | `/home/christian/factory/firstmate/projects/backlot/src/daemon/supervisor.ts:127` |
 | 88 | low | shortcoming | A daemonizing service is respawned as duplicates and can escape both group kill and tag reclaim | `/home/christian/factory/firstmate/projects/backlot/src/daemon/supervisor.ts:122` |
 | 89 | low | shortcoming | ~~Unix socket is created with umask-derived permissions and only chmodded after it is already accepting connections~~ **FIXED** | `src/daemon/index.ts:180` |
-| 90 | low | bug | Concurrent worktree mutation during sync crashes with an unclassified TypeError | `src/core/sync.ts:109` |
-| 91 | low | bug | --watch ignore filter swallows .github/, .gitignore, and .gitlab-ci.yml edits | `src/daemon/engine.ts:512` |
-| 92 | low | shortcoming | Sync cache written non-atomically inside the mutable env tree; loss disables deletion mirroring | `src/core/sync.ts:152` |
-| 93 | low | shortcoming | Deletion mirror leaves empty directories behind after renames/deletes | `src/core/sync.ts:147` |
+| 90 | low | bug | ~~Concurrent worktree mutation during sync crashes with an unclassified TypeError~~ **FIXED** | `src/core/sync.ts:109` |
+| 91 | low | bug | ~~--watch ignore filter swallows .github/, .gitignore, and .gitlab-ci.yml edits~~ **FIXED** | `src/daemon/engine.ts:512` |
+| 92 | low | shortcoming | ~~Sync cache written non-atomically inside the mutable env tree; loss disables deletion mirroring~~ **FIXED** | `src/core/sync.ts:152` |
+| 93 | low | shortcoming | ~~Deletion mirror leaves empty directories behind after renames/deletes~~ **FIXED** | `src/core/sync.ts:147` |
 | 94 | low | shortcoming | Stale-job 'recovery' test asserts on the Journal method, not on daemon recovery invoking it | `tests/concurrency-fixes.test.ts:150` |
 | 95 | low | bug | Exit-code failure-message annotations interpolate properties that don't exist — diagnostics are always empty | `tests/hygiene.test.ts:89` |
 | 96 | low | shortcoming | 'Machine-wide' appliance start lock only tested with two callers in one process | `tests/appliances.test.ts:151` |
