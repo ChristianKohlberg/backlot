@@ -21,7 +21,13 @@ import type { ApplianceSpec } from '../core/manifest.js';
 const PROBE_TIMEOUT_MS = 3000;
 const START_POLL_MS = 500;
 /** A start lock older than this is a crashed starter, not a live one. */
+/**
+ * A start lock is stale once nobody could still be legitimately holding it.
+ * A fixed 5 minutes was WRONG for an appliance declaring a longer timeout: a
+ * second caller stole the lock mid-start and raced the first one's container.
+ */
 const LOCK_STALE_MS = 5 * 60 * 1000;
+const lockStaleMs = (timeoutS?: number): number => Math.max(LOCK_STALE_MS, (timeoutS ?? 0) * 1000 + 60_000);
 
 export function probeTcp(target: string, timeoutMs = PROBE_TIMEOUT_MS): Promise<boolean> {
   const [host, portStr] = target.split(':');
@@ -66,14 +72,14 @@ function lockDir(target: string): string {
   return join(dir, `${target.replace(/[^A-Za-z0-9._-]/g, '_')}-${sha256(target).slice(0, 8)}.lock`);
 }
 
-function acquireLock(target: string): boolean {
+function acquireLock(target: string, timeoutS?: number): boolean {
   const lock = lockDir(target);
   try {
     mkdirSync(lock);
     return true;
   } catch {
     try {
-      if (now() - statSync(lock).mtimeMs > LOCK_STALE_MS) {
+      if (now() - statSync(lock).mtimeMs > lockStaleMs(timeoutS)) {
         rmdirSync(lock);
         mkdirSync(lock);
         return true;
@@ -128,7 +134,7 @@ export async function ensureAppliance(
   }
   const timeoutMs = (spec.timeout ?? 60) * 1000;
   const deadline = now() + timeoutMs;
-  if (!acquireLock(spec.probe)) {
+  if (!acquireLock(spec.probe, spec.timeout)) {
     // Someone else is starting it right now; wait for their result.
     say(`appliance '${name}' is being started by another consumer — waiting`);
     if (await awaitUp(name, spec, root, deadline)) return 'adopted';

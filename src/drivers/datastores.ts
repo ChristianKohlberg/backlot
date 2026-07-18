@@ -288,7 +288,16 @@ class CommandDs implements DsDriver {
     return sha256(this.bakeKey ? `${base}\n@bake:${this.bakeKey}` : base);
   }
   private templateNs(preset: string): string {
-    return `backlot_tpl_${this.stackId}_${preset}_${this.contentKey().slice(0, 8)}`.replace(/[^A-Za-z0-9_]/g, '_');
+    const hash = this.contentKey().slice(0, 8);
+    const raw = `backlot_tpl_${this.stackId}_${preset}_${hash}`.replace(/[^A-Za-z0-9_]/g, '_');
+    // Postgres truncates identifiers at 63 bytes, and the DISAMBIGUATING hash
+    // is at the end — so a long stack id silently cut it off and two different
+    // templates collapsed onto one database. Trim the stack/preset middle
+    // instead, and always keep the hash.
+    const LIMIT = 63;
+    if (raw.length <= LIMIT) return raw;
+    const suffix = `_${hash}`;
+    return raw.slice(0, LIMIT - suffix.length) + suffix;
   }
   private bakedMarker(preset: string): string {
     const dir = join(templatesRoot(), this.stackId);
@@ -301,7 +310,12 @@ class CommandDs implements DsDriver {
     if (this.spec.ephemeral) {
       // Ephemeral (redis-class): no presets, no templates — reset = the drop:
       // command as a flush; create (optional) runs only on first bind.
-      if (force && exists && this.spec.drop) await shQuiet(template(this.spec.drop, { ns: nsE }), h.envTree);
+      if (force && exists && this.spec.drop) {
+        // For an ephemeral store the drop command IS the reset. Swallowing its
+        // failure handed the caller an environment that reported reset-data
+        // hygiene while still holding the previous lease's keys.
+        await sh(template(this.spec.drop, { ns: nsE }), h.envTree, `flush failed for ephemeral '${this.name}' — the store was NOT reset`);
+      }
       if (!exists && this.spec.create) {
         await sh(template(this.spec.create, { ns: nsE, preset }), h.envTree, `create failed for ephemeral '${this.name}'`);
       }

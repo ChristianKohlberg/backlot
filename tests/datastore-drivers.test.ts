@@ -224,3 +224,45 @@ describe('baked template markers self-heal when the server loses the template', 
     await expect(ds.ensure(h, 'dev', false, false)).rejects.toThrow(/template restore failed/);
   }, 30_000);
 });
+
+describe('template identifiers survive Postgres truncation', () => {
+  it('keeps the disambiguating hash for a long stack id', () => {
+    const spec = { driver: 'postgres', url: 'postgres://h/{{ns}}', create: 'echo a', template_restore: 'true', drop: 'true' } as never;
+    const longStack = 'a-really-quite-long-monorepo-stack-identifier-that-goes-on';
+    const a = makeDatastore('app', spec, longStack) as unknown as { templateNs?: (p: string) => string };
+    // templateNs is private; drive it through the public surface instead by
+    // comparing two datastores whose ONLY difference is the create command,
+    // which is what the content hash encodes.
+    const one = makeDatastore('app', { ...(spec as object), create: 'echo one' } as never, longStack);
+    const two = makeDatastore('app', { ...(spec as object), create: 'echo two' } as never, longStack);
+    void a;
+
+    // Both build a template name from stackId + preset + a content hash. With
+    // the hash at the END, Postgres's 63-char truncation silently removed it
+    // and two different templates collapsed onto one database.
+    const nsOne = (one as unknown as { templateNs: (p: string) => string })['templateNs']?.call(one, 'dev');
+    const nsTwo = (two as unknown as { templateNs: (p: string) => string })['templateNs']?.call(two, 'dev');
+    expect(nsOne).toBeDefined();
+    expect(nsOne!.length).toBeLessThanOrEqual(63);
+    expect(nsTwo!.length).toBeLessThanOrEqual(63);
+    expect(nsOne).not.toBe(nsTwo);
+  });
+});
+
+describe('an ephemeral flush failure is reported, not swallowed', () => {
+  it('fails the reset instead of claiming a store was cleared', async () => {
+    process.env.BACKLOT_STATE_DIR = mk('backlot-ds-eph-');
+    const h = handle('eph-e1');
+    const ds = makeDatastore(
+      'cache',
+      { driver: 'redis', url: 'redis://h/{{ns}}', ephemeral: true, create: 'true', drop: 'exit 9' } as never,
+      'stk-eph',
+    );
+    await ds.ensure(h, 'dev', false, false); // first bind: create only
+
+    // force+exists is the reset-data path. The drop command IS the reset here,
+    // so swallowing its failure handed back an environment that reported clean
+    // hygiene while still holding the previous lease's keys.
+    await expect(ds.ensure(h, 'dev', true, true)).rejects.toThrow(/NOT reset|flush failed/);
+  }, 30_000);
+});

@@ -48,17 +48,17 @@ marked as they are resolved or refuted.
 | 35 | medium | bug | fail_streak migration swallows every SQLite error as 'column already exists'; journal is opened pre-election with no busy_timeout | `src/core/journal.ts:90` |
 | 36 | medium | bug | Case-only rename deletes the file from the env tree on macOS's case-insensitive APFS | `src/core/sync.ts:139` |
 | 37 | medium | shortcoming | probeFree misses wildcard listeners on macOS, so the 'port occupied by a foreign process' guard never fires there | `src/core/ports.ts:3` |
-| 38 | medium | bug | Appliance start lock goes 'stale' at a fixed 5 min while spec.timeout can be larger | `src/drivers/appliances.ts:24` |
+| 38 | medium | bug | ~~Appliance start lock goes 'stale' at a fixed 5 min while spec.timeout can be larger~~ **FIXED** | `src/drivers/appliances.ts:24` |
 | 39 | medium | bug | ready: gate is skipped when the appliance already answers TCP (adopt path) | `src/drivers/appliances.ts:114` |
-| 40 | medium | bug | Ephemeral reset flush failures are silently swallowed, breaking reset-data hygiene | `src/drivers/datastores.ts:267` |
+| 40 | medium | bug | ~~Ephemeral reset flush failures are silently swallowed, breaking reset-data hygiene~~ **FIXED** | `src/drivers/datastores.ts:267` |
 | 41 | medium | shortcoming | Server-side env namespaces leak unrecoverably when drop fails at teardown | `src/drivers/datastores.ts:301` |
-| 42 | medium | bug | templateNs can exceed Postgres's 63-char identifier limit, truncating the disambiguating hash | `src/drivers/datastores.ts:254` |
+| 42 | medium | bug | ~~templateNs can exceed Postgres's 63-char identifier limit, truncating the disambiguating hash~~ **FIXED** | `src/drivers/datastores.ts:254` |
 | 43 | medium | bug | 'TTL refreshed by any CLI touch' is false — ctx/exec/logs/token/pull never refresh the lease | `src/daemon/engine.ts:741` |
 | 44 | medium | bug | ~~Bind reset never cleans env-side droppings — stale files persist across bindings and pollute later verdicts' artifacts~~ **FIXED** (gated to reset-data/pristine) | `src/core/sync.ts:139` |
 | 45 | medium | shortcoming | Synchronous sync/hash/copy and execFileSync git calls serialize the whole daemon — 'different environments bind in parallel' only partially holds | `src/core/sync.ts:95` |
 | 46 | medium | shortcoming | Decision 0016 (Accepted) is unimplemented — no states:/inputs:, per-check state:, --state, or snapshot/restore | `src/core/manifest.ts:54` |
-| 47 | medium | bug | Adapter never validates required args; missing cwd silently falls back to the daemon's own cwd | `src/daemon/index.ts:22` |
-| 48 | medium | shortcoming | No holder identity over MCP: concurrent agents on one worktree silently share and clobber one lease | `src/mcp/index.ts:22` |
+| 47 | medium | bug | ~~Adapter never validates required args; missing cwd silently falls back to the daemon's own cwd~~ **FIXED** | `src/daemon/index.ts:22` |
+| 48 | medium | shortcoming | ~~No holder identity over MCP: concurrent agents on one worktree silently share and clobber one lease~~ **FIXED** | `src/mcp/index.ts:22` |
 | 49 | medium | shortcoming | After daemon restart a leased 'warm' env yields misleading work-errors from token/exec with no recovery hint | `src/daemon/engine.ts:775` |
 | 50 | medium | bug | ~~Recorded env ports are never reserved — a warm env's port can be handed to a second env or lost to any process~~ **FIXED** | `src/daemon/engine.ts:240` |
 | 51 | medium | bug | ~~truncateLogs reads whole file as one utf8 string — logs past ~512 MiB become permanently untrimmable~~ **FIXED** | `src/core/retention.ts:53` |
@@ -93,7 +93,7 @@ marked as they are resolved or refuted.
 | 80 | low | shortcoming | Promised but not implemented: the entire substrate seam (remote story), plus dependent 0.3 features | `src/drivers/types.ts:1` |
 | 81 | low | shortcoming | Docs describe template keying the code has already superseded — architecture §7/driver-spec vs content-derived bake keys | `docs/architecture.md:184` |
 | 82 | low | bug | ~~RPC client's 15-minute timeout is a dead no-op, so an MCP tool call can hang forever~~ **FIXED** | `src/cli/client.ts:65` |
-| 83 | low | bug | serverInfo.version hardcoded at 0.4.0 while the package is 0.5.0 | `src/mcp/index.ts:125` |
+| 83 | low | bug | ~~serverInfo.version hardcoded at 0.4.0 while the package is 0.5.0~~ **FIXED** | `src/mcp/index.ts:125` |
 | 84 | low | shortcoming | Port probe/allocation pinned to 127.0.0.1 while readiness and consumer URLs use 'localhost' | `src/core/ports.ts:7` |
 | 85 | low | shortcoming | Retention sweep never covers env trees/data — abandoned stacks' environments persist forever | `src/core/retention.ts:113` |
 | 86 | low | bug | ~~stopAll skips the group check entirely when the wrapper already exited (restart-pending window)~~ **FIXED** | `/home/christian/factory/firstmate/projects/backlot/src/daemon/supervisor.ts:194` |
