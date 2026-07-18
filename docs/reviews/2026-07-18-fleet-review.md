@@ -12,8 +12,8 @@ marked as they are resolved or refuted.
 | # | sev | kind | finding | location |
 |---|-----|------|---------|----------|
 | 1 | critical | bug | ~~Unconditional socket unlink defeats the daemon singleton election~~ **FIXED** (lock-file election, `src/daemon/election.ts`) | `src/daemon/index.ts:171` |
-| 2 | high | bug | CLI hangs forever if the daemon dies mid-request; the 15-min RPC timeout is inert | `src/cli/client.ts:65` |
-| 3 | high | bug | Daemon-unreachable and all client-side crashes exit 2 (env-error) instead of 3 (infra-error) | `src/cli/index.ts:320` |
+| 2 | high | bug | ~~CLI hangs forever if the daemon dies mid-request; the 15-min RPC timeout is inert~~ **FIXED** | `src/cli/client.ts:65` |
+| 3 | high | bug | ~~Daemon-unreachable and all client-side crashes exit 2 (env-error) instead of 3 (infra-error)~~ **FIXED** | `src/cli/index.ts:320` |
 | 4 | high | bug | Teardown runs outside the env lock; exec/token/check never re-check 'recycling' | `src/daemon/engine.ts:920` |
 | 5 | high | bug | Pristine wipe destroys tree/data before journal invalidation; crash leaves fingerprints asserting state that no longer exists | `src/daemon/engine.ts:350` |
 | 6 | high | bug | ~~macOS recovery reap signals unverifiable pids — pid reuse kills innocent process groups~~ **FIXED** (`1dd7144`) | `src/daemon/supervisor.ts:244` |
@@ -37,9 +37,9 @@ marked as they are resolved or refuted.
 | 24 | high | bug | Bind-time reset never cleans env-side untracked files, violating the documented contract | `src/core/sync.ts:139` |
 | 25 | high | bug | Parallel-bind test passes even against a fully serialized daemon — its core assertion is vacuous | `tests/concurrency.test.ts:85` |
 | 26 | high | shortcoming | Pid-reuse refusal is only unit-tested on sameProcess; the actual reap path is untested and appears to kill bystanders | `tests/orphan-reclaim.test.ts:136` |
-| 27 | medium | bug | Singleton election TOCTOU: stale-socket rmSync can unlink the winner's live socket, yielding two daemons | `src/daemon/index.ts:171` |
-| 28 | medium | bug | exec re-joins argv with spaces, silently corrupting any command argument containing whitespace | `src/cli/index.ts:214` |
-| 29 | medium | bug | run --pull discards the pull RPC's result: a failed pull exits 0 with no diagnostic | `src/cli/index.ts:186` |
+| 27 | medium | bug | ~~Singleton election TOCTOU: stale-socket rmSync can unlink the winner's live socket, yielding two daemons~~ **FIXED** | `src/daemon/index.ts:171` |
+| 28 | medium | bug | ~~exec re-joins argv with spaces, silently corrupting any command argument containing whitespace~~ **FIXED** | `src/cli/index.ts:214` |
+| 29 | medium | bug | ~~run --pull discards the pull RPC's result: a failed pull exits 0 with no diagnostic~~ **FIXED** | `src/cli/index.ts:186` |
 | 30 | medium | shortcoming | Daemon defaults every unclassified failure — including its own internal bugs — to env-error | `src/daemon/index.ts:148` |
 | 31 | medium | bug | bindAndStart epilogue clobbers a concurrent 'degraded' write (lost update) | `src/daemon/engine.ts:488` |
 | 32 | medium | bug | Sweeper starts on a timer and races recovery; stale-snapshot saveEnv resurrects a deleted env | `src/daemon/index.ts:194` |
@@ -80,8 +80,8 @@ marked as they are resolved or refuted.
 | 67 | medium | shortcoming | Hung-check timeout test asserts verdict text, never the process table — group-kill regression and grandchild leak undetectable | `tests/ops.test.ts:61` |
 | 68 | medium | bug | helpers.ts stop()/waitHttp cannot see a signal-killed child: exitCode stays null, stop() hangs forever | `tests/helpers.ts:58` |
 | 69 | medium | shortcoming | helpers.ts claims to 'play the engine' but diverges from supervisor semantics: no sh -c, no detached group, bare kill | `tests/helpers.ts:45` |
-| 70 | low | bug | Non-numeric --lines yields NaN and silently returns the entire log instead of a usage error | `src/cli/index.ts:237` |
-| 71 | low | shortcoming | Detached-run polling never maps a failed verdict to exit 1, unlike synchronous run | `src/cli/index.ts:196` |
+| 70 | low | bug | ~~Non-numeric --lines yields NaN and silently returns the entire log instead of a usage error~~ **FIXED** | `src/cli/index.ts:237` |
+| 71 | low | shortcoming | ~~Detached-run polling never maps a failed verdict to exit 1, unlike synchronous run~~ **FIXED** | `src/cli/index.ts:196` |
 | 72 | low | bug | Idle-quiesce acts on a stale idleness check — claimForTeardown never re-validates lastUsedAt | `src/daemon/engine.ts:1014` |
 | 73 | low | shortcoming | Capacity waiters have no fairness — a waiter can starve and fail while younger waiters succeed | `src/daemon/engine.ts:279` |
 | 74 | low | bug | Unhandled rejection from fire-and-forget sweep kills the daemon on any journal/FS write failure | `src/daemon/index.ts:194` |
@@ -92,7 +92,7 @@ marked as they are resolved or refuted.
 | 79 | low | bug | dropBakedTemplates replays drop commands with the wrong cwd, silently defeating the new leak fix | `src/drivers/datastores.ts:308` |
 | 80 | low | shortcoming | Promised but not implemented: the entire substrate seam (remote story), plus dependent 0.3 features | `src/drivers/types.ts:1` |
 | 81 | low | shortcoming | Docs describe template keying the code has already superseded — architecture §7/driver-spec vs content-derived bake keys | `docs/architecture.md:184` |
-| 82 | low | bug | RPC client's 15-minute timeout is a dead no-op, so an MCP tool call can hang forever | `src/cli/client.ts:65` |
+| 82 | low | bug | ~~RPC client's 15-minute timeout is a dead no-op, so an MCP tool call can hang forever~~ **FIXED** | `src/cli/client.ts:65` |
 | 83 | low | bug | serverInfo.version hardcoded at 0.4.0 while the package is 0.5.0 | `src/mcp/index.ts:125` |
 | 84 | low | shortcoming | Port probe/allocation pinned to 127.0.0.1 while readiness and consumer URLs use 'localhost' | `src/core/ports.ts:7` |
 | 85 | low | shortcoming | Retention sweep never covers env trees/data — abandoned stacks' environments persist forever | `src/core/retention.ts:113` |
