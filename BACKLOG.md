@@ -40,6 +40,18 @@ real product gap someone reading the docs would expect to work.
   macOS, so the same stack.yaml can behave differently on the two legs backlot
   tests. Either document sh-portable-only, or pick a shell explicitly.
 
+- [ ] **P2 · macOS: hello-python never passes its readiness probe.** The last
+  survivor of the four macOS failures this review inherited. The service starts
+  and logs `hello-python listening on :<port>`, but `ready: { http: /health }`
+  times out after 30s, so the bind fails with an env-error. Not reproducible on
+  Linux, and not reproducible locally against an IPv4-only Node service (the
+  readiness probe now tries `127.0.0.1` as well as the advertised `localhost`,
+  which was the obvious dual-stack explanation and did NOT fix it). Needs
+  someone on a real Mac, or a debug CI run that curls the port from the runner,
+  to find out whether the socket is reachable at all. Tracked rather than
+  quarantined — an `it.skipIf` here would hide the platform gap the macOS leg
+  exists to expose.
+
 ## CI — macOS-runner failures (2026-07-11) — DIAGNOSED 2026-07-18
 
 - [x] **P2 · macOS runners: `run`-flow tests die on "pool at capacity (1/1) —
