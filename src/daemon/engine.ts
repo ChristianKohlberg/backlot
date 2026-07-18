@@ -17,7 +17,7 @@ import { BrokerError, template, templateEnv, now, shortId, matchesAny } from '..
 import { makeDatastore, type DsHandle } from '../drivers/datastores.js';
 import { ensureAppliance, stopAppliance, probeTcp } from '../drivers/appliances.js';
 import { EnvSupervisor, killGroupVerified, reapPids } from './supervisor.js';
-import { isAlive, procScanSupported, sameProcess, scanTagged } from '../core/procscan.js';
+import { isAlive, procScanSupported, sameProcess, scanTagged, serviceTag } from '../core/procscan.js';
 import { policy } from '../core/policy.js';
 import { retentionSweep } from '../core/retention.js';
 import { logEvent, recentEvents } from '../core/events.js';
@@ -49,6 +49,11 @@ export interface UpOptions {
  * Run a check/exec command as a PROCESS GROUP with a hard timeout — killing
  * only the `sh` wrapper would orphan grandchildren (a hung Playwright would
  * hold the environment busy forever).
+ */
+/**
+ * Checks and exec run detached too, so they can outlive the daemon exactly as
+ * services can. They carry the same tag, which is what lets `pool gc` find and
+ * reclaim a hung check's group after an ungraceful exit.
  */
 function runGroupCmd(
   cmd: string,
@@ -688,7 +693,7 @@ export class Engine {
         return runGroupCmd(
           template(check.run, ctx),
           check.cwd ? join(dirs.tree, check.cwd) : dirs.tree,
-          { ...process.env, ...templateEnv(check.env, ctx) },
+          { ...process.env, ...templateEnv(check.env, ctx), ...serviceTag(env.id, `check:${opts.check}`, stateRoot()) },
           timeoutS,
         );
       }).finally(() => clearInterval(beat));
@@ -1007,8 +1012,23 @@ export class Engine {
   /** Slow teardown of an already-claimed ('recycling') env. */
   private async teardownClaimed(env: EnvRow): Promise<void> {
     this.stopWatch(env.id);
-    await this.supervisor(env).stopAll();
+    const survivors = await this.supervisor(env).stopAll();
     this.supervisors.delete(env.id);
+    // After a daemon restart the in-memory supervisor is EMPTY, so stopAll is a
+    // no-op and only the journal knows what is still running. Reap those too,
+    // or teardown deletes the row and the processes become unattributable
+    // except by tag.
+    const recorded = this.journal.getEnv(env.id)?.servicePids ?? env.servicePids;
+    const stillRecorded = Object.keys(recorded).length > 0 ? await reapPids(recorded) : {};
+    const unresolved = { ...survivors, ...stillRecorded };
+    if (Object.keys(unresolved).length > 0) {
+      logEvent({
+        level: 'warn',
+        kind: 'teardown',
+        envId: env.id,
+        detail: `${Object.keys(unresolved).length} service process(es) outlived teardown — 'backlot pool gc' reclaims them by tag`,
+      });
+    }
     // Drop server-side namespaces too (best effort — the manifest may be gone).
     try {
       const stack = loadStack(env.stackRoot);

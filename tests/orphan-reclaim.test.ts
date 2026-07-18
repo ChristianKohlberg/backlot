@@ -351,3 +351,66 @@ describe('journal compatibility', () => {
     expect(back.servicePids.web!.startTime).toBeUndefined();
   });
 });
+
+describe('process identity is available on every platform', () => {
+  it('pins a live pid and rejects a wrong recorded value, /proc or not', () => {
+    // The Linux path reads /proc; elsewhere it shells out to `ps -o lstart=`.
+    // Either way the contract is the same, and it is the contract the reaper
+    // depends on to avoid signalling a recycled pid.
+    const st = startTime(process.pid);
+    expect(st).toBeDefined();
+    expect(sameProcess(process.pid, st)).toBe(true);
+    expect(sameProcess(process.pid, (st ?? 0) + 10_000)).toBe(false);
+  });
+
+  it('reports a group as alive while any member survives, not just the leader', async () => {
+    const p = spawn('sh', ['-c', 'sleep 5'], { detached: true, stdio: 'ignore' });
+    p.unref();
+    await settle(300);
+    expect(groupAlive(p.pid!)).toBe(true);
+    process.kill(-p.pid!, 'SIGKILL');
+    await waitFor(() => !groupAlive(p.pid!), 5000);
+    expect(groupAlive(p.pid!)).toBe(false);
+  }, 30_000);
+});
+
+describe('supervisor restart budget', () => {
+  it('treats a crash after stable operation as fresh, not part of a flap', async () => {
+    if (!procScanSupported()) return;
+    // A 400ms stability threshold makes the reset observable: each kill below
+    // is separated by a restart plus a wait, so every crash follows a stable
+    // run and must reset the budget. Five crashes with the budget of 3 would
+    // otherwise degrade the environment.
+    const ctx = makeContext({ BACKLOT_SWEEP_MS: '400', BACKLOT_STABLE_MS: '400' });
+    contexts.push(ctx.cleanup);
+    const wt = makeWt('budget', POLITE);
+    dirs.push(wt);
+    const up = await ctx.cli(['up', '--json'], wt);
+    expect(up.exitCode).toBe(0);
+
+    // Kill the real server three times with pauses; the supervisor restarts it
+    // each time. Three crashes must not degrade an environment that has been
+    // healthy in between — the budget is for a tight loop, not a lifetime.
+    for (let i = 0; i < 5; i++) {
+      const pid = servers(ctx.stateDir)[0];
+      if (pid) {
+        try {
+          process.kill(-pid, 'SIGKILL');
+        } catch {
+          process.kill(pid, 'SIGKILL');
+        }
+      }
+      await waitFor(() => servers(ctx.stateDir).length > 0, 15_000);
+      await settle(700); // stay up past the stability threshold
+    }
+
+    const ls = await ctx.cli(['pool', 'ls', '--json'], wt);
+    const envs = ls.json?.envs as Array<{ id: string; state: string }>;
+    // A degraded env is auto-reaped by the sweeper, so it VANISHES rather than
+    // showing 'degraded' — asserting only on the state would silently miss the
+    // failure. The environment must still be here, and still healthy.
+    expect(envs.length, 'the environment was degraded and reaped').toBeGreaterThan(0);
+    expect(envs.every((e) => e.state !== 'degraded')).toBe(true);
+    expect(servers(ctx.stateDir).length, 'the service should still be supervised').toBeGreaterThan(0);
+  }, 90_000);
+});

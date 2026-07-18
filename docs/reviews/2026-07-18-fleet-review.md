@@ -31,7 +31,7 @@ marked as they are resolved or refuted.
 | 18 | high | bug | ~~freePort() has no 'error' handler — fd exhaustion (EMFILE) crashes the whole daemon~~ **FIXED** | `src/core/ports.ts:14` |
 | 19 | high | bug | ~~--watch fs.watch has no 'error' listener — async watcher error (inotify ENOSPC) kills the daemon~~ **FIXED** | `src/daemon/engine.ts:510` |
 | 20 | high | bug | killGroupVerified kills an innocent process group when a dead pid is reused by a new group leader | `/home/christian/factory/firstmate/projects/backlot/src/daemon/supervisor.ts:244` |
-| 21 | high | bug | Spawn failure during an automatic restart silently ends supervision; env stays hot and reports healthy | `/home/christian/factory/firstmate/projects/backlot/src/daemon/supervisor.ts:119` |
+| 21 | high | bug | ~~Spawn failure during an automatic restart silently ends supervision; env stays hot and reports healthy~~ **FIXED** | `/home/christian/factory/firstmate/projects/backlot/src/daemon/supervisor.ts:119` |
 | 22 | high | shortcoming | Baked-template markers persist a manifest shell command and re-execute it long after the repo is gone | `src/core/retention.ts:101` |
 | 23 | high | bug | Stat-gate misses same-size edits within one mtime clock tick — stale env content, silent | `src/core/sync.ts:112` |
 | 24 | high | bug | Bind-time reset never cleans env-side untracked files, violating the documented contract | `src/core/sync.ts:139` |
@@ -64,10 +64,10 @@ marked as they are resolved or refuted.
 | 51 | medium | bug | truncateLogs reads whole file as one utf8 string — logs past ~512 MiB become permanently untrimmable | `src/core/retention.ts:53` |
 | 52 | medium | bug | env.ports is fixed at createEnv — a manifest that adds a service port permanently breaks existing envs | `src/daemon/engine.ts:446` |
 | 53 | medium | bug | ~~A service flapping to degraded during a later service's boot is clobbered back to hot~~ **FIXED** | `/home/christian/factory/firstmate/projects/backlot/src/daemon/engine.ts:488` |
-| 54 | medium | bug | Runtime teardown and bind ignore journal-recorded survivor pids; fresh-supervisor stopAll is a silent no-op | `/home/christian/factory/firstmate/projects/backlot/src/daemon/engine.ts:922` |
+| 54 | medium | bug | ~~Runtime teardown and bind ignore journal-recorded survivor pids; fresh-supervisor stopAll is a silent no-op~~ **FIXED** | `/home/christian/factory/firstmate/projects/backlot/src/daemon/engine.ts:922` |
 | 55 | medium | bug | Fast-path saveEnv clobbers concurrent updateServicePids writes with stale pids | `/home/christian/factory/firstmate/projects/backlot/src/daemon/engine.ts:392` |
-| 56 | medium | shortcoming | On non-Linux hosts, recovery kills recorded pids on bare liveness, re-opening the pid-reuse hazard | `/home/christian/factory/firstmate/projects/backlot/src/core/procscan.ts:126` |
-| 57 | medium | shortcoming | Check/exec process groups are untagged and their timeout kill is unverified | `/home/christian/factory/firstmate/projects/backlot/src/daemon/engine.ts:60` |
+| 56 | medium | shortcoming | ~~On non-Linux hosts, recovery kills recorded pids on bare liveness, re-opening the pid-reuse hazard~~ **FIXED** | `/home/christian/factory/firstmate/projects/backlot/src/core/procscan.ts:126` |
+| 57 | medium | shortcoming | ~~Check/exec process groups are untagged and their timeout kill is unverified~~ **FIXED** | `/home/christian/factory/firstmate/projects/backlot/src/daemon/engine.ts:60` |
 | 58 | medium | bug | Command-family datastore key is unsanitized and escapes templatesRoot; the sqlite guard's comment claims a sibling check that does not exist | `src/drivers/datastores.ts:259` |
 | 59 | medium | shortcoming | Service and check `cwd` from stack.yaml are joined without safeJoin, letting a process run outside its environment tree | `src/daemon/supervisor.ts:78` |
 | 60 | medium | bug | Symlinks are dereferenced or silently dropped; walkAll crashes on dangling links in bind --ref | `src/core/sync.ts:61` |
@@ -96,8 +96,8 @@ marked as they are resolved or refuted.
 | 83 | low | bug | serverInfo.version hardcoded at 0.4.0 while the package is 0.5.0 | `src/mcp/index.ts:125` |
 | 84 | low | shortcoming | Port probe/allocation pinned to 127.0.0.1 while readiness and consumer URLs use 'localhost' | `src/core/ports.ts:7` |
 | 85 | low | shortcoming | Retention sweep never covers env trees/data — abandoned stacks' environments persist forever | `src/core/retention.ts:113` |
-| 86 | low | bug | stopAll skips the group check entirely when the wrapper already exited (restart-pending window) | `/home/christian/factory/firstmate/projects/backlot/src/daemon/supervisor.ts:194` |
-| 87 | low | shortcoming | Restart budget never resets after stable operation — three lifetime crashes degrade a long-lived env | `/home/christian/factory/firstmate/projects/backlot/src/daemon/supervisor.ts:127` |
+| 86 | low | bug | ~~stopAll skips the group check entirely when the wrapper already exited (restart-pending window)~~ **FIXED** | `/home/christian/factory/firstmate/projects/backlot/src/daemon/supervisor.ts:194` |
+| 87 | low | shortcoming | ~~Restart budget never resets after stable operation — three lifetime crashes degrade a long-lived env~~ **FIXED** | `/home/christian/factory/firstmate/projects/backlot/src/daemon/supervisor.ts:127` |
 | 88 | low | shortcoming | A daemonizing service is respawned as duplicates and can escape both group kill and tag reclaim | `/home/christian/factory/firstmate/projects/backlot/src/daemon/supervisor.ts:122` |
 | 89 | low | shortcoming | Unix socket is created with umask-derived permissions and only chmodded after it is already accepting connections | `src/daemon/index.ts:180` |
 | 90 | low | bug | Concurrent worktree mutation during sync crashes with an unclassified TypeError | `src/core/sync.ts:109` |

@@ -7,7 +7,7 @@
 import { spawn, execFile, type ChildProcess } from 'node:child_process';
 import { appendFileSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
-import { BrokerError } from '../core/util.js';
+import { BrokerError, now } from '../core/util.js';
 import { stateRoot } from '../core/paths.js';
 import { groupAlive, processGroup, sameProcess, serviceTag, startTime } from '../core/procscan.js';
 import type { ReadySpec, ServiceSpec } from '../core/manifest.js';
@@ -28,7 +28,14 @@ interface Running {
   restartTimer: NodeJS.Timeout | null;
   /** Kernel start time of `proc.pid`, captured at spawn (pid-reuse guard). */
   startTime?: number;
+  /** When the current process was launched — the restart budget resets after STABLE_MS. */
+  startedAt: number;
+  /** A spawn 'error' is being handled; 'exit' may or may not follow it. */
+  spawnFailed?: boolean;
 }
+
+/** Uptime past which a crash counts as fresh rather than part of a flap. */
+const STABLE_MS = (): number => Number(process.env.BACKLOT_STABLE_MS ?? 60_000);
 
 export class EnvSupervisor {
   private services = new Map<string, Running>();
@@ -76,7 +83,7 @@ export class EnvSupervisor {
   start(name: string, spec: ServiceSpec, env: Record<string, string>, watchMode: boolean): void {
     const cmd = watchMode && spec.watch_run ? spec.watch_run : spec.run;
     const cwd = spec.cwd ? join(this.envTree, spec.cwd) : this.envTree;
-    const running: Running = { proc: null as unknown as ChildProcess, buf: '', restarts: 0, expectedExit: false, restartTimer: null };
+    const running: Running = { proc: null as unknown as ChildProcess, buf: '', restarts: 0, expectedExit: false, restartTimer: null, startedAt: now() };
     const launch = () => {
       running.restartTimer = null;
       // A teardown that landed while this restart was pending: do not respawn.
@@ -99,6 +106,7 @@ export class EnvSupervisor {
         detached: true,
       });
       running.proc = proc;
+      running.startedAt = now();
       // Capture identity immediately: once the pid exits this is unreadable,
       // and an un-pinned pid is one the reaper must refuse to signal.
       running.startTime = proc.pid ? startTime(proc.pid) : undefined;
@@ -118,11 +126,33 @@ export class EnvSupervisor {
       // listener it becomes an uncaught exception that kills the whole daemon.
       proc.on('error', (err) => {
         this.note(name, `spawn error: ${err.message}`);
+        // A spawn failure emits 'error' with NO 'exit', so the restart logic
+        // below never ran: supervision simply stopped while the environment
+        // stayed 'hot' and reported healthy. Drive the same path as an exit.
+        if (running.expectedExit || running.spawnFailed) return;
+        running.spawnFailed = true;
+        this.onPidsChanged?.();
+        if (running.restarts < 3) {
+          running.restarts++;
+          this.note(name, `restarting after spawn failure (attempt ${running.restarts})`);
+          running.restartTimer = setTimeout(() => {
+            running.spawnFailed = false;
+            launch();
+          }, 500 * running.restarts);
+          running.restartTimer.unref();
+        } else {
+          this.note(name, 'spawn keeps failing — giving up (environment degraded)');
+          this.onDegraded?.(name);
+        }
       });
       proc.on('exit', (code) => {
         if (running.expectedExit) return;
         this.note(name, `exited (${code})`);
         this.onPidsChanged?.(); // the dead pid must leave the journal
+        // The budget is for FLAPPING — a tight crash loop — not for a service's
+        // whole lifetime. Without this reset, three unrelated crashes hours
+        // apart degraded a long-lived environment that was never unhealthy.
+        if (now() - running.startedAt > STABLE_MS()) running.restarts = 0;
         // Bounded restart for long-lived services (decision 0010).
         if (running.restarts < 3) {
           running.restarts++;
@@ -191,7 +221,11 @@ export class EnvSupervisor {
         clearTimeout(r.restartTimer);
         r.restartTimer = null;
       }
-      if (r.proc && r.proc.exitCode === null && r.proc.pid) {
+      // NOTE the exitCode check is deliberately absent: `sh -c` forks, so the
+      // wrapper can be gone while the real server lives on in its group. The
+      // identity check inside killGroupVerified fails safe for a dead leader, so
+      // survivors get RECORDED for tag reclaim instead of vanishing silently.
+      if (r.proc && r.proc.pid) {
         // Verify the group is actually gone rather than resolving as soon as
         // SIGKILL is *sent* — the caller goes on to delete the env root and
         // drop the pid, so a survivor here becomes an untrackable orphan.

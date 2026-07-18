@@ -15,12 +15,15 @@
  *   - "is pid N still the process I recorded?"        -> `sameProcess`
  *   - "which backlot processes has everyone lost?"    -> `scanTagged`
  *
- * Both rely on /proc, so they are Linux-only; on other platforms identity
- * degrades to a bare liveness check and orphan scanning reports unsupported.
- * That is deliberate: it is better to skip a sweep than to guess at identity
- * and signal someone else's process.
+ * Identity works on every platform: /proc where it exists, `ps -o lstart=`
+ * otherwise, so a recycled pid is never mistaken for the process we recorded.
+ * Orphan SCANNING needs to read other processes' environments and so is
+ * Linux-only; elsewhere `pool gc` reports unsupported rather than guessing.
+ * That asymmetry is deliberate — skipping a sweep is safe, signalling a
+ * stranger's process is not.
  */
 import { readFileSync, readdirSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
 
 export const ENV_TAG = 'BACKLOT_ENV_ID';
 export const SERVICE_TAG = 'BACKLOT_SERVICE';
@@ -50,7 +53,7 @@ export const procScanSupported = (): boolean => process.platform === 'linux';
  * the whole line.
  */
 export function startTime(pid: number): number | undefined {
-  if (!procScanSupported()) return undefined;
+  if (!procScanSupported()) return darwinStartTime(pid);
   try {
     const stat = readFileSync(`/proc/${pid}/stat`, 'utf8');
     const rest = stat.slice(stat.lastIndexOf(')') + 2).split(' ');
@@ -58,6 +61,33 @@ export function startTime(pid: number): number | undefined {
     return Number.isFinite(ticks) ? ticks : undefined;
   } catch {
     return undefined; // gone, or not ours to read
+  }
+}
+
+/**
+ * A portable identity for platforms without /proc.
+ *
+ * Without this, non-Linux recovery fell back to a bare liveness check, which is
+ * exactly the pid-reuse hazard the start time exists to close — and macOS is
+ * the platform backlot's primary users are on. `ps -o lstart=` reports a
+ * process's start wall-clock to the second, which is enough to distinguish a
+ * recycled pid from the process we recorded.
+ *
+ * Returns undefined if ps is unavailable or the pid is gone; callers treat an
+ * un-verifiable pid as un-signallable, so failing to read is safe.
+ */
+function darwinStartTime(pid: number): number | undefined {
+  try {
+    const out = execFileSync('ps', ['-o', 'lstart=', '-p', String(pid)], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+      timeout: 2000,
+    }).trim();
+    if (!out) return undefined;
+    const ms = Date.parse(out);
+    return Number.isFinite(ms) ? ms : undefined;
+  } catch {
+    return undefined; // gone, not ours to read, or no ps
   }
 }
 
