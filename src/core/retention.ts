@@ -6,6 +6,7 @@
 import { readdirSync, statSync, rmSync, readFileSync, writeFileSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { artifactsRoot, templatesRoot, envsRoot } from './paths.js';
+import { logEvent } from './events.js';
 import { runQuiet } from './util.js';
 import { parseBakedMarker } from '../drivers/datastores.js';
 import type { Journal } from './journal.js';
@@ -98,7 +99,13 @@ export async function pruneTemplates(p: Policy, root = templatesRoot()): Promise
       if (f.endsWith('.baked')) {
         try {
           const marker = parseBakedMarker(readFileSync(full, 'utf8'));
-          if (marker.drop) await runQuiet(marker.drop, root);
+          if (marker.drop) {
+            // This command came from a manifest that may no longer exist on
+            // disk. Re-executing it silently is the part that deserves a
+            // record, so the state dir stays auditable.
+            logEvent({ level: 'info', kind: 'retention', detail: `dropping baked template via persisted command from ${f}` });
+            await runQuiet(marker.drop, root);
+          }
         } catch {
           /* unreadable marker — still prune the file */
         }

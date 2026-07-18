@@ -13,7 +13,7 @@ import { syncIntoEnv, changedOutputs, pullOutputs } from '../core/sync.js';
 import { runUpkeep, templateBakeKeys } from '../core/upkeep.js';
 import { freePort, probeFree } from '../core/ports.js';
 import { envsRoot, artifactsRoot, stateRoot } from '../core/paths.js';
-import { BrokerError, template, templateEnv, now, shortId, matchesAny } from '../core/util.js';
+import { BrokerError, template, templateEnv, now, shortId, matchesAny, safeJoin } from '../core/util.js';
 import { makeDatastore, type DsHandle } from '../drivers/datastores.js';
 import { ensureAppliance, stopAppliance, probeTcp } from '../drivers/appliances.js';
 import { EnvSupervisor, killGroupVerified, reapPids } from './supervisor.js';
@@ -692,7 +692,7 @@ export class Engine {
         this.assertUsable(env.id);
         return runGroupCmd(
           template(check.run, ctx),
-          check.cwd ? join(dirs.tree, check.cwd) : dirs.tree,
+          check.cwd ? safeJoin(dirs.tree, check.cwd, `check '${opts.check}' cwd`) : dirs.tree,
           { ...process.env, ...templateEnv(check.env, ctx), ...serviceTag(env.id, `check:${opts.check}`, stateRoot()) },
           timeoutS,
         );

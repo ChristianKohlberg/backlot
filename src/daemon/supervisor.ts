@@ -7,7 +7,7 @@
 import { spawn, execFile, type ChildProcess } from 'node:child_process';
 import { appendFileSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
-import { BrokerError, now } from '../core/util.js';
+import { BrokerError, now, safeJoin } from '../core/util.js';
 import { stateRoot } from '../core/paths.js';
 import { groupAlive, processGroup, sameProcess, serviceTag, startTime } from '../core/procscan.js';
 import type { ReadySpec, ServiceSpec } from '../core/manifest.js';
@@ -82,7 +82,10 @@ export class EnvSupervisor {
 
   start(name: string, spec: ServiceSpec, env: Record<string, string>, watchMode: boolean): void {
     const cmd = watchMode && spec.watch_run ? spec.watch_run : spec.run;
-    const cwd = spec.cwd ? join(this.envTree, spec.cwd) : this.envTree;
+    // A repo can already run arbitrary shell here, so this is not a privilege
+    // boundary — it makes an ACCIDENT loud. `cwd: ../sibling` silently ran the
+    // service outside its environment tree, against files backlot never synced.
+    const cwd = spec.cwd ? safeJoin(this.envTree, spec.cwd, `service '${name}' cwd`) : this.envTree;
     const running: Running = { proc: null as unknown as ChildProcess, buf: '', restarts: 0, expectedExit: false, restartTimer: null, startedAt: now() };
     const launch = () => {
       running.restartTimer = null;

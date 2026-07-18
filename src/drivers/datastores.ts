@@ -373,6 +373,13 @@ class CommandDs implements DsDriver {
 // ---------------------------------------------------------------- factory
 
 export function makeDatastore(name: string, spec: DatastoreSpec, stackId: string, bakeKey?: string): DsDriver {
+  // The datastore KEY becomes part of a filename (sqlite database, .baked
+  // marker), so a key with a separator or `..` would escape the state root.
+  // Checked here for EVERY driver: the command family builds marker paths too,
+  // and only the sqlite driver used to guard this.
+  if (/[/\\]|(^|[/\\])\.\.($|[/\\])/.test(name)) {
+    throw new BrokerError('work-error', `datastore key '${name}' must not contain path separators or '..'`, 'manifest');
+  }
   switch (spec.driver) {
     case 'sqlite':
       return new SqliteDs(name, spec, stackId, bakeKey);

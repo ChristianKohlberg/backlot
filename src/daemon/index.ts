@@ -188,6 +188,11 @@ async function start(): Promise<void> {
   // live one: any daemon that could have been listening lost the lock.
   if (existsSync(sock)) rmSync(sock, { force: true }); // stale socket from a dead daemon
 
+  // Create the socket ALREADY private. The chmod below runs inside the listen
+  // callback, by which point the socket exists and can accept connections, so
+  // a permissive umask left a window where it was world-reachable. The socket
+  // has no RPC auth and exposes arbitrary-shell verbs, so the window matters.
+  process.umask(0o077);
   server.listen(sock, () => {
     ownsSocket = true;
     // The socket has no RPC auth and exposes arbitrary-shell verbs (exec/token),

@@ -32,7 +32,7 @@ marked as they are resolved or refuted.
 | 19 | high | bug | ~~--watch fs.watch has no 'error' listener — async watcher error (inotify ENOSPC) kills the daemon~~ **FIXED** | `src/daemon/engine.ts:510` |
 | 20 | high | bug | killGroupVerified kills an innocent process group when a dead pid is reused by a new group leader | `/home/christian/factory/firstmate/projects/backlot/src/daemon/supervisor.ts:244` |
 | 21 | high | bug | ~~Spawn failure during an automatic restart silently ends supervision; env stays hot and reports healthy~~ **FIXED** | `/home/christian/factory/firstmate/projects/backlot/src/daemon/supervisor.ts:119` |
-| 22 | high | shortcoming | Baked-template markers persist a manifest shell command and re-execute it long after the repo is gone | `src/core/retention.ts:101` |
+| 22 | high | shortcoming | ~~Baked-template markers persist a manifest shell command and re-execute it long after the repo is gone~~ **FIXED** | `src/core/retention.ts:101` |
 | 23 | high | bug | Stat-gate misses same-size edits within one mtime clock tick — stale env content, silent | `src/core/sync.ts:112` |
 | 24 | high | bug | Bind-time reset never cleans env-side untracked files, violating the documented contract | `src/core/sync.ts:139` |
 | 25 | high | bug | Parallel-bind test passes even against a fully serialized daemon — its core assertion is vacuous | `tests/concurrency.test.ts:85` |
@@ -68,8 +68,8 @@ marked as they are resolved or refuted.
 | 55 | medium | bug | Fast-path saveEnv clobbers concurrent updateServicePids writes with stale pids | `/home/christian/factory/firstmate/projects/backlot/src/daemon/engine.ts:392` |
 | 56 | medium | shortcoming | ~~On non-Linux hosts, recovery kills recorded pids on bare liveness, re-opening the pid-reuse hazard~~ **FIXED** | `/home/christian/factory/firstmate/projects/backlot/src/core/procscan.ts:126` |
 | 57 | medium | shortcoming | ~~Check/exec process groups are untagged and their timeout kill is unverified~~ **FIXED** | `/home/christian/factory/firstmate/projects/backlot/src/daemon/engine.ts:60` |
-| 58 | medium | bug | Command-family datastore key is unsanitized and escapes templatesRoot; the sqlite guard's comment claims a sibling check that does not exist | `src/drivers/datastores.ts:259` |
-| 59 | medium | shortcoming | Service and check `cwd` from stack.yaml are joined without safeJoin, letting a process run outside its environment tree | `src/daemon/supervisor.ts:78` |
+| 58 | medium | bug | ~~Command-family datastore key is unsanitized and escapes templatesRoot; the sqlite guard's comment claims a sibling check that does not exist~~ **FIXED** | `src/drivers/datastores.ts:259` |
+| 59 | medium | shortcoming | ~~Service and check `cwd` from stack.yaml are joined without safeJoin, letting a process run outside its environment tree~~ **FIXED** | `src/daemon/supervisor.ts:78` |
 | 60 | medium | bug | Symlinks are dereferenced or silently dropped; walkAll crashes on dangling links in bind --ref | `src/core/sync.ts:61` |
 | 61 | medium | bug | File mode changes (chmod +x) never propagate into the env tree | `src/core/sync.ts:128` |
 | 62 | medium | shortcoming | changedOutputs reports worktree-side edits as env changes; pull then clobbers newer worktree state | `src/core/sync.ts:162` |
@@ -99,7 +99,7 @@ marked as they are resolved or refuted.
 | 86 | low | bug | ~~stopAll skips the group check entirely when the wrapper already exited (restart-pending window)~~ **FIXED** | `/home/christian/factory/firstmate/projects/backlot/src/daemon/supervisor.ts:194` |
 | 87 | low | shortcoming | ~~Restart budget never resets after stable operation — three lifetime crashes degrade a long-lived env~~ **FIXED** | `/home/christian/factory/firstmate/projects/backlot/src/daemon/supervisor.ts:127` |
 | 88 | low | shortcoming | A daemonizing service is respawned as duplicates and can escape both group kill and tag reclaim | `/home/christian/factory/firstmate/projects/backlot/src/daemon/supervisor.ts:122` |
-| 89 | low | shortcoming | Unix socket is created with umask-derived permissions and only chmodded after it is already accepting connections | `src/daemon/index.ts:180` |
+| 89 | low | shortcoming | ~~Unix socket is created with umask-derived permissions and only chmodded after it is already accepting connections~~ **FIXED** | `src/daemon/index.ts:180` |
 | 90 | low | bug | Concurrent worktree mutation during sync crashes with an unclassified TypeError | `src/core/sync.ts:109` |
 | 91 | low | bug | --watch ignore filter swallows .github/, .gitignore, and .gitlab-ci.yml edits | `src/daemon/engine.ts:512` |
 | 92 | low | shortcoming | Sync cache written non-atomically inside the mutable env tree; loss disables deletion mirroring | `src/core/sync.ts:152` |
