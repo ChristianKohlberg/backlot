@@ -209,7 +209,19 @@ async function start(): Promise<void> {
       logEvent({ level: 'error', kind: 'recover', detail: `recovery failed: ${String((err as Error).message ?? err)}` });
     });
     const sweepMs = Number(process.env.BACKLOT_SWEEP_MS ?? 15_000);
-    setInterval(() => void engine.sweep(), sweepMs).unref();
+    // The sweeper must not run DURING recovery: it would act on rows recovery
+    // is still reconciling, and a stale-snapshot save could resurrect an env
+    // recovery had just deleted. Each tick also swallows its own rejection —
+    // a fire-and-forget async call whose promise rejects is an unhandled
+    // rejection, which takes the daemon down on any transient journal or FS
+    // write failure.
+    void recovered.then(() => {
+      setInterval(() => {
+        void engine.sweep().catch((err) => {
+          logEvent({ level: 'error', kind: 'sweep', detail: `sweep failed: ${String((err as Error).message ?? err)}` });
+        });
+      }, sweepMs).unref();
+    });
     // Detach from the spawning CLI's lifetime.
     if (process.send) process.send('ready');
   });

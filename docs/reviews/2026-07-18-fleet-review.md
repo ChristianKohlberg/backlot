@@ -14,7 +14,7 @@ marked as they are resolved or refuted.
 | 1 | critical | bug | ~~Unconditional socket unlink defeats the daemon singleton election~~ **FIXED** (lock-file election, `src/daemon/election.ts`) | `src/daemon/index.ts:171` |
 | 2 | high | bug | ~~CLI hangs forever if the daemon dies mid-request; the 15-min RPC timeout is inert~~ **FIXED** | `src/cli/client.ts:65` |
 | 3 | high | bug | ~~Daemon-unreachable and all client-side crashes exit 2 (env-error) instead of 3 (infra-error)~~ **FIXED** | `src/cli/index.ts:320` |
-| 4 | high | bug | Teardown runs outside the env lock; exec/token/check never re-check 'recycling' | `src/daemon/engine.ts:920` |
+| 4 | high | bug | ~~Teardown runs outside the env lock; exec/token/check never re-check 'recycling'~~ **FIXED** | `src/daemon/engine.ts:920` |
 | 5 | high | bug | Pristine wipe destroys tree/data before journal invalidation; crash leaves fingerprints asserting state that no longer exists | `src/daemon/engine.ts:350` |
 | 6 | high | bug | ~~macOS recovery reap signals unverifiable pids — pid reuse kills innocent process groups~~ **FIXED** (`1dd7144`) | `src/daemon/supervisor.ts:244` |
 | 7 | high | bug | ~~macOS group-liveness fallback checks only the leader~~ **FIXED** (`kill(-pgid,0)`, `1dd7144`) | `src/core/procscan.ts:89` |
@@ -41,10 +41,10 @@ marked as they are resolved or refuted.
 | 28 | medium | bug | ~~exec re-joins argv with spaces, silently corrupting any command argument containing whitespace~~ **FIXED** | `src/cli/index.ts:214` |
 | 29 | medium | bug | ~~run --pull discards the pull RPC's result: a failed pull exits 0 with no diagnostic~~ **FIXED** | `src/cli/index.ts:186` |
 | 30 | medium | shortcoming | Daemon defaults every unclassified failure — including its own internal bugs — to env-error | `src/daemon/index.ts:148` |
-| 31 | medium | bug | bindAndStart epilogue clobbers a concurrent 'degraded' write (lost update) | `src/daemon/engine.ts:488` |
-| 32 | medium | bug | Sweeper starts on a timer and races recovery; stale-snapshot saveEnv resurrects a deleted env | `src/daemon/index.ts:194` |
+| 31 | medium | bug | ~~bindAndStart epilogue clobbers a concurrent 'degraded' write (lost update)~~ **FIXED** | `src/daemon/engine.ts:488` |
+| 32 | medium | bug | ~~Sweeper starts on a timer and races recovery; stale-snapshot saveEnv resurrects a deleted env~~ **FIXED** | `src/daemon/index.ts:194` |
 | 33 | medium | bug | engines allows Node 22.5–22.12 where node:sqlite needs --experimental-sqlite; daemon cannot start | `src/core/journal.ts:5` |
-| 34 | medium | bug | Bind epilogue's full-row saveEnv clobbers a concurrent 'degraded' write from the flap callback | `src/daemon/engine.ts:488` |
+| 34 | medium | bug | ~~Bind epilogue's full-row saveEnv clobbers a concurrent 'degraded' write from the flap callback~~ **FIXED** | `src/daemon/engine.ts:488` |
 | 35 | medium | bug | fail_streak migration swallows every SQLite error as 'column already exists'; journal is opened pre-election with no busy_timeout | `src/core/journal.ts:90` |
 | 36 | medium | bug | Case-only rename deletes the file from the env tree on macOS's case-insensitive APFS | `src/core/sync.ts:139` |
 | 37 | medium | shortcoming | probeFree misses wildcard listeners on macOS, so the 'port occupied by a foreign process' guard never fires there | `src/core/ports.ts:3` |
@@ -63,7 +63,7 @@ marked as they are resolved or refuted.
 | 50 | medium | bug | Recorded env ports are never reserved — a warm env's port can be handed to a second env or lost to any process | `src/daemon/engine.ts:240` |
 | 51 | medium | bug | truncateLogs reads whole file as one utf8 string — logs past ~512 MiB become permanently untrimmable | `src/core/retention.ts:53` |
 | 52 | medium | bug | env.ports is fixed at createEnv — a manifest that adds a service port permanently breaks existing envs | `src/daemon/engine.ts:446` |
-| 53 | medium | bug | A service flapping to degraded during a later service's boot is clobbered back to hot | `/home/christian/factory/firstmate/projects/backlot/src/daemon/engine.ts:488` |
+| 53 | medium | bug | ~~A service flapping to degraded during a later service's boot is clobbered back to hot~~ **FIXED** | `/home/christian/factory/firstmate/projects/backlot/src/daemon/engine.ts:488` |
 | 54 | medium | bug | Runtime teardown and bind ignore journal-recorded survivor pids; fresh-supervisor stopAll is a silent no-op | `/home/christian/factory/firstmate/projects/backlot/src/daemon/engine.ts:922` |
 | 55 | medium | bug | Fast-path saveEnv clobbers concurrent updateServicePids writes with stale pids | `/home/christian/factory/firstmate/projects/backlot/src/daemon/engine.ts:392` |
 | 56 | medium | shortcoming | On non-Linux hosts, recovery kills recorded pids on bare liveness, re-opening the pid-reuse hazard | `/home/christian/factory/firstmate/projects/backlot/src/core/procscan.ts:126` |
@@ -84,7 +84,7 @@ marked as they are resolved or refuted.
 | 71 | low | shortcoming | ~~Detached-run polling never maps a failed verdict to exit 1, unlike synchronous run~~ **FIXED** | `src/cli/index.ts:196` |
 | 72 | low | bug | Idle-quiesce acts on a stale idleness check — claimForTeardown never re-validates lastUsedAt | `src/daemon/engine.ts:1014` |
 | 73 | low | shortcoming | Capacity waiters have no fairness — a waiter can starve and fail while younger waiters succeed | `src/daemon/engine.ts:279` |
-| 74 | low | bug | Unhandled rejection from fire-and-forget sweep kills the daemon on any journal/FS write failure | `src/daemon/index.ts:194` |
+| 74 | low | bug | ~~Unhandled rejection from fire-and-forget sweep kills the daemon on any journal/FS write failure~~ **FIXED** | `src/daemon/index.ts:194` |
 | 75 | low | shortcoming | Sleep pardon fires on event-loop starvation, not just system sleep, skewing every deadline | `src/daemon/engine.ts:972` |
 | 76 | low | bug | recover() drops surviving-process records when finishing a 'recycling' teardown | `src/daemon/engine.ts:151` |
 | 77 | low | shortcoming | SIGTERM handler and journal-mutating shutdown are armed before the singleton election | `src/daemon/index.ts:203` |

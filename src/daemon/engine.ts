@@ -153,6 +153,9 @@ export class Engine {
       }
       if (env.state === 'hot' || env.state === 'degraded') env.state = 'warm';
       env.servicePids = survivors;
+      // Reaping awaits real kills, so this row may have been torn down while we
+      // were working. Saving a snapshot of a deleted row resurrects it.
+      if (!this.journal.getEnv(env.id)) continue;
       this.journal.saveEnv(env);
       envs++;
     }
@@ -511,15 +514,35 @@ export class Engine {
           clearInterval(beat);
           const survivors = await sup.stopAll();
           this.supervisors.delete(env.id);
-          env.state = 'warm';
-          env.servicePids = survivors;
-          this.journal.saveEnv(env);
+          // Same stale-snapshot rule as the epilogue: preserve a concurrent
+          // degrade, and never write back a row that has been recycled away.
+          const live = this.journal.getEnv(env.id);
+          if (live) {
+            live.state = live.state === 'degraded' ? 'degraded' : 'warm';
+            live.servicePids = survivors;
+            this.journal.saveEnv(live);
+          }
           throw err;
         }
         started.add(name);
       }
     }
 
+    // `env` is a SNAPSHOT taken before services started. Writing it back whole
+    // discards anything that changed meanwhile — in particular the onDegraded
+    // callback, which fires when an EARLIER service flaps while a later one is
+    // still booting. Promoting to 'hot' from the stale snapshot lost that, and
+    // the environment was handed out as healthy with a dead service in it.
+    const current = this.journal.getEnv(env.id);
+    if (!current) {
+      // Recycled underneath us: saving would resurrect a deleted row.
+      throw new BrokerError('env-error', `environment ${env.id} was recycled during bind — retry`, 'pool');
+    }
+    if (current.state === 'degraded') {
+      env.state = 'degraded';
+      this.journal.saveEnv({ ...current, servicePids: sup.pids(), lastUsedAt: now() });
+      throw new BrokerError('env-error', `environment ${env.id} degraded during bind — a service flapped past its restart budget`, 'pool');
+    }
     env.state = 'hot';
     env.servicePids = sup.pids();
     env.bindCount += 1;
@@ -660,14 +683,15 @@ export class Engine {
       const runStart = now();
       const beat = setInterval(() => opts.onProgress?.(`running check '${opts.check}' … ${Math.round((now() - runStart) / 1000)}s`), 5000);
       beat.unref();
-      const res = await this.envLocked(env.id, () =>
-        runGroupCmd(
+      const res = await this.envLocked(env.id, () => {
+        this.assertUsable(env.id);
+        return runGroupCmd(
           template(check.run, ctx),
           check.cwd ? join(dirs.tree, check.cwd) : dirs.tree,
           { ...process.env, ...templateEnv(check.env, ctx) },
           timeoutS,
-        ),
-      ).finally(() => clearInterval(beat));
+        );
+      }).finally(() => clearInterval(beat));
       const artifactsDir = this.collectArtifacts(env.id, dirs.tree, check.artifacts ?? []);
       return {
         check: opts.check,
@@ -782,6 +806,24 @@ export class Engine {
     return this.ctx(cwd, h);
   }
 
+  /**
+   * Re-read an environment INSIDE its lock and refuse work on one that is being
+   * torn down.
+   *
+   * Teardown claims the row under the pool lock and then runs slowly outside the
+   * env lock, so a request that resolved its lease before the claim can arrive
+   * here afterwards and operate on a tree that is about to be deleted (or
+   * already is). bindAndStart already re-checks; exec, token, and the check
+   * phase did not.
+   */
+  private assertUsable(envId: string): EnvRow {
+    const fresh = this.journal.getEnv(envId);
+    if (!fresh || fresh.state === 'recycling') {
+      throw new BrokerError('env-error', `environment ${envId} is being recycled — retry`, 'pool');
+    }
+    return fresh;
+  }
+
   async exec(cwd: string, cmd: string, holder?: string) {
     const stack = loadStack(cwd);
     const h = holder ?? resolve(cwd);
@@ -794,13 +836,14 @@ export class Engine {
     for (const [name, port] of Object.entries(env.ports)) extra[`BACKLOT_PORT_${name.toUpperCase()}`] = String(port);
     for (const [name, s] of Object.entries(ctx.services)) extra[`BACKLOT_URL_${name.toUpperCase()}`] = s.url;
     for (const [name, d] of Object.entries(ctx.datastores)) extra[`BACKLOT_DS_${name.toUpperCase()}`] = d.url;
-    return this.envLocked(env.id, () =>
-      new Promise((resolvePromise) => {
+    return this.envLocked(env.id, () => {
+      this.assertUsable(env.id);
+      return new Promise((resolvePromise) => {
         execFile('sh', ['-c', cmd], { cwd: dirs.tree, env: { ...process.env, ...extra }, maxBuffer: 32 * 1024 * 1024 }, (err, stdout, stderr) =>
           resolvePromise({ exitCode: err ? ((err as { code?: number }).code ?? 1) : 0, stdout: String(stdout).slice(-8000), stderr: String(stderr).slice(-8000) }),
         );
-      }),
-    );
+      });
+    });
   }
 
   /** Resolve auth.token with {{role}} and run it in the env tree. */
@@ -813,14 +856,15 @@ export class Engine {
     const env = this.journal.getEnv(lease.envId)!;
     const dirs = this.envDirs(env.id);
     const ctx = { ...this.templateCtx(stack, env), role };
-    return this.envLocked(env.id, () =>
-      new Promise((resolvePromise, reject) => {
+    return this.envLocked(env.id, () => {
+      this.assertUsable(env.id);
+      return new Promise((resolvePromise, reject) => {
         execFile('sh', ['-c', template(spec, ctx)], { cwd: dirs.tree, maxBuffer: 1024 * 1024 }, (err, stdout, stderr) => {
           if (err) reject(new BrokerError('work-error', `auth.token command failed`, 'auth', String(stderr).slice(0, 400)));
           else resolvePromise({ token: String(stdout).trim(), role });
         });
-      }),
-    );
+      });
+    });
   }
 
   logs(cwd: string, service: string, lines: number, holder?: string) {
