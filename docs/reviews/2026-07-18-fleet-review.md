@@ -19,10 +19,10 @@ marked as they are resolved or refuted.
 | 6 | high | bug | ~~macOS recovery reap signals unverifiable pids — pid reuse kills innocent process groups~~ **FIXED** (`1dd7144`) | `src/daemon/supervisor.ts:244` |
 | 7 | high | bug | ~~macOS group-liveness fallback checks only the leader~~ **FIXED** (`kill(-pgid,0)`, `1dd7144`) | `src/core/procscan.ts:89` |
 | 8 | high | bug | ~~macOS CI 'pool at capacity (1/1)' is deterministic: poolMaxHeuristic=1 on 3-core/7GB arm runners plus run's ephemeral holder~~ **FIXED** (fail-fast diagnosis + CI pin; heuristic floor left as an owner decision) | `src/core/policy.ts:44` |
-| 9 | high | bug | CommandDs namespace omits the datastore name: two same-driver datastores collide | `src/drivers/datastores.ts:219` |
-| 10 | high | bug | Baked marker outlives the server-side template DB: permanent misclassified bind failure | `src/drivers/datastores.ts:284` |
-| 11 | high | bug | SQLite restore/reset ignores -wal/-shm sidecars: stale WAL replayed over fresh template | `src/drivers/datastores.ts:186` |
-| 12 | high | shortcoming | All driver shell executions are unbounded: no timeout, no process-group kill | `src/drivers/datastores.ts:57` |
+| 9 | high | bug | ~~CommandDs namespace omits the datastore name: two same-driver datastores collide~~ **FIXED** | `src/drivers/datastores.ts:219` |
+| 10 | high | bug | ~~Baked marker outlives the server-side template DB: permanent misclassified bind failure~~ **FIXED** | `src/drivers/datastores.ts:284` |
+| 11 | high | bug | ~~SQLite restore/reset ignores -wal/-shm sidecars: stale WAL replayed over fresh template~~ **FIXED** | `src/drivers/datastores.ts:186` |
+| 12 | high | shortcoming | ~~All driver shell executions are unbounded: no timeout, no process-group kill~~ **FIXED** | `src/drivers/datastores.ts:57` |
 | 13 | high | bug | `backlot run --pull` pulls from the wrong lease or silently no-ops — write-back contract broken | `src/cli/index.ts:186` |
 | 14 | high | bug | Service crash mid-run yields a work-error verdict — taxonomy and §9 'never a silently wrong verdict' violated | `src/daemon/engine.ts:630` |
 | 15 | high | bug | --watch performs a full stop/build/restart on every save — the promised two-stage reload does not exist | `src/daemon/engine.ts:397` |

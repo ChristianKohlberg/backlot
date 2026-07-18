@@ -1,0 +1,226 @@
+/**
+ * Fleet review, datastore-driver cluster. Each test drives the real driver and
+ * asserts on real state (file contents, database rows, wall-clock), not on
+ * whether a function was called.
+ */
+import { describe, it, expect, afterAll } from 'vitest';
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync, existsSync, readFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
+import { makeDatastore, type DsHandle } from '../src/drivers/datastores.js';
+import { runBounded } from '../src/core/exec.js';
+
+const dirs: string[] = [];
+const mk = (p: string) => {
+  const d = mkdtempSync(join(tmpdir(), p));
+  dirs.push(d);
+  return d;
+};
+afterAll(() => {
+  for (const d of dirs) rmSync(d, { recursive: true, force: true });
+});
+
+function handle(envId = 'ds-e1'): DsHandle {
+  const root = mk('backlot-ds-');
+  return { envId, envTree: root, dataDir: join(root, 'data') };
+}
+
+describe('sqlite: WAL sidecars must not survive a template restore', () => {
+  it("does not replay a previous lease's WAL onto a restored database", async () => {
+    process.env.BACKLOT_STATE_DIR = mk('backlot-ds-state-');
+    const h = handle();
+    // template: true is the path the finding describes — restore is a file
+    // copy over the .db, which leaves any sidecar untouched. The create
+    // command seeds a marker row so template content is identifiable.
+    const seed = join(mk('backlot-ds-seed-'), 'seed.mjs');
+    writeFileSync(
+      seed,
+      `import { DatabaseSync } from 'node:sqlite';
+const db = new DatabaseSync(process.argv[2]);
+db.exec('DROP TABLE IF EXISTS rows');
+db.exec('CREATE TABLE rows (v TEXT)');
+db.exec("INSERT INTO rows VALUES ('from-template')");
+db.close();`,
+    );
+    const ds = makeDatastore(
+      'app',
+      { driver: 'sqlite', file: 'app.db', create: `node ${seed} {{ns}}`, template: true } as never,
+      'stk',
+    );
+    const dbPath = ds.ns(h);
+
+    // Lease 1: bake + restore, then write in WAL mode and leave the sidecar
+    // behind exactly as a SIGKILLed dev-server would.
+    await ds.ensure(h, 'dev', false, false);
+    const db = new DatabaseSync(dbPath);
+    db.exec('PRAGMA journal_mode = WAL');
+    db.exec("INSERT INTO rows VALUES ('lease-one-secret')");
+    const wal = `${dbPath}-wal`;
+    const walBytes = existsSync(wal) ? readFileSync(wal) : null;
+    db.close();
+    expect(walBytes).not.toBeNull(); // the scenario requires a real WAL
+
+    // Lease 2, hygiene reset-data -> force: restore copies the template over
+    // the .db. Re-plant the crash-left sidecar to model the race.
+    writeFileSync(wal, walBytes!);
+    await ds.ensure(h, 'dev', true, true);
+
+    expect(existsSync(wal)).toBe(false);
+
+    // The restored store must contain ONLY template content. If the stale WAL
+    // survived, SQLite recovers lease one's frames and the secret reappears in
+    // an environment the user was told was reset.
+    const fresh = new DatabaseSync(dbPath);
+    const vals = (fresh.prepare('SELECT v FROM rows').all() as Array<{ v: string }>).map((r) => r.v);
+    fresh.close();
+    expect(vals).toEqual(['from-template']);
+    expect(vals).not.toContain('lease-one-secret');
+  }, 30_000);
+
+  it('drop removes the sidecars too, so the next database is not poisoned', async () => {
+    const h = handle();
+    const ds = makeDatastore('app', { driver: 'sqlite', file: 'app.db', create: 'true' } as never, 'stk');
+    const dbPath = ds.ns(h);
+    await ds.ensure(h, 'dev', false, false);
+    writeFileSync(`${dbPath}-wal`, 'stale');
+    writeFileSync(`${dbPath}-shm`, 'stale');
+
+    await ds.drop(h);
+
+    expect(existsSync(dbPath)).toBe(false);
+    expect(existsSync(`${dbPath}-wal`)).toBe(false);
+    expect(existsSync(`${dbPath}-shm`)).toBe(false);
+  });
+});
+
+describe('command family: namespaces must not collide', () => {
+  it('gives two same-driver datastores in one stack distinct namespaces', () => {
+    const h = handle('stk-e7');
+    const spec = { driver: 'postgres', url: 'postgres://localhost/{{ns}}', create: 'true' } as never;
+    const app = makeDatastore('app', spec, 'stk');
+    const audit = makeDatastore('audit', spec, 'stk');
+
+    // Before the fix both were `backlot_stk_e7`: audit's clean-slate drop
+    // destroyed app's freshly seeded database, and both services were handed
+    // the identical url.
+    expect(app.ns(h)).not.toBe(audit.ns(h));
+    expect(app.url(h)).not.toBe(audit.url(h));
+    // Still SQL-safe and still env-scoped.
+    expect(app.ns(h)).toMatch(/^[A-Za-z0-9_]+$/);
+    expect(app.ns(h)).toContain('e7');
+    expect(app.ns(h)).toContain('app');
+  });
+
+  it('keeps namespaces distinct across environments as well', () => {
+    const spec = { driver: 'postgres', url: 'postgres://localhost/{{ns}}', create: 'true' } as never;
+    const app = makeDatastore('app', spec, 'stk');
+    expect(app.ns(handle('stk-e1'))).not.toBe(app.ns(handle('stk-e2')));
+  });
+});
+
+describe('repo-declared commands are bounded', () => {
+  it('kills a hung command and its whole process group', async () => {
+    const cwd = mk('backlot-ds-hang-');
+    const marker = join(cwd, 'child-alive');
+    const started = Date.now();
+
+    // `sh -c` forks, so the grandchild is what actually leaks. It touches a
+    // file every 200ms; if the group survived the timeout it keeps touching.
+    const r = await runBounded(
+      `sh -c 'while true; do touch ${marker}; sleep 0.2; done' & wait`,
+      cwd,
+      1,
+    );
+    const elapsed = Date.now() - started;
+
+    expect(r.timedOut).toBe(true);
+    expect(elapsed).toBeLessThan(6000); // bounded, not hung forever
+
+    // Prove the descendant died: clear the marker, wait, and it must not return.
+    rmSync(marker, { force: true });
+    await new Promise((res) => setTimeout(res, 1200));
+    expect(existsSync(marker)).toBe(false);
+  }, 30_000);
+
+  it('reports a normal failure without waiting for the timeout', async () => {
+    const started = Date.now();
+    const r = await runBounded('exit 3', mk('backlot-ds-fail-'), 30);
+    expect(r.code).toBe(3);
+    expect(r.timedOut).toBe(false);
+    expect(Date.now() - started).toBeLessThan(5000);
+  });
+
+  it('captures output from a successful command', async () => {
+    const r = await runBounded('echo hello-from-cmd', mk('backlot-ds-ok-'), 30);
+    expect(r.code).toBe(0);
+    expect(r.output).toContain('hello-from-cmd');
+  });
+
+  it('settles even when the command cannot be spawned', async () => {
+    // A cwd that does not exist makes spawn emit 'error' with no 'exit'. The
+    // promise must still settle, or the caller's lock wedges forever.
+    const r = await runBounded('true', join(tmpdir(), 'backlot-does-not-exist-xyz'), 5);
+    expect(r.code).toBe(1);
+  });
+});
+
+describe('baked template markers self-heal when the server loses the template', () => {
+  it('rebakes instead of failing every future bind forever', async () => {
+    // A file-backed stand-in for a server: "databases" are files in a dir, so
+    // wiping the appliance (docker rm -f, volume prune) is an rm -rf. No real
+    // postgres needed to drive the exact failure.
+    const server = mk('backlot-ds-server-');
+    process.env.BACKLOT_STATE_DIR = mk('backlot-ds-state2-');
+    const h = handle('bake-e1');
+
+    const spec = {
+      driver: 'postgres',
+      url: 'fake://{{ns}}',
+      create: `echo baked > ${server}/{{ns}}`,
+      // Restore FAILS when the template file is absent, exactly as
+      // `createdb -T missing_template` does.
+      template_restore: `test -f ${server}/{{template}} && cp ${server}/{{template}} ${server}/{{ns}}`,
+      drop: `rm -f ${server}/{{ns}}`,
+    } as never;
+    const ds = makeDatastore('app', spec, 'stk-bake');
+
+    // First bind bakes the template and writes the local marker.
+    await ds.ensure(h, 'dev', false, false);
+    expect(existsSync(join(server, ds.ns(h)))).toBe(true);
+    const templates = readFileSync(join(server, ds.ns(h)), 'utf8');
+    expect(templates.trim()).toBe('baked');
+
+    // The appliance is recreated empty. Every server-side database is gone,
+    // but the LOCAL marker still claims the template exists.
+    rmSync(server, { recursive: true, force: true });
+    mkdirSync(server, { recursive: true });
+
+    // Before the fix this threw 'template restore failed' on this bind and
+    // every bind after it, blaming the repo's restore command for what was an
+    // infrastructure event, with no path back short of deleting state by hand.
+    await ds.ensure(h, 'dev', true, true);
+    expect(existsSync(join(server, ds.ns(h)))).toBe(true);
+    expect(readFileSync(join(server, ds.ns(h)), 'utf8').trim()).toBe('baked');
+  }, 30_000);
+
+  it('still surfaces a genuinely broken restore command after rebaking', async () => {
+    const server = mk('backlot-ds-server2-');
+    process.env.BACKLOT_STATE_DIR = mk('backlot-ds-state3-');
+    const h = handle('bake-e2');
+    const ds = makeDatastore(
+      'app',
+      {
+        driver: 'postgres',
+        url: 'fake://{{ns}}',
+        create: `echo baked > ${server}/{{ns}}`,
+        template_restore: 'exit 7', // always broken — not an infrastructure blip
+        drop: `rm -f ${server}/{{ns}}`,
+      } as never,
+      'stk-bake2',
+    );
+    // Self-healing must not become an infinite retry that hides a real defect:
+    // one rebake, one retry, then the repo's error surfaces.
+    await expect(ds.ensure(h, 'dev', false, false)).rejects.toThrow(/template restore failed/);
+  }, 30_000);
+});

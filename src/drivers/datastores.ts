@@ -27,7 +27,8 @@ import { join } from 'node:path';
 import { execFile } from 'node:child_process';
 import { connect } from 'node:net';
 import { templatesRoot } from '../core/paths.js';
-import { sha256, template, runQuiet, BrokerError } from '../core/util.js';
+import { sha256, template, BrokerError } from '../core/util.js';
+import { runBounded, DEFAULT_CMD_TIMEOUT_S } from '../core/exec.js';
 import type { DatastoreSpec } from '../core/manifest.js';
 
 export interface DsHandle {
@@ -52,15 +53,25 @@ export interface DsDriver {
   rebake(): void | Promise<void>;
 }
 
-const sh = (cmd: string, cwd: string, errCtx: string): Promise<void> =>
-  new Promise((resolve, reject) => {
-    execFile('sh', ['-c', cmd], { cwd, maxBuffer: 16 * 1024 * 1024 }, (err, _out, stderr) => {
-      if (err) reject(new BrokerError('work-error', errCtx, 'datastore', String(stderr).slice(0, 800)));
-      else resolve();
-    });
-  });
+const sh = async (cmd: string, cwd: string, errCtx: string): Promise<void> => {
+  const r = await runBounded(cmd, cwd);
+  if (r.timedOut) {
+    // A hung command is an environment problem, not the repo's code being
+    // wrong — and it must be reported, never waited on forever.
+    throw new BrokerError(
+      'env-error',
+      `${errCtx}: command did not finish within ${DEFAULT_CMD_TIMEOUT_S}s and was killed`,
+      'datastore',
+      r.output.slice(-800),
+    );
+  }
+  if (r.code !== 0) throw new BrokerError('work-error', errCtx, 'datastore', r.output.slice(-800));
+};
 
-const shQuiet = runQuiet;
+/** Best-effort variant: failures are expected (clean-slate drops) and ignored. */
+const shQuiet = async (cmd: string, cwd: string): Promise<void> => {
+  await runBounded(cmd, cwd);
+};
 
 /**
  * In-process bake serialization (vetbill-1i49). All binds flow through the
@@ -119,7 +130,7 @@ export async function dropBakedTemplates(dir: string, cwd: string): Promise<numb
     try {
       const marker = parseBakedMarker(readFileSync(join(dir, f), 'utf8'));
       if (marker.drop) {
-        await runQuiet(marker.drop, cwd);
+        await shQuiet(marker.drop, cwd);
         dropped++;
       }
     } catch {
@@ -183,17 +194,38 @@ class SqliteDs implements DsDriver {
       await withBakeLock(tpl, async () => {
         if (!existsSync(tpl)) await this.runCreate(h.envTree, tpl, preset); // bake once
       });
+      // The sidecars MUST go before the .db is replaced. SQLite in WAL mode
+      // recovers `-wal` frames onto whatever database file it finds, so a
+      // leftover WAL from the previous lease would be replayed over the fresh
+      // template — resurrecting the old lease's rows inside a supposedly reset
+      // store, or corrupting it outright.
+      dropSidecars(dbPath);
       copyFileSync(tpl, dbPath, fsConstants.COPYFILE_FICLONE); // restore = CoW clone where the fs supports it
     } else {
+      dropSidecars(dbPath);
       await this.runCreate(h.envTree, dbPath, preset);
     }
   }
 
   async drop(h: DsHandle): Promise<void> {
-    rmSync(this.ns(h), { force: true });
+    const db = this.ns(h);
+    rmSync(db, { force: true });
+    dropSidecars(db); // an orphaned -wal outlives its database and poisons the next one
   }
   rebake(): void {
     rmSync(join(templatesRoot(), this.stackId), { recursive: true, force: true });
+  }
+}
+
+/**
+ * SQLite writes alongside the database: `<db>-wal` (journal) and `<db>-shm`
+ * (shared index), plus `-journal` in rollback mode. They are only meaningful
+ * with the exact database they were written for, so any operation that
+ * replaces or removes the .db must remove them in the same breath.
+ */
+function dropSidecars(dbPath: string): void {
+  for (const suffix of ['-wal', '-shm', '-journal']) {
+    rmSync(`${dbPath}${suffix}`, { force: true });
   }
 }
 
@@ -216,7 +248,12 @@ class CommandDs implements DsDriver {
   }
 
   ns(h: DsHandle): string {
-    return `backlot_${h.envId}`.replace(/[^A-Za-z0-9_]/g, '_');
+    // The datastore NAME belongs in the namespace. Without it, two datastores
+    // of the same driver in one stack (say `app` and `audit` on one postgres)
+    // resolve to the identical database: the second one's clean-slate drop
+    // destroys the first's freshly seeded data, and both services are handed
+    // the same url.
+    return `backlot_${h.envId}_${this.name}`.replace(/[^A-Za-z0-9_]/g, '_');
   }
   url(h: DsHandle): string {
     return template(this.spec.url!, { ns: this.ns(h) });
@@ -291,7 +328,30 @@ class CommandDs implements DsDriver {
         };
         writeFileSync(this.bakedMarker(preset), JSON.stringify(marker));
       });
-      await sh(template(this.spec.template_restore, { template: tpl, ns }), h.envTree, `template restore failed for '${this.name}' preset '${preset}'`);
+      const restore = () =>
+        sh(template(this.spec.template_restore!, { template: tpl, ns }), h.envTree, `template restore failed for '${this.name}' preset '${preset}'`);
+      try {
+        await restore();
+      } catch (err) {
+        // The marker is LOCAL; the template database lives on the server. Wipe
+        // the appliance (docker rm -f, volume prune) and the marker still
+        // claims a template that no longer exists, so every future bind fails
+        // forever — blaming the repo's restore command for an infrastructure
+        // event. Drop the stale marker, bake once more, and retry.
+        rmSync(this.bakedMarker(preset), { force: true });
+        await withBakeLock(tpl, async () => {
+          if (existsSync(this.bakedMarker(preset))) return;
+          await shQuiet(this.spec.drop ? template(this.spec.drop, { ns: tpl }) : 'true', h.envTree);
+          await sh(template(create, { ns: tpl, preset }), h.envTree, `template rebake failed for '${this.name}' preset '${preset}' (after a failed restore: ${(err as Error).message})`);
+          const marker: BakedMarker = {
+            v: 1,
+            ns: tpl,
+            drop: this.spec.drop ? template(this.spec.drop, { ns: tpl }) : null,
+          };
+          writeFileSync(this.bakedMarker(preset), JSON.stringify(marker));
+        });
+        await restore(); // a second failure is genuinely the repo's problem
+      }
     } else {
       await sh(template(this.spec.create, { ns, preset }), h.envTree, `seed failed for '${this.name}' preset '${preset}'`);
     }

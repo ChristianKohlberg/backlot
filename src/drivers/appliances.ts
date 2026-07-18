@@ -10,7 +10,7 @@
  * and blames nobody's code when one is missing: every failure here is an
  * infra-error by construction.
  */
-import { execFile } from 'node:child_process';
+import { runBounded, DEFAULT_CMD_TIMEOUT_S } from '../core/exec.js';
 import { connect } from 'node:net';
 import { mkdirSync, rmdirSync, statSync } from 'node:fs';
 import { join } from 'node:path';
@@ -41,12 +41,19 @@ export function probeTcp(target: string, timeoutMs = PROBE_TIMEOUT_MS): Promise<
   });
 }
 
-const sh = (cmd: string, cwd: string): Promise<{ code: number; output: string }> =>
-  new Promise((resolve) => {
-    execFile('sh', ['-c', cmd], { cwd, maxBuffer: 16 * 1024 * 1024 }, (err, stdout, stderr) => {
-      resolve({ code: err ? 1 : 0, output: `${stdout}${stderr}` });
-    });
-  });
+/**
+ * Appliance commands are the likeliest to hang: `start: docker run ...` without
+ * `-d` never returns, and an unbounded wait there wedges the bind AND leaves
+ * the environment permanently busy (so its lease never expires and teardown
+ * refuses it). Bounded, in its own process group.
+ */
+const sh = async (cmd: string, cwd: string): Promise<{ code: number; output: string }> => {
+  const r = await runBounded(cmd, cwd);
+  return {
+    code: r.code,
+    output: r.timedOut ? `${r.output}\n[killed: exceeded ${DEFAULT_CMD_TIMEOUT_S}s]` : r.output,
+  };
+};
 
 /**
  * One start attempt per probe target machine-wide, whatever stack asked.
