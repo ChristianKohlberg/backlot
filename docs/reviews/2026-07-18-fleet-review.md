@@ -34,7 +34,7 @@ marked as they are resolved or refuted.
 | 21 | high | bug | ~~Spawn failure during an automatic restart silently ends supervision; env stays hot and reports healthy~~ **FIXED** | `/home/christian/factory/firstmate/projects/backlot/src/daemon/supervisor.ts:119` |
 | 22 | high | shortcoming | ~~Baked-template markers persist a manifest shell command and re-execute it long after the repo is gone~~ **FIXED** | `src/core/retention.ts:101` |
 | 23 | high | bug | ~~Stat-gate misses same-size edits within one mtime clock tick — stale env content, silent~~ **FIXED** | `src/core/sync.ts:112` |
-| 24 | high | bug | Bind-time reset never cleans env-side untracked files, violating the documented contract | `src/core/sync.ts:139` |
+| 24 | high | bug | ~~Bind-time reset never cleans env-side untracked files, violating the documented contract~~ **FIXED** (gated to reset-data/pristine) | `src/core/sync.ts:139` |
 | 25 | high | bug | Parallel-bind test passes even against a fully serialized daemon — its core assertion is vacuous | `tests/concurrency.test.ts:85` |
 | 26 | high | shortcoming | Pid-reuse refusal is only unit-tested on sameProcess; the actual reap path is untested and appears to kill bystanders | `tests/orphan-reclaim.test.ts:136` |
 | 27 | medium | bug | ~~Singleton election TOCTOU: stale-socket rmSync can unlink the winner's live socket, yielding two daemons~~ **FIXED** | `src/daemon/index.ts:171` |
@@ -54,7 +54,7 @@ marked as they are resolved or refuted.
 | 41 | medium | shortcoming | Server-side env namespaces leak unrecoverably when drop fails at teardown | `src/drivers/datastores.ts:301` |
 | 42 | medium | bug | templateNs can exceed Postgres's 63-char identifier limit, truncating the disambiguating hash | `src/drivers/datastores.ts:254` |
 | 43 | medium | bug | 'TTL refreshed by any CLI touch' is false — ctx/exec/logs/token/pull never refresh the lease | `src/daemon/engine.ts:741` |
-| 44 | medium | bug | Bind reset never cleans env-side droppings — stale files persist across bindings and pollute later verdicts' artifacts | `src/core/sync.ts:139` |
+| 44 | medium | bug | ~~Bind reset never cleans env-side droppings — stale files persist across bindings and pollute later verdicts' artifacts~~ **FIXED** (gated to reset-data/pristine) | `src/core/sync.ts:139` |
 | 45 | medium | shortcoming | Synchronous sync/hash/copy and execFileSync git calls serialize the whole daemon — 'different environments bind in parallel' only partially holds | `src/core/sync.ts:95` |
 | 46 | medium | shortcoming | Decision 0016 (Accepted) is unimplemented — no states:/inputs:, per-check state:, --state, or snapshot/restore | `src/core/manifest.ts:54` |
 | 47 | medium | bug | Adapter never validates required args; missing cwd silently falls back to the daemon's own cwd | `src/daemon/index.ts:22` |

@@ -132,7 +132,23 @@ const statOf = (p: string): { size: number; mtime: number; mode: number } | null
   }
 };
 
-export function syncIntoEnv(stackRoot: string, envTree: string, manifest: Manifest): SyncResult {
+/**
+ * `cleanUntracked` sweeps env-side files no sync produced — droppings left by a
+ * check, service, or exec.
+ *
+ * It is deliberately NOT the default. docs/architecture.md describes the reset
+ * as cleaning untracked files on every bind, but doing that would delete any
+ * artifact a repo builds inside the environment and forgets to declare under
+ * `caches:` — including upkeep output — turning every bind into a full rebuild.
+ * So it runs only when the caller asked for a clean slate (reset-data or
+ * pristine); a plain `reuse` bind stays fast and keeps its droppings.
+ */
+export function syncIntoEnv(
+  stackRoot: string,
+  envTree: string,
+  manifest: Manifest,
+  cleanUntracked = false,
+): SyncResult {
   mkdirSync(envTree, { recursive: true });
   const files = enumerate(stackRoot, manifest).sort();
   const protectedPatterns = [...(manifest.caches ?? []), ...(manifest.sync?.keep ?? [])];
@@ -216,6 +232,22 @@ export function syncIntoEnv(stackRoot: string, envTree: string, manifest: Manife
     }
   }
 
+
+  // A clean-slate bind also removes what no sync produced. The deletion mirror
+  // above only knows files the PREVIOUS sync wrote, so anything a check,
+  // service, or exec created inside the environment used to survive every bind
+  // and contaminate later verdicts.
+  if (cleanUntracked) {
+    for (const rel of walkAll(envTree)) {
+      if (next[rel] || rel === CACHE_FILE || matchesAny(rel, protectedPatterns)) continue;
+      try {
+        rmSync(safeJoin(envTree, rel, 'env dropping'), { force: true });
+        deleted++;
+      } catch {
+        /* outside the tree or unreadable — leave it */
+      }
+    }
+  }
 
   writeFileSync(cachePath(envTree), JSON.stringify({ syncedAt: Date.now(), entries: next } satisfies CacheFile));
 

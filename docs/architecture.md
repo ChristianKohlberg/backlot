@@ -151,9 +151,12 @@ local/remote abstraction; the local substrate is enumerate-and-copy.)
 - `--watch` sessions opt into a daemon-side debounced worktree watcher that auto-syncs
   on save, feeding the environment's own dev-server watchers. Two-stage reload;
   stopped on release/expiry/quiesce/recycle. Watch activity refreshes the lease.
-- The environment-side reset before each bind restores tracked files hard and cleans
-  untracked ones, **except** declared `caches:` (node_modules, obj/, …) and `sync.keep`
-  paths. A poisoned env tree self-heals on next bind.
+- The environment-side reset restores tracked files hard on every bind. A **clean-slate**
+  bind (`--reset-data` or `--pristine`) additionally removes untracked env-side files —
+  droppings left by a check, service, or `exec` — **except** declared `caches:`
+  (node_modules, obj/, …) and `sync.keep` paths. A plain `reuse` bind keeps them, so an
+  undeclared build artifact is not destroyed on every bind; declare expensive output
+  under `caches:` and a poisoned env tree then self-heals on the next clean-slate bind.
 - Git-ignored-but-needed files (`.env.local`) are declarable via `sync.include`.
 - Oversized/binary diffs fall back to file copy past a threshold.
 

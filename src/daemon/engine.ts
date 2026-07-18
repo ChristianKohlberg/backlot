@@ -407,7 +407,9 @@ export class Engine {
     }
 
     say('syncing worktree');
-    const sync = syncIntoEnv(sourceRoot ?? stack.root, dirs.tree, stack.manifest);
+    // reset-data and pristine mean "clean slate", so they also sweep env-side
+    // droppings; a plain reuse bind keeps them (and keeps its build artifacts).
+    const sync = syncIntoEnv(sourceRoot ?? stack.root, dirs.tree, stack.manifest, hygiene !== 'reuse');
     say(`synced ${sync.files.length} files (${sync.copied} changed, ${sync.deleted} removed)`);
     const upkeep = await runUpkeep(dirs.tree, sync.files, stack.manifest, env.fingerprints);
     // Content-derived template identity (vetbill-1i49): divergent

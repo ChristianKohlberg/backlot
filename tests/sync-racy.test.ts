@@ -8,7 +8,7 @@
  * this machine for exactly this reason.
  */
 import { describe, it, expect, afterAll } from 'vitest';
-import { mkdtempSync, rmSync, writeFileSync, readFileSync, statSync, chmodSync, symlinkSync, existsSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync, statSync, chmodSync, symlinkSync, existsSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -132,5 +132,54 @@ describe('symlinks do not crash enumeration', () => {
     // link and throw ENOENT, failing the whole bind.
     expect(() => syncIntoEnv(src, env, manifest)).not.toThrow();
     expect(readFileSync(join(env, 'real.txt'), 'utf8')).toBe('here');
+  });
+});
+
+describe('env-side droppings are swept only on a clean-slate bind', () => {
+  it('removes untracked env files when the caller asked for a reset', () => {
+    const { src, env } = repo();
+    writeFileSync(join(src, 'tracked.txt'), 'v1');
+    syncIntoEnv(src, env, manifest);
+
+    // A check/service/exec wrote these INSIDE the environment. The deletion
+    // mirror never saw them, because it only knows what a previous sync wrote.
+    writeFileSync(join(env, 'poison.txt'), 'left by a previous holder');
+    writeFileSync(join(env, 'artifact.log'), 'noise');
+
+    const after = syncIntoEnv(src, env, manifest, true);
+
+    expect(existsSync(join(env, 'poison.txt'))).toBe(false);
+    expect(existsSync(join(env, 'artifact.log'))).toBe(false);
+    expect(after.deleted).toBeGreaterThanOrEqual(2);
+    expect(readFileSync(join(env, 'tracked.txt'), 'utf8')).toBe('v1'); // tracked files survive
+  });
+
+  it('leaves droppings alone on a plain reuse bind', () => {
+    const { src, env } = repo();
+    writeFileSync(join(src, 'tracked.txt'), 'v1');
+    syncIntoEnv(src, env, manifest);
+    writeFileSync(join(env, 'build-output.bin'), 'expensive');
+
+    syncIntoEnv(src, env, manifest); // reuse: no sweep
+
+    // This is the whole reason the sweep is gated: an undeclared build artifact
+    // must not be destroyed on every ordinary bind.
+    expect(existsSync(join(env, 'build-output.bin'))).toBe(true);
+  });
+
+  it('never sweeps declared caches or sync.keep, even on a reset', () => {
+    const { src, env } = repo();
+    writeFileSync(join(src, 'tracked.txt'), 'v1');
+    const withCaches = { name: 'racy', services: {}, checks: {}, caches: ['vendor/**'], sync: { keep: ['.env.local'] } } as never;
+    syncIntoEnv(src, env, withCaches);
+
+    mkdirSync(join(env, 'vendor'), { recursive: true });
+    writeFileSync(join(env, 'vendor', 'dep.js'), 'cached');
+    writeFileSync(join(env, '.env.local'), 'SECRET=1');
+
+    syncIntoEnv(src, env, withCaches, true);
+
+    expect(existsSync(join(env, 'vendor', 'dep.js'))).toBe(true);
+    expect(existsSync(join(env, '.env.local'))).toBe(true);
   });
 });
