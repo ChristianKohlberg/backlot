@@ -18,7 +18,7 @@ marked as they are resolved or refuted.
 | 5 | high | bug | Pristine wipe destroys tree/data before journal invalidation; crash leaves fingerprints asserting state that no longer exists | `src/daemon/engine.ts:350` |
 | 6 | high | bug | ~~macOS recovery reap signals unverifiable pids — pid reuse kills innocent process groups~~ **FIXED** (`1dd7144`) | `src/daemon/supervisor.ts:244` |
 | 7 | high | bug | ~~macOS group-liveness fallback checks only the leader~~ **FIXED** (`kill(-pgid,0)`, `1dd7144`) | `src/core/procscan.ts:89` |
-| 8 | high | bug | macOS CI 'pool at capacity (1/1)' is deterministic: poolMaxHeuristic=1 on 3-core/7GB arm runners plus run's ephemeral holder | `src/core/policy.ts:44` |
+| 8 | high | bug | ~~macOS CI 'pool at capacity (1/1)' is deterministic: poolMaxHeuristic=1 on 3-core/7GB arm runners plus run's ephemeral holder~~ **FIXED** (fail-fast diagnosis + CI pin; heuristic floor left as an owner decision) | `src/core/policy.ts:44` |
 | 9 | high | bug | CommandDs namespace omits the datastore name: two same-driver datastores collide | `src/drivers/datastores.ts:219` |
 | 10 | high | bug | Baked marker outlives the server-side template DB: permanent misclassified bind failure | `src/drivers/datastores.ts:284` |
 | 11 | high | bug | SQLite restore/reset ignores -wal/-shm sidecars: stale WAL replayed over fresh template | `src/drivers/datastores.ts:186` |
@@ -28,8 +28,8 @@ marked as they are resolved or refuted.
 | 15 | high | bug | --watch performs a full stop/build/restart on every save — the promised two-stage reload does not exist | `src/daemon/engine.ts:397` |
 | 16 | high | shortcoming | Pool capacity is per-stack while the memory heuristic is per-machine — multi-project hosts have no global cap | `src/daemon/engine.ts:270` |
 | 17 | high | shortcoming | MCP surface has no long-running-op story: progress dropped, no cancel, detach/job verbs unexposed | `src/mcp/index.ts:139` |
-| 18 | high | bug | freePort() has no 'error' handler — fd exhaustion (EMFILE) crashes the whole daemon | `src/core/ports.ts:14` |
-| 19 | high | bug | --watch fs.watch has no 'error' listener — async watcher error (inotify ENOSPC) kills the daemon | `src/daemon/engine.ts:510` |
+| 18 | high | bug | ~~freePort() has no 'error' handler — fd exhaustion (EMFILE) crashes the whole daemon~~ **FIXED** | `src/core/ports.ts:14` |
+| 19 | high | bug | ~~--watch fs.watch has no 'error' listener — async watcher error (inotify ENOSPC) kills the daemon~~ **FIXED** | `src/daemon/engine.ts:510` |
 | 20 | high | bug | killGroupVerified kills an innocent process group when a dead pid is reused by a new group leader | `/home/christian/factory/firstmate/projects/backlot/src/daemon/supervisor.ts:244` |
 | 21 | high | bug | Spawn failure during an automatic restart silently ends supervision; env stays hot and reports healthy | `/home/christian/factory/firstmate/projects/backlot/src/daemon/supervisor.ts:119` |
 | 22 | high | shortcoming | Baked-template markers persist a manifest shell command and re-execute it long after the repo is gone | `src/core/retention.ts:101` |

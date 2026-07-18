@@ -3,21 +3,26 @@
 Known work, roughly prioritized. Committed to the repo so it survives sessions.
 Each item notes severity and where it was found.
 
-## CI — remaining macOS-runner failures (2026-07-11, post port-race fix)
+## CI — macOS-runner failures (2026-07-11) — DIAGNOSED 2026-07-18
 
-- [ ] **P2 · macOS runners: `run`-flow tests die on "pool at capacity (1/1) —
-  waited 60s".** With the Linux rebind race fixed (services now own their
-  process group) the ubuntu leg is green; 4 macOS-leg tests still fail — all
-  flows needing a *second* env (`run smoke` x2, #21d shared-holder run,
-  hello-python). The exit-code asserts now surface the CLI error:
-  `env-error: pool at capacity (1/1) — waited 60s; release a lease or raise
-  BACKLOT_POOL_MAX`. Passes on real Macs; on slow shared runners the first
-  env apparently isn't released/quiesced within the 60s capacity wait.
-  Pre-existing (baseline probe on main-equivalent code fails identically —
-  the legs were fail-fast-cancelled for months, so it was never visible).
-  Open question is test intent: raise BACKLOT_POOL_MAX in those contexts,
-  lengthen the capacity wait under CI, or fix a release/sweeper timing bug —
-  needs a look at what the pool tests are meant to prove.
+- [x] **P2 · macOS runners: `run`-flow tests die on "pool at capacity (1/1) —
+  waited 60s".** Root cause found by the 2026-07-18 fleet review, and it is NOT
+  a slow-runner timing problem as this entry previously hypothesised. It is
+  arithmetic: `poolMaxHeuristic` is `min(floor(cores/2), floor(memGB/4))`, and
+  `macos-latest` is 3 vCPU / 7 GB, so both terms are 1. Every failing flow does
+  a session `up` and then a `run`, and `run` always mints its own ephemeral
+  holder (`engine.ts`, `holder = run-<id>`), so it needs a SECOND environment
+  that a 1-env pool may never create. The 60s wait could never succeed on any
+  runner at any speed. ubuntu-latest (4 vCPU / 16 GB) gives 2 and passes; real
+  Macs give >= 2 and pass.
+  Fixed on two fronts: capacity waits now fail fast with a structural
+  diagnosis naming the blocking lease instead of burning the window and
+  blaming timing, and CI pins `BACKLOT_POOL_MAX=2`.
+  **Open product question deliberately NOT decided here:** the documented core
+  loop cannot run on any pool of 1, so a 1-environment machine cannot use
+  backlot as documented. Raising the heuristic floor to 2 would fix that but
+  doubles peak memory on exactly the smallest machines — a real trade, and an
+  owner's call rather than a review's.
 
 ## Polish — found during live Revamp/parallel testing (2026-07-03)
 

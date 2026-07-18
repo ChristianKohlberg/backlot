@@ -19,7 +19,15 @@ jobs:
         with: { node-version: 22 }
       - run: corepack enable && pnpm install --frozen-lockfile || npm install
       - run: npm run typecheck
+      # The suite exercises the documented core loop (a session `up` plus a
+      # `run`), which needs TWO environments: `run` always mints its own
+      # ephemeral holder. The capacity heuristic resolves to 1 on small runners
+      # (macos-latest is 3 vCPU / 7 GB -> floor(3/2) = floor(7/4) = 1), which is
+      # what produced the long-standing 'pool at capacity (1/1)' macOS failures.
+      # Pin it here rather than weakening the heuristic for real machines.
       - run: npm test
+        env:
+          BACKLOT_POOL_MAX: '2'
       # The fixture must stay runnable raw (no backlot) — it doubles as the docs.
       - name: hello-web boots and serves seeded data
         working-directory: examples/hello-web

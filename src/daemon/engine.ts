@@ -275,12 +275,47 @@ export class Engine {
     return null;
   }
 
+  /**
+   * Is the pool full of environments whose leases outlast our whole wait?
+   *
+   * If so, queueing cannot possibly succeed, and reporting "waited 60s" blames
+   * a timing problem that does not exist. This is the shape a session `up`
+   * followed by a `run` hits on a one-environment pool: `run` always mints its
+   * own ephemeral holder, so it needs a SECOND environment that the pool is not
+   * allowed to create. MUST run under the pool lock.
+   */
+  private structuralCapacityBlock(stack: Stack, deadline: number): string | null {
+    const envs = this.journal.envsForStack(stack.id);
+    if (envs.length < POOL_MAX()) return null; // room to grow
+    const holders: string[] = [];
+    for (const env of envs) {
+      // These resolve on their own — the sweeper reaps them and frees capacity.
+      if (env.state === 'degraded' || env.state === 'recycling') return null;
+      const lease = this.journal.leaseForEnv(env.id);
+      if (!lease) return null; // a free env exists; this is a transient race
+      if (lease.expiresAt <= deadline) return null; // it will expire in time
+      holders.push(`${env.id} held by '${lease.holder}' (${lease.kind}, ${Math.round((lease.expiresAt - now()) / 60_000)}m left)`);
+    }
+    return holders.join('; ');
+  }
+
   /** Queue at capacity WITHOUT holding the pool lock while sleeping. */
   private async acquireEnv(stack: Stack, holder: string, kind: LeaseKind, hygiene: Hygiene, ttlMs: number): Promise<EnvRow> {
     const start = now();
     for (;;) {
       const env = await this.poolLocked(() => this.tryClaim(stack, holder, kind, hygiene, ttlMs));
       if (env) return env;
+      // Refuse to burn the full wait on something that provably cannot resolve.
+      const blocked = await this.poolLocked(() => this.structuralCapacityBlock(stack, now() + WAIT_MS()));
+      if (blocked) {
+        throw new BrokerError(
+          'env-error',
+          `pool at capacity (${POOL_MAX()}/${POOL_MAX()}) and every environment is leased past the wait window — queueing cannot succeed. Blocking: ${blocked}. ` +
+            `A 'run' always takes its own environment, so a session lease plus a run needs BACKLOT_POOL_MAX >= 2 (currently ${POOL_MAX()}). ` +
+            `Raise BACKLOT_POOL_MAX, or release the blocking lease first.`,
+          'pool',
+        );
+      }
       if (now() - start > WAIT_MS()) {
         throw new BrokerError('env-error', `pool at capacity (${POOL_MAX()}/${POOL_MAX()}) — waited ${Math.round(WAIT_MS() / 1000)}s; release a lease or raise BACKLOT_POOL_MAX`, 'pool');
       }
