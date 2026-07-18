@@ -12,6 +12,18 @@ export function probeFree(port: number): Promise<boolean> {
 export function freePort(): Promise<number> {
   return new Promise((resolve, reject) => {
     const srv = createServer();
+    // net.Server emits 'error' asynchronously; with no listener Node rethrows
+    // it as an uncaught exception and the whole daemon dies. Under fd
+    // exhaustion (EMFILE) that is exactly when every environment in the pool
+    // needs the daemon alive to reclaim.
+    srv.once('error', (err) => {
+      try {
+        srv.close();
+      } catch {
+        /* never listened */
+      }
+      reject(err);
+    });
     srv.listen(0, '127.0.0.1', () => {
       const addr = srv.address();
       if (addr && typeof addr === 'object') srv.close(() => resolve(addr.port));

@@ -521,6 +521,15 @@ export class Engine {
     } catch {
       return; // recursive fs.watch unavailable — --watch degrades to verbs-only
     }
+    // The try/catch above only covers synchronous construction. fs.watch also
+    // emits 'error' asynchronously — inotify watch limits (ENOSPC), or the
+    // watched tree being moved away — and an unhandled 'error' on an
+    // EventEmitter takes the daemon down with it. Losing --watch for one
+    // environment is a degradation; losing the daemon strands every one.
+    watcher.on('error', (err) => {
+      logEvent({ level: 'warn', kind: 'watch', envId, detail: `watcher stopped: ${String((err as Error).message ?? err)} — --watch is off for this environment; explicit verbs still sync` });
+      this.stopWatch(envId);
+    });
     this.watchers.set(envId, {
       close: () => {
         if (timer) clearTimeout(timer);
