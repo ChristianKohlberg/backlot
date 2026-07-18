@@ -9,6 +9,7 @@ import { existsSync, rmSync, writeFileSync, chmodSync } from 'node:fs';
 import { socketPath, pidPath } from '../core/paths.js';
 import { BrokerError } from '../core/util.js';
 import { Engine } from './engine.js';
+import { logEvent } from '../core/events.js';
 
 // Singleton guard: recover() and listen happen only AFTER we win the socket,
 // so a losing daemon never reaps the winner's children or mutates the journal.
@@ -77,6 +78,8 @@ async function dispatch(verb: string, args: Record<string, unknown>, emit: (phas
     case 'pool-reconcile':
       // Local substrate: reconcile = doctor + reap anything degraded/stuck.
       return engine.poolReconcile();
+    case 'pool-gc':
+      return engine.poolGc();
     case 'shutdown':
       setTimeout(async () => {
         await engine.shutdown();
@@ -108,6 +111,18 @@ function pingExisting(): Promise<boolean> {
   });
 }
 
+/**
+ * Recovery reconciles prior daemon state, and now genuinely waits on kills
+ * (verified reaps, orphan sweep) instead of firing signals blind. Requests are
+ * therefore held until it completes: serving `status` mid-reconcile would show
+ * a caller envs that are about to change state, which is the old synchronous
+ * contract silently broken.
+ *
+ * `ping` is exempt — the singleton election must be answerable immediately, or
+ * a second daemon would conclude the socket is stale and take over.
+ */
+let recovered: Promise<void> = Promise.resolve();
+
 const server = createServer((req, res) => {
   let body = '';
   req.on('data', (d) => (body += d));
@@ -126,6 +141,7 @@ const server = createServer((req, res) => {
       };
       try {
         const { verb, args } = JSON.parse(body || '{}');
+        if (verb !== 'ping') await recovered;
         const data = await dispatch(verb, args ?? {}, emit);
         res.end(JSON.stringify({ type: 'result', ok: true, data }) + '\n');
       } catch (err) {
@@ -166,8 +182,14 @@ async function start(): Promise<void> {
       /* best-effort; the 0700 state dir is the backstop */
     }
     writeFileSync(pidPath(), String(process.pid));
-    // Only NOW, as the sole owner, reconcile prior daemon state.
-    engine.recover();
+    // Only NOW, as the sole owner, reconcile prior daemon state. Recovery
+    // verifies each reap and sweeps for orphans, so it awaits real work; every
+    // non-ping request queues behind it.
+    recovered = engine.recover().catch((err) => {
+      // A failed reconcile must not wedge the daemon forever — surface it and
+      // let requests through rather than hanging every client.
+      logEvent({ level: 'error', kind: 'recover', detail: `recovery failed: ${String((err as Error).message ?? err)}` });
+    });
     const sweepMs = Number(process.env.BACKLOT_SWEEP_MS ?? 15_000);
     setInterval(() => void engine.sweep(), sweepMs).unref();
     // Detach from the spawning CLI's lifetime.

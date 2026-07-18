@@ -12,15 +12,16 @@ import { loadStack, defaultPreset, type Stack } from '../core/manifest.js';
 import { syncIntoEnv, changedOutputs, pullOutputs } from '../core/sync.js';
 import { runUpkeep, templateBakeKeys } from '../core/upkeep.js';
 import { freePort, probeFree } from '../core/ports.js';
-import { envsRoot, artifactsRoot } from '../core/paths.js';
+import { envsRoot, artifactsRoot, stateRoot } from '../core/paths.js';
 import { BrokerError, template, templateEnv, now, shortId, matchesAny } from '../core/util.js';
 import { makeDatastore, type DsHandle } from '../drivers/datastores.js';
 import { ensureAppliance, stopAppliance, probeTcp } from '../drivers/appliances.js';
-import { EnvSupervisor, reapPids } from './supervisor.js';
+import { EnvSupervisor, killGroupVerified, reapPids } from './supervisor.js';
+import { isAlive, procScanSupported, sameProcess, scanTagged } from '../core/procscan.js';
 import { policy } from '../core/policy.js';
 import { retentionSweep } from '../core/retention.js';
 import { logEvent, recentEvents } from '../core/events.js';
-import type { Hygiene, LeaseKind } from '../core/types.js';
+import type { Hygiene, LeaseKind, ServicePid } from '../core/types.js';
 
 const POOL_MAX = () => policy().poolMax;
 const LEASE_TTL = (kind: LeaseKind) => (kind === 'session' ? policy().sessionTtlMs : policy().runTtlMs);
@@ -90,6 +91,7 @@ export class Engine {
   private supervisors = new Map<string, EnvSupervisor>();
   private lastSweep = now();
   private lastRetention = now();
+  private lastGc = now();
 
   // -------- concurrency: a short pool lock for claim/release bookkeeping and
   // one lock per environment for bind/exec/reset. Two environments (or two
@@ -132,22 +134,90 @@ export class Engine {
   }
 
   /** Recovery (decision 0009): reap recorded PIDs from a previous daemon life; hot -> warm. */
-  recover(): void {
+  async recover(): Promise<void> {
     let envs = 0;
+    let stranded = 0;
     for (const env of this.journal.allEnvs()) {
-      if (Object.keys(env.servicePids).length > 0) reapPids(env.servicePids);
+      // Keep whatever survived the reap RECORDED. Clearing servicePids
+      // unconditionally used to strand survivors permanently: supervisor()
+      // vends a fresh empty supervisor after a restart, so every later
+      // stopAll() for that env was a silent no-op and the process kept its
+      // port until a human found it (issue #5).
+      const survivors =
+        Object.keys(env.servicePids).length > 0 ? await reapPids(env.servicePids) : {};
+      stranded += Object.keys(survivors).length;
       // A 'recycling' env from a crashed daemon never finished teardown — finish it.
       if (env.state === 'recycling') {
         void this.teardownClaimed(env).catch(() => undefined);
         continue;
       }
       if (env.state === 'hot' || env.state === 'degraded') env.state = 'warm';
-      env.servicePids = {};
+      env.servicePids = survivors;
       this.journal.saveEnv(env);
       envs++;
     }
     const jobs = this.journal.failStaleJobs();
-    logEvent({ level: 'info', kind: 'recover', detail: `reconciled ${envs} env(s), ${jobs} stale job(s)` });
+    logEvent({
+      level: stranded ? 'warn' : 'info',
+      kind: 'recover',
+      detail: `reconciled ${envs} env(s), ${jobs} stale job(s)${stranded ? `, ${stranded} service(s) survived the reap` : ''}`,
+    });
+    // Anything the journal never knew about — the owner died before the pids
+    // were ever written, or the env row is long gone — is only findable by tag.
+    const gc = await this.poolGc();
+    if (gc.reclaimed.length) {
+      logEvent({ level: 'warn', kind: 'gc', detail: `reclaimed ${gc.reclaimed.length} orphaned process(es) at startup` });
+    }
+  }
+
+  /**
+   * Reclaim backlot-spawned processes that no live environment accounts for.
+   *
+   * A process is an orphan when it carries this state root's tag but its env
+   * either no longer exists in the journal, or exists in a state that must have
+   * no services running (warm/recycling). Anything belonging to a hot env, or
+   * to an env with an operation in flight, is left strictly alone — a bind
+   * racing the sweep must not have its dev-server shot out from under it.
+   */
+  async poolGc(): Promise<{ supported: boolean; reclaimed: Array<{ pid: number; envId: string; service: string }>; skipped: number }> {
+    if (!procScanSupported()) return { supported: false, reclaimed: [], skipped: 0 };
+    const tagged = scanTagged(stateRoot());
+    if (tagged.length === 0) return { supported: true, reclaimed: [], skipped: 0 };
+
+    // Snapshot which envs may legitimately own a running process right now.
+    const live = new Set<string>();
+    for (const env of this.journal.allEnvs()) {
+      if (env.state === 'hot' || env.state === 'provisioning' || this.busy.has(env.id)) live.add(env.id);
+    }
+    for (const id of this.busy) live.add(id);
+
+    const reclaimed: Array<{ pid: number; envId: string; service: string }> = [];
+    let skipped = 0;
+    for (const proc of tagged) {
+      if (live.has(proc.envId)) {
+        skipped++;
+        continue;
+      }
+      // Pin identity to the exact process the scan saw: between the scan and
+      // this kill the pid could have exited and been reused.
+      const dead = await killGroupVerified(proc.pid, proc.startTime);
+      if (dead) reclaimed.push({ pid: proc.pid, envId: proc.envId, service: proc.service });
+    }
+    if (reclaimed.length) {
+      // A reclaimed process may have been the one the journal was still
+      // tracking — drop those records so doctor() doesn't report drift.
+      for (const env of this.journal.allEnvs()) {
+        const keep = Object.fromEntries(
+          Object.entries(env.servicePids).filter(([, rec]) => !reclaimed.some((r) => r.pid === rec.pid)),
+        );
+        if (Object.keys(keep).length !== Object.keys(env.servicePids).length) {
+          env.servicePids = keep;
+          this.journal.saveEnv(env);
+        }
+      }
+      logEvent({ level: 'info', kind: 'gc', detail: `reclaimed ${reclaimed.length} orphaned process(es)` });
+    }
+    return { supported: true, reclaimed, skipped };
   }
 
   // ---------------------------------------------------------------- pool
@@ -404,10 +474,10 @@ export class Engine {
           say(`'${name}' ready`);
         } catch (err) {
           clearInterval(beat);
-          await sup.stopAll();
+          const survivors = await sup.stopAll();
           this.supervisors.delete(env.id);
           env.state = 'warm';
-          env.servicePids = {};
+          env.servicePids = survivors;
           this.journal.saveEnv(env);
           throw err;
         }
@@ -794,19 +864,32 @@ export class Engine {
     const issues: Array<{ level: string; envId?: string; issue: string }> = [];
     for (const env of this.journal.allEnvs()) {
       if (env.state === 'recycling') issues.push({ level: 'warn', envId: env.id, issue: 'stuck in recycling (a daemon likely died mid-teardown; restart reconciles)' });
-      // Journal says these pids run — are they actually alive?
-      for (const [svc, pid] of Object.entries(env.servicePids)) {
-        let alive = true;
-        try {
-          process.kill(pid, 0);
-        } catch {
-          alive = false;
+      // Journal says these pids run — are they actually alive, and still ours?
+      for (const [svc, rec] of Object.entries(env.servicePids)) {
+        if (!isAlive(rec.pid)) {
+          issues.push({ level: 'error', envId: env.id, issue: `journal records pid ${rec.pid} for service '${svc}' but it is not running (recovery drift)` });
+        } else if (!sameProcess(rec.pid, rec.startTime)) {
+          // Alive, but a DIFFERENT process now holds that pid. Signalling it
+          // would hit a bystander, so surface it rather than reaping it.
+          issues.push({ level: 'error', envId: env.id, issue: `pid ${rec.pid} recorded for service '${svc}' now belongs to another process (pid reuse) — 'backlot pool gc' will re-derive ownership from process tags` });
         }
-        if (!alive) issues.push({ level: 'error', envId: env.id, issue: `journal records pid ${pid} for service '${svc}' but it is not running (recovery drift)` });
       }
       // (Port liveness is intentionally NOT probed here: a service bound to ::
       // vs a 127.0.0.1 probe gives false positives across IPv4/IPv6 dual-stack.
       // The pid-divergence check above is the reliable "is it alive" signal.)
+    }
+    // The inverse drift, and the one that actually leaks memory: a tagged
+    // process is running that no live env accounts for. Only reported here —
+    // doctor diagnoses, `pool gc` is the verb that acts.
+    if (procScanSupported()) {
+      const liveEnvs = new Set(
+        this.journal.allEnvs().filter((e) => e.state === 'hot' || e.state === 'provisioning').map((e) => e.id),
+      );
+      for (const id of this.busy) liveEnvs.add(id);
+      const orphans = scanTagged(stateRoot()).filter((p) => !liveEnvs.has(p.envId));
+      for (const o of orphans) {
+        issues.push({ level: 'error', envId: o.envId, issue: `orphaned process ${o.pid} ('${o.service}') is running with no live environment — run 'backlot pool gc' to reclaim it` });
+      }
     }
     logEvent({ level: issues.length ? 'warn' : 'info', kind: 'doctor', detail: `${issues.length} issue(s)` });
     return { ok: issues.length === 0, issues, events: recentEvents(20) };
@@ -889,6 +972,18 @@ export class Engine {
     if (gap > 3 * interval) this.journal.pardon(gap - interval); // sleep pardon (decision 0009)
     this.lastSweep = t;
 
+    // Orphan reclaim (~1 min cadence): a consumer that died ungracefully can
+    // strand a dev-server between daemon restarts, and each one is ~1 GB. Far
+    // cheaper than a /proc scan every sweep, far sooner than the next restart.
+    if (t - this.lastGc > Number(process.env.BACKLOT_GC_MS ?? 60_000)) {
+      this.lastGc = t;
+      try {
+        await this.poolGc();
+      } catch {
+        /* best-effort */
+      }
+    }
+
     // Disk retention (~10 min cadence): nothing backlot writes grows forever.
     if (t - this.lastRetention > Number(process.env.BACKLOT_RETENTION_MS ?? 10 * 60_000)) {
       this.lastRetention = t;
@@ -922,12 +1017,14 @@ export class Engine {
         const claimed = await this.claimForTeardown(env.id, false);
         if (!claimed) continue;
         this.stopWatch(env.id);
-        await this.supervisor(claimed).stopAll();
+        const survivors = await this.supervisor(claimed).stopAll();
         this.supervisors.delete(env.id);
         const fresh = this.journal.getEnv(env.id);
         if (fresh) {
           fresh.state = 'warm';
-          fresh.servicePids = {};
+          // Anything that outlived SIGKILL stays recorded, so the next gc pass
+          // (or a later restart) can still find it instead of losing it.
+          fresh.servicePids = survivors;
           this.journal.saveEnv(fresh);
         }
       }
@@ -936,11 +1033,14 @@ export class Engine {
 
   async shutdown(): Promise<void> {
     for (const id of [...this.watchers.keys()]) this.stopWatch(id);
-    for (const sup of this.supervisors.values()) await sup.stopAll();
+    const survivors = new Map<string, Record<string, ServicePid>>();
+    for (const [id, sup] of this.supervisors) survivors.set(id, await sup.stopAll());
     for (const env of this.journal.allEnvs()) {
       if (env.state === 'hot') {
         env.state = 'warm';
-        env.servicePids = {};
+        // Record, never assume: a service that survived our own SIGKILL must
+        // remain findable by the next daemon life.
+        env.servicePids = survivors.get(env.id) ?? {};
         this.journal.saveEnv(env);
       }
     }

@@ -26,7 +26,9 @@ Usage:
   backlot status          daemon, pool, and lease overview
   backlot appliance ls|start|stop [name]
                           shared backing servers: probe, ensure up, explicit stop
-  backlot pool ls|recycle [--all]
+  backlot pool ls|recycle [--all]|reconcile|gc|doctor
+                          gc reclaims service processes orphaned by an ungraceful
+                          exit; doctor reports drift without acting on it
   backlot daemon stop     stop the daemon (environments are recovered on next use)
 
 Every verb accepts --json. Long verbs (up/run/sync/bind/reset-data) show live progress
@@ -280,9 +282,10 @@ async function main(): Promise<void> {
       if (sub === 'ls') res = await rpc('status', {});
       else if (sub === 'recycle') res = await rpc('pool-recycle', { all: flags.has('--all') });
       else if (sub === 'reconcile') res = await rpc('pool-reconcile', {});
+      else if (sub === 'gc') res = await rpc('pool-gc', {});
       else if (sub === 'doctor') res = await rpc('doctor', {});
       else {
-        console.error(`backlot pool: unknown subcommand '${sub}' (ls | recycle | reconcile | doctor)`);
+        console.error(`backlot pool: unknown subcommand '${sub}' (ls | recycle | reconcile | gc | doctor)`);
         process.exit(64);
       }
       break;

@@ -8,7 +8,10 @@ import { spawn, execFile, type ChildProcess } from 'node:child_process';
 import { appendFileSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { BrokerError } from '../core/util.js';
+import { stateRoot } from '../core/paths.js';
+import { groupAlive, processGroup, sameProcess, serviceTag, startTime } from '../core/procscan.js';
 import type { ReadySpec, ServiceSpec } from '../core/manifest.js';
+import type { ServicePid } from '../core/types.js';
 
 export interface ServiceEvent {
   at: number;
@@ -23,6 +26,8 @@ interface Running {
   expectedExit: boolean;
   /** Pending restart timer — must be cancellable by stopAll so it can't orphan. */
   restartTimer: NodeJS.Timeout | null;
+  /** Kernel start time of `proc.pid`, captured at spawn (pid-reuse guard). */
+  startTime?: number;
 }
 
 export class EnvSupervisor {
@@ -56,9 +61,11 @@ export class EnvSupervisor {
     return this.services.get(name)?.buf ?? '';
   }
 
-  pids(): Record<string, number> {
-    const out: Record<string, number> = {};
-    for (const [name, r] of this.services) if (r.proc.pid && r.proc.exitCode === null) out[name] = r.proc.pid;
+  pids(): Record<string, ServicePid> {
+    const out: Record<string, ServicePid> = {};
+    for (const [name, r] of this.services) {
+      if (r.proc?.pid && r.proc.exitCode === null) out[name] = { pid: r.proc.pid, startTime: r.startTime };
+    }
     return out;
   }
 
@@ -76,7 +83,11 @@ export class EnvSupervisor {
       if (running.expectedExit) return;
       const proc = spawn('sh', ['-c', cmd], {
         cwd,
-        env: { ...process.env, ...env },
+        // The tag rides in the environment so it is INHERITED by every
+        // descendant. After an ungraceful death the sh -c wrapper is gone but
+        // the real server still carries it, which is what lets a later daemon
+        // find and reclaim an orphan it never spawned itself (issue #5).
+        env: { ...process.env, ...env, ...serviceTag(this.envId, name, stateRoot()) },
         stdio: ['ignore', 'pipe', 'pipe'],
         // Own process group, so signals reach the service and not just the
         // sh -c wrapper. On Linux (dash) the wrapper forks instead of
@@ -88,6 +99,9 @@ export class EnvSupervisor {
         detached: true,
       });
       running.proc = proc;
+      // Capture identity immediately: once the pid exits this is unreadable,
+      // and an un-pinned pid is one the reaper must refuse to signal.
+      running.startTime = proc.pid ? startTime(proc.pid) : undefined;
       this.onPidsChanged?.();
       const sink = (d: Buffer) => {
         const s = d.toString();
@@ -166,7 +180,9 @@ export class EnvSupervisor {
     }
   }
 
-  async stopAll(): Promise<void> {
+  /** Stop every service; returns any that refused to die (empty is the norm). */
+  async stopAll(): Promise<Record<string, ServicePid>> {
+    const survivors: Record<string, ServicePid> = {};
     for (const [name, r] of this.services) {
       r.expectedExit = true;
       // Cancel any pending restart BEFORE it can fire — otherwise launch()
@@ -175,51 +191,98 @@ export class EnvSupervisor {
         clearTimeout(r.restartTimer);
         r.restartTimer = null;
       }
-      if (r.proc && r.proc.exitCode === null) {
-        await new Promise<void>((resolve) => {
-          r.proc.once('exit', () => resolve());
-          killGroup(r.proc);
-          setTimeout(() => {
-            killGroup(r.proc, 'SIGKILL');
-            resolve();
-          }, 2000).unref();
-        });
+      if (r.proc && r.proc.exitCode === null && r.proc.pid) {
+        // Verify the group is actually gone rather than resolving as soon as
+        // SIGKILL is *sent* — the caller goes on to delete the env root and
+        // drop the pid, so a survivor here becomes an untrackable orphan.
+        const dead = await killGroupVerified(r.proc.pid, r.startTime);
+        if (!dead) {
+          this.note(name, `still running after SIGKILL (pid ${r.proc.pid})`);
+          survivors[name] = { pid: r.proc.pid, startTime: r.startTime };
+        }
       }
-      this.note(name, 'stopped');
+      this.note(name, survivors[name] ? 'stop failed' : 'stopped');
     }
     this.services.clear();
+    return survivors;
   }
 }
 
 const tail = (s: string, n = 600): string => s.slice(-n);
 
-/** Signal a service's whole process group; fall back to the leader alone. */
-function killGroup(proc: ChildProcess, signal: NodeJS.Signals = 'SIGTERM'): void {
-  if (!proc.pid) return;
+/** Signal a whole process group, falling back to the single pid we know of. */
+function signalGroup(pgid: number, pid: number, signal: NodeJS.Signals): void {
   try {
-    process.kill(-proc.pid, signal); // detached spawn => pid is the group leader
+    process.kill(-pgid, signal);
   } catch {
+    // Not a group leader (or the group is already gone) — at minimum reach the
+    // one process we can name.
     try {
-      proc.kill(signal);
+      process.kill(pid, signal);
     } catch {
       /* already gone */
     }
   }
 }
 
-/** Kill PIDs recorded by a previous daemon life (recovery, decision 0009). */
-export function reapPids(pids: Record<string, number>): void {
-  for (const pid of Object.values(pids)) {
-    // Recorded pids are group leaders (services spawn detached) — signal the
-    // group so the actual server dies too, not just the sh -c wrapper.
-    try {
-      process.kill(-pid);
-    } catch {
-      try {
-        process.kill(pid);
-      } catch {
-        /* already gone */
-      }
-    }
+/**
+ * SIGTERM a group, wait for it to actually die, then SIGKILL and confirm.
+ *
+ * The previous recovery path fired one SIGTERM and moved on, which anything
+ * with a graceful-shutdown handler (a .NET host, `ng serve` under a trapping
+ * shell) simply outlives — and since the caller then dropped the pid, the
+ * survivor became unreachable forever. Escalation plus a verified verdict is
+ * what makes "reaped" mean reaped.
+ *
+ * Returns true if the leader is confirmed gone.
+ */
+export async function killGroupVerified(
+  pid: number,
+  recordedStart?: number,
+  graceMs = 2000,
+): Promise<boolean> {
+  if (!sameProcess(pid, recordedStart) && !groupAlive(pid)) return true; // dead, or no longer ours
+  // Resolve the group BEFORE signalling: once the leader exits its /proc entry
+  // is gone and the surviving siblings become unattributable.
+  const pgid = processGroup(pid) ?? pid;
+  const gone = () => !groupAlive(pgid);
+
+  signalGroup(pgid, pid, 'SIGTERM');
+  const deadline = Date.now() + graceMs;
+  while (Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, 50));
+    if (gone()) return true;
   }
+  // The leader dying is NOT the success condition. `sh -c` commonly forks, so
+  // the wrapper exits on SIGTERM while the real server — which ignored it —
+  // keeps its port and its ~1 GB. Escalate against the whole group.
+  signalGroup(pgid, pid, 'SIGKILL');
+  // SIGKILL is not instantaneous: the kernel still has to tear the group down,
+  // and reporting "reaped" early would let the caller drop the pid one poll
+  // before the process is actually off the table.
+  const hard = Date.now() + 2000;
+  while (Date.now() < hard) {
+    await new Promise((r) => setTimeout(r, 50));
+    if (gone()) return true;
+  }
+  return gone();
+}
+
+/**
+ * Kill PIDs recorded by a previous daemon life (recovery, decision 0009).
+ *
+ * Returns the entries that were NOT confirmed dead. The caller must keep those
+ * in the journal — a forgotten pid is an orphan nobody can ever reclaim.
+ */
+export async function reapPids(pids: Record<string, ServicePid>): Promise<Record<string, ServicePid>> {
+  const survivors: Record<string, ServicePid> = {};
+  await Promise.all(
+    Object.entries(pids).map(async ([name, rec]) => {
+      // Recorded pids are group leaders (services spawn detached) — signal the
+      // group so the actual server dies too, not just the sh -c wrapper.
+      const dead = await killGroupVerified(rec.pid, rec.startTime);
+      if (!dead) survivors[name] = rec;
+    }),
+  );
+  return survivors;
 }

@@ -12,6 +12,16 @@ export type LeaseKind = 'session' | 'run';
 /** The field an agent branches on mechanically (decision 0010). */
 export type ErrorClass = 'work-error' | 'env-error' | 'infra-error';
 
+/**
+ * A recorded service process. `startTime` (kernel clock ticks since boot,
+ * Linux only) pins the pid to one process *life*, so a later daemon can tell
+ * "still my service" from "the OS reused that pid" before signalling it.
+ */
+export interface ServicePid {
+  pid: number;
+  startTime?: number;
+}
+
 export interface Environment {
   id: string;
   stack: string;

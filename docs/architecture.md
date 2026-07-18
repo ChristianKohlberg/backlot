@@ -249,6 +249,17 @@ Every failure is classified — the field an agent branches on mechanically:
   executes detached on the box, journaled; the CLI reattaches. Orphan discovery:
   drivers tag instances so `pool reconcile` can adopt or reap what the journal forgot.
   Local orphans cost RAM; remote orphans cost money — the asymmetry drives the design.
+- **Locally, the same tagging rule applies to service processes.** Every supervised
+  service is spawned carrying `BACKLOT_ENV_ID` / `BACKLOT_SERVICE` / `BACKLOT_STATE_ROOT`,
+  inherited by every descendant. Pids alone are not ownership: a recorded pid may have
+  been recycled by the OS, and `sh -c` frequently forks so the recorded pid is only the
+  wrapper. Cleanup therefore (a) pins each pid to one process *life* via its kernel
+  start time, (b) verifies the whole process **group** is gone rather than trusting that
+  the leader exited, and (c) falls back to `scanTagged` — a /proc sweep by tag — for
+  processes no journal row can name. `pool gc` is that sweep as a verb; recovery and the
+  sweeper run it automatically. A process is only ever reclaimed when no live env
+  accounts for it. The state-root tag scopes all of this, so parallel installs and
+  concurrent test daemons can never reap each other.
 
 ## 11. The consumer's interface
 
@@ -265,7 +276,7 @@ backlot logs <service> [--lines N]               # supervised service logs
 backlot token --role <r>                         # mint a token via auth.token
 backlot reset-data | pull | release
 backlot status | doctor                          # pool state | active health check
-backlot pool ls|recycle [--all]|reconcile|doctor
+backlot pool ls|recycle [--all]|reconcile|gc|doctor
 backlot daemon stop
 ```
 
