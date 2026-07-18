@@ -201,11 +201,18 @@ export class EnvSupervisor {
         throw new BrokerError('work-error', `service '${name}' exited during boot (${running.proc.exitCode})`, name, tail(buf));
       }
       if (ready.http && url) {
-        try {
-          const res = await fetch(`${url}${ready.http}`, { signal: AbortSignal.timeout(1500) });
-          if (res.status === 200) return;
-        } catch {
-          /* not yet */
+        // Probe every address the advertised host can mean. `localhost` is
+        // ambiguous on a dual-stack machine: macOS resolves it to ::1 first,
+        // and a service bound IPv4-only (the common case — see
+        // examples/hello-python) is simply not there. The readiness probe then
+        // times out against a service that IS running and healthy.
+        for (const candidate of probeUrls(url)) {
+          try {
+            const res = await fetch(`${candidate}${ready.http}`, { signal: AbortSignal.timeout(1500) });
+            if (res.status === 200) return;
+          } catch {
+            /* not on this address — try the next */
+          }
         }
       } else if (ready.log) {
         if (new RegExp(ready.log).test(buf)) return;
@@ -254,6 +261,17 @@ export class EnvSupervisor {
     this.services.clear();
     return survivors;
   }
+}
+
+/**
+ * The addresses an advertised URL may actually be served on.
+ *
+ * Keeps the CONSUMER-facing url unchanged (that is a contract) while making the
+ * internal readiness probe robust to IPv4/IPv6 resolution order.
+ */
+function probeUrls(url: string): string[] {
+  if (!url.includes('//localhost')) return [url];
+  return [url, url.replace('//localhost', '//127.0.0.1')];
 }
 
 const tail = (s: string, n = 600): string => s.slice(-n);

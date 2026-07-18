@@ -13,7 +13,7 @@
  * AND start time still match a live process. Only the winner is allowed to
  * touch the socket.
  */
-import { openSync, writeSync, closeSync, readFileSync, renameSync, rmSync, unlinkSync } from 'node:fs';
+import { openSync, writeSync, closeSync, readFileSync, renameSync, rmSync, unlinkSync, statSync } from 'node:fs';
 import { lockPath } from '../core/paths.js';
 import { sameProcess, startTime } from '../core/procscan.js';
 
@@ -40,6 +40,23 @@ function claimIsLive(claim: Claim | undefined): boolean {
   return sameProcess(claim.pid, claim.startTime);
 }
 
+/** Was this lock written within the last few seconds? */
+function recentlyTouched(path: string, withinMs = 3000): boolean {
+  try {
+    return Date.now() - statSync(path).mtimeMs < withinMs;
+  } catch {
+    return false;
+  }
+}
+
+/** Deliberately synchronous: election runs before the daemon serves anything. */
+function sleepMs(ms: number): void {
+  const until = Date.now() + ms;
+  while (Date.now() < until) {
+    /* spin briefly */
+  }
+}
+
 /**
  * Try to become the daemon for this state root.
  *
@@ -48,11 +65,16 @@ function claimIsLive(claim: Claim | undefined): boolean {
  */
 export function electSelf(path = lockPath()): boolean {
   for (let attempt = 0; attempt < 5; attempt++) {
-    // Atomic create-if-absent: the kernel picks exactly one winner.
+    // Build the payload BEFORE creating the file. Computing it afterwards left
+    // the lock existing but EMPTY for as long as the claim took to assemble —
+    // and on platforms where identity comes from `ps` that is tens of
+    // milliseconds. A racing daemon read the empty file, concluded the holder
+    // was dead, stole the lock, and both ended up bound.
+    const claim = JSON.stringify(selfClaim());
     try {
       const fd = openSync(path, 'wx', 0o600);
       try {
-        writeSync(fd, JSON.stringify(selfClaim()));
+        writeSync(fd, claim);
       } finally {
         closeSync(fd);
       }
@@ -63,6 +85,12 @@ export function electSelf(path = lockPath()): boolean {
 
     const held = readClaim(path);
     if (claimIsLive(held)) return false; // a real daemon owns this state root
+    // An unreadable lock that was just touched is a claim mid-write, not a
+    // stale one. Give the writer a moment rather than racing it.
+    if (!held && recentlyTouched(path)) {
+      sleepMs(50);
+      if (claimIsLive(readClaim(path))) return false;
+    }
 
     // The holder is dead (or the file is corrupt). Break the lock by writing a
     // fresh claim to a private path and renaming it over the lock — rename is

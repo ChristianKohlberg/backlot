@@ -124,3 +124,19 @@ describe('daemon singleton under a real race', () => {
     expect(lock.pid).toBe([...pids][0]);
   }, 60_000);
 });
+
+describe('election under a slow claim', () => {
+  it('does not steal a lock that exists but is still being written', () => {
+    const dir = mkdir('backlot-elect-slow-');
+    const lock = join(dir, 'daemon.lock');
+    // The exact state macOS exposed in CI: the winner has CREATED the lock but
+    // not finished writing it, because assembling the claim runs `ps`. A racing
+    // daemon that reads the empty file must not conclude the holder is dead.
+    writeFileSync(lock, '');
+    expect(electSelf(lock)).toBe(true); // stale-and-empty is eventually breakable
+
+    // But a lock whose live holder finished writing is never broken.
+    writeFileSync(lock, JSON.stringify({ pid: 1, startTime: startTime(1) }));
+    expect(electSelf(lock)).toBe(false);
+  });
+});
