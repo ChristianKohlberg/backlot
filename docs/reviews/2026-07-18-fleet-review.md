@@ -23,35 +23,35 @@ marked as they are resolved or refuted.
 | 10 | high | bug | ~~Baked marker outlives the server-side template DB: permanent misclassified bind failure~~ **FIXED** | `src/drivers/datastores.ts:284` |
 | 11 | high | bug | ~~SQLite restore/reset ignores -wal/-shm sidecars: stale WAL replayed over fresh template~~ **FIXED** | `src/drivers/datastores.ts:186` |
 | 12 | high | shortcoming | ~~All driver shell executions are unbounded: no timeout, no process-group kill~~ **FIXED** | `src/drivers/datastores.ts:57` |
-| 13 | high | bug | `backlot run --pull` pulls from the wrong lease or silently no-ops — write-back contract broken | `src/cli/index.ts:186` |
-| 14 | high | bug | Service crash mid-run yields a work-error verdict — taxonomy and §9 'never a silently wrong verdict' violated | `src/daemon/engine.ts:630` |
+| 13 | high | bug | ~~`backlot run --pull` pulls from the wrong lease or silently no-ops — write-back contract broken~~ **FIXED** | `src/cli/index.ts:186` |
+| 14 | high | bug | ~~Service crash mid-run yields a work-error verdict — taxonomy and §9 'never a silently wrong verdict' violated~~ **FIXED** | `src/daemon/engine.ts:630` |
 | 15 | high | bug | --watch performs a full stop/build/restart on every save — the promised two-stage reload does not exist | `src/daemon/engine.ts:397` |
 | 16 | high | shortcoming | Pool capacity is per-stack while the memory heuristic is per-machine — multi-project hosts have no global cap | `src/daemon/engine.ts:270` |
 | 17 | high | shortcoming | MCP surface has no long-running-op story: progress dropped, no cancel, detach/job verbs unexposed | `src/mcp/index.ts:139` |
 | 18 | high | bug | ~~freePort() has no 'error' handler — fd exhaustion (EMFILE) crashes the whole daemon~~ **FIXED** | `src/core/ports.ts:14` |
 | 19 | high | bug | ~~--watch fs.watch has no 'error' listener — async watcher error (inotify ENOSPC) kills the daemon~~ **FIXED** | `src/daemon/engine.ts:510` |
-| 20 | high | bug | killGroupVerified kills an innocent process group when a dead pid is reused by a new group leader | `/home/christian/factory/firstmate/projects/backlot/src/daemon/supervisor.ts:244` |
+| 20 | high | bug | ~~killGroupVerified kills an innocent process group when a dead pid is reused by a new group leader~~ **FIXED** (`1dd7144`) | `/home/christian/factory/firstmate/projects/backlot/src/daemon/supervisor.ts:244` |
 | 21 | high | bug | ~~Spawn failure during an automatic restart silently ends supervision; env stays hot and reports healthy~~ **FIXED** | `/home/christian/factory/firstmate/projects/backlot/src/daemon/supervisor.ts:119` |
 | 22 | high | shortcoming | ~~Baked-template markers persist a manifest shell command and re-execute it long after the repo is gone~~ **FIXED** | `src/core/retention.ts:101` |
 | 23 | high | bug | ~~Stat-gate misses same-size edits within one mtime clock tick — stale env content, silent~~ **FIXED** | `src/core/sync.ts:112` |
 | 24 | high | bug | ~~Bind-time reset never cleans env-side untracked files, violating the documented contract~~ **FIXED** (gated to reset-data/pristine) | `src/core/sync.ts:139` |
 | 25 | high | bug | ~~Parallel-bind test passes even against a fully serialized daemon — its core assertion is vacuous~~ **FIXED** | `tests/concurrency.test.ts:85` |
-| 26 | high | shortcoming | Pid-reuse refusal is only unit-tested on sameProcess; the actual reap path is untested and appears to kill bystanders | `tests/orphan-reclaim.test.ts:136` |
+| 26 | high | shortcoming | ~~Pid-reuse refusal is only unit-tested on sameProcess; the actual reap path is untested and appears to kill bystanders~~ **FIXED** (reap-safety tests, `1dd7144`) | `tests/orphan-reclaim.test.ts:136` |
 | 27 | medium | bug | ~~Singleton election TOCTOU: stale-socket rmSync can unlink the winner's live socket, yielding two daemons~~ **FIXED** | `src/daemon/index.ts:171` |
 | 28 | medium | bug | ~~exec re-joins argv with spaces, silently corrupting any command argument containing whitespace~~ **FIXED** | `src/cli/index.ts:214` |
 | 29 | medium | bug | ~~run --pull discards the pull RPC's result: a failed pull exits 0 with no diagnostic~~ **FIXED** | `src/cli/index.ts:186` |
-| 30 | medium | shortcoming | Daemon defaults every unclassified failure — including its own internal bugs — to env-error | `src/daemon/index.ts:148` |
+| 30 | medium | shortcoming | ~~Daemon defaults every unclassified failure — including its own internal bugs — to env-error~~ **FIXED** | `src/daemon/index.ts:148` |
 | 31 | medium | bug | ~~bindAndStart epilogue clobbers a concurrent 'degraded' write (lost update)~~ **FIXED** | `src/daemon/engine.ts:488` |
 | 32 | medium | bug | ~~Sweeper starts on a timer and races recovery; stale-snapshot saveEnv resurrects a deleted env~~ **FIXED** | `src/daemon/index.ts:194` |
-| 33 | medium | bug | engines allows Node 22.5–22.12 where node:sqlite needs --experimental-sqlite; daemon cannot start | `src/core/journal.ts:5` |
+| 33 | medium | bug | ~~engines allows Node 22.5–22.12 where node:sqlite needs --experimental-sqlite; daemon cannot start~~ **FIXED** | `src/core/journal.ts:5` |
 | 34 | medium | bug | ~~Bind epilogue's full-row saveEnv clobbers a concurrent 'degraded' write from the flap callback~~ **FIXED** | `src/daemon/engine.ts:488` |
-| 35 | medium | bug | fail_streak migration swallows every SQLite error as 'column already exists'; journal is opened pre-election with no busy_timeout | `src/core/journal.ts:90` |
+| 35 | medium | bug | ~~fail_streak migration swallows every SQLite error as 'column already exists'; journal is opened pre-election with no busy_timeout~~ **FIXED** | `src/core/journal.ts:90` |
 | 36 | medium | bug | Case-only rename deletes the file from the env tree on macOS's case-insensitive APFS | `src/core/sync.ts:139` |
-| 37 | medium | shortcoming | probeFree misses wildcard listeners on macOS, so the 'port occupied by a foreign process' guard never fires there | `src/core/ports.ts:3` |
+| 37 | medium | shortcoming | ~~probeFree misses wildcard listeners on macOS, so the 'port occupied by a foreign process' guard never fires there~~ **FIXED** | `src/core/ports.ts:3` |
 | 38 | medium | bug | ~~Appliance start lock goes 'stale' at a fixed 5 min while spec.timeout can be larger~~ **FIXED** | `src/drivers/appliances.ts:24` |
-| 39 | medium | bug | ready: gate is skipped when the appliance already answers TCP (adopt path) | `src/drivers/appliances.ts:114` |
+| 39 | medium | bug | ~~ready: gate is skipped when the appliance already answers TCP (adopt path)~~ **FIXED** | `src/drivers/appliances.ts:114` |
 | 40 | medium | bug | ~~Ephemeral reset flush failures are silently swallowed, breaking reset-data hygiene~~ **FIXED** | `src/drivers/datastores.ts:267` |
-| 41 | medium | shortcoming | Server-side env namespaces leak unrecoverably when drop fails at teardown | `src/drivers/datastores.ts:301` |
+| 41 | medium | shortcoming | ~~Server-side env namespaces leak unrecoverably when drop fails at teardown~~ **FIXED** | `src/drivers/datastores.ts:301` |
 | 42 | medium | bug | ~~templateNs can exceed Postgres's 63-char identifier limit, truncating the disambiguating hash~~ **FIXED** | `src/drivers/datastores.ts:254` |
 | 43 | medium | bug | 'TTL refreshed by any CLI touch' is false — ctx/exec/logs/token/pull never refresh the lease | `src/daemon/engine.ts:741` |
 | 44 | medium | bug | ~~Bind reset never cleans env-side droppings — stale files persist across bindings and pollute later verdicts' artifacts~~ **FIXED** (gated to reset-data/pristine) | `src/core/sync.ts:139` |
@@ -65,7 +65,7 @@ marked as they are resolved or refuted.
 | 52 | medium | bug | ~~env.ports is fixed at createEnv — a manifest that adds a service port permanently breaks existing envs~~ **FIXED** | `src/daemon/engine.ts:446` |
 | 53 | medium | bug | ~~A service flapping to degraded during a later service's boot is clobbered back to hot~~ **FIXED** | `/home/christian/factory/firstmate/projects/backlot/src/daemon/engine.ts:488` |
 | 54 | medium | bug | ~~Runtime teardown and bind ignore journal-recorded survivor pids; fresh-supervisor stopAll is a silent no-op~~ **FIXED** | `/home/christian/factory/firstmate/projects/backlot/src/daemon/engine.ts:922` |
-| 55 | medium | bug | Fast-path saveEnv clobbers concurrent updateServicePids writes with stale pids | `/home/christian/factory/firstmate/projects/backlot/src/daemon/engine.ts:392` |
+| 55 | medium | bug | ~~Fast-path saveEnv clobbers concurrent updateServicePids writes with stale pids~~ **FIXED** | `/home/christian/factory/firstmate/projects/backlot/src/daemon/engine.ts:392` |
 | 56 | medium | shortcoming | ~~On non-Linux hosts, recovery kills recorded pids on bare liveness, re-opening the pid-reuse hazard~~ **FIXED** | `/home/christian/factory/firstmate/projects/backlot/src/core/procscan.ts:126` |
 | 57 | medium | shortcoming | ~~Check/exec process groups are untagged and their timeout kill is unverified~~ **FIXED** | `/home/christian/factory/firstmate/projects/backlot/src/daemon/engine.ts:60` |
 | 58 | medium | bug | ~~Command-family datastore key is unsanitized and escapes templatesRoot; the sqlite guard's comment claims a sibling check that does not exist~~ **FIXED** | `src/drivers/datastores.ts:259` |

@@ -469,6 +469,11 @@ export class Engine {
     if (unchanged) {
       env.fingerprints['@source'] = sync.sourceHash;
       env.lastUsedAt = now();
+      // Refresh from the LIVE supervisor before saving. A service that restarted
+      // during this bind updated the journal through onPidsChanged, and writing
+      // the pre-bind snapshot back put dead pids there — which recovery would
+      // later signal, missing the real process.
+      env.servicePids = this.supervisor(env).pids();
       this.journal.saveEnv(env);
       return env;
     }
@@ -704,7 +709,7 @@ export class Engine {
     };
   }
 
-  async run(opts: UpOptions & { check: string }) {
+  async run(opts: UpOptions & { check: string; pull?: boolean }) {
     const stack = loadStack(opts.cwd);
     const check = stack.manifest.checks?.[opts.check];
     if (!check) {
@@ -738,6 +743,13 @@ export class Engine {
         );
       }).finally(() => clearInterval(beat));
       const artifactsDir = this.collectArtifacts(env.id, dirs.tree, check.artifacts ?? []);
+      // A check that failed because the ENVIRONMENT fell over is not the repo's
+      // code being wrong. Reporting work-error there is a silently wrong
+      // verdict (architecture section 9) — an agent reads it as "my change
+      // broke the test" and starts editing code to fix a dead dev-server.
+      const envDied =
+        res.exitCode !== 0 && !res.timedOut && !this.supervisor(env).allHealthyPids();
+      const failClass: 'work-error' | 'env-error' = envDied ? 'env-error' : 'work-error';
       return {
         check: opts.check,
         ok: res.exitCode === 0 && !res.timedOut,
@@ -747,10 +759,21 @@ export class Engine {
             ? null
             : res.timedOut
               ? { class: 'work-error', message: `check '${opts.check}' timed out after ${timeoutS}s (process group killed; raise checks.${opts.check}.timeout if legitimate)`, logExcerpt: res.output.slice(-800) }
-              : { class: 'work-error', message: `check '${opts.check}' failed (exit ${res.exitCode})`, logExcerpt: res.output.slice(-800) },
+              : {
+                  class: failClass,
+                  message: envDied
+                    ? `check '${opts.check}' failed (exit ${res.exitCode}) while a service was not running — the environment failed, not necessarily the code`
+                    : `check '${opts.check}' failed (exit ${res.exitCode})`,
+                  logExcerpt: res.output.slice(-800),
+                },
         output: res.output,
         artifactsDir,
         outputsChanged: changedOutputs(stack.root, dirs.tree, stack.manifest),
+        // The write-back must happen HERE, while the run still holds its own
+        // ephemeral lease. Doing it from the CLI afterwards targeted the
+        // CALLER's holder — a different environment, or none at all — so
+        // `run --pull` either pulled from the wrong lease or silently no-oped.
+        pulled: opts.pull ? pullOutputs(stack.root, dirs.tree, stack.manifest) : undefined,
         envId: env.id,
         durationMs: now() - startedAt,
       };
@@ -1075,7 +1098,21 @@ export class Engine {
       const dirs = this.envDirs(env.id);
       const h: DsHandle = { envId: env.id, envTree: dirs.tree, dataDir: dirs.data };
       for (const [name, spec] of Object.entries(stack.manifest.datastores ?? {})) {
-        if (env.datastoreNs[name]) await makeDatastore(name, spec, stack.id).drop(h);
+        if (!env.datastoreNs[name]) continue;
+        try {
+          await makeDatastore(name, spec, stack.id).drop(h);
+        } catch (err) {
+          // The env row is about to be deleted, taking the only record of this
+          // namespace with it — so a swallowed failure leaks a server-side
+          // database nothing can ever name again. Say so loudly enough to be
+          // actionable.
+          logEvent({
+            level: 'error',
+            kind: 'teardown',
+            envId: env.id,
+            detail: `datastore '${name}' namespace was NOT dropped and is now orphaned on the server: ${String((err as Error).message ?? err)}`,
+          });
+        }
       }
     } catch {
       /* stack unloadable — local files still go */

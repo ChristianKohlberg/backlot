@@ -186,14 +186,9 @@ async function main(): Promise<void> {
           return;
         }
       } else {
-        res = await rpc('run', { cwd, holder, check, hygiene: hygiene() }, progress);
+        res = await rpc('run', { cwd, holder, check, hygiene: hygiene(), pull: flags.has('--pull') }, progress);
         endProgress();
-        if (res.ok && flags.has('--pull')) {
-          // The write-back is part of what the caller asked for; discarding its
-          // result made a failed pull exit 0 with no diagnostic at all.
-          const pulled = await rpc('pull', { cwd, holder });
-          if (!pulled.ok) errExit(pulled.error);
-        }
+
       }
       break;
     }

@@ -85,11 +85,19 @@ export class Journal {
         stack TEXT PRIMARY KEY, next_env INTEGER NOT NULL DEFAULT 1
       );
     `);
-    // Migration for journals created before fail_streak existed.
+    // Concurrent readers exist (tests and tools open the journal directly while
+    // the daemon runs), and without a busy timeout any overlap is an immediate
+    // SQLITE_BUSY rather than a short wait.
+    this.db.exec('PRAGMA busy_timeout = 5000');
+    // Migration for journals created before fail_streak existed. Swallowing
+    // EVERY error here hid real failures (a corrupt journal, a locked file) as
+    // "column already exists", so the daemon carried on against a schema it did
+    // not actually have. Only the duplicate-column case is benign.
     try {
-      this.db.exec("ALTER TABLE envs ADD COLUMN fail_streak INTEGER NOT NULL DEFAULT 0");
-    } catch {
-      /* column already exists */
+      this.db.exec('ALTER TABLE envs ADD COLUMN fail_streak INTEGER NOT NULL DEFAULT 0');
+    } catch (err) {
+      const msg = String((err as Error).message ?? err);
+      if (!/duplicate column name/i.test(msg)) throw err;
     }
   }
 

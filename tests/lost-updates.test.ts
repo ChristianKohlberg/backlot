@@ -204,3 +204,35 @@ describe('a detached run interrupted by a daemon crash is resolved, not left pen
     expect((job?.verdict as { ok?: boolean } | null)?.ok).toBe(false);
   }, 120_000);
 });
+
+describe('a check that fails because the environment died is not blamed on the code', () => {
+  it('classifies the verdict env-error, not work-error', async () => {
+    const stateDir = mkdtempSync(join(tmpdir(), 'backlot-verdict-'));
+    const wt = mkdtempSync(join(tmpdir(), 'backlot-verdict-wt-'));
+    dirs.push(stateDir, wt);
+    // The service reports ready, then dies. The check then fails against a
+    // dead dependency — which is the environment failing, not the repo's code.
+    writeFileSync(
+      join(wt, 'stack.yaml'),
+      `name: vd\nservices:\n  web: { run: "echo ready; sleep 1; exit 1", ready: { log: ready, timeout: 10 } }\nchecks:\n  probe: { run: "sleep 3; exit 4" }\n`,
+    );
+    execFileSync('git', ['init', '-q'], { cwd: wt });
+    const env = { ...process.env, BACKLOT_STATE_DIR: stateDir, BACKLOT_SWEEP_MS: '30000' };
+    const run = await new Promise<Record<string, unknown> | undefined>((resolve) => {
+      execFile(process.execPath, [CLI, 'run', 'probe', '--json'], { cwd: wt, env, maxBuffer: 8 * 1024 * 1024 }, (_e, out) => {
+        try {
+          resolve(JSON.parse(String(out)));
+        } catch {
+          resolve(undefined);
+        }
+      });
+    });
+
+    const failure = run?.failure as { class?: string; message?: string } | null;
+    expect(run?.ok).toBe(false);
+    // An agent branches on this mechanically: work-error tells it to go and
+    // edit code, which cannot fix a dev-server that fell over.
+    expect(failure?.class).toBe('env-error');
+    expect(failure?.message).toMatch(/environment failed/);
+  }, 120_000);
+});

@@ -1,11 +1,22 @@
 import { createServer } from 'node:net';
 
+/**
+ * Is `port` genuinely free?
+ *
+ * Binding only 127.0.0.1 misses a foreign process listening on the WILDCARD
+ * address: on Linux that bind collides and reports busy, but on macOS it
+ * succeeds, so the "port occupied by a foreign process" guard never fired
+ * there and the service started into a port someone else already held.
+ * Probing the wildcard as well is what makes the two platforms agree.
+ */
 export function probeFree(port: number): Promise<boolean> {
-  return new Promise((resolve) => {
-    const srv = createServer();
-    srv.once('error', () => resolve(false));
-    srv.listen(port, '127.0.0.1', () => srv.close(() => resolve(true)));
-  });
+  const bind = (host: string) =>
+    new Promise<boolean>((resolve) => {
+      const srv = createServer();
+      srv.once('error', () => resolve(false));
+      srv.listen(port, host, () => srv.close(() => resolve(true)));
+    });
+  return bind('127.0.0.1').then((loopback) => (loopback ? bind('0.0.0.0') : false));
 }
 
 /** OS-allocated free port — stable per environment once recorded (decision 0004). */

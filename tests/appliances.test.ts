@@ -135,16 +135,38 @@ describe('ensureAppliance', () => {
     expect(err.message).toContain('never answered');
   });
 
-  it('adoption skips the ready: gate (it only guards the start path)', async () => {
+  it('applies the ready: gate on adoption, not only on the start path', async () => {
     const port = await freePort();
     servers.push(await listen(port));
     const work = tempDir('appliance-ready');
     const marker = join(work.dir, 'ready.marker');
-    // Probe answers (listener above) so adoption short-circuits before ready:
-    // — the ready gate only guards the start path, by design. Assert that
-    // contract: an unsatisfiable ready does not block adoption.
-    const res = await ensureAppliance('db', { probe: `127.0.0.1:${port}`, ready: `test -f ${marker}` }, work.dir, silent);
-    expect(res).toBe('up');
+
+    // This test previously asserted the OPPOSITE — that adoption short-circuits
+    // before ready: "by design". That contradicts decision 0018, which states
+    // ready: exists precisely "because servers like Postgres accept connections
+    // before they serve them". An open port is the condition ready: is there to
+    // disambiguate, so honouring it only when backlot happened to run start:
+    // made the gate meaningless for the common case: a long-lived appliance
+    // that is already up.
+    const err = await ensureAppliance(
+      'db',
+      { probe: `127.0.0.1:${port}`, ready: `test -f ${marker}`, timeout: 2 },
+      work.dir,
+      silent,
+    ).catch((e) => e);
+    expect(err).toBeInstanceOf(BrokerError);
+    expect(err.klass).toBe('infra-error'); // 0018: appliance failures are never anyone's code
+    expect(err.message).toMatch(/ready: gate never passed/);
+
+    // Once the gate is satisfiable, the same appliance adopts cleanly.
+    writeFileSync(marker, '');
+    const ok = await ensureAppliance(
+      'db',
+      { probe: `127.0.0.1:${port}`, ready: `test -f ${marker}`, timeout: 2 },
+      work.dir,
+      silent,
+    );
+    expect(ok).toBe('up');
     work.cleanup();
   });
 

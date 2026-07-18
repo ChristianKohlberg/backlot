@@ -34,7 +34,7 @@ async function dispatch(verb: string, args: Record<string, unknown>, emit: (phas
         onProgress: emit,
       });
     case 'run':
-      return engine.run({ cwd, holder, check: String(args.check), hygiene: (args.hygiene as never) ?? undefined, onProgress: emit });
+      return engine.run({ cwd, holder, check: String(args.check), hygiene: (args.hygiene as never) ?? undefined, pull: Boolean(args.pull), onProgress: emit });
     case 'run-detach': {
       const jobId = engine.createJob(cwd, String(args.check));
       // Fire-and-forget — env/pool locks make it safe; the journaled verdict
@@ -146,13 +146,23 @@ const server = createServer((req, res) => {
           /* client hung up mid-stream */
         }
       };
+      let verbForLog = '?';
       try {
         const { verb, args } = JSON.parse(body || '{}');
+        verbForLog = String(verb ?? '?');
         if (verb !== 'ping') await recovered;
         const data = await dispatch(verb, args ?? {}, emit);
         res.end(JSON.stringify({ type: 'result', ok: true, data }) + '\n');
       } catch (err) {
-        const e = err instanceof BrokerError ? err.toJSON() : { class: 'env-error', message: String((err as Error).message ?? err) };
+        // An unclassified throw is a DAEMON bug, not a bad environment.
+        // Labelling it env-error told the agent to recycle an environment,
+        // which cannot fix a TypeError in the broker — and buried the defect.
+        const e = err instanceof BrokerError
+          ? err.toJSON()
+          : { class: 'infra-error', message: `internal daemon error: ${String((err as Error).message ?? err)}` };
+        if (!(err instanceof BrokerError)) {
+          logEvent({ level: 'error', kind: 'internal', detail: `${verbForLog}: ${String((err as Error).stack ?? err)}`.slice(0, 1000) });
+        }
         res.end(JSON.stringify({ type: 'result', ok: false, error: e }) + '\n');
       }
     })();

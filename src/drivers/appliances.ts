@@ -124,7 +124,25 @@ export async function ensureAppliance(
   root: string,
   say: (msg: string) => void,
 ): Promise<ApplianceResult> {
-  if (await probeTcp(spec.probe)) return 'up';
+  const timeoutMsEarly = (spec.timeout ?? 60) * 1000;
+  if (await probeTcp(spec.probe)) {
+    // An open TCP port is NOT readiness. Postgres accepts connections while
+    // still recovering; a container forwards the port before the server is
+    // listening. Returning 'up' here skipped the declared ready: gate entirely,
+    // so the bind proceeded against a half-started appliance and the failure
+    // surfaced later as an unrelated work-error.
+    if (!spec.ready) return 'up';
+    const first = await sh(spec.ready, root);
+    if (first.code === 0) return 'up';
+    say(`appliance '${name}' answers at ${spec.probe} but is not ready yet — waiting`);
+    if (await awaitUp(name, spec, root, now() + timeoutMsEarly)) return 'adopted';
+    throw new BrokerError(
+      'infra-error',
+      `appliance '${name}' answers at ${spec.probe} but its ready: gate never passed within ${spec.timeout ?? 60}s`,
+      'appliance',
+      first.output.slice(0, 800),
+    );
+  }
   if (!spec.start) {
     throw new BrokerError(
       'infra-error',
@@ -146,7 +164,8 @@ export async function ensureAppliance(
   }
   try {
     // Locked. Re-probe: it may have come up between our probe and the lock.
-    if (await probeTcp(spec.probe)) return 'up';
+    // Same rule as above — the ready: gate decides, not the open port.
+    if (await probeTcp(spec.probe) && (await awaitUp(name, spec, root, now() + 1000))) return 'up';
     say(`starting appliance '${name}'`);
     const r = await sh(spec.start, root);
     if (r.code !== 0) {
