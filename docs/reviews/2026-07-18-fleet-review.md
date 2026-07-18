@@ -33,7 +33,7 @@ marked as they are resolved or refuted.
 | 20 | high | bug | killGroupVerified kills an innocent process group when a dead pid is reused by a new group leader | `/home/christian/factory/firstmate/projects/backlot/src/daemon/supervisor.ts:244` |
 | 21 | high | bug | ~~Spawn failure during an automatic restart silently ends supervision; env stays hot and reports healthy~~ **FIXED** | `/home/christian/factory/firstmate/projects/backlot/src/daemon/supervisor.ts:119` |
 | 22 | high | shortcoming | ~~Baked-template markers persist a manifest shell command and re-execute it long after the repo is gone~~ **FIXED** | `src/core/retention.ts:101` |
-| 23 | high | bug | Stat-gate misses same-size edits within one mtime clock tick — stale env content, silent | `src/core/sync.ts:112` |
+| 23 | high | bug | ~~Stat-gate misses same-size edits within one mtime clock tick — stale env content, silent~~ **FIXED** | `src/core/sync.ts:112` |
 | 24 | high | bug | Bind-time reset never cleans env-side untracked files, violating the documented contract | `src/core/sync.ts:139` |
 | 25 | high | bug | Parallel-bind test passes even against a fully serialized daemon — its core assertion is vacuous | `tests/concurrency.test.ts:85` |
 | 26 | high | shortcoming | Pid-reuse refusal is only unit-tested on sameProcess; the actual reap path is untested and appears to kill bystanders | `tests/orphan-reclaim.test.ts:136` |
@@ -70,8 +70,8 @@ marked as they are resolved or refuted.
 | 57 | medium | shortcoming | ~~Check/exec process groups are untagged and their timeout kill is unverified~~ **FIXED** | `/home/christian/factory/firstmate/projects/backlot/src/daemon/engine.ts:60` |
 | 58 | medium | bug | ~~Command-family datastore key is unsanitized and escapes templatesRoot; the sqlite guard's comment claims a sibling check that does not exist~~ **FIXED** | `src/drivers/datastores.ts:259` |
 | 59 | medium | shortcoming | ~~Service and check `cwd` from stack.yaml are joined without safeJoin, letting a process run outside its environment tree~~ **FIXED** | `src/daemon/supervisor.ts:78` |
-| 60 | medium | bug | Symlinks are dereferenced or silently dropped; walkAll crashes on dangling links in bind --ref | `src/core/sync.ts:61` |
-| 61 | medium | bug | File mode changes (chmod +x) never propagate into the env tree | `src/core/sync.ts:128` |
+| 60 | medium | bug | ~~Symlinks are dereferenced or silently dropped; walkAll crashes on dangling links in bind --ref~~ **FIXED** | `src/core/sync.ts:61` |
+| 61 | medium | bug | ~~File mode changes (chmod +x) never propagate into the env tree~~ **FIXED** | `src/core/sync.ts:128` |
 | 62 | medium | shortcoming | changedOutputs reports worktree-side edits as env changes; pull then clobbers newer worktree state | `src/core/sync.ts:162` |
 | 63 | medium | shortcoming | Submodule and nested-repo contents are silently absent from the env tree | `src/core/sync.ts:47` |
 | 64 | medium | bug | Pristine wipes tree and ledger on disk but persists the journal only at bind end | `src/daemon/engine.ts:346` |

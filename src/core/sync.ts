@@ -16,7 +16,7 @@
 import { execFileSync } from 'node:child_process';
 import {
   copyFileSync, mkdirSync, rmSync, existsSync, readFileSync, writeFileSync,
-  readdirSync, statSync, constants as fsConstants,
+  readdirSync, statSync, lstatSync, chmodSync, constants as fsConstants,
 } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileHash, matchesAny, sha256, isFile, safeJoin } from './util.js';
@@ -36,8 +36,30 @@ interface CacheEntry {
   srcMtime: number;
   dstSize: number;
   dstMtime: number;
+  /** Permission bits. chmod changes ctime, not mtime, so content alone misses it. */
+  mode?: number;
 }
 type SyncCache = Record<string, CacheEntry>;
+
+/**
+ * The cache plus the wall-clock at which it was written.
+ *
+ * Filesystem mtimes are coarse (a few ms on Linux, 1s on some filesystems), so
+ * a file rewritten to the SAME SIZE within the same tick as the stat we
+ * recorded is indistinguishable from the file we already synced. The stat gate
+ * then reuses the cached hash forever and the environment silently keeps stale
+ * content — the stat never drifts again on its own.
+ *
+ * git solves this with "racily clean": an entry whose mtime is not strictly
+ * older than the index write is not trusted and must be re-hashed. Same rule.
+ */
+interface CacheFile {
+  syncedAt?: number;
+  entries: SyncCache;
+}
+
+/** Filesystem timestamp granularity to distrust around the write. */
+const RACY_WINDOW_MS = 2000;
 
 function enumerate(stackRoot: string, manifest: Manifest): string[] {
   let listed: string[];
@@ -66,27 +88,45 @@ function walkAll(root: string, prefix = ''): string[] {
   for (const name of readdirSync(join(root, prefix))) {
     if (name === '.git' || name === 'node_modules') continue;
     const rel = prefix ? `${prefix}/${name}` : name;
-    if (statSync(join(root, rel)).isDirectory()) out.push(...walkAll(root, rel));
+    // lstat, not stat: a DANGLING symlink makes stat throw ENOENT, which took
+    // down the whole enumeration — and this is the live path for `bind --ref`,
+    // whose `git archive | tar -x` extraction preserves symlinks, dangling
+    // ones included. Directory symlinks are listed but not followed, so a link
+    // pointing at an ancestor cannot send this into an infinite walk.
+    let st;
+    try {
+      st = lstatSync(join(root, rel));
+    } catch {
+      continue; // vanished mid-walk
+    }
+    if (st.isSymbolicLink()) out.push(rel);
+    else if (st.isDirectory()) out.push(...walkAll(root, rel));
     else out.push(rel);
   }
   return out;
 }
 
-const cachePath = (envRoot: string) => join(envRoot, '.backlot-synced.json');
+const CACHE_FILE = '.backlot-synced.json';
+const cachePath = (envRoot: string) => join(envRoot, CACHE_FILE);
 
-function loadCache(envTree: string): SyncCache {
+function loadCache(envTree: string): CacheFile {
   try {
     const raw = JSON.parse(readFileSync(cachePath(envTree), 'utf8'));
-    return Array.isArray(raw) ? {} : (raw as SyncCache); // migrate from the v0.1 list format
+    if (Array.isArray(raw)) return { entries: {} }; // v0.1 list format
+    // v0.2 wrote the entry map at the top level, with no timestamp. Treat it as
+    // entries with an unknown write time, which makes every entry racy once —
+    // one extra hashing pass, then the new format takes over.
+    if (raw && typeof raw === 'object' && 'entries' in raw) return raw as CacheFile;
+    return { entries: (raw ?? {}) as SyncCache };
   } catch {
-    return {};
+    return { entries: {} };
   }
 }
 
-const statOf = (p: string): { size: number; mtime: number } | null => {
+const statOf = (p: string): { size: number; mtime: number; mode: number } | null => {
   try {
     const s = statSync(p);
-    return { size: s.size, mtime: s.mtimeMs };
+    return { size: s.size, mtime: s.mtimeMs, mode: s.mode & 0o777 };
   } catch {
     return null;
   }
@@ -96,7 +136,12 @@ export function syncIntoEnv(stackRoot: string, envTree: string, manifest: Manife
   mkdirSync(envTree, { recursive: true });
   const files = enumerate(stackRoot, manifest).sort();
   const protectedPatterns = [...(manifest.caches ?? []), ...(manifest.sync?.keep ?? [])];
-  const prev = loadCache(envTree);
+  const cache = loadCache(envTree);
+  const prev = cache.entries;
+  // An entry whose recorded mtime sits at or after the previous cache write
+  // cannot be trusted: the file may have changed again inside the same
+  // timestamp tick. Re-hash those instead of believing the stat.
+  const racyFrom = cache.syncedAt === undefined ? -Infinity : cache.syncedAt - RACY_WINDOW_MS;
   const next: SyncCache = {};
 
   let copied = 0;
@@ -109,29 +154,50 @@ export function syncIntoEnv(stackRoot: string, envTree: string, manifest: Manife
     const srcStat = statOf(src)!;
 
     // Source hash: stat-gated.
-    const srcHash =
-      cached && cached.srcSize === srcStat.size && cached.srcMtime === srcStat.mtime
-        ? cached.hash
-        : fileHash(src)!;
+    const trustSrcStat =
+      cached !== undefined &&
+      cached.srcSize === srcStat.size &&
+      cached.srcMtime === srcStat.mtime &&
+      cached.srcMtime < racyFrom; // strictly older than the last write: safe
+    const srcHash = trustSrcStat ? cached.hash : fileHash(src)!;
 
     // Env-side hash: stat-gated too (this is the reset guarantee — a mutated
     // tracked file in the env has a drifted stat or hash and gets overwritten).
     const dstStat = statOf(dst);
     let dstHash: string | null = null;
     if (dstStat) {
-      dstHash =
-        cached && cached.dstSize === dstStat.size && cached.dstMtime === dstStat.mtime
-          ? cached.hash
-          : fileHash(dst);
+      const trustDstStat =
+        cached !== undefined &&
+        cached.dstSize === dstStat.size &&
+        cached.dstMtime === dstStat.mtime &&
+        cached.dstMtime < racyFrom;
+      dstHash = trustDstStat ? cached.hash : fileHash(dst);
     }
 
-    if (dstHash !== srcHash) {
+    const contentDiffers = dstHash !== srcHash;
+    if (contentDiffers) {
       mkdirSync(dirname(dst), { recursive: true });
       copyFileSync(src, dst, fsConstants.COPYFILE_FICLONE); // CoW clone on APFS/reflink fs; falls back to copy
       copied++;
     }
-    const newDstStat = dstHash !== srcHash ? statOf(dst)! : dstStat!;
-    next[rel] = { hash: srcHash, srcSize: srcStat.size, srcMtime: srcStat.mtime, dstSize: newDstStat.size, dstMtime: newDstStat.mtime };
+    // copyFileSync only applies the source mode when it CREATES the file, and a
+    // chmod moves ctime rather than mtime — so `chmod +x` on an unchanged file
+    // never reached the environment, and the service failed with 'Permission
+    // denied' blamed on the repo.
+    const dstNow = statOf(dst);
+    if (dstNow && dstNow.mode !== srcStat.mode) {
+      chmodSync(dst, srcStat.mode);
+      if (!contentDiffers) copied++; // a real change was propagated
+    }
+    const newDstStat = statOf(dst)!;
+    next[rel] = {
+      hash: srcHash,
+      srcSize: srcStat.size,
+      srcMtime: srcStat.mtime,
+      dstSize: newDstStat.size,
+      dstMtime: newDstStat.mtime,
+      mode: srcStat.mode,
+    };
   }
 
   // Mirror deletions relative to the PREVIOUS binding, never touching caches/keep.
@@ -149,7 +215,9 @@ export function syncIntoEnv(stackRoot: string, envTree: string, manifest: Manife
       deleted++;
     }
   }
-  writeFileSync(cachePath(envTree), JSON.stringify(next));
+
+
+  writeFileSync(cachePath(envTree), JSON.stringify({ syncedAt: Date.now(), entries: next } satisfies CacheFile));
 
   const sourceHash = sha256(files.map((f) => `${f}:${next[f]!.hash}`).join('\n'));
   return { copied, deleted, files, sourceHash };
