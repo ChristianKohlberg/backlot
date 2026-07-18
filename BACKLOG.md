@@ -18,11 +18,11 @@ Each item notes severity and where it was found.
   Fixed on two fronts: capacity waits now fail fast with a structural
   diagnosis naming the blocking lease instead of burning the window and
   blaming timing, and CI pins `BACKLOT_POOL_MAX=2`.
-  **Open product question deliberately NOT decided here:** the documented core
-  loop cannot run on any pool of 1, so a 1-environment machine cannot use
-  backlot as documented. Raising the heuristic floor to 2 would fix that but
-  doubles peak memory on exactly the smallest machines — a real trade, and an
-  owner's call rather than a review's.
+  Owner decision (2026-07-18): the heuristic floor is now **2**, not 1. A
+  default under which the primary workflow cannot run is the worse failure, and
+  a cap is not a reservation — the second environment is only created when the
+  user actually asks for concurrent work. `BACKLOT_POOL_MAX=1` opts back out on
+  a constrained host, at the price of that loop.
 
 ## Polish — found during live Revamp/parallel testing (2026-07-03)
 

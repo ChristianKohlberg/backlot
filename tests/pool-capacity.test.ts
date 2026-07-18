@@ -55,11 +55,13 @@ function ctx() {
 }
 
 describe('pool capacity diagnostics', () => {
-  it('the capacity heuristic can legitimately resolve to 1', () => {
-    // Documents the mechanism rather than this machine's value: floor(3/2) and
-    // floor(7/4) both give 1 on GitHub's macos-latest arm runners.
-    expect(poolMaxHeuristic()).toBeGreaterThanOrEqual(1);
-    expect(Math.max(1, Math.min(8, Math.min(Math.floor(3 / 2), Math.floor(7 / 4))))).toBe(1);
+  it('never resolves below the two environments the core loop needs', () => {
+    // The raw terms genuinely reach 1 on a 3 vCPU / 7 GB runner...
+    expect(Math.min(Math.floor(3 / 2), Math.floor(7 / 4))).toBe(1);
+    // ...but the floor is 2, because `up` + `run` structurally needs two envs.
+    // A pool of 1 cannot run backlot as documented.
+    expect(poolMaxHeuristic()).toBeGreaterThanOrEqual(2);
+    expect(poolMaxHeuristic()).toBeLessThanOrEqual(8);
   });
 
   it('fails fast with a structural diagnosis instead of waiting out the window', async () => {

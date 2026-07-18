@@ -312,7 +312,7 @@ variable > `$STATE_DIR/config.json` > built-in default.
 | Env var | config.json key | Default |
 | --- | --- | --- |
 | `BACKLOT_STATE_DIR` | — | `$XDG_STATE_HOME/backlot` (the per-machine root; 0700) |
-| `BACKLOT_POOL_MAX` | `poolMax` | `min(cores/2, memGB/4)`, clamped [1,8] |
+| `BACKLOT_POOL_MAX` | `poolMax` | `min(cores/2, memGB/4)`, clamped **[2,8]** — the floor is 2 because `up` + `run` needs two envs |
 | `BACKLOT_LEASE_TTL_MS` | `sessionTtlMs` / `runTtlMs` | 30 min / 10 min |
 | `BACKLOT_IDLE_TTL_MS` | `idleTtlMs` | 30 min |
 | `BACKLOT_WAIT_MS` | `waitMs` | 60 s (queue-at-capacity timeout) |
