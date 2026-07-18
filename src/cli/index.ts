@@ -4,7 +4,7 @@
  * human); exit codes are contractual — 0 ok, 1 work-error, 2 env-error,
  * 3 infra-error, 64 usage. See docs/architecture.md §11.
  */
-import { ensureDaemon, rpc, type RpcError } from './client.js';
+import { ensureDaemon, rpc, classifyClientError, type RpcError } from './client.js';
 
 const USAGE = `backlot — puts a working instance of a web application in front of you.
 
@@ -26,7 +26,9 @@ Usage:
   backlot status          daemon, pool, and lease overview
   backlot appliance ls|start|stop [name]
                           shared backing servers: probe, ensure up, explicit stop
-  backlot pool ls|recycle [--all]
+  backlot pool ls|recycle [--all]|reconcile|gc|doctor
+                          gc reclaims service processes orphaned by an ungraceful
+                          exit; doctor reports drift without acting on it
   backlot daemon stop     stop the daemon (environments are recovered on next use)
 
 Every verb accepts --json. Long verbs (up/run/sync/bind/reset-data) show live progress
@@ -94,6 +96,11 @@ const errExit = (e: RpcError): never => {
   }
   process.exit(code);
 };
+
+/** POSIX single-quote quoting: safe for anything, including embedded quotes. */
+function shellQuote(arg: string): string {
+  return `'${arg.replace(/'/g, `'\\''`)}'`;
+}
 
 function humanize(data: unknown): string {
   return JSON.stringify(data, null, 2);
@@ -179,9 +186,9 @@ async function main(): Promise<void> {
           return;
         }
       } else {
-        res = await rpc('run', { cwd, holder, check, hygiene: hygiene() }, progress);
+        res = await rpc('run', { cwd, holder, check, hygiene: hygiene(), pull: flags.has('--pull') }, progress);
         endProgress();
-        if (res.ok && flags.has('--pull')) await rpc('pull', { cwd, holder });
+
       }
       break;
     }
@@ -192,6 +199,16 @@ async function main(): Promise<void> {
         process.exit(64);
       }
       res = jobId === 'ls' ? await rpc('job-ls', {}) : await rpc('job', { jobId });
+      // Symmetry with synchronous `run`: a finished job with a failed verdict
+      // exits 1. Without this an agent polling a detached run could not branch
+      // on the exit code at all, only by parsing the body.
+      if (jobId !== 'ls' && res.ok) {
+        const job = res.data as { state?: string; verdict?: { ok?: boolean } | null };
+        if (job.state === 'done' && job.verdict && job.verdict.ok === false) {
+          out(res.data);
+          process.exit(1);
+        }
+      }
       break;
     }
     case 'ctx':
@@ -209,7 +226,13 @@ async function main(): Promise<void> {
     }
     case 'exec': {
       // The whole passthrough is the command, verbatim — its own --flags intact.
-      const cmd = (passthrough ?? positional).join(' ');
+      //
+      // One token is a SHELL STRING: `exec 'echo hi > out.txt'` must keep its
+      // redirection and operators. Several tokens mean the caller's own shell
+      // already split them, so their boundaries are real and must survive —
+      // joining on spaces turned `exec cat "my file.txt"` into two arguments.
+      const parts = passthrough ?? positional;
+      const cmd = parts.length === 1 ? parts[0]! : parts.map(shellQuote).join(' ');
       if (!cmd) {
         console.error('backlot exec: no command given');
         process.exit(64);
@@ -232,7 +255,15 @@ async function main(): Promise<void> {
         console.error('backlot logs: which service?');
         process.exit(64);
       }
-      res = await rpc('logs', { cwd, holder, service, lines: Number(flagValue('--lines') ?? 40) });
+      const rawLines = flagValue('--lines');
+      const lines = rawLines === undefined ? 40 : Number(rawLines);
+      // NaN reached the daemon as slice(-NaN) and quietly returned the WHOLE
+      // log — the opposite of what a bounded --lines asks for.
+      if (!Number.isInteger(lines) || lines <= 0) {
+        console.error(`backlot logs: --lines expects a positive integer, got '${rawLines}'`);
+        process.exit(64);
+      }
+      res = await rpc('logs', { cwd, holder, service, lines });
       if (res.ok && !json) {
         console.log((res.data as { lines: string }).lines);
         return;
@@ -280,9 +311,10 @@ async function main(): Promise<void> {
       if (sub === 'ls') res = await rpc('status', {});
       else if (sub === 'recycle') res = await rpc('pool-recycle', { all: flags.has('--all') });
       else if (sub === 'reconcile') res = await rpc('pool-reconcile', {});
+      else if (sub === 'gc') res = await rpc('pool-gc', {});
       else if (sub === 'doctor') res = await rpc('doctor', {});
       else {
-        console.error(`backlot pool: unknown subcommand '${sub}' (ls | recycle | reconcile | doctor)`);
+        console.error(`backlot pool: unknown subcommand '${sub}' (ls | recycle | reconcile | gc | doctor)`);
         process.exit(64);
       }
       break;
@@ -314,7 +346,12 @@ async function main(): Promise<void> {
 
 main().catch((err) => {
   const msg = String((err as Error).message ?? err);
-  if (json) console.log(JSON.stringify({ ok: false, error: { class: 'env-error', message: msg } }));
-  else console.error(`backlot: ${msg}`);
-  process.exit(2);
+  // Agents branch on the error class MECHANICALLY (decision 0010), so a
+  // client-side failure must not masquerade as env-error: that tells the agent
+  // to recycle an environment, which cannot fix an unreachable or wedged
+  // daemon. Anything that is not a classified daemon response is infra.
+  const cls = classifyClientError(err);
+  if (json) console.log(JSON.stringify({ ok: false, error: { class: cls, message: msg } }));
+  else console.error(`backlot: [${cls}] ${msg}`);
+  process.exit(cls === 'infra-error' ? 3 : 2);
 });

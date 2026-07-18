@@ -4,7 +4,7 @@
  */
 import { describe, it, expect, afterAll, afterEach } from 'vitest';
 import { execFile, execFileSync } from 'node:child_process';
-import { mkdtempSync, rmSync, writeFileSync, readFileSync, mkdirSync, utimesSync, statSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync, readFileSync, mkdirSync, utimesSync, statSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -16,14 +16,14 @@ function makeContext() {
   const env = { ...process.env, BACKLOT_STATE_DIR: stateDir, BACKLOT_SWEEP_MS: '500' };
   const cli = (args: string[], cwd: string): Promise<{ exitCode: number; json?: Record<string, unknown> }> =>
     new Promise((resolve) => {
-      execFile(process.execPath, [CLI, ...args], { cwd, env, maxBuffer: 16 * 1024 * 1024 }, (err, stdout) => {
+      execFile(process.execPath, [CLI, ...args], { cwd, env, maxBuffer: 16 * 1024 * 1024 }, (err, stdout, stderr) => {
         let json;
         try {
           json = JSON.parse(String(stdout));
         } catch {
           /* non-json */
         }
-        resolve({ exitCode: err ? ((err as { code?: number }).code ?? 1) : 0, json });
+        resolve({ exitCode: err ? ((err as { code?: number }).code ?? 1) : 0, json, stdout: String(stdout), stderr: String(stderr) });
       });
     });
   const cleanup = () => {
@@ -46,7 +46,7 @@ const STACK = `name: opsy
 services:
   web: { run: node server.mjs, port: web, env: { PORT: "{{ports.web}}" }, ready: { http: /, timeout: 20 } }
 checks:
-  hang: { run: "sleep 300", timeout: 2 }
+  hang: { run: "sh -c 'sleep 300 & echo $! > hung-child.pid; wait'", timeout: 2 }
   quick: { run: "true" }
 `;
 
@@ -67,10 +67,34 @@ describe('check timeouts and job ls', () => {
     const start = Date.now();
     const res = await ctx.cli(['run', 'hang', '--json'], wt);
     expect(Date.now() - start).toBeLessThan(30_000); // 2s timeout + bind, nowhere near 300s
-    expect(res.exitCode, `output: ${(res as { output?: string }).output ?? ''}${res.stdout ?? ''}${res.stderr ?? ''}`).toBe(1);
+    expect(res.exitCode, `stdout: ${res.stdout ?? ''}\nstderr: ${res.stderr ?? ''}`).toBe(1);
     const v = res.json!;
     expect(v.ok).toBe(false);
     expect((v.failure as { message: string }).message).toContain('timed out after 2s');
+
+    // The verdict text alone proved nothing about the PROCESS TABLE: a
+    // regression from group-kill back to killing only the sh wrapper would
+    // still produce this message while leaking the real child. The fixture
+    // forks deliberately and records the grandchild's pid, so this asserts the
+    // thing the test is named for.
+    const envs = (await ctx.cli(['pool', 'ls', '--json'], wt)).json!.envs as Array<{ id: string }>;
+    let childPid: number | undefined;
+    for (const e of envs) {
+      const f = join(ctx.stateDir, 'envs', e.id, 'tree', 'hung-child.pid');
+      if (existsSync(f)) childPid = Number(readFileSync(f, 'utf8').trim());
+    }
+    expect(childPid, 'the hang fixture should have recorded its child pid').toBeGreaterThan(0);
+    const alive = (pid: number) => {
+      try {
+        process.kill(pid, 0);
+        return true;
+      } catch {
+        return false;
+      }
+    };
+    // Give the group kill a moment to land, then require the grandchild gone.
+    for (let i = 0; i < 40 && alive(childPid!); i++) await new Promise((r) => setTimeout(r, 100));
+    expect(alive(childPid!), `grandchild ${childPid} outlived the group kill`).toBe(false);
   }, 60_000);
 
   it('job ls lists detached runs newest-first with their outcome', async () => {
@@ -94,7 +118,7 @@ describe('check timeouts and job ls', () => {
     writeFileSync(join(wt, 'message.txt'), 'v2-dirty');
 
     const bound = await ctx.cli(['bind', '--ref', 'HEAD', '--json'], wt);
-    expect(bound.exitCode, `output: ${(bound as { output?: string }).output ?? ''}${bound.stdout ?? ''}${bound.stderr ?? ''}`).toBe(0);
+    expect(bound.exitCode, `stdout: ${bound.stdout ?? ''}\nstderr: ${bound.stderr ?? ''}`).toBe(0);
     const url = (bound.json!.urls as Record<string, string>).web!;
     expect(await (await fetch(url)).text()).toBe('v1'); // the COMMIT, not the dirty tree
 
@@ -102,7 +126,7 @@ describe('check timeouts and job ls', () => {
     expect(await (await fetch(url)).text()).toBe('v2-dirty'); // back to worktree state
 
     const bad = await ctx.cli(['bind', '--ref', 'nope-branch', '--json'], wt);
-    expect(bad.exitCode, `output: ${(bad as { output?: string }).output ?? ''}${bad.stdout ?? ''}${bad.stderr ?? ''}`).toBe(1); // work-error: not a commit
+    expect(bad.exitCode, `stdout: ${bad.stdout ?? ''}\nstderr: ${bad.stderr ?? ''}`).toBe(1); // work-error: not a commit
   }, 60_000);
 });
 

@@ -12,17 +12,19 @@ import { loadStack, defaultPreset, type Stack } from '../core/manifest.js';
 import { syncIntoEnv, changedOutputs, pullOutputs } from '../core/sync.js';
 import { runUpkeep, templateBakeKeys } from '../core/upkeep.js';
 import { freePort, probeFree } from '../core/ports.js';
-import { envsRoot, artifactsRoot } from '../core/paths.js';
-import { BrokerError, template, templateEnv, now, shortId, matchesAny } from '../core/util.js';
+import { envsRoot, artifactsRoot, stateRoot } from '../core/paths.js';
+import { BrokerError, template, templateEnv, now, shortId, matchesAny, safeJoin } from '../core/util.js';
 import { makeDatastore, type DsHandle } from '../drivers/datastores.js';
 import { ensureAppliance, stopAppliance, probeTcp } from '../drivers/appliances.js';
-import { EnvSupervisor, reapPids } from './supervisor.js';
+import { EnvSupervisor, killGroupVerified, reapPids } from './supervisor.js';
+import { isAlive, procScanSupported, sameProcess, scanTagged, serviceTag } from '../core/procscan.js';
 import { policy } from '../core/policy.js';
 import { retentionSweep } from '../core/retention.js';
 import { logEvent, recentEvents } from '../core/events.js';
-import type { Hygiene, LeaseKind } from '../core/types.js';
+import type { Hygiene, LeaseKind, ServicePid } from '../core/types.js';
 
 const POOL_MAX = () => policy().poolMax;
+const POOL_MAX_TOTAL = () => policy().poolMaxTotal;
 const LEASE_TTL = (kind: LeaseKind) => (kind === 'session' ? policy().sessionTtlMs : policy().runTtlMs);
 const IDLE_TTL = () => policy().idleTtlMs;
 const WAIT_MS = () => policy().waitMs;
@@ -48,6 +50,11 @@ export interface UpOptions {
  * Run a check/exec command as a PROCESS GROUP with a hard timeout — killing
  * only the `sh` wrapper would orphan grandchildren (a hung Playwright would
  * hold the environment busy forever).
+ */
+/**
+ * Checks and exec run detached too, so they can outlive the daemon exactly as
+ * services can. They carry the same tag, which is what lets `pool gc` find and
+ * reclaim a hung check's group after an ungraceful exit.
  */
 function runGroupCmd(
   cmd: string,
@@ -90,6 +97,11 @@ export class Engine {
   private supervisors = new Map<string, EnvSupervisor>();
   private lastSweep = now();
   private lastRetention = now();
+  private lastGc = now();
+  private lastSweepMono = performance.now();
+  /** FIFO tickets for capacity waiters, so an early waiter is not starved. */
+  private waitTicket = 0;
+  private waiting: number[] = [];
 
   // -------- concurrency: a short pool lock for claim/release bookkeeping and
   // one lock per environment for bind/exec/reset. Two environments (or two
@@ -132,22 +144,102 @@ export class Engine {
   }
 
   /** Recovery (decision 0009): reap recorded PIDs from a previous daemon life; hot -> warm. */
-  recover(): void {
+  async recover(): Promise<void> {
     let envs = 0;
+    let stranded = 0;
     for (const env of this.journal.allEnvs()) {
-      if (Object.keys(env.servicePids).length > 0) reapPids(env.servicePids);
-      // A 'recycling' env from a crashed daemon never finished teardown — finish it.
+      // Keep whatever survived the reap RECORDED. Clearing servicePids
+      // unconditionally used to strand survivors permanently: supervisor()
+      // vends a fresh empty supervisor after a restart, so every later
+      // stopAll() for that env was a silent no-op and the process kept its
+      // port until a human found it (issue #5).
+      const survivors =
+        Object.keys(env.servicePids).length > 0 ? await reapPids(env.servicePids) : {};
+      stranded += Object.keys(survivors).length;
+      // A 'recycling' env from a crashed daemon never finished teardown — finish
+      // it. Persist survivors FIRST: teardownClaimed deletes the row, so a
+      // process that outlived the reap would otherwise lose its only record and
+      // be findable by tag alone.
       if (env.state === 'recycling') {
-        void this.teardownClaimed(env).catch(() => undefined);
+        if (Object.keys(survivors).length > 0) {
+          env.servicePids = survivors;
+          this.journal.saveEnv(env);
+        }
+        void this.teardownClaimed(env).catch((err) =>
+          logEvent({ level: 'error', kind: 'teardown', envId: env.id, detail: `recovery teardown failed: ${String((err as Error).message ?? err)}` }),
+        );
         continue;
       }
       if (env.state === 'hot' || env.state === 'degraded') env.state = 'warm';
-      env.servicePids = {};
+      env.servicePids = survivors;
+      // Reaping awaits real kills, so this row may have been torn down while we
+      // were working. Saving a snapshot of a deleted row resurrects it.
+      if (!this.journal.getEnv(env.id)) continue;
       this.journal.saveEnv(env);
       envs++;
     }
     const jobs = this.journal.failStaleJobs();
-    logEvent({ level: 'info', kind: 'recover', detail: `reconciled ${envs} env(s), ${jobs} stale job(s)` });
+    logEvent({
+      level: stranded ? 'warn' : 'info',
+      kind: 'recover',
+      detail: `reconciled ${envs} env(s), ${jobs} stale job(s)${stranded ? `, ${stranded} service(s) survived the reap` : ''}`,
+    });
+    // Anything the journal never knew about — the owner died before the pids
+    // were ever written, or the env row is long gone — is only findable by tag.
+    const gc = await this.poolGc();
+    if (gc.reclaimed.length) {
+      logEvent({ level: 'warn', kind: 'gc', detail: `reclaimed ${gc.reclaimed.length} orphaned process(es) at startup` });
+    }
+  }
+
+  /**
+   * Reclaim backlot-spawned processes that no live environment accounts for.
+   *
+   * A process is an orphan when it carries this state root's tag but its env
+   * either no longer exists in the journal, or exists in a state that must have
+   * no services running (warm/recycling). Anything belonging to a hot env, or
+   * to an env with an operation in flight, is left strictly alone — a bind
+   * racing the sweep must not have its dev-server shot out from under it.
+   */
+  async poolGc(): Promise<{ supported: boolean; reclaimed: Array<{ pid: number; envId: string; service: string }>; skipped: number }> {
+    if (!procScanSupported()) return { supported: false, reclaimed: [], skipped: 0 };
+    const tagged = scanTagged(stateRoot());
+    if (tagged.length === 0) return { supported: true, reclaimed: [], skipped: 0 };
+
+    // Snapshot which envs may legitimately own a running process right now.
+    const live = new Set<string>();
+    for (const env of this.journal.allEnvs()) {
+      if (env.state === 'hot' || env.state === 'provisioning' || this.busy.has(env.id)) live.add(env.id);
+    }
+    for (const id of this.busy) live.add(id);
+
+    const reclaimed: Array<{ pid: number; envId: string; service: string }> = [];
+    let skipped = 0;
+    for (const proc of tagged) {
+      if (live.has(proc.envId)) {
+        skipped++;
+        continue;
+      }
+      // Pin identity to the exact process the scan saw: between the scan and
+      // this kill the pid could have exited and been reused.
+      const dead = await killGroupVerified(proc.pid, proc.startTime);
+      if (dead) reclaimed.push({ pid: proc.pid, envId: proc.envId, service: proc.service });
+    }
+    if (reclaimed.length) {
+      // A reclaimed process may have been the one the journal was still
+      // tracking — drop those records so doctor() doesn't report drift.
+      for (const env of this.journal.allEnvs()) {
+        const keep = Object.fromEntries(
+          Object.entries(env.servicePids).filter(([, rec]) => !reclaimed.some((r) => r.pid === rec.pid)),
+        );
+        if (Object.keys(keep).length !== Object.keys(env.servicePids).length) {
+          env.servicePids = keep;
+          this.journal.saveEnv(env);
+        }
+      }
+      logEvent({ level: 'info', kind: 'gc', detail: `reclaimed ${reclaimed.length} orphaned process(es)` });
+    }
+    return { supported: true, reclaimed, skipped };
   }
 
   // ---------------------------------------------------------------- pool
@@ -165,9 +257,20 @@ export class Engine {
     const dirs = this.envDirs(id);
     mkdirSync(dirs.tree, { recursive: true });
     mkdirSync(dirs.data, { recursive: true });
+    // freePort asks the OS for an unused port and immediately closes the
+    // listener, so nothing stops the SAME port being handed to the next
+    // environment moments later — two warm envs would then collide the first
+    // time both went hot. Exclude everything already recorded pool-wide.
+    const taken = new Set<number>();
+    for (const e of this.journal.allEnvs()) for (const p of Object.values(e.ports)) taken.add(p);
     const ports: Record<string, number> = {};
     for (const [, spec] of Object.entries(stack.manifest.services)) {
-      if (spec.port && !(spec.port in ports)) ports[spec.port] = await freePort();
+      if (spec.port && !(spec.port in ports)) {
+        let port = await freePort();
+        for (let attempt = 0; attempt < 50 && taken.has(port); attempt++) port = await freePort();
+        taken.add(port);
+        ports[spec.port] = port;
+      }
     }
     const env: EnvRow = {
       id, stack: stack.id, stackRoot: stack.root, state: 'warm', root: dirs.root,
@@ -197,7 +300,9 @@ export class Engine {
       .filter((e) => !this.journal.leaseForEnv(e.id) && e.state !== 'degraded' && e.state !== 'recycling')
       .sort((a, b) => (a.state === 'hot' ? -1 : 1) - (b.state === 'hot' ? -1 : 1));
     let env = free[0];
-    if (!env && envs.length < POOL_MAX()) env = await this.createEnv(stack);
+    // Two ceilings: this stack's, and the machine's across every stack.
+    const total = this.journal.allEnvs().length;
+    if (!env && envs.length < POOL_MAX() && total < POOL_MAX_TOTAL()) env = await this.createEnv(stack);
     if (env) {
       this.journal.saveLease({ id: `l-${shortId()}`, envId: env.id, kind, holder, hygiene, expiresAt: now() + ttlMs });
       return env;
@@ -205,12 +310,74 @@ export class Engine {
     return null;
   }
 
+  /**
+   * Is the pool full of environments whose leases outlast our whole wait?
+   *
+   * If so, queueing cannot possibly succeed, and reporting "waited 60s" blames
+   * a timing problem that does not exist. This is the shape a session `up`
+   * followed by a `run` hits on a one-environment pool: `run` always mints its
+   * own ephemeral holder, so it needs a SECOND environment that the pool is not
+   * allowed to create. MUST run under the pool lock.
+   */
+  private structuralCapacityBlock(stack: Stack, deadline: number): string | null {
+    const envs = this.journal.envsForStack(stack.id);
+    const total = this.journal.allEnvs().length;
+    if (envs.length < POOL_MAX() && total < POOL_MAX_TOTAL()) return null; // room to grow
+    // A machine-wide block can clear when ANOTHER stack releases, so only a
+    // per-stack block is structural.
+    if (envs.length < POOL_MAX()) return null;
+    const holders: string[] = [];
+    for (const env of envs) {
+      // These resolve on their own — the sweeper reaps them and frees capacity.
+      if (env.state === 'degraded' || env.state === 'recycling') return null;
+      const lease = this.journal.leaseForEnv(env.id);
+      if (!lease) return null; // a free env exists; this is a transient race
+      if (lease.expiresAt <= deadline) return null; // it will expire in time
+      holders.push(`${env.id} held by '${lease.holder}' (${lease.kind}, ${Math.round((lease.expiresAt - now()) / 60_000)}m left)`);
+    }
+    return holders.join('; ');
+  }
+
   /** Queue at capacity WITHOUT holding the pool lock while sleeping. */
   private async acquireEnv(stack: Stack, holder: string, kind: LeaseKind, hygiene: Hygiene, ttlMs: number): Promise<EnvRow> {
     const start = now();
+    // FIFO ticket. Without ordering, every waiter polled independently and a
+    // freed environment went to whoever happened to poll first — so an early
+    // waiter could time out while later arrivals were served.
+    const ticket = ++this.waitTicket;
+    this.waiting.push(ticket);
+    try {
+      return await this.acquireQueued(stack, holder, kind, hygiene, ttlMs, start, ticket);
+    } finally {
+      this.waiting = this.waiting.filter((t) => t !== ticket);
+    }
+  }
+
+  private async acquireQueued(
+    stack: Stack,
+    holder: string,
+    kind: LeaseKind,
+    hygiene: Hygiene,
+    ttlMs: number,
+    start: number,
+    ticket: number,
+  ): Promise<EnvRow> {
     for (;;) {
-      const env = await this.poolLocked(() => this.tryClaim(stack, holder, kind, hygiene, ttlMs));
+      // Only the head of the queue may claim; everyone else waits their turn.
+      const myTurn = this.waiting.length === 0 || this.waiting[0] === ticket;
+      const env = myTurn ? await this.poolLocked(() => this.tryClaim(stack, holder, kind, hygiene, ttlMs)) : null;
       if (env) return env;
+      // Refuse to burn the full wait on something that provably cannot resolve.
+      const blocked = await this.poolLocked(() => this.structuralCapacityBlock(stack, now() + WAIT_MS()));
+      if (blocked) {
+        throw new BrokerError(
+          'env-error',
+          `pool at capacity (${POOL_MAX()}/${POOL_MAX()} for this stack, ${this.journal.allEnvs().length}/${POOL_MAX_TOTAL()} machine-wide) and every environment is leased past the wait window — queueing cannot succeed. Blocking: ${blocked}. ` +
+            `A 'run' always takes its own environment, so a session lease plus a run needs BACKLOT_POOL_MAX >= 2 (currently ${POOL_MAX()}). ` +
+            `Raise BACKLOT_POOL_MAX, or release the blocking lease first.`,
+          'pool',
+        );
+      }
       if (now() - start > WAIT_MS()) {
         throw new BrokerError('env-error', `pool at capacity (${POOL_MAX()}/${POOL_MAX()}) — waited ${Math.round(WAIT_MS() / 1000)}s; release a lease or raise BACKLOT_POOL_MAX`, 'pool');
       }
@@ -273,6 +440,24 @@ export class Engine {
       throw new BrokerError('env-error', `environment ${env.id} is being recycled — retry`, 'pool');
     }
     const dirs = this.envDirs(env.id);
+    // Ports are allocated once at createEnv (decision 0004: stable for the
+    // environment's lifetime). A service ADDED to the manifest afterwards had
+    // no port, so every bind of an existing environment failed on the
+    // undefined lookup — permanently, for envs created before the edit.
+    // Existing keys are never reassigned, so stability holds.
+    let addedPort = false;
+    const takenPorts = new Set<number>();
+    for (const e of this.journal.allEnvs()) for (const p of Object.values(e.ports)) takenPorts.add(p);
+    for (const spec of Object.values(stack.manifest.services)) {
+      if (spec.port && !(spec.port in env.ports)) {
+        let port = await freePort();
+        for (let attempt = 0; attempt < 50 && takenPorts.has(port); attempt++) port = await freePort();
+        takenPorts.add(port);
+        env.ports[spec.port] = port;
+        addedPort = true;
+      }
+    }
+    if (addedPort) this.journal.saveEnv(env);
     if (hygiene === 'pristine') {
       say('preparing a pristine environment');
       await this.supervisor(env).stopAll();
@@ -283,6 +468,12 @@ export class Engine {
       mkdirSync(dirs.data, { recursive: true });
       env.fingerprints = {};
       env.presets = {};
+      // Persist the cleared ledger NOW, not at the end of the bind. Appliances,
+      // sync and upkeep all run before the epilogue, and a crash in any of them
+      // used to leave the journal asserting fingerprints and presets for state
+      // that no longer exists on disk — so the next bind skipped work it had to
+      // redo.
+      this.journal.saveEnv(env);
     }
 
     // Appliances first: shared backing servers must answer before anything
@@ -294,7 +485,9 @@ export class Engine {
     }
 
     say('syncing worktree');
-    const sync = syncIntoEnv(sourceRoot ?? stack.root, dirs.tree, stack.manifest);
+    // reset-data and pristine mean "clean slate", so they also sweep env-side
+    // droppings; a plain reuse bind keeps them (and keeps its build artifacts).
+    const sync = syncIntoEnv(sourceRoot ?? stack.root, dirs.tree, stack.manifest, hygiene !== 'reuse');
     say(`synced ${sync.files.length} files (${sync.copied} changed, ${sync.deleted} removed)`);
     const upkeep = await runUpkeep(dirs.tree, sync.files, stack.manifest, env.fingerprints);
     // Content-derived template identity (vetbill-1i49): divergent
@@ -305,7 +498,7 @@ export class Engine {
     for (const r of upkeep.ran) say(`upkeep: ${r.run}`);
     for (const dsName of upkeep.rebakeTemplates) {
       const spec = stack.manifest.datastores?.[dsName];
-      if (spec) await makeDatastore(dsName, spec, stack.id, bakeKeys[dsName]).rebake();
+      if (spec) await makeDatastore(dsName, spec, stack.id, bakeKeys[dsName]).rebake(stack.root);
     }
 
     // Fast path: identical source, services healthy, data untouched -> reuse as-is.
@@ -319,6 +512,11 @@ export class Engine {
     if (unchanged) {
       env.fingerprints['@source'] = sync.sourceHash;
       env.lastUsedAt = now();
+      // Refresh from the LIVE supervisor before saving. A service that restarted
+      // during this bind updated the journal through onPidsChanged, and writing
+      // the pre-bind snapshot back put dead pids there — which recovery would
+      // later signal, missing the real process.
+      env.servicePids = this.supervisor(env).pids();
       this.journal.saveEnv(env);
       return env;
     }
@@ -404,17 +602,37 @@ export class Engine {
           say(`'${name}' ready`);
         } catch (err) {
           clearInterval(beat);
-          await sup.stopAll();
+          const survivors = await sup.stopAll();
           this.supervisors.delete(env.id);
-          env.state = 'warm';
-          env.servicePids = {};
-          this.journal.saveEnv(env);
+          // Same stale-snapshot rule as the epilogue: preserve a concurrent
+          // degrade, and never write back a row that has been recycled away.
+          const live = this.journal.getEnv(env.id);
+          if (live) {
+            live.state = live.state === 'degraded' ? 'degraded' : 'warm';
+            live.servicePids = survivors;
+            this.journal.saveEnv(live);
+          }
           throw err;
         }
         started.add(name);
       }
     }
 
+    // `env` is a SNAPSHOT taken before services started. Writing it back whole
+    // discards anything that changed meanwhile — in particular the onDegraded
+    // callback, which fires when an EARLIER service flaps while a later one is
+    // still booting. Promoting to 'hot' from the stale snapshot lost that, and
+    // the environment was handed out as healthy with a dead service in it.
+    const current = this.journal.getEnv(env.id);
+    if (!current) {
+      // Recycled underneath us: saving would resurrect a deleted row.
+      throw new BrokerError('env-error', `environment ${env.id} was recycled during bind — retry`, 'pool');
+    }
+    if (current.state === 'degraded') {
+      env.state = 'degraded';
+      this.journal.saveEnv({ ...current, servicePids: sup.pids(), lastUsedAt: now() });
+      throw new BrokerError('env-error', `environment ${env.id} degraded during bind — a service flapped past its restart budget`, 'pool');
+    }
     env.state = 'hot';
     env.servicePids = sup.pids();
     env.bindCount += 1;
@@ -439,7 +657,10 @@ export class Engine {
     try {
       watcher = fsWatch(stackRoot, { recursive: true }, (_event, filename) => {
         const f = String(filename ?? '');
-        if (f.startsWith('.git') || f.includes('/.git/') || f.startsWith('.backlot')) return;
+        // `.startsWith('.git')` also matched .github/, .gitignore and
+        // .gitlab-ci.yml, so edits to CI config and ignore rules never synced
+        // under --watch. Match the .git DIRECTORY, not the prefix.
+        if (f === '.git' || f.startsWith('.git/') || f.includes('/.git/') || f.startsWith('.backlot')) return;
         if (timer) clearTimeout(timer);
         timer = setTimeout(() => {
           void this.up({ cwd, holder, kind: 'session', hygiene: 'reuse', watch: true }).catch(() => {
@@ -451,6 +672,15 @@ export class Engine {
     } catch {
       return; // recursive fs.watch unavailable — --watch degrades to verbs-only
     }
+    // The try/catch above only covers synchronous construction. fs.watch also
+    // emits 'error' asynchronously — inotify watch limits (ENOSPC), or the
+    // watched tree being moved away — and an unhandled 'error' on an
+    // EventEmitter takes the daemon down with it. Losing --watch for one
+    // environment is a degradation; losing the daemon strands every one.
+    watcher.on('error', (err) => {
+      logEvent({ level: 'warn', kind: 'watch', envId, detail: `watcher stopped: ${String((err as Error).message ?? err)} — --watch is off for this environment; explicit verbs still sync` });
+      this.stopWatch(envId);
+    });
     this.watchers.set(envId, {
       close: () => {
         if (timer) clearTimeout(timer);
@@ -522,7 +752,7 @@ export class Engine {
     };
   }
 
-  async run(opts: UpOptions & { check: string }) {
+  async run(opts: UpOptions & { check: string; pull?: boolean }) {
     const stack = loadStack(opts.cwd);
     const check = stack.manifest.checks?.[opts.check];
     if (!check) {
@@ -546,15 +776,23 @@ export class Engine {
       const runStart = now();
       const beat = setInterval(() => opts.onProgress?.(`running check '${opts.check}' … ${Math.round((now() - runStart) / 1000)}s`), 5000);
       beat.unref();
-      const res = await this.envLocked(env.id, () =>
-        runGroupCmd(
+      const res = await this.envLocked(env.id, () => {
+        this.assertUsable(env.id);
+        return runGroupCmd(
           template(check.run, ctx),
-          check.cwd ? join(dirs.tree, check.cwd) : dirs.tree,
-          { ...process.env, ...templateEnv(check.env, ctx) },
+          check.cwd ? safeJoin(dirs.tree, check.cwd, `check '${opts.check}' cwd`) : dirs.tree,
+          { ...process.env, ...templateEnv(check.env, ctx), ...serviceTag(env.id, `check:${opts.check}`, stateRoot()) },
           timeoutS,
-        ),
-      ).finally(() => clearInterval(beat));
+        );
+      }).finally(() => clearInterval(beat));
       const artifactsDir = this.collectArtifacts(env.id, dirs.tree, check.artifacts ?? []);
+      // A check that failed because the ENVIRONMENT fell over is not the repo's
+      // code being wrong. Reporting work-error there is a silently wrong
+      // verdict (architecture section 9) — an agent reads it as "my change
+      // broke the test" and starts editing code to fix a dead dev-server.
+      const envDied =
+        res.exitCode !== 0 && !res.timedOut && !this.supervisor(env).allHealthyPids();
+      const failClass: 'work-error' | 'env-error' = envDied ? 'env-error' : 'work-error';
       return {
         check: opts.check,
         ok: res.exitCode === 0 && !res.timedOut,
@@ -564,10 +802,21 @@ export class Engine {
             ? null
             : res.timedOut
               ? { class: 'work-error', message: `check '${opts.check}' timed out after ${timeoutS}s (process group killed; raise checks.${opts.check}.timeout if legitimate)`, logExcerpt: res.output.slice(-800) }
-              : { class: 'work-error', message: `check '${opts.check}' failed (exit ${res.exitCode})`, logExcerpt: res.output.slice(-800) },
+              : {
+                  class: failClass,
+                  message: envDied
+                    ? `check '${opts.check}' failed (exit ${res.exitCode}) while a service was not running — the environment failed, not necessarily the code`
+                    : `check '${opts.check}' failed (exit ${res.exitCode})`,
+                  logExcerpt: res.output.slice(-800),
+                },
         output: res.output,
         artifactsDir,
         outputsChanged: changedOutputs(stack.root, dirs.tree, stack.manifest),
+        // The write-back must happen HERE, while the run still holds its own
+        // ephemeral lease. Doing it from the CLI afterwards targeted the
+        // CALLER's holder — a different environment, or none at all — so
+        // `run --pull` either pulled from the wrong lease or silently no-oped.
+        pulled: opts.pull ? pullOutputs(stack.root, dirs.tree, stack.manifest) : undefined,
         envId: env.id,
         durationMs: now() - startedAt,
       };
@@ -668,6 +917,35 @@ export class Engine {
     return this.ctx(cwd, h);
   }
 
+  /**
+   * Re-read an environment INSIDE its lock and refuse work on one that is being
+   * torn down.
+   *
+   * Teardown claims the row under the pool lock and then runs slowly outside the
+   * env lock, so a request that resolved its lease before the claim can arrive
+   * here afterwards and operate on a tree that is about to be deleted (or
+   * already is). bindAndStart already re-checks; exec, token, and the check
+   * phase did not.
+   */
+  private assertUsable(envId: string): EnvRow {
+    const fresh = this.journal.getEnv(envId);
+    if (!fresh || fresh.state === 'recycling') {
+      throw new BrokerError('env-error', `environment ${envId} is being recycled — retry`, 'pool');
+    }
+    // A daemon restart downgrades every hot env to warm: the lease survives but
+    // the services do not. exec/token then failed against a tree with nothing
+    // running, and the command's own error ("connection refused") read as the
+    // repo's fault with no hint that a rebind was all it needed.
+    if (fresh.state === 'warm') {
+      throw new BrokerError(
+        'env-error',
+        `environment ${envId} holds your lease but its services are not running (the daemon restarted) — run 'backlot up' to rebind before exec/token`,
+        'lease',
+      );
+    }
+    return fresh;
+  }
+
   async exec(cwd: string, cmd: string, holder?: string) {
     const stack = loadStack(cwd);
     const h = holder ?? resolve(cwd);
@@ -680,13 +958,14 @@ export class Engine {
     for (const [name, port] of Object.entries(env.ports)) extra[`BACKLOT_PORT_${name.toUpperCase()}`] = String(port);
     for (const [name, s] of Object.entries(ctx.services)) extra[`BACKLOT_URL_${name.toUpperCase()}`] = s.url;
     for (const [name, d] of Object.entries(ctx.datastores)) extra[`BACKLOT_DS_${name.toUpperCase()}`] = d.url;
-    return this.envLocked(env.id, () =>
-      new Promise((resolvePromise) => {
+    return this.envLocked(env.id, () => {
+      this.assertUsable(env.id);
+      return new Promise((resolvePromise) => {
         execFile('sh', ['-c', cmd], { cwd: dirs.tree, env: { ...process.env, ...extra }, maxBuffer: 32 * 1024 * 1024 }, (err, stdout, stderr) =>
           resolvePromise({ exitCode: err ? ((err as { code?: number }).code ?? 1) : 0, stdout: String(stdout).slice(-8000), stderr: String(stderr).slice(-8000) }),
         );
-      }),
-    );
+      });
+    });
   }
 
   /** Resolve auth.token with {{role}} and run it in the env tree. */
@@ -699,14 +978,15 @@ export class Engine {
     const env = this.journal.getEnv(lease.envId)!;
     const dirs = this.envDirs(env.id);
     const ctx = { ...this.templateCtx(stack, env), role };
-    return this.envLocked(env.id, () =>
-      new Promise((resolvePromise, reject) => {
+    return this.envLocked(env.id, () => {
+      this.assertUsable(env.id);
+      return new Promise((resolvePromise, reject) => {
         execFile('sh', ['-c', template(spec, ctx)], { cwd: dirs.tree, maxBuffer: 1024 * 1024 }, (err, stdout, stderr) => {
           if (err) reject(new BrokerError('work-error', `auth.token command failed`, 'auth', String(stderr).slice(0, 400)));
           else resolvePromise({ token: String(stdout).trim(), role });
         });
-      }),
-    );
+      });
+    });
   }
 
   logs(cwd: string, service: string, lines: number, holder?: string) {
@@ -794,19 +1074,32 @@ export class Engine {
     const issues: Array<{ level: string; envId?: string; issue: string }> = [];
     for (const env of this.journal.allEnvs()) {
       if (env.state === 'recycling') issues.push({ level: 'warn', envId: env.id, issue: 'stuck in recycling (a daemon likely died mid-teardown; restart reconciles)' });
-      // Journal says these pids run — are they actually alive?
-      for (const [svc, pid] of Object.entries(env.servicePids)) {
-        let alive = true;
-        try {
-          process.kill(pid, 0);
-        } catch {
-          alive = false;
+      // Journal says these pids run — are they actually alive, and still ours?
+      for (const [svc, rec] of Object.entries(env.servicePids)) {
+        if (!isAlive(rec.pid)) {
+          issues.push({ level: 'error', envId: env.id, issue: `journal records pid ${rec.pid} for service '${svc}' but it is not running (recovery drift)` });
+        } else if (!sameProcess(rec.pid, rec.startTime)) {
+          // Alive, but a DIFFERENT process now holds that pid. Signalling it
+          // would hit a bystander, so surface it rather than reaping it.
+          issues.push({ level: 'error', envId: env.id, issue: `pid ${rec.pid} recorded for service '${svc}' now belongs to another process (pid reuse) — 'backlot pool gc' will re-derive ownership from process tags` });
         }
-        if (!alive) issues.push({ level: 'error', envId: env.id, issue: `journal records pid ${pid} for service '${svc}' but it is not running (recovery drift)` });
       }
       // (Port liveness is intentionally NOT probed here: a service bound to ::
       // vs a 127.0.0.1 probe gives false positives across IPv4/IPv6 dual-stack.
       // The pid-divergence check above is the reliable "is it alive" signal.)
+    }
+    // The inverse drift, and the one that actually leaks memory: a tagged
+    // process is running that no live env accounts for. Only reported here —
+    // doctor diagnoses, `pool gc` is the verb that acts.
+    if (procScanSupported()) {
+      const liveEnvs = new Set(
+        this.journal.allEnvs().filter((e) => e.state === 'hot' || e.state === 'provisioning').map((e) => e.id),
+      );
+      for (const id of this.busy) liveEnvs.add(id);
+      const orphans = scanTagged(stateRoot()).filter((p) => !liveEnvs.has(p.envId));
+      for (const o of orphans) {
+        issues.push({ level: 'error', envId: o.envId, issue: `orphaned process ${o.pid} ('${o.service}') is running with no live environment — run 'backlot pool gc' to reclaim it` });
+      }
     }
     logEvent({ level: issues.length ? 'warn' : 'info', kind: 'doctor', detail: `${issues.length} issue(s)` });
     return { ok: issues.length === 0, issues, events: recentEvents(20) };
@@ -836,15 +1129,44 @@ export class Engine {
   /** Slow teardown of an already-claimed ('recycling') env. */
   private async teardownClaimed(env: EnvRow): Promise<void> {
     this.stopWatch(env.id);
-    await this.supervisor(env).stopAll();
+    const survivors = await this.supervisor(env).stopAll();
     this.supervisors.delete(env.id);
+    // After a daemon restart the in-memory supervisor is EMPTY, so stopAll is a
+    // no-op and only the journal knows what is still running. Reap those too,
+    // or teardown deletes the row and the processes become unattributable
+    // except by tag.
+    const recorded = this.journal.getEnv(env.id)?.servicePids ?? env.servicePids;
+    const stillRecorded = Object.keys(recorded).length > 0 ? await reapPids(recorded) : {};
+    const unresolved = { ...survivors, ...stillRecorded };
+    if (Object.keys(unresolved).length > 0) {
+      logEvent({
+        level: 'warn',
+        kind: 'teardown',
+        envId: env.id,
+        detail: `${Object.keys(unresolved).length} service process(es) outlived teardown — 'backlot pool gc' reclaims them by tag`,
+      });
+    }
     // Drop server-side namespaces too (best effort — the manifest may be gone).
     try {
       const stack = loadStack(env.stackRoot);
       const dirs = this.envDirs(env.id);
       const h: DsHandle = { envId: env.id, envTree: dirs.tree, dataDir: dirs.data };
       for (const [name, spec] of Object.entries(stack.manifest.datastores ?? {})) {
-        if (env.datastoreNs[name]) await makeDatastore(name, spec, stack.id).drop(h);
+        if (!env.datastoreNs[name]) continue;
+        try {
+          await makeDatastore(name, spec, stack.id).drop(h);
+        } catch (err) {
+          // The env row is about to be deleted, taking the only record of this
+          // namespace with it — so a swallowed failure leaks a server-side
+          // database nothing can ever name again. Say so loudly enough to be
+          // actionable.
+          logEvent({
+            level: 'error',
+            kind: 'teardown',
+            envId: env.id,
+            detail: `datastore '${name}' namespace was NOT dropped and is now orphaned on the server: ${String((err as Error).message ?? err)}`,
+          });
+        }
       }
     } catch {
       /* stack unloadable — local files still go */
@@ -886,8 +1208,31 @@ export class Engine {
     const t = now();
     const gap = t - this.lastSweep;
     const interval = Number(process.env.BACKLOT_SWEEP_MS ?? 15_000);
-    if (gap > 3 * interval) this.journal.pardon(gap - interval); // sleep pardon (decision 0009)
+    // Sleep pardon (decision 0009). A long gap in wall-clock time can mean the
+    // machine suspended — or merely that the event loop was starved (a
+    // synchronous hash of a huge tree, heavy host load). Pardoning the second
+    // case pushes every lease and idle deadline out for a machine that never
+    // slept, so leases outlive their TTL and idle envs keep their memory.
+    //
+    // performance.now() is MONOTONIC and does not advance while suspended, so
+    // wall-clock advancing far beyond it is the signal that distinguishes them.
+    const monoGap = performance.now() - this.lastSweepMono;
+    this.lastSweepMono = performance.now();
+    const suspended = gap - monoGap > 2 * interval;
+    if (gap > 3 * interval && suspended) this.journal.pardon(gap - interval);
     this.lastSweep = t;
+
+    // Orphan reclaim (~1 min cadence): a consumer that died ungracefully can
+    // strand a dev-server between daemon restarts, and each one is ~1 GB. Far
+    // cheaper than a /proc scan every sweep, far sooner than the next restart.
+    if (t - this.lastGc > Number(process.env.BACKLOT_GC_MS ?? 60_000)) {
+      this.lastGc = t;
+      try {
+        await this.poolGc();
+      } catch {
+        /* best-effort */
+      }
+    }
 
     // Disk retention (~10 min cadence): nothing backlot writes grows forever.
     if (t - this.lastRetention > Number(process.env.BACKLOT_RETENTION_MS ?? 10 * 60_000)) {
@@ -909,6 +1254,14 @@ export class Engine {
     }
     for (const env of this.journal.allEnvs()) {
       if (this.busy.has(env.id)) continue;
+      // An environment whose STACK no longer exists on disk can never be bound
+      // again — the repo was deleted or moved. Nothing reclaimed those, so an
+      // abandoned project's env trees and data kept their disk forever.
+      if (!existsSync(env.stackRoot) && !this.journal.leaseForEnv(env.id)) {
+        logEvent({ level: 'info', kind: 'retention', envId: env.id, detail: `stack root ${env.stackRoot} is gone — reclaiming the environment` });
+        await this.recycleOne(env.id, true);
+        continue;
+      }
       if (env.state === 'degraded') {
         // Dead env — reap regardless of a stale lease (force), but never while an
         // op is in flight (claimForTeardown always respects busy). The holder's
@@ -921,13 +1274,23 @@ export class Engine {
         // between the idle check and the service kill (dead-URL race).
         const claimed = await this.claimForTeardown(env.id, false);
         if (!claimed) continue;
+        // Re-check under the claim: a bind may have touched this environment
+        // between the idle test above and the claim, and quiescing it then
+        // stops services a live caller is about to use.
+        if (now() - claimed.lastUsedAt <= IDLE_TTL()) {
+          claimed.state = 'hot';
+          this.journal.saveEnv(claimed);
+          continue;
+        }
         this.stopWatch(env.id);
-        await this.supervisor(claimed).stopAll();
+        const survivors = await this.supervisor(claimed).stopAll();
         this.supervisors.delete(env.id);
         const fresh = this.journal.getEnv(env.id);
         if (fresh) {
           fresh.state = 'warm';
-          fresh.servicePids = {};
+          // Anything that outlived SIGKILL stays recorded, so the next gc pass
+          // (or a later restart) can still find it instead of losing it.
+          fresh.servicePids = survivors;
           this.journal.saveEnv(fresh);
         }
       }
@@ -936,11 +1299,14 @@ export class Engine {
 
   async shutdown(): Promise<void> {
     for (const id of [...this.watchers.keys()]) this.stopWatch(id);
-    for (const sup of this.supervisors.values()) await sup.stopAll();
+    const survivors = new Map<string, Record<string, ServicePid>>();
+    for (const [id, sup] of this.supervisors) survivors.set(id, await sup.stopAll());
     for (const env of this.journal.allEnvs()) {
       if (env.state === 'hot') {
         env.state = 'warm';
-        env.servicePids = {};
+        // Record, never assume: a service that survived our own SIGKILL must
+        // remain findable by the next daemon life.
+        env.servicePids = survivors.get(env.id) ?? {};
         this.journal.saveEnv(env);
       }
     }

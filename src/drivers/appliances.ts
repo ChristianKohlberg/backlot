@@ -10,7 +10,7 @@
  * and blames nobody's code when one is missing: every failure here is an
  * infra-error by construction.
  */
-import { execFile } from 'node:child_process';
+import { runBounded, DEFAULT_CMD_TIMEOUT_S } from '../core/exec.js';
 import { connect } from 'node:net';
 import { mkdirSync, rmdirSync, statSync } from 'node:fs';
 import { join } from 'node:path';
@@ -21,7 +21,13 @@ import type { ApplianceSpec } from '../core/manifest.js';
 const PROBE_TIMEOUT_MS = 3000;
 const START_POLL_MS = 500;
 /** A start lock older than this is a crashed starter, not a live one. */
+/**
+ * A start lock is stale once nobody could still be legitimately holding it.
+ * A fixed 5 minutes was WRONG for an appliance declaring a longer timeout: a
+ * second caller stole the lock mid-start and raced the first one's container.
+ */
 const LOCK_STALE_MS = 5 * 60 * 1000;
+const lockStaleMs = (timeoutS?: number): number => Math.max(LOCK_STALE_MS, (timeoutS ?? 0) * 1000 + 60_000);
 
 export function probeTcp(target: string, timeoutMs = PROBE_TIMEOUT_MS): Promise<boolean> {
   const [host, portStr] = target.split(':');
@@ -41,12 +47,19 @@ export function probeTcp(target: string, timeoutMs = PROBE_TIMEOUT_MS): Promise<
   });
 }
 
-const sh = (cmd: string, cwd: string): Promise<{ code: number; output: string }> =>
-  new Promise((resolve) => {
-    execFile('sh', ['-c', cmd], { cwd, maxBuffer: 16 * 1024 * 1024 }, (err, stdout, stderr) => {
-      resolve({ code: err ? 1 : 0, output: `${stdout}${stderr}` });
-    });
-  });
+/**
+ * Appliance commands are the likeliest to hang: `start: docker run ...` without
+ * `-d` never returns, and an unbounded wait there wedges the bind AND leaves
+ * the environment permanently busy (so its lease never expires and teardown
+ * refuses it). Bounded, in its own process group.
+ */
+const sh = async (cmd: string, cwd: string): Promise<{ code: number; output: string }> => {
+  const r = await runBounded(cmd, cwd);
+  return {
+    code: r.code,
+    output: r.timedOut ? `${r.output}\n[killed: exceeded ${DEFAULT_CMD_TIMEOUT_S}s]` : r.output,
+  };
+};
 
 /**
  * One start attempt per probe target machine-wide, whatever stack asked.
@@ -59,14 +72,14 @@ function lockDir(target: string): string {
   return join(dir, `${target.replace(/[^A-Za-z0-9._-]/g, '_')}-${sha256(target).slice(0, 8)}.lock`);
 }
 
-function acquireLock(target: string): boolean {
+function acquireLock(target: string, timeoutS?: number): boolean {
   const lock = lockDir(target);
   try {
     mkdirSync(lock);
     return true;
   } catch {
     try {
-      if (now() - statSync(lock).mtimeMs > LOCK_STALE_MS) {
+      if (now() - statSync(lock).mtimeMs > lockStaleMs(timeoutS)) {
         rmdirSync(lock);
         mkdirSync(lock);
         return true;
@@ -111,7 +124,25 @@ export async function ensureAppliance(
   root: string,
   say: (msg: string) => void,
 ): Promise<ApplianceResult> {
-  if (await probeTcp(spec.probe)) return 'up';
+  const timeoutMsEarly = (spec.timeout ?? 60) * 1000;
+  if (await probeTcp(spec.probe)) {
+    // An open TCP port is NOT readiness. Postgres accepts connections while
+    // still recovering; a container forwards the port before the server is
+    // listening. Returning 'up' here skipped the declared ready: gate entirely,
+    // so the bind proceeded against a half-started appliance and the failure
+    // surfaced later as an unrelated work-error.
+    if (!spec.ready) return 'up';
+    const first = await sh(spec.ready, root);
+    if (first.code === 0) return 'up';
+    say(`appliance '${name}' answers at ${spec.probe} but is not ready yet — waiting`);
+    if (await awaitUp(name, spec, root, now() + timeoutMsEarly)) return 'adopted';
+    throw new BrokerError(
+      'infra-error',
+      `appliance '${name}' answers at ${spec.probe} but its ready: gate never passed within ${spec.timeout ?? 60}s`,
+      'appliance',
+      first.output.slice(0, 800),
+    );
+  }
   if (!spec.start) {
     throw new BrokerError(
       'infra-error',
@@ -121,7 +152,7 @@ export async function ensureAppliance(
   }
   const timeoutMs = (spec.timeout ?? 60) * 1000;
   const deadline = now() + timeoutMs;
-  if (!acquireLock(spec.probe)) {
+  if (!acquireLock(spec.probe, spec.timeout)) {
     // Someone else is starting it right now; wait for their result.
     say(`appliance '${name}' is being started by another consumer — waiting`);
     if (await awaitUp(name, spec, root, deadline)) return 'adopted';
@@ -133,7 +164,8 @@ export async function ensureAppliance(
   }
   try {
     // Locked. Re-probe: it may have come up between our probe and the lock.
-    if (await probeTcp(spec.probe)) return 'up';
+    // Same rule as above — the ready: gate decides, not the open port.
+    if (await probeTcp(spec.probe) && (await awaitUp(name, spec, root, now() + 1000))) return 'up';
     say(`starting appliance '${name}'`);
     const r = await sh(spec.start, root);
     if (r.code !== 0) {

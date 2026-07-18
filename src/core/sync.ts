@@ -16,10 +16,10 @@
 import { execFileSync } from 'node:child_process';
 import {
   copyFileSync, mkdirSync, rmSync, existsSync, readFileSync, writeFileSync,
-  readdirSync, statSync, constants as fsConstants,
+  readdirSync, statSync, lstatSync, chmodSync, renameSync, rmdirSync, constants as fsConstants,
 } from 'node:fs';
 import { dirname, join } from 'node:path';
-import { fileHash, matchesAny, sha256, isFile, safeJoin } from './util.js';
+import { fileHash, matchesAny, sha256, isFile, safeJoin, BrokerError } from './util.js';
 import type { Manifest } from './manifest.js';
 
 export interface SyncResult {
@@ -36,8 +36,30 @@ interface CacheEntry {
   srcMtime: number;
   dstSize: number;
   dstMtime: number;
+  /** Permission bits. chmod changes ctime, not mtime, so content alone misses it. */
+  mode?: number;
 }
 type SyncCache = Record<string, CacheEntry>;
+
+/**
+ * The cache plus the wall-clock at which it was written.
+ *
+ * Filesystem mtimes are coarse (a few ms on Linux, 1s on some filesystems), so
+ * a file rewritten to the SAME SIZE within the same tick as the stat we
+ * recorded is indistinguishable from the file we already synced. The stat gate
+ * then reuses the cached hash forever and the environment silently keeps stale
+ * content — the stat never drifts again on its own.
+ *
+ * git solves this with "racily clean": an entry whose mtime is not strictly
+ * older than the index write is not trusted and must be re-hashed. Same rule.
+ */
+interface CacheFile {
+  syncedAt?: number;
+  entries: SyncCache;
+}
+
+/** Filesystem timestamp granularity to distrust around the write. */
+const RACY_WINDOW_MS = 2000;
 
 function enumerate(stackRoot: string, manifest: Manifest): string[] {
   let listed: string[];
@@ -52,6 +74,34 @@ function enumerate(stackRoot: string, manifest: Manifest): string[] {
     // Not a git repo: fall back to everything (minus default noise).
     listed = walkAll(stackRoot);
   }
+  // A submodule appears in ls-files only as its GITLINK path, which stats as a
+  // directory and is dropped by the isFile filter below — so its contents were
+  // silently absent from the environment and the build failed with a
+  // work-error blaming the repo, with no hint about the cause. Fail loudly
+  // instead: partial support here would be worse than an honest refusal.
+  try {
+    const staged = execFileSync('git', ['-C', stackRoot, 'ls-files', '-s', '-z', '--', '.'], {
+      encoding: 'utf8',
+      maxBuffer: 64 * 1024 * 1024,
+    });
+    const gitlinks = staged
+      .split('\0')
+      .filter(Boolean)
+      .filter((l) => l.startsWith('160000 '))
+      .map((l) => l.split('\t')[1] ?? '')
+      .filter(Boolean);
+    if (gitlinks.length > 0) {
+      throw new BrokerError(
+        'work-error',
+        `this repository uses git submodules (${gitlinks.slice(0, 3).join(', ')}${gitlinks.length > 3 ? ', …' : ''}), which backlot does not project into an environment — their contents would be silently missing. Vendor them, or declare the paths you need under sync.include.`,
+        'sync',
+      );
+    }
+  } catch (err) {
+    if (err instanceof BrokerError) throw err;
+    /* not a git repo, or ls-files unavailable — the walkAll path covers it */
+  }
+
   const include = manifest.sync?.include ?? [];
   for (const inc of include) {
     safeJoin(stackRoot, inc, 'sync.include'); // reject ../ or absolute before use
@@ -66,78 +116,207 @@ function walkAll(root: string, prefix = ''): string[] {
   for (const name of readdirSync(join(root, prefix))) {
     if (name === '.git' || name === 'node_modules') continue;
     const rel = prefix ? `${prefix}/${name}` : name;
-    if (statSync(join(root, rel)).isDirectory()) out.push(...walkAll(root, rel));
+    // lstat, not stat: a DANGLING symlink makes stat throw ENOENT, which took
+    // down the whole enumeration — and this is the live path for `bind --ref`,
+    // whose `git archive | tar -x` extraction preserves symlinks, dangling
+    // ones included. Directory symlinks are listed but not followed, so a link
+    // pointing at an ancestor cannot send this into an infinite walk.
+    let st;
+    try {
+      st = lstatSync(join(root, rel));
+    } catch {
+      continue; // vanished mid-walk
+    }
+    if (st.isSymbolicLink()) out.push(rel);
+    else if (st.isDirectory()) out.push(...walkAll(root, rel));
     else out.push(rel);
   }
   return out;
 }
 
-const cachePath = (envRoot: string) => join(envRoot, '.backlot-synced.json');
+const CACHE_FILE = '.backlot-synced.json';
+const cachePath = (envRoot: string) => join(envRoot, CACHE_FILE);
 
-function loadCache(envTree: string): SyncCache {
+function loadCache(envTree: string): CacheFile {
   try {
     const raw = JSON.parse(readFileSync(cachePath(envTree), 'utf8'));
-    return Array.isArray(raw) ? {} : (raw as SyncCache); // migrate from the v0.1 list format
+    if (Array.isArray(raw)) return { entries: {} }; // v0.1 list format
+    // v0.2 wrote the entry map at the top level, with no timestamp. Treat it as
+    // entries with an unknown write time, which makes every entry racy once —
+    // one extra hashing pass, then the new format takes over.
+    if (raw && typeof raw === 'object' && 'entries' in raw) return raw as CacheFile;
+    return { entries: (raw ?? {}) as SyncCache };
   } catch {
-    return {};
+    return { entries: {} };
   }
 }
 
-const statOf = (p: string): { size: number; mtime: number } | null => {
+const statOf = (p: string): { size: number; mtime: number; mode: number } | null => {
   try {
     const s = statSync(p);
-    return { size: s.size, mtime: s.mtimeMs };
+    return { size: s.size, mtime: s.mtimeMs, mode: s.mode & 0o777 };
   } catch {
     return null;
   }
 };
 
-export function syncIntoEnv(stackRoot: string, envTree: string, manifest: Manifest): SyncResult {
+/**
+ * `cleanUntracked` sweeps env-side files no sync produced — droppings left by a
+ * check, service, or exec.
+ *
+ * It is deliberately NOT the default. docs/architecture.md describes the reset
+ * as cleaning untracked files on every bind, but doing that would delete any
+ * artifact a repo builds inside the environment and forgets to declare under
+ * `caches:` — including upkeep output — turning every bind into a full rebuild.
+ * So it runs only when the caller asked for a clean slate (reset-data or
+ * pristine); a plain `reuse` bind stays fast and keeps its droppings.
+ */
+/**
+ * Probe the filesystem rather than guessing from the platform: APFS is
+ * case-insensitive by default but can be formatted case-sensitive, and a
+ * case-sensitive volume can be mounted on macOS. Guessing either way is wrong
+ * on somebody's machine.
+ *
+ * Cached per tree — this runs on every sync.
+ */
+const caseSensitivityCache = new Map<string, boolean>();
+function isCaseInsensitive(dir: string): boolean {
+  const hit = caseSensitivityCache.get(dir);
+  if (hit !== undefined) return hit;
+  let result = false;
+  const probe = join(dir, '.backlot-case-probe');
+  try {
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(probe, '');
+    result = existsSync(join(dir, '.BACKLOT-CASE-PROBE'));
+  } catch {
+    result = false; // cannot tell — assume case-sensitive, the safer default
+  } finally {
+    try {
+      rmSync(probe, { force: true });
+    } catch {
+      /* best-effort */
+    }
+  }
+  caseSensitivityCache.set(dir, result);
+  return result;
+}
+
+/**
+ * Remove directories left empty by a deletion, up to (never including) the env
+ * tree root. A rename that moves a file out of a directory otherwise leaves the
+ * empty directory behind forever, and tools that glob directories see a layout
+ * the worktree no longer has.
+ */
+function pruneEmptyParents(envTree: string, removed: string): void {
+  let dir = dirname(removed);
+  while (dir.startsWith(envTree) && dir !== envTree) {
+    try {
+      rmdirSync(dir); // throws ENOTEMPTY unless it is genuinely empty
+    } catch {
+      return;
+    }
+    dir = dirname(dir);
+  }
+}
+
+export function syncIntoEnv(
+  stackRoot: string,
+  envTree: string,
+  manifest: Manifest,
+  cleanUntracked = false,
+): SyncResult {
   mkdirSync(envTree, { recursive: true });
   const files = enumerate(stackRoot, manifest).sort();
   const protectedPatterns = [...(manifest.caches ?? []), ...(manifest.sync?.keep ?? [])];
-  const prev = loadCache(envTree);
+  const cache = loadCache(envTree);
+  const prev = cache.entries;
+  // An entry whose recorded mtime sits at or after the previous cache write
+  // cannot be trusted: the file may have changed again inside the same
+  // timestamp tick. Re-hash those instead of believing the stat.
+  const racyFrom = cache.syncedAt === undefined ? -Infinity : cache.syncedAt - RACY_WINDOW_MS;
   const next: SyncCache = {};
 
   let copied = 0;
+  const vanished = new Set<string>();
   for (const rel of files) {
     // git ls-files can't emit ../ but the sync.include path can — belt-and-suspenders
     // so neither the copy nor the deletion-mirror below can ever leave envTree.
     const dst = safeJoin(envTree, rel, 'synced file');
     const src = join(stackRoot, rel);
     const cached = prev[rel];
-    const srcStat = statOf(src)!;
+    // A worktree is LIVE: a branch switch or a build can delete a file between
+    // enumeration and this read. Asserting non-null crashed the bind with an
+    // unclassified TypeError instead of simply syncing what is there.
+    const srcStat = statOf(src);
+    if (!srcStat) {
+      vanished.add(rel);
+      continue;
+    }
 
     // Source hash: stat-gated.
-    const srcHash =
-      cached && cached.srcSize === srcStat.size && cached.srcMtime === srcStat.mtime
-        ? cached.hash
-        : fileHash(src)!;
+    const trustSrcStat =
+      cached !== undefined &&
+      cached.srcSize === srcStat.size &&
+      cached.srcMtime === srcStat.mtime &&
+      cached.srcMtime < racyFrom; // strictly older than the last write: safe
+    const srcHash = trustSrcStat ? cached.hash : fileHash(src);
+    if (srcHash === null) {
+      vanished.add(rel); // disappeared between the stat and the hash
+      continue;
+    }
 
     // Env-side hash: stat-gated too (this is the reset guarantee — a mutated
     // tracked file in the env has a drifted stat or hash and gets overwritten).
     const dstStat = statOf(dst);
     let dstHash: string | null = null;
     if (dstStat) {
-      dstHash =
-        cached && cached.dstSize === dstStat.size && cached.dstMtime === dstStat.mtime
-          ? cached.hash
-          : fileHash(dst);
+      const trustDstStat =
+        cached !== undefined &&
+        cached.dstSize === dstStat.size &&
+        cached.dstMtime === dstStat.mtime &&
+        cached.dstMtime < racyFrom;
+      dstHash = trustDstStat ? cached.hash : fileHash(dst);
     }
 
-    if (dstHash !== srcHash) {
+    const contentDiffers = dstHash !== srcHash;
+    if (contentDiffers) {
       mkdirSync(dirname(dst), { recursive: true });
       copyFileSync(src, dst, fsConstants.COPYFILE_FICLONE); // CoW clone on APFS/reflink fs; falls back to copy
       copied++;
     }
-    const newDstStat = dstHash !== srcHash ? statOf(dst)! : dstStat!;
-    next[rel] = { hash: srcHash, srcSize: srcStat.size, srcMtime: srcStat.mtime, dstSize: newDstStat.size, dstMtime: newDstStat.mtime };
+    // copyFileSync only applies the source mode when it CREATES the file, and a
+    // chmod moves ctime rather than mtime — so `chmod +x` on an unchanged file
+    // never reached the environment, and the service failed with 'Permission
+    // denied' blamed on the repo.
+    const dstNow = statOf(dst);
+    if (dstNow && dstNow.mode !== srcStat.mode) {
+      chmodSync(dst, srcStat.mode);
+      if (!contentDiffers) copied++; // a real change was propagated
+    }
+    const newDstStat = statOf(dst)!;
+    next[rel] = {
+      hash: srcHash,
+      srcSize: srcStat.size,
+      srcMtime: srcStat.mtime,
+      dstSize: newDstStat.size,
+      dstMtime: newDstStat.mtime,
+      mode: srcStat.mode,
+    };
   }
 
   // Mirror deletions relative to the PREVIOUS binding, never touching caches/keep.
   let deleted = 0;
+  // On a case-INSENSITIVE filesystem (macOS APFS by default), a case-only
+  // rename — README.md -> Readme.md — leaves the old key in `prev` and the new
+  // one in `next` while both name the SAME file on disk. Deleting the old key
+  // then destroys the file that was just synced. Compare case-insensitively
+  // before removing anything.
+  const nextLower = new Set(Object.keys(next).map((k) => k.toLowerCase()));
+  const caseInsensitiveFs = isCaseInsensitive(envTree);
   for (const rel of Object.keys(prev)) {
     if (next[rel] || matchesAny(rel, protectedPatterns)) continue;
+    if (caseInsensitiveFs && nextLower.has(rel.toLowerCase())) continue;
     let victim: string;
     try {
       victim = safeJoin(envTree, rel, 'synced file'); // never rm outside the env tree
@@ -146,29 +325,82 @@ export function syncIntoEnv(stackRoot: string, envTree: string, manifest: Manife
     }
     if (existsSync(victim)) {
       rmSync(victim, { force: true });
+      pruneEmptyParents(envTree, victim);
       deleted++;
     }
   }
-  writeFileSync(cachePath(envTree), JSON.stringify(next));
 
-  const sourceHash = sha256(files.map((f) => `${f}:${next[f]!.hash}`).join('\n'));
-  return { copied, deleted, files, sourceHash };
+
+  // A clean-slate bind also removes what no sync produced. The deletion mirror
+  // above only knows files the PREVIOUS sync wrote, so anything a check,
+  // service, or exec created inside the environment used to survive every bind
+  // and contaminate later verdicts.
+  if (cleanUntracked) {
+    for (const rel of walkAll(envTree)) {
+      if (next[rel] || rel === CACHE_FILE || matchesAny(rel, protectedPatterns)) continue;
+      try {
+        const target = safeJoin(envTree, rel, 'env dropping');
+        rmSync(target, { force: true });
+        pruneEmptyParents(envTree, target);
+        deleted++;
+      } catch {
+        /* outside the tree or unreadable — leave it */
+      }
+    }
+  }
+
+  // Atomic: a torn cache file silently disables deletion mirroring on the next
+  // bind (loadCache swallows the parse error and returns empty), so stale files
+  // would linger with no signal at all.
+  const tmp = `${cachePath(envTree)}.tmp`;
+  writeFileSync(tmp, JSON.stringify({ syncedAt: Date.now(), entries: next } satisfies CacheFile));
+  renameSync(tmp, cachePath(envTree));
+
+  const present = files.filter((f) => !vanished.has(f));
+  const sourceHash = sha256(present.map((f) => `${f}:${next[f]!.hash}`).join('\n'));
+  return { copied, deleted, files: present, sourceHash };
 }
 
 /**
  * Outputs contract (decision 0011): report env-side changes to declared
  * outputs; copy back only on explicit pull.
  */
+/**
+ * Which declared outputs did the ENVIRONMENT change?
+ *
+ * Comparing the env copy against the LIVE worktree answered a different
+ * question: a worktree file edited after the bind also differs, so backlot
+ * reported it as an env-side change and a subsequent pull copied the stale
+ * bind-time copy over the newer worktree content. The bind-time hash recorded
+ * in the sync cache is the correct baseline.
+ */
 export function changedOutputs(stackRoot: string, envTree: string, manifest: Manifest): string[] {
+  const bound = loadCache(envTree).entries;
   return (manifest.outputs ?? []).filter((rel) => {
     const envH = fileHash(join(envTree, rel));
-    return envH !== null && envH !== fileHash(join(stackRoot, rel));
+    if (envH === null) return false;
+    const baseline = bound[rel]?.hash;
+    // With no recorded baseline (an output the sync never produced) fall back to
+    // the worktree comparison — it is the only reference available.
+    return baseline === undefined ? envH !== fileHash(join(stackRoot, rel)) : envH !== baseline;
   });
 }
 
 export function pullOutputs(stackRoot: string, envTree: string, manifest: Manifest): string[] {
   const changed = changedOutputs(stackRoot, envTree, manifest);
+  const bound = loadCache(envTree).entries;
   for (const rel of changed) {
+    // Refuse to overwrite a worktree file that ALSO moved on since the bind.
+    // The worktree is the source of truth (decision 0011); silently reverting
+    // an edit the user made after binding is data loss, not a write-back.
+    const baseline = bound[rel]?.hash;
+    if (baseline !== undefined && fileHash(join(stackRoot, rel)) !== baseline) {
+      throw new BrokerError(
+        'work-error',
+        `output '${rel}' changed in BOTH the environment and the worktree since the bind — refusing to overwrite your worktree copy. Resolve it by hand, or discard the worktree change and pull again.`,
+        'outputs',
+      );
+    }
     // outputs write BACK into the worktree — must never escape it (a rogue
     // '../../.bashrc' output would otherwise be overwritten from env content).
     const dst = safeJoin(stackRoot, rel, 'outputs');

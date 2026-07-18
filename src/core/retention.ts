@@ -3,9 +3,10 @@
  * daemon sweeper (~10 min cadence); every function is idempotent, best-effort,
  * and unit-testable in isolation.
  */
-import { readdirSync, statSync, rmSync, readFileSync, writeFileSync, existsSync } from 'node:fs';
+import { readdirSync, statSync, rmSync, readFileSync, writeFileSync, existsSync, openSync, readSync, closeSync } from 'node:fs';
 import { join } from 'node:path';
 import { artifactsRoot, templatesRoot, envsRoot } from './paths.js';
+import { logEvent } from './events.js';
 import { runQuiet } from './util.js';
 import { parseBakedMarker } from '../drivers/datastores.js';
 import type { Journal } from './journal.js';
@@ -49,10 +50,22 @@ export function truncateLogs(p: Policy, root = envsRoot()): number {
     for (const logFile of entriesOf(logDir)) {
       const full = join(logDir, logFile);
       try {
-        if (statSync(full).size > p.logCapBytes) {
-          const content = readFileSync(full, 'utf8');
-          const keep = content.slice(-Math.floor(p.logCapBytes / 4));
-          writeFileSync(full, `[backlot: truncated by retention sweep]\n${keep}`);
+        const size = statSync(full).size;
+        if (size > p.logCapBytes) {
+          // Read only the TAIL. Loading the whole file as one utf8 string
+          // throws past Node's ~512 MiB string limit, so the very logs that
+          // most needed trimming were the ones that could never be trimmed —
+          // and they then grew without bound.
+          const keepBytes = Math.floor(p.logCapBytes / 4);
+          const fd = openSync(full, 'r');
+          let tail: Buffer;
+          try {
+            tail = Buffer.alloc(Math.min(keepBytes, size));
+            readSync(fd, tail, 0, tail.length, Math.max(0, size - tail.length));
+          } finally {
+            closeSync(fd);
+          }
+          writeFileSync(full, Buffer.concat([Buffer.from('[backlot: truncated by retention sweep]\n'), tail]));
           truncated++;
         }
       } catch {
@@ -98,7 +111,13 @@ export async function pruneTemplates(p: Policy, root = templatesRoot()): Promise
       if (f.endsWith('.baked')) {
         try {
           const marker = parseBakedMarker(readFileSync(full, 'utf8'));
-          if (marker.drop) await runQuiet(marker.drop, root);
+          if (marker.drop) {
+            // This command came from a manifest that may no longer exist on
+            // disk. Re-executing it silently is the part that deserves a
+            // record, so the state dir stays auditable.
+            logEvent({ level: 'info', kind: 'retention', detail: `dropping baked template via persisted command from ${f}` });
+            await runQuiet(marker.drop, root);
+          }
         } catch {
           /* unreadable marker — still prune the file */
         }

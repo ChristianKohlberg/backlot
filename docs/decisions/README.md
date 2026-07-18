@@ -22,3 +22,5 @@ supersedes it and update this index — never edit a decision in place.
 | [0015](0015-remote-submit-and-poll.md) | Remote runs are submit-and-poll; provider TTLs mandatory |
 | [0016](0016-data-states-not-seeds-three-baselines-scenarios-in-tests.md) | Data states not seeds: three baselines, scenarios in tests, snapshots for the expensive middle |
 | [0017](0017-rename-infront-to-backlot.md) | Rename: infront → backlot — the standing-sets metaphor, collision-free, real word |
+| [0018](0018-appliances-ensured-not-owned.md) | Appliances are ensured, not owned: backlot starts shared backing servers but never stops them implicitly |
+| [0019](0019-service-ownership-by-tag-not-pid.md) | Service ownership is proven by tag and process group, not by a recorded pid |

@@ -7,8 +7,11 @@
 import { spawn, execFile, type ChildProcess } from 'node:child_process';
 import { appendFileSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
-import { BrokerError } from '../core/util.js';
+import { BrokerError, now, safeJoin } from '../core/util.js';
+import { stateRoot } from '../core/paths.js';
+import { groupAlive, processGroup, sameProcess, serviceTag, startTime } from '../core/procscan.js';
 import type { ReadySpec, ServiceSpec } from '../core/manifest.js';
+import type { ServicePid } from '../core/types.js';
 
 export interface ServiceEvent {
   at: number;
@@ -23,7 +26,16 @@ interface Running {
   expectedExit: boolean;
   /** Pending restart timer — must be cancellable by stopAll so it can't orphan. */
   restartTimer: NodeJS.Timeout | null;
+  /** Kernel start time of `proc.pid`, captured at spawn (pid-reuse guard). */
+  startTime?: number;
+  /** When the current process was launched — the restart budget resets after STABLE_MS. */
+  startedAt: number;
+  /** A spawn 'error' is being handled; 'exit' may or may not follow it. */
+  spawnFailed?: boolean;
 }
+
+/** Uptime past which a crash counts as fresh rather than part of a flap. */
+const STABLE_MS = (): number => Number(process.env.BACKLOT_STABLE_MS ?? 60_000);
 
 export class EnvSupervisor {
   private services = new Map<string, Running>();
@@ -56,9 +68,11 @@ export class EnvSupervisor {
     return this.services.get(name)?.buf ?? '';
   }
 
-  pids(): Record<string, number> {
-    const out: Record<string, number> = {};
-    for (const [name, r] of this.services) if (r.proc.pid && r.proc.exitCode === null) out[name] = r.proc.pid;
+  pids(): Record<string, ServicePid> {
+    const out: Record<string, ServicePid> = {};
+    for (const [name, r] of this.services) {
+      if (r.proc?.pid && r.proc.exitCode === null) out[name] = { pid: r.proc.pid, startTime: r.startTime };
+    }
     return out;
   }
 
@@ -68,15 +82,22 @@ export class EnvSupervisor {
 
   start(name: string, spec: ServiceSpec, env: Record<string, string>, watchMode: boolean): void {
     const cmd = watchMode && spec.watch_run ? spec.watch_run : spec.run;
-    const cwd = spec.cwd ? join(this.envTree, spec.cwd) : this.envTree;
-    const running: Running = { proc: null as unknown as ChildProcess, buf: '', restarts: 0, expectedExit: false, restartTimer: null };
+    // A repo can already run arbitrary shell here, so this is not a privilege
+    // boundary — it makes an ACCIDENT loud. `cwd: ../sibling` silently ran the
+    // service outside its environment tree, against files backlot never synced.
+    const cwd = spec.cwd ? safeJoin(this.envTree, spec.cwd, `service '${name}' cwd`) : this.envTree;
+    const running: Running = { proc: null as unknown as ChildProcess, buf: '', restarts: 0, expectedExit: false, restartTimer: null, startedAt: now() };
     const launch = () => {
       running.restartTimer = null;
       // A teardown that landed while this restart was pending: do not respawn.
       if (running.expectedExit) return;
       const proc = spawn('sh', ['-c', cmd], {
         cwd,
-        env: { ...process.env, ...env },
+        // The tag rides in the environment so it is INHERITED by every
+        // descendant. After an ungraceful death the sh -c wrapper is gone but
+        // the real server still carries it, which is what lets a later daemon
+        // find and reclaim an orphan it never spawned itself (issue #5).
+        env: { ...process.env, ...env, ...serviceTag(this.envId, name, stateRoot()) },
         stdio: ['ignore', 'pipe', 'pipe'],
         // Own process group, so signals reach the service and not just the
         // sh -c wrapper. On Linux (dash) the wrapper forks instead of
@@ -88,6 +109,10 @@ export class EnvSupervisor {
         detached: true,
       });
       running.proc = proc;
+      running.startedAt = now();
+      // Capture identity immediately: once the pid exits this is unreadable,
+      // and an un-pinned pid is one the reaper must refuse to signal.
+      running.startTime = proc.pid ? startTime(proc.pid) : undefined;
       this.onPidsChanged?.();
       const sink = (d: Buffer) => {
         const s = d.toString();
@@ -104,11 +129,44 @@ export class EnvSupervisor {
       // listener it becomes an uncaught exception that kills the whole daemon.
       proc.on('error', (err) => {
         this.note(name, `spawn error: ${err.message}`);
+        // A spawn failure emits 'error' with NO 'exit', so the restart logic
+        // below never ran: supervision simply stopped while the environment
+        // stayed 'hot' and reported healthy. Drive the same path as an exit.
+        if (running.expectedExit || running.spawnFailed) return;
+        running.spawnFailed = true;
+        this.onPidsChanged?.();
+        if (running.restarts < 3) {
+          running.restarts++;
+          this.note(name, `restarting after spawn failure (attempt ${running.restarts})`);
+          running.restartTimer = setTimeout(() => {
+            running.spawnFailed = false;
+            launch();
+          }, 500 * running.restarts);
+          running.restartTimer.unref();
+        } else {
+          this.note(name, 'spawn keeps failing — giving up (environment degraded)');
+          this.onDegraded?.(name);
+        }
       });
       proc.on('exit', (code) => {
         if (running.expectedExit) return;
+        // A service that DAEMONIZES (forks and returns 0 immediately) is not a
+        // supervised service: backlot restarts it, each restart forks another
+        // background copy, and those copies escape both the group kill and, if
+        // they detach far enough, the tag scan. Refuse it rather than
+        // multiplying processes nobody can reclaim.
+        if (code === 0 && now() - running.startedAt < 2000 && running.restarts === 0) {
+          this.note(name, 'exited 0 immediately — a service must stay in the FOREGROUND (it looks daemonized)');
+          running.expectedExit = true;
+          this.onDegraded?.(name);
+          return;
+        }
         this.note(name, `exited (${code})`);
         this.onPidsChanged?.(); // the dead pid must leave the journal
+        // The budget is for FLAPPING — a tight crash loop — not for a service's
+        // whole lifetime. Without this reset, three unrelated crashes hours
+        // apart degraded a long-lived environment that was never unhealthy.
+        if (now() - running.startedAt > STABLE_MS()) running.restarts = 0;
         // Bounded restart for long-lived services (decision 0010).
         if (running.restarts < 3) {
           running.restarts++;
@@ -143,11 +201,18 @@ export class EnvSupervisor {
         throw new BrokerError('work-error', `service '${name}' exited during boot (${running.proc.exitCode})`, name, tail(buf));
       }
       if (ready.http && url) {
-        try {
-          const res = await fetch(`${url}${ready.http}`, { signal: AbortSignal.timeout(1500) });
-          if (res.status === 200) return;
-        } catch {
-          /* not yet */
+        // Probe every address the advertised host can mean. `localhost` is
+        // ambiguous on a dual-stack machine: macOS resolves it to ::1 first,
+        // and a service bound IPv4-only (the common case — see
+        // examples/hello-python) is simply not there. The readiness probe then
+        // times out against a service that IS running and healthy.
+        for (const candidate of probeUrls(url)) {
+          try {
+            const res = await fetch(`${candidate}${ready.http}`, { signal: AbortSignal.timeout(1500) });
+            if (res.status === 200) return;
+          } catch {
+            /* not on this address — try the next */
+          }
         }
       } else if (ready.log) {
         if (new RegExp(ready.log).test(buf)) return;
@@ -166,7 +231,9 @@ export class EnvSupervisor {
     }
   }
 
-  async stopAll(): Promise<void> {
+  /** Stop every service; returns any that refused to die (empty is the norm). */
+  async stopAll(): Promise<Record<string, ServicePid>> {
+    const survivors: Record<string, ServicePid> = {};
     for (const [name, r] of this.services) {
       r.expectedExit = true;
       // Cancel any pending restart BEFORE it can fire — otherwise launch()
@@ -175,51 +242,120 @@ export class EnvSupervisor {
         clearTimeout(r.restartTimer);
         r.restartTimer = null;
       }
-      if (r.proc && r.proc.exitCode === null) {
-        await new Promise<void>((resolve) => {
-          r.proc.once('exit', () => resolve());
-          killGroup(r.proc);
-          setTimeout(() => {
-            killGroup(r.proc, 'SIGKILL');
-            resolve();
-          }, 2000).unref();
-        });
+      // NOTE the exitCode check is deliberately absent: `sh -c` forks, so the
+      // wrapper can be gone while the real server lives on in its group. The
+      // identity check inside killGroupVerified fails safe for a dead leader, so
+      // survivors get RECORDED for tag reclaim instead of vanishing silently.
+      if (r.proc && r.proc.pid) {
+        // Verify the group is actually gone rather than resolving as soon as
+        // SIGKILL is *sent* — the caller goes on to delete the env root and
+        // drop the pid, so a survivor here becomes an untrackable orphan.
+        const dead = await killGroupVerified(r.proc.pid, r.startTime);
+        if (!dead) {
+          this.note(name, `still running after SIGKILL (pid ${r.proc.pid})`);
+          survivors[name] = { pid: r.proc.pid, startTime: r.startTime };
+        }
       }
-      this.note(name, 'stopped');
+      this.note(name, survivors[name] ? 'stop failed' : 'stopped');
     }
     this.services.clear();
+    return survivors;
   }
+}
+
+/**
+ * The addresses an advertised URL may actually be served on.
+ *
+ * Keeps the CONSUMER-facing url unchanged (that is a contract) while making the
+ * internal readiness probe robust to IPv4/IPv6 resolution order.
+ */
+function probeUrls(url: string): string[] {
+  if (!url.includes('//localhost')) return [url];
+  return [url, url.replace('//localhost', '//127.0.0.1')];
 }
 
 const tail = (s: string, n = 600): string => s.slice(-n);
 
-/** Signal a service's whole process group; fall back to the leader alone. */
-function killGroup(proc: ChildProcess, signal: NodeJS.Signals = 'SIGTERM'): void {
-  if (!proc.pid) return;
+/** Signal a whole process group, falling back to the single pid we know of. */
+function signalGroup(pgid: number, pid: number, signal: NodeJS.Signals): void {
   try {
-    process.kill(-proc.pid, signal); // detached spawn => pid is the group leader
+    process.kill(-pgid, signal);
   } catch {
+    // Not a group leader (or the group is already gone) — at minimum reach the
+    // one process we can name.
     try {
-      proc.kill(signal);
+      process.kill(pid, signal);
     } catch {
       /* already gone */
     }
   }
 }
 
-/** Kill PIDs recorded by a previous daemon life (recovery, decision 0009). */
-export function reapPids(pids: Record<string, number>): void {
-  for (const pid of Object.values(pids)) {
-    // Recorded pids are group leaders (services spawn detached) — signal the
-    // group so the actual server dies too, not just the sh -c wrapper.
-    try {
-      process.kill(-pid);
-    } catch {
-      try {
-        process.kill(pid);
-      } catch {
-        /* already gone */
-      }
-    }
+/**
+ * SIGTERM a group, wait for it to actually die, then SIGKILL and confirm.
+ *
+ * The previous recovery path fired one SIGTERM and moved on, which anything
+ * with a graceful-shutdown handler (a .NET host, `ng serve` under a trapping
+ * shell) simply outlives — and since the caller then dropped the pid, the
+ * survivor became unreachable forever. Escalation plus a verified verdict is
+ * what makes "reaped" mean reaped.
+ *
+ * Returns true if the leader is confirmed gone.
+ */
+export async function killGroupVerified(
+  pid: number,
+  recordedStart?: number,
+  graceMs = 2000,
+): Promise<boolean> {
+  if (!sameProcess(pid, recordedStart)) {
+    // The pid is no longer the process we recorded. Whatever now sits in that
+    // group may be a stranger's — our old children and an unrelated new leader
+    // are indistinguishable by pid alone — so signalling it is never safe.
+    // Report gone only if the group is genuinely empty; otherwise leave it
+    // unresolved for tag-based reclaim, which pid reuse cannot confuse.
+    return !groupAlive(pid);
   }
+  // Resolve the group BEFORE signalling: once the leader exits its /proc entry
+  // is gone and the surviving siblings become unattributable.
+  const pgid = processGroup(pid) ?? pid;
+  const gone = () => !groupAlive(pgid);
+
+  signalGroup(pgid, pid, 'SIGTERM');
+  const deadline = Date.now() + graceMs;
+  while (Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, 50));
+    if (gone()) return true;
+  }
+  // The leader dying is NOT the success condition. `sh -c` commonly forks, so
+  // the wrapper exits on SIGTERM while the real server — which ignored it —
+  // keeps its port and its ~1 GB. Escalate against the whole group.
+  signalGroup(pgid, pid, 'SIGKILL');
+  // SIGKILL is not instantaneous: the kernel still has to tear the group down,
+  // and reporting "reaped" early would let the caller drop the pid one poll
+  // before the process is actually off the table.
+  const hard = Date.now() + 2000;
+  while (Date.now() < hard) {
+    await new Promise((r) => setTimeout(r, 50));
+    if (gone()) return true;
+  }
+  return gone();
+}
+
+/**
+ * Kill PIDs recorded by a previous daemon life (recovery, decision 0009).
+ *
+ * Returns the entries that were NOT confirmed dead. The caller must keep those
+ * in the journal — a forgotten pid is an orphan nobody can ever reclaim.
+ */
+export async function reapPids(pids: Record<string, ServicePid>): Promise<Record<string, ServicePid>> {
+  const survivors: Record<string, ServicePid> = {};
+  await Promise.all(
+    Object.entries(pids).map(async ([name, rec]) => {
+      // Recorded pids are group leaders (services spawn detached) — signal the
+      // group so the actual server dies too, not just the sh -c wrapper.
+      const dead = await killGroupVerified(rec.pid, rec.startTime);
+      if (!dead) survivors[name] = rec;
+    }),
+  );
+  return survivors;
 }

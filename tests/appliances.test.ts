@@ -6,7 +6,7 @@
  */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { createServer, type Server } from 'node:net';
-import { readFileSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
+import { readFileSync, mkdirSync, writeFileSync, rmSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import Ajv2020 from 'ajv/dist/2020.js';
 import { ensureAppliance, stopAppliance, probeTcp } from '../src/drivers/appliances.js';
@@ -135,16 +135,38 @@ describe('ensureAppliance', () => {
     expect(err.message).toContain('never answered');
   });
 
-  it('adoption skips the ready: gate (it only guards the start path)', async () => {
+  it('applies the ready: gate on adoption, not only on the start path', async () => {
     const port = await freePort();
     servers.push(await listen(port));
     const work = tempDir('appliance-ready');
     const marker = join(work.dir, 'ready.marker');
-    // Probe answers (listener above) so adoption short-circuits before ready:
-    // — the ready gate only guards the start path, by design. Assert that
-    // contract: an unsatisfiable ready does not block adoption.
-    const res = await ensureAppliance('db', { probe: `127.0.0.1:${port}`, ready: `test -f ${marker}` }, work.dir, silent);
-    expect(res).toBe('up');
+
+    // This test previously asserted the OPPOSITE — that adoption short-circuits
+    // before ready: "by design". That contradicts decision 0018, which states
+    // ready: exists precisely "because servers like Postgres accept connections
+    // before they serve them". An open port is the condition ready: is there to
+    // disambiguate, so honouring it only when backlot happened to run start:
+    // made the gate meaningless for the common case: a long-lived appliance
+    // that is already up.
+    const err = await ensureAppliance(
+      'db',
+      { probe: `127.0.0.1:${port}`, ready: `test -f ${marker}`, timeout: 2 },
+      work.dir,
+      silent,
+    ).catch((e) => e);
+    expect(err).toBeInstanceOf(BrokerError);
+    expect(err.klass).toBe('infra-error'); // 0018: appliance failures are never anyone's code
+    expect(err.message).toMatch(/ready: gate never passed/);
+
+    // Once the gate is satisfiable, the same appliance adopts cleanly.
+    writeFileSync(marker, '');
+    const ok = await ensureAppliance(
+      'db',
+      { probe: `127.0.0.1:${port}`, ready: `test -f ${marker}`, timeout: 2 },
+      work.dir,
+      silent,
+    );
+    expect(ok).toBe('up');
     work.cleanup();
   });
 
@@ -192,4 +214,42 @@ describe('stopAppliance', () => {
     expect(readFileSync(marker, 'utf8')).toBe('');
     work.cleanup();
   });
+});
+
+describe('the appliance start lock is machine-wide, not process-wide', () => {
+  let lockState: { dir: string; cleanup: () => void };
+  beforeEach(() => {
+    lockState = tempDir('appliance-lockstate');
+    process.env.BACKLOT_STATE_DIR = lockState.dir;
+  });
+  afterEach(() => {
+    delete process.env.BACKLOT_STATE_DIR;
+    lockState.cleanup();
+  });
+
+  it('holds the lock as a filesystem artifact under the shared state root', async () => {
+    const port = await freePort();
+    const work = tempDir('appliance-xproc');
+    const script = join(work.dir, 'srv.mjs');
+    writeFileSync(script, `import { createServer } from 'node:net'; createServer().listen(${port}, '127.0.0.1');`);
+    const lockRoot = join(process.env.BACKLOT_STATE_DIR!, 'appliances');
+
+    // The existing race test used two callers in ONE process, which an
+    // in-memory lock would satisfy just as well — it proved nothing about the
+    // machine-wide claim. What makes the lock machine-wide is that it lives on
+    // disk under the shared state root, where a separate process sees it.
+    const start = `sleep 1; nohup node ${script} > /dev/null 2>&1 & echo started`;
+    const spec = { probe: `127.0.0.1:${port}`, start, timeout: 20 };
+
+    const inFlight = ensureAppliance('racy', spec, work.dir, silent);
+    await new Promise((r) => setTimeout(r, 300));
+    const held = readdirSync(lockRoot).filter((f) => f.endsWith('.lock'));
+    expect(held.length, 'no lock on disk while a start is in flight').toBeGreaterThan(0);
+
+    await inFlight;
+    // Released once the start completes, so the next caller is not blocked.
+    const after = readdirSync(lockRoot).filter((f) => f.endsWith('.lock'));
+    expect(after.length).toBe(0);
+    work.cleanup();
+  }, 60_000);
 });

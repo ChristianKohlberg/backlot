@@ -7,8 +7,10 @@
 import { createServer, request } from 'node:http';
 import { existsSync, rmSync, writeFileSync, chmodSync } from 'node:fs';
 import { socketPath, pidPath } from '../core/paths.js';
+import { electSelf, releaseSelf } from './election.js';
 import { BrokerError } from '../core/util.js';
 import { Engine } from './engine.js';
+import { logEvent } from '../core/events.js';
 
 // Singleton guard: recover() and listen happen only AFTER we win the socket,
 // so a losing daemon never reaps the winner's children or mutates the journal.
@@ -32,7 +34,7 @@ async function dispatch(verb: string, args: Record<string, unknown>, emit: (phas
         onProgress: emit,
       });
     case 'run':
-      return engine.run({ cwd, holder, check: String(args.check), hygiene: (args.hygiene as never) ?? undefined, onProgress: emit });
+      return engine.run({ cwd, holder, check: String(args.check), hygiene: (args.hygiene as never) ?? undefined, pull: Boolean(args.pull), onProgress: emit });
     case 'run-detach': {
       const jobId = engine.createJob(cwd, String(args.check));
       // Fire-and-forget — env/pool locks make it safe; the journaled verdict
@@ -77,9 +79,16 @@ async function dispatch(verb: string, args: Record<string, unknown>, emit: (phas
     case 'pool-reconcile':
       // Local substrate: reconcile = doctor + reap anything degraded/stuck.
       return engine.poolReconcile();
+    case 'pool-gc':
+      return engine.poolGc();
     case 'shutdown':
       setTimeout(async () => {
         await engine.shutdown();
+        // Clean up what we own, exactly as the signal path does — a stale lock
+        // is recoverable (the next daemon sees a dead holder) but leaving one
+        // behind makes every restart pay a lock-break round.
+        if (ownsSocket) rmSync(sock, { force: true });
+        if (ownsLock) releaseSelf();
         process.exit(0);
       }, 50);
       return { stopping: true };
@@ -90,6 +99,7 @@ async function dispatch(verb: string, args: Record<string, unknown>, emit: (phas
 
 const sock = socketPath();
 let ownsSocket = false;
+let ownsLock = false;
 
 /** Is a LIVE daemon already answering on the socket? (vs. a stale socket file) */
 function pingExisting(): Promise<boolean> {
@@ -108,6 +118,18 @@ function pingExisting(): Promise<boolean> {
   });
 }
 
+/**
+ * Recovery reconciles prior daemon state, and now genuinely waits on kills
+ * (verified reaps, orphan sweep) instead of firing signals blind. Requests are
+ * therefore held until it completes: serving `status` mid-reconcile would show
+ * a caller envs that are about to change state, which is the old synchronous
+ * contract silently broken.
+ *
+ * `ping` is exempt — the singleton election must be answerable immediately, or
+ * a second daemon would conclude the socket is stale and take over.
+ */
+let recovered: Promise<void> = Promise.resolve();
+
 const server = createServer((req, res) => {
   let body = '';
   req.on('data', (d) => (body += d));
@@ -124,12 +146,23 @@ const server = createServer((req, res) => {
           /* client hung up mid-stream */
         }
       };
+      let verbForLog = '?';
       try {
         const { verb, args } = JSON.parse(body || '{}');
+        verbForLog = String(verb ?? '?');
+        if (verb !== 'ping') await recovered;
         const data = await dispatch(verb, args ?? {}, emit);
         res.end(JSON.stringify({ type: 'result', ok: true, data }) + '\n');
       } catch (err) {
-        const e = err instanceof BrokerError ? err.toJSON() : { class: 'env-error', message: String((err as Error).message ?? err) };
+        // An unclassified throw is a DAEMON bug, not a bad environment.
+        // Labelling it env-error told the agent to recycle an environment,
+        // which cannot fix a TypeError in the broker — and buried the defect.
+        const e = err instanceof BrokerError
+          ? err.toJSON()
+          : { class: 'infra-error', message: `internal daemon error: ${String((err as Error).message ?? err)}` };
+        if (!(err instanceof BrokerError)) {
+          logEvent({ level: 'error', kind: 'internal', detail: `${verbForLog}: ${String((err as Error).stack ?? err)}`.slice(0, 1000) });
+        }
         res.end(JSON.stringify({ type: 'result', ok: false, error: e }) + '\n');
       }
     })();
@@ -152,8 +185,24 @@ async function start(): Promise<void> {
     if (process.send) process.send('ready');
     process.exit(0);
   }
+  // Win the lock BEFORE touching the socket. Without this, two daemons that
+  // both saw no answer to their ping would each unlink the socket — the second
+  // deleting the first's LIVE one — and both would then bind successfully,
+  // sweeping the same journal and reaping each other's processes.
+  if (!electSelf()) {
+    if (process.send) process.send('ready'); // someone else owns it; the client can proceed
+    process.exit(0);
+  }
+  ownsLock = true;
+  // Only the election winner may remove a socket, so this can no longer be a
+  // live one: any daemon that could have been listening lost the lock.
   if (existsSync(sock)) rmSync(sock, { force: true }); // stale socket from a dead daemon
 
+  // Create the socket ALREADY private. The chmod below runs inside the listen
+  // callback, by which point the socket exists and can accept connections, so
+  // a permissive umask left a window where it was world-reachable. The socket
+  // has no RPC auth and exposes arbitrary-shell verbs, so the window matters.
+  process.umask(0o077);
   server.listen(sock, () => {
     ownsSocket = true;
     // The socket has no RPC auth and exposes arbitrary-shell verbs (exec/token),
@@ -166,10 +215,28 @@ async function start(): Promise<void> {
       /* best-effort; the 0700 state dir is the backstop */
     }
     writeFileSync(pidPath(), String(process.pid));
-    // Only NOW, as the sole owner, reconcile prior daemon state.
-    engine.recover();
+    // Only NOW, as the sole owner, reconcile prior daemon state. Recovery
+    // verifies each reap and sweeps for orphans, so it awaits real work; every
+    // non-ping request queues behind it.
+    recovered = engine.recover().catch((err) => {
+      // A failed reconcile must not wedge the daemon forever — surface it and
+      // let requests through rather than hanging every client.
+      logEvent({ level: 'error', kind: 'recover', detail: `recovery failed: ${String((err as Error).message ?? err)}` });
+    });
     const sweepMs = Number(process.env.BACKLOT_SWEEP_MS ?? 15_000);
-    setInterval(() => void engine.sweep(), sweepMs).unref();
+    // The sweeper must not run DURING recovery: it would act on rows recovery
+    // is still reconciling, and a stale-snapshot save could resurrect an env
+    // recovery had just deleted. Each tick also swallows its own rejection —
+    // a fire-and-forget async call whose promise rejects is an unhandled
+    // rejection, which takes the daemon down on any transient journal or FS
+    // write failure.
+    void recovered.then(() => {
+      setInterval(() => {
+        void engine.sweep().catch((err) => {
+          logEvent({ level: 'error', kind: 'sweep', detail: `sweep failed: ${String((err as Error).message ?? err)}` });
+        });
+      }, sweepMs).unref();
+    });
     // Detach from the spawning CLI's lifetime.
     if (process.send) process.send('ready');
   });
@@ -179,10 +246,15 @@ void start();
 
 for (const sig of ['SIGINT', 'SIGTERM'] as const) {
   process.on(sig, () => {
+    // A daemon that LOST the election must exit without touching shared state:
+    // engine.shutdown() stops services and rewrites env rows, which would let a
+    // conceding process tear down the winner's environments.
+    if (!ownsLock && !ownsSocket) process.exit(0);
     void engine.shutdown().then(() => {
       // Only remove the socket if WE own it — a losing/duplicate daemon must
       // never delete the healthy daemon's socket.
       if (ownsSocket) rmSync(sock, { force: true });
+      if (ownsLock) releaseSelf();
       process.exit(0);
     });
   });

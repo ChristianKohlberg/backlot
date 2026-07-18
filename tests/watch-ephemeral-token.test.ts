@@ -16,14 +16,14 @@ function makeContext() {
   const env = { ...process.env, BACKLOT_STATE_DIR: stateDir, BACKLOT_SWEEP_MS: '500' };
   const cli = (args: string[], cwd: string): Promise<{ exitCode: number; json?: Record<string, unknown>; out: string }> =>
     new Promise((resolve) => {
-      execFile(process.execPath, [CLI, ...args], { cwd, env, maxBuffer: 16 * 1024 * 1024 }, (err, stdout) => {
+      execFile(process.execPath, [CLI, ...args], { cwd, env, maxBuffer: 16 * 1024 * 1024 }, (err, stdout, stderr) => {
         let json;
         try {
           json = JSON.parse(String(stdout));
         } catch {
           /* non-json */
         }
-        resolve({ exitCode: err ? ((err as { code?: number }).code ?? 1) : 0, json, out: String(stdout) });
+        resolve({ exitCode: err ? ((err as { code?: number }).code ?? 1) : 0, json, out: String(stdout), stdout: String(stdout), stderr: String(stderr) });
       });
     });
   const cleanup = () => {
@@ -66,7 +66,7 @@ services:
       { 'server.mjs': SERVE, 'message.txt': 'v1' },
     );
     const up = await ctx.cli(['up', '--watch', '--json'], wt);
-    expect(up.exitCode, `output: ${(up as { output?: string }).output ?? ''}${up.stdout ?? ''}${up.stderr ?? ''}`).toBe(0);
+    expect(up.exitCode, `stdout: ${up.stdout ?? ''}\nstderr: ${up.stderr ?? ''}`).toBe(0);
     const url = (up.json!.urls as Record<string, string>).web!;
     expect(await (await fetch(url)).text()).toBe('v1');
 
@@ -144,7 +144,7 @@ auth:
     );
     await ctx.cli(['up'], wt);
     const res = await ctx.cli(['token', '--role', 'detektiv', '--json'], wt);
-    expect(res.exitCode, `output: ${(res as { output?: string }).output ?? ''}${res.stdout ?? ''}${res.stderr ?? ''}`).toBe(0);
+    expect(res.exitCode, `stdout: ${res.stdout ?? ''}\nstderr: ${res.stderr ?? ''}`).toBe(0);
     expect(res.json!.token).toMatch(/^fake-jwt-for-detektiv-on-\d+$/);
     expect(res.json!.role).toBe('detektiv');
   }, 60_000);

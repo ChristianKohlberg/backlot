@@ -3,21 +3,75 @@
 Known work, roughly prioritized. Committed to the repo so it survives sessions.
 Each item notes severity and where it was found.
 
-## CI — remaining macOS-runner failures (2026-07-11, post port-race fix)
+## Promised but not implemented (2026-07-18 fleet review)
 
-- [ ] **P2 · macOS runners: `run`-flow tests die on "pool at capacity (1/1) —
-  waited 60s".** With the Linux rebind race fixed (services now own their
-  process group) the ubuntu leg is green; 4 macOS-leg tests still fail — all
-  flows needing a *second* env (`run smoke` x2, #21d shared-holder run,
-  hello-python). The exit-code asserts now surface the CLI error:
-  `env-error: pool at capacity (1/1) — waited 60s; release a lease or raise
-  BACKLOT_POOL_MAX`. Passes on real Macs; on slow shared runners the first
-  env apparently isn't released/quiesced within the 60s capacity wait.
-  Pre-existing (baseline probe on main-equivalent code fails identically —
-  the legs were fail-fast-cancelled for months, so it was never visible).
-  Open question is test intent: raise BACKLOT_POOL_MAX in those contexts,
-  lengthen the capacity wait under CI, or fix a release/sweeper timing bug —
-  needs a look at what the pool tests are meant to prove.
+The review found several documented capabilities the code does not deliver.
+They are recorded here rather than quietly corrected away, because each is a
+real product gap someone reading the docs would expect to work.
+
+- [ ] **P2 · `--watch` two-stage reload.** Docs promised the watcher projects a
+  file and the environment's own dev-server picks it up. In fact the sync takes
+  the ordinary bind path, whose fast path requires an unchanged source hash —
+  which a watch-triggered sync never has — so every save stops and restarts the
+  services. architecture.md now states the gap; closing it needs a source-only
+  sync path that skips the service lifecycle.
+- [ ] **P2 · Decision 0016 (data states) is unimplemented.** No `states:`,
+  no `inputs:`, no per-check `state:`, no `--state`, no snapshot/restore. The
+  decision is marked Accepted, so either build it or supersede it with a new
+  decision — an Accepted decision the code ignores is worse than no decision.
+- [ ] **P3 · The substrate seam is spec-only.** docs/driver-spec.md describes
+  remote substrates and `pool reconcile` adoption, but no remote driver exists
+  and nothing exercises the seam. The local paths hard-code local assumptions
+  (process groups, /proc tags, file copies), so the first real driver will
+  find the seam narrower than the spec suggests.
+- [ ] **P3 · MCP has no long-running-operation story.** Progress frames are
+  dropped, there is no cancel, and the detach/job verbs are not exposed — so an
+  agent driving a slow bind over MCP can only block. The CLI has `--detach`;
+  the adapter should surface it.
+- [ ] **P3 · Probe host and advertised host disagree.** Port probing binds
+  `127.0.0.1` (and now the wildcard) while `ctx` advertises `http://localhost:…`.
+  On a dual-stack host `localhost` can resolve to `::1`, where a service bound
+  only to IPv4 is not listening — so a probed-free, "ready" service can still be
+  unreachable for the consumer. Changing the advertised host is a visible
+  contract change (tests and consumers expect `localhost`), so it needs a
+  deliberate decision rather than a quiet swap.
+- [ ] **P3 · `/bin/sh` differs across the two supported platforms.** Service and
+  check commands run under `sh`, which is dash on Ubuntu and bash-as-sh on
+  macOS, so the same stack.yaml can behave differently on the two legs backlot
+  tests. Either document sh-portable-only, or pick a shell explicitly.
+
+- [ ] **P2 · macOS: hello-python never passes its readiness probe.** The last
+  survivor of the four macOS failures this review inherited. The service starts
+  and logs `hello-python listening on :<port>`, but `ready: { http: /health }`
+  times out after 30s, so the bind fails with an env-error. Not reproducible on
+  Linux, and not reproducible locally against an IPv4-only Node service (the
+  readiness probe now tries `127.0.0.1` as well as the advertised `localhost`,
+  which was the obvious dual-stack explanation and did NOT fix it). Needs
+  someone on a real Mac, or a debug CI run that curls the port from the runner,
+  to find out whether the socket is reachable at all. Tracked rather than
+  quarantined — an `it.skipIf` here would hide the platform gap the macOS leg
+  exists to expose.
+
+## CI — macOS-runner failures (2026-07-11) — DIAGNOSED 2026-07-18
+
+- [x] **P2 · macOS runners: `run`-flow tests die on "pool at capacity (1/1) —
+  waited 60s".** Root cause found by the 2026-07-18 fleet review, and it is NOT
+  a slow-runner timing problem as this entry previously hypothesised. It is
+  arithmetic: `poolMaxHeuristic` is `min(floor(cores/2), floor(memGB/4))`, and
+  `macos-latest` is 3 vCPU / 7 GB, so both terms are 1. Every failing flow does
+  a session `up` and then a `run`, and `run` always mints its own ephemeral
+  holder (`engine.ts`, `holder = run-<id>`), so it needs a SECOND environment
+  that a 1-env pool may never create. The 60s wait could never succeed on any
+  runner at any speed. ubuntu-latest (4 vCPU / 16 GB) gives 2 and passes; real
+  Macs give >= 2 and pass.
+  Fixed on two fronts: capacity waits now fail fast with a structural
+  diagnosis naming the blocking lease instead of burning the window and
+  blaming timing, and CI pins `BACKLOT_POOL_MAX=2`.
+  Owner decision (2026-07-18): the heuristic floor is now **2**, not 1. A
+  default under which the primary workflow cannot run is the worse failure, and
+  a cap is not a reservation — the second environment is only created when the
+  user actually asks for concurrent work. `BACKLOT_POOL_MAX=1` opts back out on
+  a constrained host, at the price of that loop.
 
 ## Polish — found during live Revamp/parallel testing (2026-07-03)
 

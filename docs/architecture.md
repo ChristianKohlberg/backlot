@@ -56,7 +56,7 @@ Kubernetes, Windows, secrets management, and dashboards are not.
 | **Substrate** | Where environments physically live, behind a driver: `local` (supervised processes in a directory), later `docker`, `morph`, `sprites`, `ssh`. |
 | **Environment** | A pooled slot on a substrate: its own copy of the tree, warm caches, running services, allocated ports, a datastore namespace. Durable; belongs to the pool, never to a person or task. |
 | **Binding** | A source state (ref + dirty diff) plus a data state (preset, at a hygiene level) attached to an environment. An immutable snapshot. |
-| **Lease** | Temporary ownership of an environment, with a TTL refreshed by any CLI touch. Expiry returns the environment to the pool **warm** — nothing is torn down. |
+| **Lease** | Temporary ownership of an environment, with a TTL refreshed by the verbs that BIND (`up`, `sync`, `bind`, `run`). Read-only verbs (`ctx`, `logs`, `token`, `pull`, `status`) do not refresh it. Expiry returns the environment to the pool **warm** — nothing is torn down. |
 
 Plus one verb-noun: a **Run** — a named check executed against a binding, producing an
 exit code, a JSON verdict, and collected artifacts.
@@ -118,7 +118,10 @@ Local pools are convergence all the way down. Same verbs above the driver line.
   quiesce idle environments while no CLI is running.
 - **Concurrency lives at the environment boundary**: a short pool lock serializes
   claim/release bookkeeping; one lock per environment serializes bind/exec/reset on it.
-  Different environments (and different stacks) bind in parallel; the sweeper never
+  Different environments (and different stacks) bind in parallel — with the caveat
+  that sync hashing, file copying and the `git` calls are synchronous, so a very
+  large bind still blocks the daemon's event loop and delays others while it runs;
+  the sweeper never
   expires or quiesces an environment with an operation in flight.
 - **Local even when compute is remote.** A Morph environment is a pool entry whose
   driver executes over SSH. The consumer's machine is the brain; substrates are muscles.
@@ -149,11 +152,18 @@ local/remote abstraction; the local substrate is enumerate-and-copy.)
   synced at start; edits mid-run cannot contaminate the verdict. New sync = new binding
   revision.
 - `--watch` sessions opt into a daemon-side debounced worktree watcher that auto-syncs
-  on save, feeding the environment's own dev-server watchers. Two-stage reload;
-  stopped on release/expiry/quiesce/recycle. Watch activity refreshes the lease.
-- The environment-side reset before each bind restores tracked files hard and cleans
-  untracked ones, **except** declared `caches:` (node_modules, obj/, …) and `sync.keep`
-  paths. A poisoned env tree self-heals on next bind.
+  on save. **Known gap:** the sync runs the ordinary bind path, whose fast path requires
+  an unchanged source hash — which a watch-triggered sync never has. So every save
+  currently STOPS and restarts the environment's services rather than letting their own
+  watchers pick the change up. The intended two-stage reload (project the file, let the
+  dev-server reload it) is not implemented. Stopped on release/expiry/quiesce/recycle.
+  Watch activity refreshes the lease.
+- The environment-side reset restores tracked files hard on every bind. A **clean-slate**
+  bind (`--reset-data` or `--pristine`) additionally removes untracked env-side files —
+  droppings left by a check, service, or `exec` — **except** declared `caches:`
+  (node_modules, obj/, …) and `sync.keep` paths. A plain `reuse` bind keeps them, so an
+  undeclared build artifact is not destroyed on every bind; declare expensive output
+  under `caches:` and a poisoned env tree then self-heals on the next clean-slate bind.
 - Git-ignored-but-needed files (`.env.local`) are declarable via `sync.include`.
 - Oversized/binary diffs fall back to file copy past a threshold.
 
@@ -241,7 +251,9 @@ Every failure is classified — the field an agent branches on mechanically:
   grace because degradation is judged only by a service's restart budget, not by a
   post-boot health poll — a slept service simply resumes.
 - **Leases need no heartbeat daemon** because losing a lease is designed to be
-  worthless: any CLI touch refreshes the TTL; expiry returns the env warm; the source
+  worthless: a binding verb refreshes the TTL (read-only verbs deliberately do not,
+  so an idle agent that only polls `ctx` does not hold an environment forever);
+  expiry returns the env warm; the source
   of truth never left the worktree. Agents that vanish cost nothing.
 - **Remote is the mirror image**: the world keeps running (and billing) while the lid
   is shut. Therefore remote environments always carry **provider-side TTLs** as the
@@ -249,6 +261,17 @@ Every failure is classified — the field an agent branches on mechanically:
   executes detached on the box, journaled; the CLI reattaches. Orphan discovery:
   drivers tag instances so `pool reconcile` can adopt or reap what the journal forgot.
   Local orphans cost RAM; remote orphans cost money — the asymmetry drives the design.
+- **Locally, the same tagging rule applies to service processes.** Every supervised
+  service is spawned carrying `BACKLOT_ENV_ID` / `BACKLOT_SERVICE` / `BACKLOT_STATE_ROOT`,
+  inherited by every descendant. Pids alone are not ownership: a recorded pid may have
+  been recycled by the OS, and `sh -c` frequently forks so the recorded pid is only the
+  wrapper. Cleanup therefore (a) pins each pid to one process *life* via its kernel
+  start time, (b) verifies the whole process **group** is gone rather than trusting that
+  the leader exited, and (c) falls back to `scanTagged` — a /proc sweep by tag — for
+  processes no journal row can name. `pool gc` is that sweep as a verb; recovery and the
+  sweeper run it automatically. A process is only ever reclaimed when no live env
+  accounts for it. The state-root tag scopes all of this, so parallel installs and
+  concurrent test daemons can never reap each other.
 
 ## 11. The consumer's interface
 
@@ -265,7 +288,7 @@ backlot logs <service> [--lines N]               # supervised service logs
 backlot token --role <r>                         # mint a token via auth.token
 backlot reset-data | pull | release
 backlot status | doctor                          # pool state | active health check
-backlot pool ls|recycle [--all]|reconcile|doctor
+backlot pool ls|recycle [--all]|reconcile|gc|doctor
 backlot daemon stop
 ```
 
@@ -301,7 +324,7 @@ variable > `$STATE_DIR/config.json` > built-in default.
 | Env var | config.json key | Default |
 | --- | --- | --- |
 | `BACKLOT_STATE_DIR` | — | `$XDG_STATE_HOME/backlot` (the per-machine root; 0700) |
-| `BACKLOT_POOL_MAX` | `poolMax` | `min(cores/2, memGB/4)`, clamped [1,8] |
+| `BACKLOT_POOL_MAX` | `poolMax` | `min(cores/2, memGB/4)`, clamped **[2,8]** — the floor is 2 because `up` + `run` needs two envs |
 | `BACKLOT_LEASE_TTL_MS` | `sessionTtlMs` / `runTtlMs` | 30 min / 10 min |
 | `BACKLOT_IDLE_TTL_MS` | `idleTtlMs` | 30 min |
 | `BACKLOT_WAIT_MS` | `waitMs` | 60 s (queue-at-capacity timeout) |

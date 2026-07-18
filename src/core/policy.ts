@@ -9,6 +9,8 @@ import { stateRoot } from './paths.js';
 
 export interface Policy {
   poolMax: number;
+  /** Machine-wide ceiling across ALL stacks (the memory heuristic is per host). */
+  poolMaxTotal: number;
   sessionTtlMs: number;
   runTtlMs: number;
   idleTtlMs: number;
@@ -22,6 +24,7 @@ export interface Policy {
 
 interface ConfigFile {
   poolMax?: number;
+  poolMaxTotal?: number;
   sessionTtlMs?: number;
   runTtlMs?: number;
   idleTtlMs?: number;
@@ -40,11 +43,26 @@ function configFile(): ConfigFile {
   }
 }
 
-/** The designed capacity heuristic: min(cores/2, memGB/4), clamped to [1, 8]. */
+/**
+ * The designed capacity heuristic: min(cores/2, memGB/4), clamped to [2, 8].
+ *
+ * The floor is 2, not 1, because the documented core loop needs two
+ * environments: a session `up` holds one, and `run` always mints its own
+ * ephemeral holder, so it must be able to take a second. A pool of 1 cannot run
+ * backlot as documented at all — it fails with 'pool at capacity (1/1)', which
+ * is what small CI runners hit (3 vCPU / 7 GB gives 1 on both terms).
+ *
+ * This does raise peak memory on the smallest machines, which is a real cost.
+ * It is accepted deliberately: a cap is not a reservation — the second
+ * environment is only ever created when the user actually asks for concurrent
+ * work — and shipping a default under which the primary workflow cannot run is
+ * the worse failure. Set BACKLOT_POOL_MAX=1 to opt back out on a constrained
+ * host, at the price of that loop.
+ */
 export function poolMaxHeuristic(): number {
   const byCores = Math.floor(cpus().length / 2);
   const byMem = Math.floor(totalmem() / (4 * 1024 ** 3));
-  return Math.max(1, Math.min(8, Math.min(byCores || 1, byMem || 1)));
+  return Math.max(2, Math.min(8, Math.min(byCores || 1, byMem || 1)));
 }
 
 const num = (envVar: string, fileVal: number | undefined, fallback: number): number => {
@@ -58,6 +76,11 @@ export function policy(): Policy {
   const f = configFile();
   return {
     poolMax: num('BACKLOT_POOL_MAX', f.poolMax, poolMaxHeuristic()),
+    // poolMax is PER STACK, but poolMaxHeuristic is derived from this machine's
+    // cores and memory — so three projects each ran up to poolMax environments
+    // and tripled a budget that was calculated once for the host. This is the
+    // machine-wide ceiling; raise it deliberately if the host can take it.
+    poolMaxTotal: num('BACKLOT_POOL_MAX_TOTAL', f.poolMaxTotal, poolMaxHeuristic()),
     sessionTtlMs: num('BACKLOT_LEASE_TTL_MS', f.sessionTtlMs, 30 * 60_000),
     runTtlMs: num('BACKLOT_LEASE_TTL_MS', f.runTtlMs, 10 * 60_000),
     idleTtlMs: num('BACKLOT_IDLE_TTL_MS', f.idleTtlMs, 30 * 60_000),

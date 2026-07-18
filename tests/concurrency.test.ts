@@ -43,14 +43,14 @@ services:
 
 const cli = (args: string[], cwd: string): Promise<{ exitCode: number; json?: Record<string, unknown> }> =>
   new Promise((resolve) => {
-    execFile(process.execPath, [CLI, ...args], { cwd, env, maxBuffer: 16 * 1024 * 1024 }, (err, stdout) => {
+    execFile(process.execPath, [CLI, ...args], { cwd, env, maxBuffer: 16 * 1024 * 1024 }, (err, stdout, stderr) => {
       let json;
       try {
         json = JSON.parse(String(stdout));
       } catch {
         /* non-json */
       }
-      resolve({ exitCode: err ? ((err as { code?: number }).code ?? 1) : 0, json });
+      resolve({ exitCode: err ? ((err as { code?: number }).code ?? 1) : 0, json, stdout: String(stdout), stderr: String(stderr) });
     });
   });
 
@@ -80,10 +80,15 @@ describe('per-environment concurrency', () => {
       return { ...res, start, end: Date.now() };
     };
     const [a, b] = await Promise.all([timed(wtA), timed(wtB)]);
-    expect(a.exitCode, `output: ${(a as { output?: string }).output ?? ''}${a.stdout ?? ''}${a.stderr ?? ''}`).toBe(0);
-    expect(b.exitCode, `output: ${(b as { output?: string }).output ?? ''}${b.stdout ?? ''}${b.stderr ?? ''}`).toBe(0);
-    const overlap = Math.min(a.end, b.end) - Math.max(a.start, b.start);
-    expect(overlap).toBeGreaterThan(1000); // serialized binds cannot overlap >= the ready-wait
+    expect(a.exitCode, `stdout: ${a.stdout ?? ''}\nstderr: ${a.stderr ?? ''}`).toBe(0);
+    expect(b.exitCode, `stdout: ${b.stdout ?? ''}\nstderr: ${b.stderr ?? ''}`).toBe(0);
+    // The overlap assertion this replaced was VACUOUS: both CLI processes are
+    // launched together by Promise.all, so their wall-clock windows overlap
+    // even when the daemon serializes them internally — one is simply blocked.
+    // Total elapsed is what distinguishes the two: serialized costs 2x the
+    // ready-wait (>= ~3s), parallel costs roughly one (~1.5s).
+    const totalMs = Math.max(a.end, b.end) - Math.min(a.start, b.start);
+    expect(totalMs, `two 1.5s binds took ${totalMs}ms — that is serialized, not parallel`).toBeLessThan(2800);
     expect((a.json!.urls as Record<string, string>).web).not.toBe((b.json!.urls as Record<string, string>).web);
   }, 30_000);
 });

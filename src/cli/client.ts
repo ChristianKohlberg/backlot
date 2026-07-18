@@ -9,6 +9,26 @@ import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { socketPath, stateRoot } from '../core/paths.js';
 
+/** A wedged daemon must not hang a caller forever. Overridable for tests. */
+const RPC_TIMEOUT_MS = (): number => Number(process.env.BACKLOT_RPC_TIMEOUT_MS ?? 15 * 60_000);
+
+/**
+ * Classify a client-side failure for the exit-code contract (decision 0010).
+ *
+ * Agents branch on the class mechanically, so an unreachable or wedged daemon
+ * must NOT report env-error: that tells the agent to recycle an environment,
+ * which cannot fix a broken daemon. Anything that never became a classified
+ * daemon response is infrastructure.
+ */
+export function classifyClientError(err: unknown): 'infra-error' | 'env-error' {
+  const tagged = (err as { backlotClass?: string })?.backlotClass;
+  if (tagged === 'infra-error' || tagged === 'env-error') return tagged;
+  const msg = String((err as Error)?.message ?? err);
+  return /daemon (did not|closed|is not)|ECONNREFUSED|ENOENT|EACCES|EPIPE|ECONNRESET|socket/i.test(msg)
+    ? 'infra-error'
+    : 'env-error';
+}
+
 export interface RpcError {
   class?: string;
   code?: string;
@@ -62,7 +82,16 @@ export function rpc(
       },
     );
     req.on('error', reject);
-    req.setTimeout(15 * 60_000);
+    // setTimeout ALONE is inert: Node emits 'timeout' and does nothing else, so
+    // a wedged daemon left the CLI (and any agent driving it) hanging forever.
+    // Destroying the socket is what turns the deadline into a real one.
+    req.setTimeout(RPC_TIMEOUT_MS(), () => {
+      req.destroy(
+        Object.assign(new Error(`daemon did not respond to '${verb}' within ${Math.round(RPC_TIMEOUT_MS() / 1000)}s — it may be wedged; check ${join(stateRoot(), 'daemon.log')}`), {
+          backlotClass: 'infra-error' as const,
+        }),
+      );
+    });
     req.end(JSON.stringify({ verb, args }));
   });
 }

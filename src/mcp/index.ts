@@ -8,6 +8,7 @@
  * Every tool result is the same JSON the CLI's --json emits, as text content.
  */
 import { createInterface } from 'node:readline';
+import { createRequire } from 'node:module';
 import { ensureDaemon, rpc } from '../cli/client.js';
 
 const PROTOCOL = '2025-06-18';
@@ -19,8 +20,28 @@ interface Tool {
   verb: string;
 }
 
+/**
+ * Read from package.json rather than a literal: the hardcoded value had already
+ * drifted (0.4.0 while the package shipped 0.5.0), so clients were told the
+ * wrong version of the tool they were driving.
+ */
+const VERSION: string = (() => {
+  try {
+    const require = createRequire(import.meta.url);
+    return (require('../../package.json') as { version?: string }).version ?? '0.0.0';
+  } catch {
+    return '0.0.0';
+  }
+})();
+
 const cwdProp = {
   cwd: { type: 'string', description: 'Worktree directory (a stack.yaml is found upward from here). REQUIRED — the MCP server has no meaningful cwd of its own.' },
+  // Without this, every agent working in one worktree resolves to the same
+  // holder (the path) and silently shares — and clobbers — a single lease.
+  holder: {
+    type: 'string',
+    description: 'Optional lease identity. Agents sharing a worktree MUST pass distinct holders, or they share one environment and overwrite each other.',
+  },
 };
 
 const TOOLS: Tool[] = [
@@ -122,7 +143,7 @@ rl.on('line', (line) => {
           return respond(id, {
             protocolVersion: PROTOCOL,
             capabilities: { tools: {} },
-            serverInfo: { name: 'backlot', version: '0.4.0' },
+            serverInfo: { name: 'backlot', version: VERSION },
           });
         case 'notifications/initialized':
           return; // notification — no response
@@ -135,6 +156,15 @@ rl.on('line', (line) => {
           const tool = TOOLS.find((t) => t.name === toolName);
           if (!tool) return respondError(id, -32602, `unknown tool '${toolName}'`);
           const args = (params?.arguments ?? {}) as Record<string, unknown>;
+          // The schema marks these required, but nothing enforced it — and the
+          // daemon falls back to ITS OWN cwd, which is meaningless here. A
+          // missing cwd silently operated on whatever stack happened to sit
+          // above the daemon's working directory.
+          const required = (tool.inputSchema as { required?: string[] }).required ?? [];
+          const missing = required.filter((k) => args[k] === undefined || args[k] === null || args[k] === '');
+          if (missing.length > 0) {
+            return respondError(id, -32602, `tool '${toolName}' requires: ${missing.join(', ')}`);
+          }
           await ensureDaemon();
           const res = await rpc(tool.verb, args);
           const text = JSON.stringify(res.ok ? res.data : { error: res.error });

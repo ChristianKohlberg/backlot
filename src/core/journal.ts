@@ -4,7 +4,30 @@
  */
 import { DatabaseSync } from 'node:sqlite';
 import { journalPath } from './paths.js';
-import type { EnvState, Hygiene, LeaseKind } from './types.js';
+import type { EnvState, Hygiene, LeaseKind, ServicePid } from './types.js';
+
+/**
+ * service_pids was once `{"web": 1234}` and is now
+ * `{"web": {"pid":1234,"startTime":99}}`. Journals outlive releases, so read
+ * both shapes; a bare number simply has no identity pin (see ServicePid).
+ */
+function parseServicePids(raw: string): Record<string, ServicePid> {
+  const out: Record<string, ServicePid> = {};
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return out;
+  }
+  if (!parsed || typeof parsed !== 'object') return out;
+  for (const [name, v] of Object.entries(parsed as Record<string, unknown>)) {
+    if (typeof v === 'number') out[name] = { pid: v };
+    else if (v && typeof v === 'object' && typeof (v as ServicePid).pid === 'number') {
+      out[name] = { pid: (v as ServicePid).pid, startTime: (v as ServicePid).startTime };
+    }
+  }
+  return out;
+}
 
 export interface EnvRow {
   id: string;
@@ -19,7 +42,7 @@ export interface EnvRow {
   bindCount: number;
   createdAt: number;
   lastUsedAt: number;
-  servicePids: Record<string, number>;
+  servicePids: Record<string, ServicePid>;
   /** Consecutive bind failures — >= 2 auto-escalates the next bind to pristine (decision 0007). */
   failStreak: number;
 }
@@ -62,11 +85,19 @@ export class Journal {
         stack TEXT PRIMARY KEY, next_env INTEGER NOT NULL DEFAULT 1
       );
     `);
-    // Migration for journals created before fail_streak existed.
+    // Concurrent readers exist (tests and tools open the journal directly while
+    // the daemon runs), and without a busy timeout any overlap is an immediate
+    // SQLITE_BUSY rather than a short wait.
+    this.db.exec('PRAGMA busy_timeout = 5000');
+    // Migration for journals created before fail_streak existed. Swallowing
+    // EVERY error here hid real failures (a corrupt journal, a locked file) as
+    // "column already exists", so the daemon carried on against a schema it did
+    // not actually have. Only the duplicate-column case is benign.
     try {
-      this.db.exec("ALTER TABLE envs ADD COLUMN fail_streak INTEGER NOT NULL DEFAULT 0");
-    } catch {
-      /* column already exists */
+      this.db.exec('ALTER TABLE envs ADD COLUMN fail_streak INTEGER NOT NULL DEFAULT 0');
+    } catch (err) {
+      const msg = String((err as Error).message ?? err);
+      if (!/duplicate column name/i.test(msg)) throw err;
     }
   }
 
@@ -84,7 +115,7 @@ export class Journal {
       bindCount: r.bind_count as number,
       createdAt: r.created_at as number,
       lastUsedAt: r.last_used_at as number,
-      servicePids: JSON.parse(r.service_pids as string),
+      servicePids: parseServicePids(r.service_pids as string),
       failStreak: (r.fail_streak as number) ?? 0,
     };
   }
@@ -144,7 +175,7 @@ export class Journal {
   }
 
   /** Update just the recorded service pids (auto-restart keeps recovery honest). */
-  updateServicePids(id: string, pids: Record<string, number>): void {
+  updateServicePids(id: string, pids: Record<string, ServicePid>): void {
     this.db.prepare('UPDATE envs SET service_pids = ? WHERE id = ?').run(JSON.stringify(pids), id);
   }
 

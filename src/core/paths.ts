@@ -27,6 +27,12 @@ export function stateRoot(): string {
 
 export const socketPath = (): string => join(stateRoot(), 'daemon.sock');
 export const pidPath = (): string => join(stateRoot(), 'daemon.pid');
+/**
+ * The singleton-election lock. Separate from daemon.pid, which stays a bare
+ * number for anything that reads it; this one carries the identity needed to
+ * tell a live holder from a crashed one.
+ */
+export const lockPath = (): string => join(stateRoot(), 'daemon.lock');
 export const journalPath = (): string => join(stateRoot(), 'journal.db');
 export const envsRoot = (): string => join(stateRoot(), 'envs');
 export const templatesRoot = (): string => join(stateRoot(), 'templates');

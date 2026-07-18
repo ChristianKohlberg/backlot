@@ -1,7 +1,7 @@
 {
   "name": "backlot",
   "version": "0.5.0",
-  "description": "The repo-aware environment broker: puts a working, seeded, provable instance of your web application in front of coding agents and humans — warm pools, leases, bind-by-sync. Brokers environments; never provides them.",
+  "description": "The repo-aware environment broker: puts a working, seeded, provable instance of your web application in front of coding agents and humans \u2014 warm pools, leases, bind-by-sync. Brokers environments; never provides them.",
   "keywords": [
     "environment",
     "broker",
@@ -17,7 +17,7 @@
   "license": "Apache-2.0",
   "type": "module",
   "engines": {
-    "node": ">=22.5.0"
+    "node": ">=22.13.0"
   },
   "bin": {
     "backlot": "dist/cli/index.js",
