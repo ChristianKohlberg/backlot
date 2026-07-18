@@ -40,6 +40,23 @@ real product gap someone reading the docs would expect to work.
   macOS, so the same stack.yaml can behave differently on the two legs backlot
   tests. Either document sh-portable-only, or pick a shell explicitly.
 
+- [ ] **P2 · hello-multi smoke is flaky in CI on BOTH legs.** Two sibling tests
+  (`hello-multi fixture > boots the full topology`, and
+  `the multi-service topology > run smoke uses the run preset`) fail
+  intermittently in GitHub Actions and have never failed locally (5/5 clean
+  runs, and 3 full-suite runs). One of them was already main's single ubuntu
+  failure before the 2026-07-18 review branch, so this predates that work.
+  Evidence from the rerun, which is the most informative capture so far:
+  `TypeError: fetch failed … SocketError: other side closed`, with
+  `localAddress: '::1' … remoteFamily: 'IPv6'` — the smoke script's HTTP call to
+  the api is accepted over IPv6 and then the socket closes mid-request, after
+  two earlier checks in the same script succeeded. The verdict is now classified
+  `env-error` with "while a service was not running", which says a supervised
+  service had exited by the time the check failed — so the question is WHICH
+  service dies and why, not whether the check logic is wrong.
+  Worth capturing the daemon's event log and the per-service logs from a failing
+  CI run before theorising further.
+
 - [ ] **P2 · macOS: hello-python never passes its readiness probe.** The last
   survivor of the four macOS failures this review inherited. The service starts
   and logs `hello-python listening on :<port>`, but `ready: { http: /health }`
