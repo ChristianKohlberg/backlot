@@ -241,7 +241,14 @@ export async function killGroupVerified(
   recordedStart?: number,
   graceMs = 2000,
 ): Promise<boolean> {
-  if (!sameProcess(pid, recordedStart) && !groupAlive(pid)) return true; // dead, or no longer ours
+  if (!sameProcess(pid, recordedStart)) {
+    // The pid is no longer the process we recorded. Whatever now sits in that
+    // group may be a stranger's — our old children and an unrelated new leader
+    // are indistinguishable by pid alone — so signalling it is never safe.
+    // Report gone only if the group is genuinely empty; otherwise leave it
+    // unresolved for tag-based reclaim, which pid reuse cannot confuse.
+    return !groupAlive(pid);
+  }
   // Resolve the group BEFORE signalling: once the leader exits its /proc entry
   // is gone and the surviving siblings become unattributable.
   const pgid = processGroup(pid) ?? pid;

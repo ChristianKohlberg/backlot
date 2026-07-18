@@ -5,12 +5,13 @@
  * per orphan stayed resident.
  */
 import { describe, it, expect, afterAll } from 'vitest';
-import { execFile, execFileSync } from 'node:child_process';
+import { execFile, execFileSync, spawn } from 'node:child_process';
 import { mkdtempSync, rmSync, writeFileSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { Journal } from '../src/core/journal.js';
+import { killGroupVerified } from '../src/daemon/supervisor.js';
 import { scanTagged, procScanSupported, startTime, sameProcess, groupAlive } from '../src/core/procscan.js';
 
 const repo = join(import.meta.dirname, '..');
@@ -149,6 +150,48 @@ describe('process identity', () => {
     while (alive(free) && free > 1) free--;
     expect(sameProcess(free, 123)).toBe(false);
   });
+});
+
+describe('reap safety: pid reuse must never hit a bystander', () => {
+  it('refuses to signal a group whose leader pid is no longer the recorded process', async () => {
+    // A live group that backlot never spawned, standing in for whatever
+    // inherited a recycled pid. Its recorded start time is deliberately wrong.
+    const victim = spawn('sh', ['-c', 'sleep 30'], { detached: true, stdio: 'ignore' });
+    victim.unref();
+    await settle(300);
+    const pid = victim.pid!;
+    expect(alive(pid)).toBe(true);
+
+    const realStart = startTime(pid);
+    const dead = await killGroupVerified(pid, (realStart ?? 0) + 999, 300);
+
+    // Not ours, group still populated -> unresolved, and CRUCIALLY untouched.
+    expect(dead).toBe(false);
+    expect(alive(pid)).toBe(true);
+
+    try {
+      process.kill(-pid, 'SIGKILL');
+    } catch {
+      /* gone */
+    }
+  }, 30_000);
+
+  it('still reports a genuinely empty group as gone', async () => {
+    const victim = spawn('sh', ['-c', 'true'], { detached: true, stdio: 'ignore' });
+    victim.unref();
+    await waitFor(() => !alive(victim.pid!), 5000);
+    expect(await killGroupVerified(victim.pid!, 12345, 300)).toBe(true);
+  }, 30_000);
+
+  it('kills a group it CAN identify', async () => {
+    const victim = spawn('sh', ['-c', 'sleep 30'], { detached: true, stdio: 'ignore' });
+    victim.unref();
+    await settle(300);
+    const pid = victim.pid!;
+    // Correct recorded identity -> the reap proceeds.
+    expect(await killGroupVerified(pid, startTime(pid), 500)).toBe(true);
+    expect(alive(pid)).toBe(false);
+  }, 30_000);
 });
 
 describe('orphan reclaim (issue #5)', () => {

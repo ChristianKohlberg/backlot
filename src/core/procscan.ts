@@ -83,11 +83,23 @@ export function processGroup(pid: number): number | undefined {
 }
 
 /**
- * Is ANY process still in this group? On a platform without /proc this can
- * only fall back to the leader, which is the weaker guarantee.
+ * Is ANY process still in this group?
+ *
+ * Without /proc, `kill(-pgid, 0)` is still a genuine GROUP query — ESRCH means
+ * the group is empty. Checking the leader instead would report "gone" the
+ * moment an `sh -c` wrapper exited, while the real server kept running, which
+ * is the whole failure this function exists to detect.
  */
 export function groupAlive(pgid: number): boolean {
-  if (!procScanSupported()) return isAlive(pgid);
+  if (!procScanSupported()) {
+    try {
+      process.kill(-pgid, 0);
+      return true;
+    } catch (err) {
+      // EPERM: the group exists but belongs to another user — still alive.
+      return (err as NodeJS.ErrnoException).code === 'EPERM';
+    }
+  }
   let entries: string[];
   try {
     entries = readdirSync('/proc');
