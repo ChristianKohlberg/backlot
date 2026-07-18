@@ -50,7 +50,7 @@ export interface DsDriver {
   /** Best-effort removal (recycle). */
   drop(h: DsHandle): Promise<void>;
   /** @rebake-template: invalidate baked templates (and drop their server-side DBs). */
-  rebake(): void | Promise<void>;
+  rebake(cwd?: string): void | Promise<void>;
 }
 
 const sh = async (cmd: string, cwd: string, errCtx: string): Promise<void> => {
@@ -212,7 +212,7 @@ class SqliteDs implements DsDriver {
     rmSync(db, { force: true });
     dropSidecars(db); // an orphaned -wal outlives its database and poisons the next one
   }
-  rebake(): void {
+  rebake(_cwd?: string): void {
     rmSync(join(templatesRoot(), this.stackId), { recursive: true, force: true });
   }
 }
@@ -374,12 +374,17 @@ class CommandDs implements DsDriver {
   async drop(h: DsHandle): Promise<void> {
     if (this.spec.drop) await shQuiet(template(this.spec.drop, { ns: this.ns(h) }), h.envTree);
   }
-  async rebake(): Promise<void> {
+  async rebake(cwd?: string): Promise<void> {
     // Drop the server-side template DBs recorded in the markers before
     // deleting the marker dir — otherwise `backlot_tpl_*` databases leak on
     // the appliance forever (vetbill-1i49).
+    //
+    // The drop command comes from the MANIFEST and is written to run in the
+    // repo (it may invoke a repo-local script or a relative tool). Running it
+    // in templatesRoot() made it fail, and shQuiet swallows failures — so the
+    // leak fix silently did nothing. Fall back only when no root is known.
     const dir = join(templatesRoot(), this.stackId);
-    await dropBakedTemplates(dir, templatesRoot());
+    await dropBakedTemplates(dir, cwd ?? templatesRoot());
     rmSync(dir, { recursive: true, force: true });
   }
 }

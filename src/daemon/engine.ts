@@ -24,6 +24,7 @@ import { logEvent, recentEvents } from '../core/events.js';
 import type { Hygiene, LeaseKind, ServicePid } from '../core/types.js';
 
 const POOL_MAX = () => policy().poolMax;
+const POOL_MAX_TOTAL = () => policy().poolMaxTotal;
 const LEASE_TTL = (kind: LeaseKind) => (kind === 'session' ? policy().sessionTtlMs : policy().runTtlMs);
 const IDLE_TTL = () => policy().idleTtlMs;
 const WAIT_MS = () => policy().waitMs;
@@ -97,6 +98,10 @@ export class Engine {
   private lastSweep = now();
   private lastRetention = now();
   private lastGc = now();
+  private lastSweepMono = performance.now();
+  /** FIFO tickets for capacity waiters, so an early waiter is not starved. */
+  private waitTicket = 0;
+  private waiting: number[] = [];
 
   // -------- concurrency: a short pool lock for claim/release bookkeeping and
   // one lock per environment for bind/exec/reset. Two environments (or two
@@ -151,9 +156,18 @@ export class Engine {
       const survivors =
         Object.keys(env.servicePids).length > 0 ? await reapPids(env.servicePids) : {};
       stranded += Object.keys(survivors).length;
-      // A 'recycling' env from a crashed daemon never finished teardown — finish it.
+      // A 'recycling' env from a crashed daemon never finished teardown — finish
+      // it. Persist survivors FIRST: teardownClaimed deletes the row, so a
+      // process that outlived the reap would otherwise lose its only record and
+      // be findable by tag alone.
       if (env.state === 'recycling') {
-        void this.teardownClaimed(env).catch(() => undefined);
+        if (Object.keys(survivors).length > 0) {
+          env.servicePids = survivors;
+          this.journal.saveEnv(env);
+        }
+        void this.teardownClaimed(env).catch((err) =>
+          logEvent({ level: 'error', kind: 'teardown', envId: env.id, detail: `recovery teardown failed: ${String((err as Error).message ?? err)}` }),
+        );
         continue;
       }
       if (env.state === 'hot' || env.state === 'degraded') env.state = 'warm';
@@ -286,7 +300,9 @@ export class Engine {
       .filter((e) => !this.journal.leaseForEnv(e.id) && e.state !== 'degraded' && e.state !== 'recycling')
       .sort((a, b) => (a.state === 'hot' ? -1 : 1) - (b.state === 'hot' ? -1 : 1));
     let env = free[0];
-    if (!env && envs.length < POOL_MAX()) env = await this.createEnv(stack);
+    // Two ceilings: this stack's, and the machine's across every stack.
+    const total = this.journal.allEnvs().length;
+    if (!env && envs.length < POOL_MAX() && total < POOL_MAX_TOTAL()) env = await this.createEnv(stack);
     if (env) {
       this.journal.saveLease({ id: `l-${shortId()}`, envId: env.id, kind, holder, hygiene, expiresAt: now() + ttlMs });
       return env;
@@ -305,7 +321,11 @@ export class Engine {
    */
   private structuralCapacityBlock(stack: Stack, deadline: number): string | null {
     const envs = this.journal.envsForStack(stack.id);
-    if (envs.length < POOL_MAX()) return null; // room to grow
+    const total = this.journal.allEnvs().length;
+    if (envs.length < POOL_MAX() && total < POOL_MAX_TOTAL()) return null; // room to grow
+    // A machine-wide block can clear when ANOTHER stack releases, so only a
+    // per-stack block is structural.
+    if (envs.length < POOL_MAX()) return null;
     const holders: string[] = [];
     for (const env of envs) {
       // These resolve on their own — the sweeper reaps them and frees capacity.
@@ -321,15 +341,38 @@ export class Engine {
   /** Queue at capacity WITHOUT holding the pool lock while sleeping. */
   private async acquireEnv(stack: Stack, holder: string, kind: LeaseKind, hygiene: Hygiene, ttlMs: number): Promise<EnvRow> {
     const start = now();
+    // FIFO ticket. Without ordering, every waiter polled independently and a
+    // freed environment went to whoever happened to poll first — so an early
+    // waiter could time out while later arrivals were served.
+    const ticket = ++this.waitTicket;
+    this.waiting.push(ticket);
+    try {
+      return await this.acquireQueued(stack, holder, kind, hygiene, ttlMs, start, ticket);
+    } finally {
+      this.waiting = this.waiting.filter((t) => t !== ticket);
+    }
+  }
+
+  private async acquireQueued(
+    stack: Stack,
+    holder: string,
+    kind: LeaseKind,
+    hygiene: Hygiene,
+    ttlMs: number,
+    start: number,
+    ticket: number,
+  ): Promise<EnvRow> {
     for (;;) {
-      const env = await this.poolLocked(() => this.tryClaim(stack, holder, kind, hygiene, ttlMs));
+      // Only the head of the queue may claim; everyone else waits their turn.
+      const myTurn = this.waiting.length === 0 || this.waiting[0] === ticket;
+      const env = myTurn ? await this.poolLocked(() => this.tryClaim(stack, holder, kind, hygiene, ttlMs)) : null;
       if (env) return env;
       // Refuse to burn the full wait on something that provably cannot resolve.
       const blocked = await this.poolLocked(() => this.structuralCapacityBlock(stack, now() + WAIT_MS()));
       if (blocked) {
         throw new BrokerError(
           'env-error',
-          `pool at capacity (${POOL_MAX()}/${POOL_MAX()}) and every environment is leased past the wait window — queueing cannot succeed. Blocking: ${blocked}. ` +
+          `pool at capacity (${POOL_MAX()}/${POOL_MAX()} for this stack, ${this.journal.allEnvs().length}/${POOL_MAX_TOTAL()} machine-wide) and every environment is leased past the wait window — queueing cannot succeed. Blocking: ${blocked}. ` +
             `A 'run' always takes its own environment, so a session lease plus a run needs BACKLOT_POOL_MAX >= 2 (currently ${POOL_MAX()}). ` +
             `Raise BACKLOT_POOL_MAX, or release the blocking lease first.`,
           'pool',
@@ -455,7 +498,7 @@ export class Engine {
     for (const r of upkeep.ran) say(`upkeep: ${r.run}`);
     for (const dsName of upkeep.rebakeTemplates) {
       const spec = stack.manifest.datastores?.[dsName];
-      if (spec) await makeDatastore(dsName, spec, stack.id, bakeKeys[dsName]).rebake();
+      if (spec) await makeDatastore(dsName, spec, stack.id, bakeKeys[dsName]).rebake(stack.root);
     }
 
     // Fast path: identical source, services healthy, data untouched -> reuse as-is.
@@ -889,6 +932,17 @@ export class Engine {
     if (!fresh || fresh.state === 'recycling') {
       throw new BrokerError('env-error', `environment ${envId} is being recycled — retry`, 'pool');
     }
+    // A daemon restart downgrades every hot env to warm: the lease survives but
+    // the services do not. exec/token then failed against a tree with nothing
+    // running, and the command's own error ("connection refused") read as the
+    // repo's fault with no hint that a rebind was all it needed.
+    if (fresh.state === 'warm') {
+      throw new BrokerError(
+        'env-error',
+        `environment ${envId} holds your lease but its services are not running (the daemon restarted) — run 'backlot up' to rebind before exec/token`,
+        'lease',
+      );
+    }
     return fresh;
   }
 
@@ -1154,7 +1208,18 @@ export class Engine {
     const t = now();
     const gap = t - this.lastSweep;
     const interval = Number(process.env.BACKLOT_SWEEP_MS ?? 15_000);
-    if (gap > 3 * interval) this.journal.pardon(gap - interval); // sleep pardon (decision 0009)
+    // Sleep pardon (decision 0009). A long gap in wall-clock time can mean the
+    // machine suspended — or merely that the event loop was starved (a
+    // synchronous hash of a huge tree, heavy host load). Pardoning the second
+    // case pushes every lease and idle deadline out for a machine that never
+    // slept, so leases outlive their TTL and idle envs keep their memory.
+    //
+    // performance.now() is MONOTONIC and does not advance while suspended, so
+    // wall-clock advancing far beyond it is the signal that distinguishes them.
+    const monoGap = performance.now() - this.lastSweepMono;
+    this.lastSweepMono = performance.now();
+    const suspended = gap - monoGap > 2 * interval;
+    if (gap > 3 * interval && suspended) this.journal.pardon(gap - interval);
     this.lastSweep = t;
 
     // Orphan reclaim (~1 min cadence): a consumer that died ungracefully can
@@ -1189,6 +1254,14 @@ export class Engine {
     }
     for (const env of this.journal.allEnvs()) {
       if (this.busy.has(env.id)) continue;
+      // An environment whose STACK no longer exists on disk can never be bound
+      // again — the repo was deleted or moved. Nothing reclaimed those, so an
+      // abandoned project's env trees and data kept their disk forever.
+      if (!existsSync(env.stackRoot) && !this.journal.leaseForEnv(env.id)) {
+        logEvent({ level: 'info', kind: 'retention', envId: env.id, detail: `stack root ${env.stackRoot} is gone — reclaiming the environment` });
+        await this.recycleOne(env.id, true);
+        continue;
+      }
       if (env.state === 'degraded') {
         // Dead env — reap regardless of a stale lease (force), but never while an
         // op is in flight (claimForTeardown always respects busy). The holder's
@@ -1201,6 +1274,14 @@ export class Engine {
         // between the idle check and the service kill (dead-URL race).
         const claimed = await this.claimForTeardown(env.id, false);
         if (!claimed) continue;
+        // Re-check under the claim: a bind may have touched this environment
+        // between the idle test above and the claim, and quiescing it then
+        // stops services a live caller is about to use.
+        if (now() - claimed.lastUsedAt <= IDLE_TTL()) {
+          claimed.state = 'hot';
+          this.journal.saveEnv(claimed);
+          continue;
+        }
         this.stopWatch(env.id);
         const survivors = await this.supervisor(claimed).stopAll();
         this.supervisors.delete(env.id);

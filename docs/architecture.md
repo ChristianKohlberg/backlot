@@ -56,7 +56,7 @@ Kubernetes, Windows, secrets management, and dashboards are not.
 | **Substrate** | Where environments physically live, behind a driver: `local` (supervised processes in a directory), later `docker`, `morph`, `sprites`, `ssh`. |
 | **Environment** | A pooled slot on a substrate: its own copy of the tree, warm caches, running services, allocated ports, a datastore namespace. Durable; belongs to the pool, never to a person or task. |
 | **Binding** | A source state (ref + dirty diff) plus a data state (preset, at a hygiene level) attached to an environment. An immutable snapshot. |
-| **Lease** | Temporary ownership of an environment, with a TTL refreshed by any CLI touch. Expiry returns the environment to the pool **warm** — nothing is torn down. |
+| **Lease** | Temporary ownership of an environment, with a TTL refreshed by the verbs that BIND (`up`, `sync`, `bind`, `run`). Read-only verbs (`ctx`, `logs`, `token`, `pull`, `status`) do not refresh it. Expiry returns the environment to the pool **warm** — nothing is torn down. |
 
 Plus one verb-noun: a **Run** — a named check executed against a binding, producing an
 exit code, a JSON verdict, and collected artifacts.
@@ -118,7 +118,10 @@ Local pools are convergence all the way down. Same verbs above the driver line.
   quiesce idle environments while no CLI is running.
 - **Concurrency lives at the environment boundary**: a short pool lock serializes
   claim/release bookkeeping; one lock per environment serializes bind/exec/reset on it.
-  Different environments (and different stacks) bind in parallel; the sweeper never
+  Different environments (and different stacks) bind in parallel — with the caveat
+  that sync hashing, file copying and the `git` calls are synchronous, so a very
+  large bind still blocks the daemon's event loop and delays others while it runs;
+  the sweeper never
   expires or quiesces an environment with an operation in flight.
 - **Local even when compute is remote.** A Morph environment is a pool entry whose
   driver executes over SSH. The consumer's machine is the brain; substrates are muscles.
@@ -149,8 +152,12 @@ local/remote abstraction; the local substrate is enumerate-and-copy.)
   synced at start; edits mid-run cannot contaminate the verdict. New sync = new binding
   revision.
 - `--watch` sessions opt into a daemon-side debounced worktree watcher that auto-syncs
-  on save, feeding the environment's own dev-server watchers. Two-stage reload;
-  stopped on release/expiry/quiesce/recycle. Watch activity refreshes the lease.
+  on save. **Known gap:** the sync runs the ordinary bind path, whose fast path requires
+  an unchanged source hash — which a watch-triggered sync never has. So every save
+  currently STOPS and restarts the environment's services rather than letting their own
+  watchers pick the change up. The intended two-stage reload (project the file, let the
+  dev-server reload it) is not implemented. Stopped on release/expiry/quiesce/recycle.
+  Watch activity refreshes the lease.
 - The environment-side reset restores tracked files hard on every bind. A **clean-slate**
   bind (`--reset-data` or `--pristine`) additionally removes untracked env-side files —
   droppings left by a check, service, or `exec` — **except** declared `caches:`
@@ -244,7 +251,9 @@ Every failure is classified — the field an agent branches on mechanically:
   grace because degradation is judged only by a service's restart budget, not by a
   post-boot health poll — a slept service simply resumes.
 - **Leases need no heartbeat daemon** because losing a lease is designed to be
-  worthless: any CLI touch refreshes the TTL; expiry returns the env warm; the source
+  worthless: a binding verb refreshes the TTL (read-only verbs deliberately do not,
+  so an idle agent that only polls `ctx` does not hold an environment forever);
+  expiry returns the env warm; the source
   of truth never left the worktree. Agents that vanish cost nothing.
 - **Remote is the mirror image**: the world keeps running (and billing) while the lid
   is shut. Therefore remote environments always carry **provider-side TTLs** as the

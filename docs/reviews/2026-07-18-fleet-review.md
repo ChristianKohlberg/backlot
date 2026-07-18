@@ -2,10 +2,17 @@
 
 Twelve parallel reviewers, one per dimension, against `2c42176`.
 
-**Status: UNVERIFIED.** The adversarial refutation pass was cut short, so nothing
-here has been independently challenged. Expect false positives. Each entry is a
-lead to confirm against the code, not a verdict. Entries are struck through and
-marked as they are resolved or refuted.
+**Status: CLOSED 2026-07-18.** Every entry was triaged against the code and then
+either fixed (struck through, with a test that fails without the fix) or recorded
+as a known gap in BACKLOG.md (marked DOCUMENTED) where closing it is a feature
+rather than a repair.
+
+Findings were produced by twelve parallel reviewers and were NOT independently
+refuted before this pass, so each was verified against the code before acting.
+Several were downgraded on inspection and two — the appliance `ready:` gate and
+the env-side cleanup sweep — turned out to conflict with a recorded decision or
+carry a blast radius that made the literal fix wrong; those are noted in the
+commits that resolved them.
 
 96 findings — critical 1, high 25, medium 43, low 27
 
@@ -25,9 +32,9 @@ marked as they are resolved or refuted.
 | 12 | high | shortcoming | ~~All driver shell executions are unbounded: no timeout, no process-group kill~~ **FIXED** | `src/drivers/datastores.ts:57` |
 | 13 | high | bug | ~~`backlot run --pull` pulls from the wrong lease or silently no-ops — write-back contract broken~~ **FIXED** | `src/cli/index.ts:186` |
 | 14 | high | bug | ~~Service crash mid-run yields a work-error verdict — taxonomy and §9 'never a silently wrong verdict' violated~~ **FIXED** | `src/daemon/engine.ts:630` |
-| 15 | high | bug | --watch performs a full stop/build/restart on every save — the promised two-stage reload does not exist | `src/daemon/engine.ts:397` |
-| 16 | high | shortcoming | Pool capacity is per-stack while the memory heuristic is per-machine — multi-project hosts have no global cap | `src/daemon/engine.ts:270` |
-| 17 | high | shortcoming | MCP surface has no long-running-op story: progress dropped, no cancel, detach/job verbs unexposed | `src/mcp/index.ts:139` |
+| 15 | high | bug | ~~--watch performs a full stop/build/restart on every save — the promised two-stage reload does not exist~~ **DOCUMENTED** (BACKLOG/architecture corrected) | `src/daemon/engine.ts:397` |
+| 16 | high | shortcoming | ~~Pool capacity is per-stack while the memory heuristic is per-machine — multi-project hosts have no global cap~~ **FIXED** | `src/daemon/engine.ts:270` |
+| 17 | high | shortcoming | ~~MCP surface has no long-running-op story: progress dropped, no cancel, detach/job verbs unexposed~~ **DOCUMENTED** (BACKLOG/architecture corrected) | `src/mcp/index.ts:139` |
 | 18 | high | bug | ~~freePort() has no 'error' handler — fd exhaustion (EMFILE) crashes the whole daemon~~ **FIXED** | `src/core/ports.ts:14` |
 | 19 | high | bug | ~~--watch fs.watch has no 'error' listener — async watcher error (inotify ENOSPC) kills the daemon~~ **FIXED** | `src/daemon/engine.ts:510` |
 | 20 | high | bug | ~~killGroupVerified kills an innocent process group when a dead pid is reused by a new group leader~~ **FIXED** (`1dd7144`) | `/home/christian/factory/firstmate/projects/backlot/src/daemon/supervisor.ts:244` |
@@ -46,20 +53,20 @@ marked as they are resolved or refuted.
 | 33 | medium | bug | ~~engines allows Node 22.5–22.12 where node:sqlite needs --experimental-sqlite; daemon cannot start~~ **FIXED** | `src/core/journal.ts:5` |
 | 34 | medium | bug | ~~Bind epilogue's full-row saveEnv clobbers a concurrent 'degraded' write from the flap callback~~ **FIXED** | `src/daemon/engine.ts:488` |
 | 35 | medium | bug | ~~fail_streak migration swallows every SQLite error as 'column already exists'; journal is opened pre-election with no busy_timeout~~ **FIXED** | `src/core/journal.ts:90` |
-| 36 | medium | bug | Case-only rename deletes the file from the env tree on macOS's case-insensitive APFS | `src/core/sync.ts:139` |
+| 36 | medium | bug | ~~Case-only rename deletes the file from the env tree on macOS's case-insensitive APFS~~ **FIXED** | `src/core/sync.ts:139` |
 | 37 | medium | shortcoming | ~~probeFree misses wildcard listeners on macOS, so the 'port occupied by a foreign process' guard never fires there~~ **FIXED** | `src/core/ports.ts:3` |
 | 38 | medium | bug | ~~Appliance start lock goes 'stale' at a fixed 5 min while spec.timeout can be larger~~ **FIXED** | `src/drivers/appliances.ts:24` |
 | 39 | medium | bug | ~~ready: gate is skipped when the appliance already answers TCP (adopt path)~~ **FIXED** | `src/drivers/appliances.ts:114` |
 | 40 | medium | bug | ~~Ephemeral reset flush failures are silently swallowed, breaking reset-data hygiene~~ **FIXED** | `src/drivers/datastores.ts:267` |
 | 41 | medium | shortcoming | ~~Server-side env namespaces leak unrecoverably when drop fails at teardown~~ **FIXED** | `src/drivers/datastores.ts:301` |
 | 42 | medium | bug | ~~templateNs can exceed Postgres's 63-char identifier limit, truncating the disambiguating hash~~ **FIXED** | `src/drivers/datastores.ts:254` |
-| 43 | medium | bug | 'TTL refreshed by any CLI touch' is false — ctx/exec/logs/token/pull never refresh the lease | `src/daemon/engine.ts:741` |
+| 43 | medium | bug | ~~'TTL refreshed by any CLI touch' is false — ctx/exec/logs/token/pull never refresh the lease~~ **DOCUMENTED** (BACKLOG/architecture corrected) | `src/daemon/engine.ts:741` |
 | 44 | medium | bug | ~~Bind reset never cleans env-side droppings — stale files persist across bindings and pollute later verdicts' artifacts~~ **FIXED** (gated to reset-data/pristine) | `src/core/sync.ts:139` |
-| 45 | medium | shortcoming | Synchronous sync/hash/copy and execFileSync git calls serialize the whole daemon — 'different environments bind in parallel' only partially holds | `src/core/sync.ts:95` |
-| 46 | medium | shortcoming | Decision 0016 (Accepted) is unimplemented — no states:/inputs:, per-check state:, --state, or snapshot/restore | `src/core/manifest.ts:54` |
+| 45 | medium | shortcoming | ~~Synchronous sync/hash/copy and execFileSync git calls serialize the whole daemon — 'different environments bind in parallel' only partially holds~~ **DOCUMENTED** (BACKLOG/architecture corrected) | `src/core/sync.ts:95` |
+| 46 | medium | shortcoming | ~~Decision 0016 (Accepted) is unimplemented — no states:/inputs:, per-check state:, --state, or snapshot/restore~~ **DOCUMENTED** (BACKLOG/architecture corrected) | `src/core/manifest.ts:54` |
 | 47 | medium | bug | ~~Adapter never validates required args; missing cwd silently falls back to the daemon's own cwd~~ **FIXED** | `src/daemon/index.ts:22` |
 | 48 | medium | shortcoming | ~~No holder identity over MCP: concurrent agents on one worktree silently share and clobber one lease~~ **FIXED** | `src/mcp/index.ts:22` |
-| 49 | medium | shortcoming | After daemon restart a leased 'warm' env yields misleading work-errors from token/exec with no recovery hint | `src/daemon/engine.ts:775` |
+| 49 | medium | shortcoming | ~~After daemon restart a leased 'warm' env yields misleading work-errors from token/exec with no recovery hint~~ **FIXED** | `src/daemon/engine.ts:775` |
 | 50 | medium | bug | ~~Recorded env ports are never reserved — a warm env's port can be handed to a second env or lost to any process~~ **FIXED** | `src/daemon/engine.ts:240` |
 | 51 | medium | bug | ~~truncateLogs reads whole file as one utf8 string — logs past ~512 MiB become permanently untrimmable~~ **FIXED** | `src/core/retention.ts:53` |
 | 52 | medium | bug | ~~env.ports is fixed at createEnv — a manifest that adds a service port permanently breaks existing envs~~ **FIXED** | `src/daemon/engine.ts:446` |
@@ -72,8 +79,8 @@ marked as they are resolved or refuted.
 | 59 | medium | shortcoming | ~~Service and check `cwd` from stack.yaml are joined without safeJoin, letting a process run outside its environment tree~~ **FIXED** | `src/daemon/supervisor.ts:78` |
 | 60 | medium | bug | ~~Symlinks are dereferenced or silently dropped; walkAll crashes on dangling links in bind --ref~~ **FIXED** | `src/core/sync.ts:61` |
 | 61 | medium | bug | ~~File mode changes (chmod +x) never propagate into the env tree~~ **FIXED** | `src/core/sync.ts:128` |
-| 62 | medium | shortcoming | changedOutputs reports worktree-side edits as env changes; pull then clobbers newer worktree state | `src/core/sync.ts:162` |
-| 63 | medium | shortcoming | Submodule and nested-repo contents are silently absent from the env tree | `src/core/sync.ts:47` |
+| 62 | medium | shortcoming | ~~changedOutputs reports worktree-side edits as env changes; pull then clobbers newer worktree state~~ **FIXED** | `src/core/sync.ts:162` |
+| 63 | medium | shortcoming | ~~Submodule and nested-repo contents are silently absent from the env tree~~ **FIXED** | `src/core/sync.ts:47` |
 | 64 | medium | bug | ~~Pristine wipes tree and ledger on disk but persists the journal only at bind end~~ **FIXED** | `src/daemon/engine.ts:346` |
 | 65 | medium | bug | ~~SIGTERM-ignorer recycle test lacks the procScan guard and deterministically fails on the macOS CI leg~~ **FIXED** | `tests/orphan-reclaim.test.ts:173` |
 | 66 | medium | shortcoming | ~~Issue-#5 suite silently reports green on macOS: bare `return` inside it() instead of skip~~ **FIXED** | `tests/orphan-reclaim.test.ts:156` |
@@ -82,23 +89,23 @@ marked as they are resolved or refuted.
 | 69 | medium | shortcoming | ~~helpers.ts claims to 'play the engine' but diverges from supervisor semantics: no sh -c, no detached group, bare kill~~ **FIXED** | `tests/helpers.ts:45` |
 | 70 | low | bug | ~~Non-numeric --lines yields NaN and silently returns the entire log instead of a usage error~~ **FIXED** | `src/cli/index.ts:237` |
 | 71 | low | shortcoming | ~~Detached-run polling never maps a failed verdict to exit 1, unlike synchronous run~~ **FIXED** | `src/cli/index.ts:196` |
-| 72 | low | bug | Idle-quiesce acts on a stale idleness check — claimForTeardown never re-validates lastUsedAt | `src/daemon/engine.ts:1014` |
-| 73 | low | shortcoming | Capacity waiters have no fairness — a waiter can starve and fail while younger waiters succeed | `src/daemon/engine.ts:279` |
+| 72 | low | bug | ~~Idle-quiesce acts on a stale idleness check — claimForTeardown never re-validates lastUsedAt~~ **FIXED** | `src/daemon/engine.ts:1014` |
+| 73 | low | shortcoming | ~~Capacity waiters have no fairness — a waiter can starve and fail while younger waiters succeed~~ **FIXED** | `src/daemon/engine.ts:279` |
 | 74 | low | bug | ~~Unhandled rejection from fire-and-forget sweep kills the daemon on any journal/FS write failure~~ **FIXED** | `src/daemon/index.ts:194` |
-| 75 | low | shortcoming | Sleep pardon fires on event-loop starvation, not just system sleep, skewing every deadline | `src/daemon/engine.ts:972` |
-| 76 | low | bug | recover() drops surviving-process records when finishing a 'recycling' teardown | `src/daemon/engine.ts:151` |
-| 77 | low | shortcoming | SIGTERM handler and journal-mutating shutdown are armed before the singleton election | `src/daemon/index.ts:203` |
-| 78 | low | shortcoming | Service/check commands run under /bin/sh: dash on Ubuntu vs bash-as-sh on macOS — same stack.yaml diverges across the two supported platforms | `src/daemon/supervisor.ts:84` |
-| 79 | low | bug | dropBakedTemplates replays drop commands with the wrong cwd, silently defeating the new leak fix | `src/drivers/datastores.ts:308` |
-| 80 | low | shortcoming | Promised but not implemented: the entire substrate seam (remote story), plus dependent 0.3 features | `src/drivers/types.ts:1` |
-| 81 | low | shortcoming | Docs describe template keying the code has already superseded — architecture §7/driver-spec vs content-derived bake keys | `docs/architecture.md:184` |
+| 75 | low | shortcoming | ~~Sleep pardon fires on event-loop starvation, not just system sleep, skewing every deadline~~ **FIXED** | `src/daemon/engine.ts:972` |
+| 76 | low | bug | ~~recover() drops surviving-process records when finishing a 'recycling' teardown~~ **FIXED** | `src/daemon/engine.ts:151` |
+| 77 | low | shortcoming | ~~SIGTERM handler and journal-mutating shutdown are armed before the singleton election~~ **FIXED** | `src/daemon/index.ts:203` |
+| 78 | low | shortcoming | ~~Service/check commands run under /bin/sh: dash on Ubuntu vs bash-as-sh on macOS — same stack.yaml diverges across the two supported platforms~~ **DOCUMENTED** (BACKLOG/architecture corrected) | `src/daemon/supervisor.ts:84` |
+| 79 | low | bug | ~~dropBakedTemplates replays drop commands with the wrong cwd, silently defeating the new leak fix~~ **FIXED** | `src/drivers/datastores.ts:308` |
+| 80 | low | shortcoming | ~~Promised but not implemented: the entire substrate seam (remote story), plus dependent 0.3 features~~ **DOCUMENTED** (BACKLOG/architecture corrected) | `src/drivers/types.ts:1` |
+| 81 | low | shortcoming | ~~Docs describe template keying the code has already superseded — architecture §7/driver-spec vs content-derived bake keys~~ **DOCUMENTED** (BACKLOG/architecture corrected) | `docs/architecture.md:184` |
 | 82 | low | bug | ~~RPC client's 15-minute timeout is a dead no-op, so an MCP tool call can hang forever~~ **FIXED** | `src/cli/client.ts:65` |
 | 83 | low | bug | ~~serverInfo.version hardcoded at 0.4.0 while the package is 0.5.0~~ **FIXED** | `src/mcp/index.ts:125` |
-| 84 | low | shortcoming | Port probe/allocation pinned to 127.0.0.1 while readiness and consumer URLs use 'localhost' | `src/core/ports.ts:7` |
-| 85 | low | shortcoming | Retention sweep never covers env trees/data — abandoned stacks' environments persist forever | `src/core/retention.ts:113` |
+| 84 | low | shortcoming | ~~Port probe/allocation pinned to 127.0.0.1 while readiness and consumer URLs use 'localhost'~~ **DOCUMENTED** (BACKLOG/architecture corrected) | `src/core/ports.ts:7` |
+| 85 | low | shortcoming | ~~Retention sweep never covers env trees/data — abandoned stacks' environments persist forever~~ **FIXED** | `src/core/retention.ts:113` |
 | 86 | low | bug | ~~stopAll skips the group check entirely when the wrapper already exited (restart-pending window)~~ **FIXED** | `/home/christian/factory/firstmate/projects/backlot/src/daemon/supervisor.ts:194` |
 | 87 | low | shortcoming | ~~Restart budget never resets after stable operation — three lifetime crashes degrade a long-lived env~~ **FIXED** | `/home/christian/factory/firstmate/projects/backlot/src/daemon/supervisor.ts:127` |
-| 88 | low | shortcoming | A daemonizing service is respawned as duplicates and can escape both group kill and tag reclaim | `/home/christian/factory/firstmate/projects/backlot/src/daemon/supervisor.ts:122` |
+| 88 | low | shortcoming | ~~A daemonizing service is respawned as duplicates and can escape both group kill and tag reclaim~~ **FIXED** | `/home/christian/factory/firstmate/projects/backlot/src/daemon/supervisor.ts:122` |
 | 89 | low | shortcoming | ~~Unix socket is created with umask-derived permissions and only chmodded after it is already accepting connections~~ **FIXED** | `src/daemon/index.ts:180` |
 | 90 | low | bug | ~~Concurrent worktree mutation during sync crashes with an unclassified TypeError~~ **FIXED** | `src/core/sync.ts:109` |
 | 91 | low | bug | ~~--watch ignore filter swallows .github/, .gitignore, and .gitlab-ci.yml edits~~ **FIXED** | `src/daemon/engine.ts:512` |
@@ -106,7 +113,7 @@ marked as they are resolved or refuted.
 | 93 | low | shortcoming | ~~Deletion mirror leaves empty directories behind after renames/deletes~~ **FIXED** | `src/core/sync.ts:147` |
 | 94 | low | shortcoming | ~~Stale-job 'recovery' test asserts on the Journal method, not on daemon recovery invoking it~~ **FIXED** | `tests/concurrency-fixes.test.ts:150` |
 | 95 | low | bug | ~~Exit-code failure-message annotations interpolate properties that don't exist — diagnostics are always empty~~ **FIXED** | `tests/hygiene.test.ts:89` |
-| 96 | low | shortcoming | 'Machine-wide' appliance start lock only tested with two callers in one process | `tests/appliances.test.ts:151` |
+| 96 | low | shortcoming | ~~'Machine-wide' appliance start lock only tested with two callers in one process~~ **FIXED** | `tests/appliances.test.ts:151` |
 
 ---
 

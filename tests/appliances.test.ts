@@ -6,7 +6,7 @@
  */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { createServer, type Server } from 'node:net';
-import { readFileSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
+import { readFileSync, mkdirSync, writeFileSync, rmSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import Ajv2020 from 'ajv/dist/2020.js';
 import { ensureAppliance, stopAppliance, probeTcp } from '../src/drivers/appliances.js';
@@ -214,4 +214,42 @@ describe('stopAppliance', () => {
     expect(readFileSync(marker, 'utf8')).toBe('');
     work.cleanup();
   });
+});
+
+describe('the appliance start lock is machine-wide, not process-wide', () => {
+  let lockState: { dir: string; cleanup: () => void };
+  beforeEach(() => {
+    lockState = tempDir('appliance-lockstate');
+    process.env.BACKLOT_STATE_DIR = lockState.dir;
+  });
+  afterEach(() => {
+    delete process.env.BACKLOT_STATE_DIR;
+    lockState.cleanup();
+  });
+
+  it('holds the lock as a filesystem artifact under the shared state root', async () => {
+    const port = await freePort();
+    const work = tempDir('appliance-xproc');
+    const script = join(work.dir, 'srv.mjs');
+    writeFileSync(script, `import { createServer } from 'node:net'; createServer().listen(${port}, '127.0.0.1');`);
+    const lockRoot = join(process.env.BACKLOT_STATE_DIR!, 'appliances');
+
+    // The existing race test used two callers in ONE process, which an
+    // in-memory lock would satisfy just as well — it proved nothing about the
+    // machine-wide claim. What makes the lock machine-wide is that it lives on
+    // disk under the shared state root, where a separate process sees it.
+    const start = `sleep 1; nohup node ${script} > /dev/null 2>&1 & echo started`;
+    const spec = { probe: `127.0.0.1:${port}`, start, timeout: 20 };
+
+    const inFlight = ensureAppliance('racy', spec, work.dir, silent);
+    await new Promise((r) => setTimeout(r, 300));
+    const held = readdirSync(lockRoot).filter((f) => f.endsWith('.lock'));
+    expect(held.length, 'no lock on disk while a start is in flight').toBeGreaterThan(0);
+
+    await inFlight;
+    // Released once the start completes, so the next caller is not blocked.
+    const after = readdirSync(lockRoot).filter((f) => f.endsWith('.lock'));
+    expect(after.length).toBe(0);
+    work.cleanup();
+  }, 60_000);
 });

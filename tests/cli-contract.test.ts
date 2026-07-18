@@ -104,7 +104,7 @@ describe('exec preserves argument boundaries', () => {
     const stateDir = mkdtempSync(join(tmpdir(), 'backlot-exec-'));
     const wt = mkdtempSync(join(tmpdir(), 'backlot-exec-wt-'));
     dirs.push(stateDir, wt);
-    writeFileSync(join(wt, 'stack.yaml'), `name: ex\nservices:\n  idle: { run: "sleep 300", ready: { log: ".", timeout: 20 } }\nchecks:\n  ok: { run: "true" }\n`);
+    writeFileSync(join(wt, 'stack.yaml'), `name: ex\nservices:\n  idle: { run: "echo ready; sleep 300", ready: { log: "ready", timeout: 20 } }\nchecks:\n  ok: { run: "true" }\n`);
     execFileSync('git', ['init', '-q'], { cwd: wt });
     const env = { ...process.env, BACKLOT_STATE_DIR: stateDir, BACKLOT_SWEEP_MS: '500' };
     const cli = (args: string[]) =>
@@ -125,7 +125,7 @@ describe('exec preserves argument boundaries', () => {
     const stateDir = mkdtempSync(join(tmpdir(), 'backlot-exec2-'));
     const wt = mkdtempSync(join(tmpdir(), 'backlot-exec2-wt-'));
     dirs.push(stateDir, wt);
-    writeFileSync(join(wt, 'stack.yaml'), `name: ex2\nservices:\n  idle: { run: "sleep 300", ready: { log: ".", timeout: 20 } }\nchecks:\n  ok: { run: "true" }\n`);
+    writeFileSync(join(wt, 'stack.yaml'), `name: ex2\nservices:\n  idle: { run: "echo ready; sleep 300", ready: { log: "ready", timeout: 20 } }\nchecks:\n  ok: { run: "true" }\n`);
     execFileSync('git', ['init', '-q'], { cwd: wt });
     const env = { ...process.env, BACKLOT_STATE_DIR: stateDir, BACKLOT_SWEEP_MS: '500' };
     const cli = (args: string[]) =>

@@ -3,6 +3,43 @@
 Known work, roughly prioritized. Committed to the repo so it survives sessions.
 Each item notes severity and where it was found.
 
+## Promised but not implemented (2026-07-18 fleet review)
+
+The review found several documented capabilities the code does not deliver.
+They are recorded here rather than quietly corrected away, because each is a
+real product gap someone reading the docs would expect to work.
+
+- [ ] **P2 · `--watch` two-stage reload.** Docs promised the watcher projects a
+  file and the environment's own dev-server picks it up. In fact the sync takes
+  the ordinary bind path, whose fast path requires an unchanged source hash —
+  which a watch-triggered sync never has — so every save stops and restarts the
+  services. architecture.md now states the gap; closing it needs a source-only
+  sync path that skips the service lifecycle.
+- [ ] **P2 · Decision 0016 (data states) is unimplemented.** No `states:`,
+  no `inputs:`, no per-check `state:`, no `--state`, no snapshot/restore. The
+  decision is marked Accepted, so either build it or supersede it with a new
+  decision — an Accepted decision the code ignores is worse than no decision.
+- [ ] **P3 · The substrate seam is spec-only.** docs/driver-spec.md describes
+  remote substrates and `pool reconcile` adoption, but no remote driver exists
+  and nothing exercises the seam. The local paths hard-code local assumptions
+  (process groups, /proc tags, file copies), so the first real driver will
+  find the seam narrower than the spec suggests.
+- [ ] **P3 · MCP has no long-running-operation story.** Progress frames are
+  dropped, there is no cancel, and the detach/job verbs are not exposed — so an
+  agent driving a slow bind over MCP can only block. The CLI has `--detach`;
+  the adapter should surface it.
+- [ ] **P3 · Probe host and advertised host disagree.** Port probing binds
+  `127.0.0.1` (and now the wildcard) while `ctx` advertises `http://localhost:…`.
+  On a dual-stack host `localhost` can resolve to `::1`, where a service bound
+  only to IPv4 is not listening — so a probed-free, "ready" service can still be
+  unreachable for the consumer. Changing the advertised host is a visible
+  contract change (tests and consumers expect `localhost`), so it needs a
+  deliberate decision rather than a quiet swap.
+- [ ] **P3 · `/bin/sh` differs across the two supported platforms.** Service and
+  check commands run under `sh`, which is dash on Ubuntu and bash-as-sh on
+  macOS, so the same stack.yaml can behave differently on the two legs backlot
+  tests. Either document sh-portable-only, or pick a shell explicitly.
+
 ## CI — macOS-runner failures (2026-07-11) — DIAGNOSED 2026-07-18
 
 - [x] **P2 · macOS runners: `run`-flow tests die on "pool at capacity (1/1) —

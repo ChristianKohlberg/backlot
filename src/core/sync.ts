@@ -19,7 +19,7 @@ import {
   readdirSync, statSync, lstatSync, chmodSync, renameSync, rmdirSync, constants as fsConstants,
 } from 'node:fs';
 import { dirname, join } from 'node:path';
-import { fileHash, matchesAny, sha256, isFile, safeJoin } from './util.js';
+import { fileHash, matchesAny, sha256, isFile, safeJoin, BrokerError } from './util.js';
 import type { Manifest } from './manifest.js';
 
 export interface SyncResult {
@@ -74,6 +74,34 @@ function enumerate(stackRoot: string, manifest: Manifest): string[] {
     // Not a git repo: fall back to everything (minus default noise).
     listed = walkAll(stackRoot);
   }
+  // A submodule appears in ls-files only as its GITLINK path, which stats as a
+  // directory and is dropped by the isFile filter below — so its contents were
+  // silently absent from the environment and the build failed with a
+  // work-error blaming the repo, with no hint about the cause. Fail loudly
+  // instead: partial support here would be worse than an honest refusal.
+  try {
+    const staged = execFileSync('git', ['-C', stackRoot, 'ls-files', '-s', '-z', '--', '.'], {
+      encoding: 'utf8',
+      maxBuffer: 64 * 1024 * 1024,
+    });
+    const gitlinks = staged
+      .split('\0')
+      .filter(Boolean)
+      .filter((l) => l.startsWith('160000 '))
+      .map((l) => l.split('\t')[1] ?? '')
+      .filter(Boolean);
+    if (gitlinks.length > 0) {
+      throw new BrokerError(
+        'work-error',
+        `this repository uses git submodules (${gitlinks.slice(0, 3).join(', ')}${gitlinks.length > 3 ? ', …' : ''}), which backlot does not project into an environment — their contents would be silently missing. Vendor them, or declare the paths you need under sync.include.`,
+        'sync',
+      );
+    }
+  } catch (err) {
+    if (err instanceof BrokerError) throw err;
+    /* not a git repo, or ls-files unavailable — the walkAll path covers it */
+  }
+
   const include = manifest.sync?.include ?? [];
   for (const inc of include) {
     safeJoin(stackRoot, inc, 'sync.include'); // reject ../ or absolute before use
@@ -143,6 +171,37 @@ const statOf = (p: string): { size: number; mtime: number; mode: number } | null
  * So it runs only when the caller asked for a clean slate (reset-data or
  * pristine); a plain `reuse` bind stays fast and keeps its droppings.
  */
+/**
+ * Probe the filesystem rather than guessing from the platform: APFS is
+ * case-insensitive by default but can be formatted case-sensitive, and a
+ * case-sensitive volume can be mounted on macOS. Guessing either way is wrong
+ * on somebody's machine.
+ *
+ * Cached per tree — this runs on every sync.
+ */
+const caseSensitivityCache = new Map<string, boolean>();
+function isCaseInsensitive(dir: string): boolean {
+  const hit = caseSensitivityCache.get(dir);
+  if (hit !== undefined) return hit;
+  let result = false;
+  const probe = join(dir, '.backlot-case-probe');
+  try {
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(probe, '');
+    result = existsSync(join(dir, '.BACKLOT-CASE-PROBE'));
+  } catch {
+    result = false; // cannot tell — assume case-sensitive, the safer default
+  } finally {
+    try {
+      rmSync(probe, { force: true });
+    } catch {
+      /* best-effort */
+    }
+  }
+  caseSensitivityCache.set(dir, result);
+  return result;
+}
+
 /**
  * Remove directories left empty by a deletion, up to (never including) the env
  * tree root. A rename that moves a file out of a directory otherwise leaves the
@@ -248,8 +307,16 @@ export function syncIntoEnv(
 
   // Mirror deletions relative to the PREVIOUS binding, never touching caches/keep.
   let deleted = 0;
+  // On a case-INSENSITIVE filesystem (macOS APFS by default), a case-only
+  // rename — README.md -> Readme.md — leaves the old key in `prev` and the new
+  // one in `next` while both name the SAME file on disk. Deleting the old key
+  // then destroys the file that was just synced. Compare case-insensitively
+  // before removing anything.
+  const nextLower = new Set(Object.keys(next).map((k) => k.toLowerCase()));
+  const caseInsensitiveFs = isCaseInsensitive(envTree);
   for (const rel of Object.keys(prev)) {
     if (next[rel] || matchesAny(rel, protectedPatterns)) continue;
+    if (caseInsensitiveFs && nextLower.has(rel.toLowerCase())) continue;
     let victim: string;
     try {
       victim = safeJoin(envTree, rel, 'synced file'); // never rm outside the env tree
@@ -298,16 +365,42 @@ export function syncIntoEnv(
  * Outputs contract (decision 0011): report env-side changes to declared
  * outputs; copy back only on explicit pull.
  */
+/**
+ * Which declared outputs did the ENVIRONMENT change?
+ *
+ * Comparing the env copy against the LIVE worktree answered a different
+ * question: a worktree file edited after the bind also differs, so backlot
+ * reported it as an env-side change and a subsequent pull copied the stale
+ * bind-time copy over the newer worktree content. The bind-time hash recorded
+ * in the sync cache is the correct baseline.
+ */
 export function changedOutputs(stackRoot: string, envTree: string, manifest: Manifest): string[] {
+  const bound = loadCache(envTree).entries;
   return (manifest.outputs ?? []).filter((rel) => {
     const envH = fileHash(join(envTree, rel));
-    return envH !== null && envH !== fileHash(join(stackRoot, rel));
+    if (envH === null) return false;
+    const baseline = bound[rel]?.hash;
+    // With no recorded baseline (an output the sync never produced) fall back to
+    // the worktree comparison — it is the only reference available.
+    return baseline === undefined ? envH !== fileHash(join(stackRoot, rel)) : envH !== baseline;
   });
 }
 
 export function pullOutputs(stackRoot: string, envTree: string, manifest: Manifest): string[] {
   const changed = changedOutputs(stackRoot, envTree, manifest);
+  const bound = loadCache(envTree).entries;
   for (const rel of changed) {
+    // Refuse to overwrite a worktree file that ALSO moved on since the bind.
+    // The worktree is the source of truth (decision 0011); silently reverting
+    // an edit the user made after binding is data loss, not a write-back.
+    const baseline = bound[rel]?.hash;
+    if (baseline !== undefined && fileHash(join(stackRoot, rel)) !== baseline) {
+      throw new BrokerError(
+        'work-error',
+        `output '${rel}' changed in BOTH the environment and the worktree since the bind — refusing to overwrite your worktree copy. Resolve it by hand, or discard the worktree change and pull again.`,
+        'outputs',
+      );
+    }
     // outputs write BACK into the worktree — must never escape it (a rogue
     // '../../.bashrc' output would otherwise be overwritten from env content).
     const dst = safeJoin(stackRoot, rel, 'outputs');

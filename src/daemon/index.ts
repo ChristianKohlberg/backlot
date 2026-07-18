@@ -246,6 +246,10 @@ void start();
 
 for (const sig of ['SIGINT', 'SIGTERM'] as const) {
   process.on(sig, () => {
+    // A daemon that LOST the election must exit without touching shared state:
+    // engine.shutdown() stops services and rewrites env rows, which would let a
+    // conceding process tear down the winner's environments.
+    if (!ownsLock && !ownsSocket) process.exit(0);
     void engine.shutdown().then(() => {
       // Only remove the socket if WE own it — a losing/duplicate daemon must
       // never delete the healthy daemon's socket.

@@ -9,6 +9,8 @@ import { stateRoot } from './paths.js';
 
 export interface Policy {
   poolMax: number;
+  /** Machine-wide ceiling across ALL stacks (the memory heuristic is per host). */
+  poolMaxTotal: number;
   sessionTtlMs: number;
   runTtlMs: number;
   idleTtlMs: number;
@@ -22,6 +24,7 @@ export interface Policy {
 
 interface ConfigFile {
   poolMax?: number;
+  poolMaxTotal?: number;
   sessionTtlMs?: number;
   runTtlMs?: number;
   idleTtlMs?: number;
@@ -73,6 +76,11 @@ export function policy(): Policy {
   const f = configFile();
   return {
     poolMax: num('BACKLOT_POOL_MAX', f.poolMax, poolMaxHeuristic()),
+    // poolMax is PER STACK, but poolMaxHeuristic is derived from this machine's
+    // cores and memory — so three projects each ran up to poolMax environments
+    // and tripled a budget that was calculated once for the host. This is the
+    // machine-wide ceiling; raise it deliberately if the host can take it.
+    poolMaxTotal: num('BACKLOT_POOL_MAX_TOTAL', f.poolMaxTotal, poolMaxHeuristic()),
     sessionTtlMs: num('BACKLOT_LEASE_TTL_MS', f.sessionTtlMs, 30 * 60_000),
     runTtlMs: num('BACKLOT_LEASE_TTL_MS', f.runTtlMs, 10 * 60_000),
     idleTtlMs: num('BACKLOT_IDLE_TTL_MS', f.idleTtlMs, 30 * 60_000),

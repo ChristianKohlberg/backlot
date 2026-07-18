@@ -150,6 +150,17 @@ export class EnvSupervisor {
       });
       proc.on('exit', (code) => {
         if (running.expectedExit) return;
+        // A service that DAEMONIZES (forks and returns 0 immediately) is not a
+        // supervised service: backlot restarts it, each restart forks another
+        // background copy, and those copies escape both the group kill and, if
+        // they detach far enough, the tag scan. Refuse it rather than
+        // multiplying processes nobody can reclaim.
+        if (code === 0 && now() - running.startedAt < 2000 && running.restarts === 0) {
+          this.note(name, 'exited 0 immediately — a service must stay in the FOREGROUND (it looks daemonized)');
+          running.expectedExit = true;
+          this.onDegraded?.(name);
+          return;
+        }
         this.note(name, `exited (${code})`);
         this.onPidsChanged?.(); // the dead pid must leave the journal
         // The budget is for FLAPPING — a tight crash loop — not for a service's

@@ -12,7 +12,7 @@ import { mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync, statSync, 
 import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { syncIntoEnv } from '../src/core/sync.js';
+import { syncIntoEnv, changedOutputs, pullOutputs } from '../src/core/sync.js';
 
 const dirs: string[] = [];
 afterAll(() => {
@@ -181,5 +181,89 @@ describe('env-side droppings are swept only on a clean-slate bind', () => {
 
     expect(existsSync(join(env, 'vendor', 'dep.js'))).toBe(true);
     expect(existsSync(join(env, '.env.local'))).toBe(true);
+  });
+});
+
+describe('outputs write-back respects the worktree as source of truth', () => {
+  it('does not report a worktree-only edit as an environment change', () => {
+    const { src, env } = repo();
+    const m = { name: 'o', services: {}, checks: {}, outputs: ['gen.txt'] } as never;
+    writeFileSync(join(src, 'gen.txt'), 'v1');
+    syncIntoEnv(src, env, m);
+
+    // The user edits the worktree AFTER binding. The environment never touched
+    // it. Comparing env-vs-worktree called that an "env change", and pull then
+    // copied the stale bind-time copy over the newer worktree content.
+    writeFileSync(join(src, 'gen.txt'), 'v2-from-user');
+
+    expect(changedOutputs(src, env, m)).toEqual([]);
+    pullOutputs(src, env, m);
+    expect(readFileSync(join(src, 'gen.txt'), 'utf8')).toBe('v2-from-user');
+  });
+
+  it('still reports and pulls a genuine environment change', () => {
+    const { src, env } = repo();
+    const m = { name: 'o', services: {}, checks: {}, outputs: ['gen.txt'] } as never;
+    writeFileSync(join(src, 'gen.txt'), 'v1');
+    syncIntoEnv(src, env, m);
+
+    writeFileSync(join(env, 'gen.txt'), 'built-in-env'); // a build wrote it
+    expect(changedOutputs(src, env, m)).toEqual(['gen.txt']);
+    pullOutputs(src, env, m);
+    expect(readFileSync(join(src, 'gen.txt'), 'utf8')).toBe('built-in-env');
+  });
+
+  it('refuses to overwrite when BOTH sides moved since the bind', () => {
+    const { src, env } = repo();
+    const m = { name: 'o', services: {}, checks: {}, outputs: ['gen.txt'] } as never;
+    writeFileSync(join(src, 'gen.txt'), 'v1');
+    syncIntoEnv(src, env, m);
+
+    writeFileSync(join(env, 'gen.txt'), 'built-in-env');
+    writeFileSync(join(src, 'gen.txt'), 'edited-by-user');
+
+    // Silently reverting the user's edit is data loss, not a write-back.
+    expect(() => pullOutputs(src, env, m)).toThrow(/BOTH the environment and the worktree/);
+    expect(readFileSync(join(src, 'gen.txt'), 'utf8')).toBe('edited-by-user');
+  });
+});
+
+describe('submodules are refused, not silently omitted', () => {
+  it('fails with an actionable error naming the submodule', () => {
+    const { src, env } = repo();
+    const inner = mkdtempSync(join(tmpdir(), 'backlot-sub-'));
+    dirs.push(inner);
+    execFileSync('git', ['init', '-q'], { cwd: inner });
+    writeFileSync(join(inner, 'lib.txt'), 'from submodule');
+    execFileSync('git', ['add', '-A'], { cwd: inner });
+    execFileSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-qm', 'init'], { cwd: inner });
+
+    writeFileSync(join(src, 'root.txt'), 'root');
+    execFileSync('git', ['-c', 'protocol.file.allow=always', 'submodule', 'add', '-q', inner, 'vendor/dep'], { cwd: src });
+
+    // A gitlink stats as a directory, so the isFile filter dropped it and the
+    // subtree simply never reached the environment — the build then failed
+    // with a work-error blaming the repo and no hint about the cause.
+    expect(() => syncIntoEnv(src, env, manifest)).toThrow(/submodule/i);
+    expect(() => syncIntoEnv(src, env, manifest)).toThrow(/vendor\/dep/);
+  }, 60_000);
+});
+
+describe('case-only renames', () => {
+  it('mirrors the deletion on a case-SENSITIVE filesystem', () => {
+    const { src, env } = repo();
+    writeFileSync(join(src, 'README.md'), 'docs');
+    syncIntoEnv(src, env, manifest);
+    expect(existsSync(join(env, 'README.md'))).toBe(true);
+
+    rmSync(join(src, 'README.md'));
+    writeFileSync(join(src, 'Readme.md'), 'docs');
+    syncIntoEnv(src, env, manifest);
+
+    // On Linux these are two distinct files, so the old one must be removed.
+    // On macOS APFS they are the SAME file and removing it would destroy the
+    // just-synced content — which is what the probe distinguishes.
+    expect(existsSync(join(env, 'Readme.md'))).toBe(true);
+    expect(readFileSync(join(env, 'Readme.md'), 'utf8')).toBe('docs');
   });
 });
