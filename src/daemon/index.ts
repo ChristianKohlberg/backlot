@@ -7,6 +7,7 @@
 import { createServer, request } from 'node:http';
 import { existsSync, rmSync, writeFileSync, chmodSync } from 'node:fs';
 import { socketPath, pidPath } from '../core/paths.js';
+import { electSelf, releaseSelf } from './election.js';
 import { BrokerError } from '../core/util.js';
 import { Engine } from './engine.js';
 import { logEvent } from '../core/events.js';
@@ -83,6 +84,11 @@ async function dispatch(verb: string, args: Record<string, unknown>, emit: (phas
     case 'shutdown':
       setTimeout(async () => {
         await engine.shutdown();
+        // Clean up what we own, exactly as the signal path does — a stale lock
+        // is recoverable (the next daemon sees a dead holder) but leaving one
+        // behind makes every restart pay a lock-break round.
+        if (ownsSocket) rmSync(sock, { force: true });
+        if (ownsLock) releaseSelf();
         process.exit(0);
       }, 50);
       return { stopping: true };
@@ -93,6 +99,7 @@ async function dispatch(verb: string, args: Record<string, unknown>, emit: (phas
 
 const sock = socketPath();
 let ownsSocket = false;
+let ownsLock = false;
 
 /** Is a LIVE daemon already answering on the socket? (vs. a stale socket file) */
 function pingExisting(): Promise<boolean> {
@@ -168,6 +175,17 @@ async function start(): Promise<void> {
     if (process.send) process.send('ready');
     process.exit(0);
   }
+  // Win the lock BEFORE touching the socket. Without this, two daemons that
+  // both saw no answer to their ping would each unlink the socket — the second
+  // deleting the first's LIVE one — and both would then bind successfully,
+  // sweeping the same journal and reaping each other's processes.
+  if (!electSelf()) {
+    if (process.send) process.send('ready'); // someone else owns it; the client can proceed
+    process.exit(0);
+  }
+  ownsLock = true;
+  // Only the election winner may remove a socket, so this can no longer be a
+  // live one: any daemon that could have been listening lost the lock.
   if (existsSync(sock)) rmSync(sock, { force: true }); // stale socket from a dead daemon
 
   server.listen(sock, () => {
@@ -205,6 +223,7 @@ for (const sig of ['SIGINT', 'SIGTERM'] as const) {
       // Only remove the socket if WE own it — a losing/duplicate daemon must
       // never delete the healthy daemon's socket.
       if (ownsSocket) rmSync(sock, { force: true });
+      if (ownsLock) releaseSelf();
       process.exit(0);
     });
   });

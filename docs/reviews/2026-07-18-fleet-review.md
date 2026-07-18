@@ -11,13 +11,13 @@ marked as they are resolved or refuted.
 
 | # | sev | kind | finding | location |
 |---|-----|------|---------|----------|
-| 1 | critical | bug | Unconditional socket unlink defeats the daemon singleton election; two daemons can both own state | `src/daemon/index.ts:171` |
+| 1 | critical | bug | ~~Unconditional socket unlink defeats the daemon singleton election~~ **FIXED** (lock-file election, `src/daemon/election.ts`) | `src/daemon/index.ts:171` |
 | 2 | high | bug | CLI hangs forever if the daemon dies mid-request; the 15-min RPC timeout is inert | `src/cli/client.ts:65` |
 | 3 | high | bug | Daemon-unreachable and all client-side crashes exit 2 (env-error) instead of 3 (infra-error) | `src/cli/index.ts:320` |
 | 4 | high | bug | Teardown runs outside the env lock; exec/token/check never re-check 'recycling' | `src/daemon/engine.ts:920` |
 | 5 | high | bug | Pristine wipe destroys tree/data before journal invalidation; crash leaves fingerprints asserting state that no longer exists | `src/daemon/engine.ts:350` |
-| 6 | high | bug | macOS recovery reap signals unverifiable pids — pid reuse kills innocent process groups | `src/daemon/supervisor.ts:244` |
-| 7 | high | bug | macOS group-liveness fallback checks only the leader, so 'verified' kills report success while children survive | `src/core/procscan.ts:89` |
+| 6 | high | bug | ~~macOS recovery reap signals unverifiable pids — pid reuse kills innocent process groups~~ **FIXED** (`1dd7144`) | `src/daemon/supervisor.ts:244` |
+| 7 | high | bug | ~~macOS group-liveness fallback checks only the leader~~ **FIXED** (`kill(-pgid,0)`, `1dd7144`) | `src/core/procscan.ts:89` |
 | 8 | high | bug | macOS CI 'pool at capacity (1/1)' is deterministic: poolMaxHeuristic=1 on 3-core/7GB arm runners plus run's ephemeral holder | `src/core/policy.ts:44` |
 | 9 | high | bug | CommandDs namespace omits the datastore name: two same-driver datastores collide | `src/drivers/datastores.ts:219` |
 | 10 | high | bug | Baked marker outlives the server-side template DB: permanent misclassified bind failure | `src/drivers/datastores.ts:284` |
