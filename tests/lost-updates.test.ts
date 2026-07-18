@@ -164,3 +164,43 @@ describe('the sweeper does not run before recovery finishes', () => {
     for (const e of envs) expect(['warm', 'degraded', 'recycling']).toContain(e.state);
   }, 90_000);
 });
+
+describe('a detached run interrupted by a daemon crash is resolved, not left pending', () => {
+  it('reports a lost job as done with a failed verdict after recovery', async () => {
+    const stateDir = mkdtempSync(join(tmpdir(), 'backlot-job-'));
+    const wt = mkdtempSync(join(tmpdir(), 'backlot-job-wt-'));
+    dirs.push(stateDir, wt);
+    writeFileSync(
+      join(wt, 'stack.yaml'),
+      `name: job\nservices:\n  web: { run: "echo ready; sleep 300", ready: { log: "ready", timeout: 10 } }\nchecks:\n  slow: { run: "sleep 60" }\n`,
+    );
+    execFileSync('git', ['init', '-q'], { cwd: wt });
+    const env = { ...process.env, BACKLOT_STATE_DIR: stateDir, BACKLOT_SWEEP_MS: '400' };
+    const cli = (args: string[]) =>
+      new Promise<Record<string, unknown> | undefined>((resolve) => {
+        execFile(process.execPath, [CLI, ...args], { cwd: wt, env, maxBuffer: 8 * 1024 * 1024 }, (_e, out) => {
+          try {
+            resolve(JSON.parse(String(out)));
+          } catch {
+            resolve(undefined);
+          }
+        });
+      });
+
+    await cli(['up', '--json']);
+    const submitted = await cli(['run', 'slow', '--detach', '--json']);
+    const jobId = String(submitted?.jobId ?? '');
+    expect(jobId).not.toBe('');
+
+    // Kill the daemon mid-run. The job can never finish, so leaving it
+    // 'running' would make a polling agent wait forever. Recovery must resolve
+    // it — and this asserts recovery DOES it, not merely that the Journal has
+    // a method which would.
+    process.kill(Number(readFileSync(join(stateDir, 'daemon.pid'), 'utf8')), 'SIGKILL');
+    await new Promise((r) => setTimeout(r, 300));
+
+    const job = await cli(['job', jobId, '--json']);
+    expect(job?.state).toBe('done');
+    expect((job?.verdict as { ok?: boolean } | null)?.ok).toBe(false);
+  }, 120_000);
+});

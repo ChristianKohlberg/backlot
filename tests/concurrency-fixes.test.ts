@@ -18,14 +18,14 @@ function makeContext(extra: Record<string, string> = {}) {
   const env = { ...process.env, BACKLOT_STATE_DIR: stateDir, BACKLOT_SWEEP_MS: '300', ...extra };
   const cli = (args: string[], cwd: string): Promise<{ exitCode: number; json?: Record<string, unknown> }> =>
     new Promise((resolve) => {
-      execFile(process.execPath, [CLI, ...args], { cwd, env, maxBuffer: 16 * 1024 * 1024 }, (err, stdout) => {
+      execFile(process.execPath, [CLI, ...args], { cwd, env, maxBuffer: 16 * 1024 * 1024 }, (err, stdout, stderr) => {
         let json;
         try {
           json = JSON.parse(String(stdout));
         } catch {
           /* non-json */
         }
-        resolve({ exitCode: err ? ((err as { code?: number }).code ?? 1) : 0, json });
+        resolve({ exitCode: err ? ((err as { code?: number }).code ?? 1) : 0, json, stdout: String(stdout), stderr: String(stderr) });
       });
     });
   const cleanup = () => {
@@ -91,7 +91,7 @@ describe('#19 daemon singleton — a second daemon defers to the live one', () =
       ctx.cli(['status', '--json'], wt),
       ctx.cli(['up', '--json'], wt),
     ]);
-    for (const r of results) expect(r.exitCode, `output: ${(r as { output?: string }).output ?? ''}${r.stdout ?? ''}${r.stderr ?? ''}`).toBe(0);
+    for (const r of results) expect(r.exitCode, `stdout: ${r.stdout ?? ''}\nstderr: ${r.stderr ?? ''}`).toBe(0);
     // All status calls report the same daemon pid — not one-per-CLI.
     const pids = new Set(results.filter((r) => r.json?.pid).map((r) => r.json!.pid));
     expect(pids.size).toBe(1);
@@ -108,14 +108,14 @@ describe('#21d run with a shared --holder does not destroy the session', () => {
 
   it('after `run` the session lease still exists and its data is intact', async () => {
     const up = await ctx.cli(['up', '--json', '--holder', 'shared'], wt);
-    expect(up.exitCode, `output: ${(up as { output?: string }).output ?? ''}${up.stdout ?? ''}${up.stderr ?? ''}`).toBe(0);
+    expect(up.exitCode, `stdout: ${up.stdout ?? ''}\nstderr: ${up.stderr ?? ''}`).toBe(0);
     const envId = up.json!.envId;
 
     await ctx.cli(['run', 'ok', '--json', '--holder', 'shared'], wt);
 
     // The session's ctx still resolves (lease alive) and points at the same env.
     const ctxRes = await ctx.cli(['ctx', '--json', '--holder', 'shared'], wt);
-    expect(ctxRes.exitCode, `output: ${(ctxRes as { output?: string }).output ?? ''}${ctxRes.stdout ?? ''}${ctxRes.stderr ?? ''}`).toBe(0);
+    expect(ctxRes.exitCode, `stdout: ${ctxRes.stdout ?? ''}\nstderr: ${ctxRes.stderr ?? ''}`).toBe(0);
     expect(ctxRes.json!.envId).toBe(envId);
     expect((ctxRes.json!.lease as unknown)).not.toBeNull();
   }, 30_000);
@@ -132,7 +132,7 @@ describe('#23 doctor + reconcile surface', () => {
   it('doctor reports a clean bill on a healthy pool and lists events', async () => {
     await ctx.cli(['up'], wt);
     const doc = await ctx.cli(['doctor', '--json'], wt);
-    expect(doc.exitCode, `output: ${(doc as { output?: string }).output ?? ''}${doc.stdout ?? ''}${doc.stderr ?? ''}`).toBe(0);
+    expect(doc.exitCode, `stdout: ${doc.stdout ?? ''}\nstderr: ${doc.stderr ?? ''}`).toBe(0);
     expect(doc.json!.ok).toBe(true);
     expect(Array.isArray(doc.json!.events)).toBe(true);
     // recover event is always logged at daemon start.
@@ -141,7 +141,7 @@ describe('#23 doctor + reconcile surface', () => {
 
   it('pool reconcile is a real verb (not exit 64)', async () => {
     const rec = await ctx.cli(['pool', 'reconcile', '--json'], wt);
-    expect(rec.exitCode, `output: ${(rec as { output?: string }).output ?? ''}${rec.stdout ?? ''}${rec.stderr ?? ''}`).toBe(0);
+    expect(rec.exitCode, `stdout: ${rec.stdout ?? ''}\nstderr: ${rec.stderr ?? ''}`).toBe(0);
     expect(Array.isArray(rec.json!.reaped)).toBe(true);
   }, 30_000);
 });

@@ -121,27 +121,18 @@ export function processGroup(pid: number): number | undefined {
  * is the whole failure this function exists to detect.
  */
 export function groupAlive(pgid: number): boolean {
-  if (!procScanSupported()) {
-    try {
-      process.kill(-pgid, 0);
-      return true;
-    } catch (err) {
-      // EPERM: the group exists but belongs to another user — still alive.
-      return (err as NodeJS.ErrnoException).code === 'EPERM';
-    }
-  }
-  let entries: string[];
+  // `kill(-pgid, 0)` is a SINGLE syscall and an authoritative group query:
+  // ESRCH means no process remains in the group. An earlier version walked all
+  // of /proc here, which is O(processes) file reads per call — and
+  // killGroupVerified polls this every 50ms, so on a busy host a single reap
+  // issued hundreds of thousands of reads and stalled the daemon.
   try {
-    entries = readdirSync('/proc');
-  } catch {
-    return isAlive(pgid);
+    process.kill(-pgid, 0);
+    return true;
+  } catch (err) {
+    // EPERM: the group exists but belongs to another user — still alive.
+    return (err as NodeJS.ErrnoException).code === 'EPERM';
   }
-  for (const entry of entries) {
-    const pid = Number(entry);
-    if (!Number.isInteger(pid) || pid <= 0) continue;
-    if (processGroup(pid) === pgid) return true;
-  }
-  return false;
 }
 
 /** Is this pid alive at all? Says nothing about whose it is. */

@@ -97,12 +97,12 @@ describe('hello-web fixture', () => {
       env: { BASE_URL: `http://localhost:${port}` },
     });
     expect(res.output).toContain('smoke ok');
-    expect(res.exitCode, `output: ${(res as { output?: string }).output ?? ''}${res.stdout ?? ''}${res.stderr ?? ''}`).toBe(0);
+    expect(res.exitCode, `stdout: ${res.stdout ?? ''}\nstderr: ${res.stderr ?? ''}`).toBe(0);
   });
 
   it('smoke check fails contractually without its injected env (exit 2)', async () => {
     const res = await runCmd(['node', 'smoke.test.mjs'], { cwd: example, env: { BASE_URL: '' } });
-    expect(res.exitCode, `output: ${(res as { output?: string }).output ?? ''}${res.stdout ?? ''}${res.stderr ?? ''}`).toBe(2);
+    expect(res.exitCode, `stdout: ${res.stdout ?? ''}\nstderr: ${res.stderr ?? ''}`).toBe(2);
   });
 
   it('two environments on different ports/DBs are fully isolated', async () => {

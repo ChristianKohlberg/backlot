@@ -18,14 +18,14 @@ function makeContext(extraEnv: Record<string, string> = {}) {
   const env = { ...process.env, BACKLOT_STATE_DIR: stateDir, BACKLOT_SWEEP_MS: '300', ...extraEnv };
   const cli = (args: string[], cwd: string): Promise<{ exitCode: number; json?: Record<string, unknown> }> =>
     new Promise((resolve) => {
-      execFile(process.execPath, [CLI, ...args], { cwd, env, maxBuffer: 16 * 1024 * 1024 }, (err, stdout) => {
+      execFile(process.execPath, [CLI, ...args], { cwd, env, maxBuffer: 16 * 1024 * 1024 }, (err, stdout, stderr) => {
         let json;
         try {
           json = JSON.parse(String(stdout));
         } catch {
           /* non-json */
         }
-        resolve({ exitCode: err ? ((err as { code?: number }).code ?? 1) : 0, json });
+        resolve({ exitCode: err ? ((err as { code?: number }).code ?? 1) : 0, json, stdout: String(stdout), stderr: String(stderr) });
       });
     });
   const cleanup = () => {
@@ -86,7 +86,7 @@ caches: [poison.txt]
     expect((await ctx.cli(['sync', '--json'], wt)).exitCode).toBe(1); // strike 2
 
     const third = await ctx.cli(['sync', '--json'], wt); // auto-escalated to pristine
-    expect(third.exitCode, `output: ${(third as { output?: string }).output ?? ''}${third.stdout ?? ''}${third.stderr ?? ''}`).toBe(0);
+    expect(third.exitCode, `stdout: ${third.stdout ?? ''}\nstderr: ${third.stderr ?? ''}`).toBe(0);
     expect(third.json!.state).toBe('hot');
   }, 60_000);
 });

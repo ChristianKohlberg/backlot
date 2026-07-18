@@ -22,14 +22,14 @@ function makeContext(extra: Record<string, string> = {}) {
   const env = { ...process.env, BACKLOT_STATE_DIR: stateDir, BACKLOT_SWEEP_MS: '300', ...extra };
   const cli = (args: string[], cwd: string): Promise<{ exitCode: number; json?: Record<string, unknown> }> =>
     new Promise((resolve) => {
-      execFile(process.execPath, [CLI, ...args], { cwd, env, maxBuffer: 16 * 1024 * 1024 }, (err, stdout) => {
+      execFile(process.execPath, [CLI, ...args], { cwd, env, maxBuffer: 16 * 1024 * 1024 }, (err, stdout, stderr) => {
         let json;
         try {
           json = JSON.parse(String(stdout));
         } catch {
           /* non-json */
         }
-        resolve({ exitCode: err ? ((err as { code?: number }).code ?? 1) : 0, json });
+        resolve({ exitCode: err ? ((err as { code?: number }).code ?? 1) : 0, json, stdout: String(stdout), stderr: String(stderr) });
       });
     });
   const daemonPid = () => Number(readFileSync(join(stateDir, 'daemon.pid'), 'utf8'));
@@ -134,8 +134,7 @@ afterAll(() => {
 });
 
 describe('process identity', () => {
-  it('pins a pid to one process life', () => {
-    if (!procScanSupported()) return;
+  it.skipIf(!procScanSupported())('pins a pid to one process life', () => {
     const st = startTime(process.pid);
     expect(st).toBeGreaterThan(0);
     expect(sameProcess(process.pid, st)).toBe(true);
@@ -194,9 +193,23 @@ describe('reap safety: pid reuse must never hit a bystander', () => {
   }, 30_000);
 });
 
+describe('the degraded contract on platforms without /proc', () => {
+  it('reports gc as unsupported rather than silently reclaiming nothing', async () => {
+    const ctx = makeContext();
+    contexts.push(ctx.cleanup);
+    const wt = makeWt('unsup', POLITE);
+    dirs.push(wt);
+    await ctx.cli(['up', '--json'], wt);
+    const gc = await ctx.cli(['pool', 'gc', '--json'], wt);
+    // This runs on EVERY platform: Linux must report supported, macOS must
+    // report unsupported. Either way the caller learns whether a sweep
+    // happened, instead of reading an empty list as "nothing to reclaim".
+    expect(gc.json?.supported).toBe(procScanSupported());
+  }, 60_000);
+});
+
 describe('orphan reclaim (issue #5)', () => {
-  it('tags every supervised service so it stays identifiable after its owner dies', async () => {
-    if (!procScanSupported()) return;
+  it.skipIf(!procScanSupported())('tags every supervised service so it stays identifiable after its owner dies', async () => {
     const ctx = makeContext();
     contexts.push(ctx.cleanup);
     const wt = makeWt('tagged', POLITE);
@@ -213,7 +226,8 @@ describe('orphan reclaim (issue #5)', () => {
     expect(tagged.every((p) => p.envId.startsWith('tagged'))).toBe(true);
   });
 
-  it('kills a service that ignores SIGTERM instead of leaving it stranded', async () => {
+  // Needs the tag scan to find the real server, which is Linux-only.
+  it.skipIf(!procScanSupported())('kills a service that ignores SIGTERM instead of leaving it stranded', async () => {
     const ctx = makeContext();
     contexts.push(ctx.cleanup);
     const wt = makeWt('stubborn', STUBBORN);
@@ -235,8 +249,7 @@ describe('orphan reclaim (issue #5)', () => {
     expect(servers(ctx.stateDir)).toEqual([]);
   }, 60_000);
 
-  it('reclaims a dev-server orphaned by an ungracefully killed daemon', async () => {
-    if (!procScanSupported()) return;
+  it.skipIf(!procScanSupported())('reclaims a dev-server orphaned by an ungracefully killed daemon', async () => {
     const ctx = makeContext();
     contexts.push(ctx.cleanup);
     const wt = makeWt('orphan', STUBBORN);
@@ -262,8 +275,7 @@ describe('orphan reclaim (issue #5)', () => {
     expect(servers(ctx.stateDir)).toEqual([]);
   }, 60_000);
 
-  it('pool gc reclaims a tagged process whose env row is gone, and reports it', async () => {
-    if (!procScanSupported()) return;
+  it.skipIf(!procScanSupported())('pool gc reclaims a tagged process whose env row is gone, and reports it', async () => {
     const ctx = makeContext();
     contexts.push(ctx.cleanup);
     const wt = makeWt('gc', STUBBORN);
@@ -288,8 +300,7 @@ describe('orphan reclaim (issue #5)', () => {
     expect(servers(ctx.stateDir)).toEqual([]);
   }, 60_000);
 
-  it('never reclaims a service belonging to a live, hot environment', async () => {
-    if (!procScanSupported()) return;
+  it.skipIf(!procScanSupported())('never reclaims a service belonging to a live, hot environment', async () => {
     const ctx = makeContext();
     contexts.push(ctx.cleanup);
     const wt = makeWt('keep', POLITE);
@@ -311,8 +322,7 @@ describe('orphan reclaim (issue #5)', () => {
     expect(servers(ctx.stateDir)).toContain(server);
   }, 60_000);
 
-  it('doctor reports an orphan rather than silently passing', async () => {
-    if (!procScanSupported()) return;
+  it.skipIf(!procScanSupported())('doctor reports an orphan rather than silently passing', async () => {
     const ctx = makeContext();
     contexts.push(ctx.cleanup);
     const wt = makeWt('diag', STUBBORN);
@@ -375,8 +385,7 @@ describe('process identity is available on every platform', () => {
 });
 
 describe('supervisor restart budget', () => {
-  it('treats a crash after stable operation as fresh, not part of a flap', async () => {
-    if (!procScanSupported()) return;
+  it.skipIf(!procScanSupported())('treats a crash after stable operation as fresh, not part of a flap', async () => {
     // A 400ms stability threshold makes the reset observable: each kill below
     // is separated by a restart plus a wait, so every crash follows a stable
     // run and must reset the budget. Five crashes with the budget of 3 would

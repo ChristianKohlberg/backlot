@@ -32,14 +32,14 @@ describe.skipIf(!hasDocker)('postgres datastore (docker-gated)', () => {
   const env = { ...process.env, BACKLOT_STATE_DIR: stateDir, BACKLOT_SWEEP_MS: '500' };
   const cli = (args: string[]): Promise<{ exitCode: number; json?: Record<string, unknown>; out: string }> =>
     new Promise((resolve) => {
-      execFile(process.execPath, [CLI, ...args], { cwd: wt, env, maxBuffer: 16 * 1024 * 1024 }, (err, stdout) => {
+      execFile(process.execPath, [CLI, ...args], { cwd: wt, env, maxBuffer: 16 * 1024 * 1024 }, (err, stdout, stderr) => {
         let json;
         try {
           json = JSON.parse(String(stdout));
         } catch {
           /* non-json */
         }
-        resolve({ exitCode: err ? ((err as { code?: number }).code ?? 1) : 0, json, out: String(stdout) });
+        resolve({ exitCode: err ? ((err as { code?: number }).code ?? 1) : 0, json, out: String(stdout), stdout: String(stdout), stderr: String(stderr) });
       });
     });
 
@@ -98,7 +98,7 @@ checks:
 
   it('up seeds a real postgres db via template bake + createdb -T restore', async () => {
     const res = await cli(['up', '--json']);
-    expect(res.exitCode, `output: ${(res as { output?: string }).output ?? ''}${res.stdout ?? ''}${res.stderr ?? ''}`).toBe(0);
+    expect(res.exitCode, `stdout: ${res.stdout ?? ''}\nstderr: ${res.stderr ?? ''}`).toBe(0);
     const ds = (res.json!.datastores as Record<string, { url: string; ns: string }>).main;
     ns = ds.ns;
     expect(ns).toMatch(/^backlot_/);
@@ -113,13 +113,13 @@ checks:
     pg(`psql -U postgres -d ${ns} -c "INSERT INTO items(name) VALUES ('mutation')"`);
     expect(pg(`psql -U postgres -d ${ns} -tAc "select count(*) from items"`).trim()).toBe('4');
     const res = await cli(['reset-data', '--json']);
-    expect(res.exitCode, `output: ${(res as { output?: string }).output ?? ''}${res.stdout ?? ''}${res.stderr ?? ''}`).toBe(0);
+    expect(res.exitCode, `stdout: ${res.stdout ?? ''}\nstderr: ${res.stderr ?? ''}`).toBe(0);
     expect(pg(`psql -U postgres -d ${ns} -tAc "select count(*) from items"`).trim()).toBe('3');
   });
 
   it('the check templates {{datastores.main.ns}} and passes against live data', async () => {
     const res = await cli(['run', 'rows', '--json']);
-    expect(res.exitCode, `output: ${(res as { output?: string }).output ?? ''}${res.stdout ?? ''}${res.stderr ?? ''}`).toBe(0);
+    expect(res.exitCode, `stdout: ${res.stdout ?? ''}\nstderr: ${res.stderr ?? ''}`).toBe(0);
     expect(res.json!.ok).toBe(true);
   });
 

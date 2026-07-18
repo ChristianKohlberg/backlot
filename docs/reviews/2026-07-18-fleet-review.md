@@ -35,7 +35,7 @@ marked as they are resolved or refuted.
 | 22 | high | shortcoming | ~~Baked-template markers persist a manifest shell command and re-execute it long after the repo is gone~~ **FIXED** | `src/core/retention.ts:101` |
 | 23 | high | bug | ~~Stat-gate misses same-size edits within one mtime clock tick — stale env content, silent~~ **FIXED** | `src/core/sync.ts:112` |
 | 24 | high | bug | ~~Bind-time reset never cleans env-side untracked files, violating the documented contract~~ **FIXED** (gated to reset-data/pristine) | `src/core/sync.ts:139` |
-| 25 | high | bug | Parallel-bind test passes even against a fully serialized daemon — its core assertion is vacuous | `tests/concurrency.test.ts:85` |
+| 25 | high | bug | ~~Parallel-bind test passes even against a fully serialized daemon — its core assertion is vacuous~~ **FIXED** | `tests/concurrency.test.ts:85` |
 | 26 | high | shortcoming | Pid-reuse refusal is only unit-tested on sameProcess; the actual reap path is untested and appears to kill bystanders | `tests/orphan-reclaim.test.ts:136` |
 | 27 | medium | bug | ~~Singleton election TOCTOU: stale-socket rmSync can unlink the winner's live socket, yielding two daemons~~ **FIXED** | `src/daemon/index.ts:171` |
 | 28 | medium | bug | ~~exec re-joins argv with spaces, silently corrupting any command argument containing whitespace~~ **FIXED** | `src/cli/index.ts:214` |
@@ -75,11 +75,11 @@ marked as they are resolved or refuted.
 | 62 | medium | shortcoming | changedOutputs reports worktree-side edits as env changes; pull then clobbers newer worktree state | `src/core/sync.ts:162` |
 | 63 | medium | shortcoming | Submodule and nested-repo contents are silently absent from the env tree | `src/core/sync.ts:47` |
 | 64 | medium | bug | ~~Pristine wipes tree and ledger on disk but persists the journal only at bind end~~ **FIXED** | `src/daemon/engine.ts:346` |
-| 65 | medium | bug | SIGTERM-ignorer recycle test lacks the procScan guard and deterministically fails on the macOS CI leg | `tests/orphan-reclaim.test.ts:173` |
-| 66 | medium | shortcoming | Issue-#5 suite silently reports green on macOS: bare `return` inside it() instead of skip | `tests/orphan-reclaim.test.ts:156` |
-| 67 | medium | shortcoming | Hung-check timeout test asserts verdict text, never the process table — group-kill regression and grandchild leak undetectable | `tests/ops.test.ts:61` |
-| 68 | medium | bug | helpers.ts stop()/waitHttp cannot see a signal-killed child: exitCode stays null, stop() hangs forever | `tests/helpers.ts:58` |
-| 69 | medium | shortcoming | helpers.ts claims to 'play the engine' but diverges from supervisor semantics: no sh -c, no detached group, bare kill | `tests/helpers.ts:45` |
+| 65 | medium | bug | ~~SIGTERM-ignorer recycle test lacks the procScan guard and deterministically fails on the macOS CI leg~~ **FIXED** | `tests/orphan-reclaim.test.ts:173` |
+| 66 | medium | shortcoming | ~~Issue-#5 suite silently reports green on macOS: bare `return` inside it() instead of skip~~ **FIXED** | `tests/orphan-reclaim.test.ts:156` |
+| 67 | medium | shortcoming | ~~Hung-check timeout test asserts verdict text, never the process table — group-kill regression and grandchild leak undetectable~~ **FIXED** | `tests/ops.test.ts:61` |
+| 68 | medium | bug | ~~helpers.ts stop()/waitHttp cannot see a signal-killed child: exitCode stays null, stop() hangs forever~~ **FIXED** | `tests/helpers.ts:58` |
+| 69 | medium | shortcoming | ~~helpers.ts claims to 'play the engine' but diverges from supervisor semantics: no sh -c, no detached group, bare kill~~ **FIXED** | `tests/helpers.ts:45` |
 | 70 | low | bug | ~~Non-numeric --lines yields NaN and silently returns the entire log instead of a usage error~~ **FIXED** | `src/cli/index.ts:237` |
 | 71 | low | shortcoming | ~~Detached-run polling never maps a failed verdict to exit 1, unlike synchronous run~~ **FIXED** | `src/cli/index.ts:196` |
 | 72 | low | bug | Idle-quiesce acts on a stale idleness check — claimForTeardown never re-validates lastUsedAt | `src/daemon/engine.ts:1014` |
@@ -104,8 +104,8 @@ marked as they are resolved or refuted.
 | 91 | low | bug | ~~--watch ignore filter swallows .github/, .gitignore, and .gitlab-ci.yml edits~~ **FIXED** | `src/daemon/engine.ts:512` |
 | 92 | low | shortcoming | ~~Sync cache written non-atomically inside the mutable env tree; loss disables deletion mirroring~~ **FIXED** | `src/core/sync.ts:152` |
 | 93 | low | shortcoming | ~~Deletion mirror leaves empty directories behind after renames/deletes~~ **FIXED** | `src/core/sync.ts:147` |
-| 94 | low | shortcoming | Stale-job 'recovery' test asserts on the Journal method, not on daemon recovery invoking it | `tests/concurrency-fixes.test.ts:150` |
-| 95 | low | bug | Exit-code failure-message annotations interpolate properties that don't exist — diagnostics are always empty | `tests/hygiene.test.ts:89` |
+| 94 | low | shortcoming | ~~Stale-job 'recovery' test asserts on the Journal method, not on daemon recovery invoking it~~ **FIXED** | `tests/concurrency-fixes.test.ts:150` |
+| 95 | low | bug | ~~Exit-code failure-message annotations interpolate properties that don't exist — diagnostics are always empty~~ **FIXED** | `tests/hygiene.test.ts:89` |
 | 96 | low | shortcoming | 'Machine-wide' appliance start lock only tested with two callers in one process | `tests/appliances.test.ts:151` |
 
 ---
