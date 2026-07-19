@@ -98,6 +98,7 @@ ever owning it ([decision 0018](docs/decisions/0018-appliances-ensured-not-owned
 ## Learn more
 
 - [docs/overview.md](docs/overview.md) — the two-page tour, with diagrams. Start here.
+- [docs/objections.md](docs/objections.md) — "why the copy?", "my agent can just run the dev servers", "compose does this" — taken seriously, with receipts.
 - [docs/architecture.md](docs/architecture.md) — the full design; it *is* the product.
 - [docs/decisions/](docs/decisions/) — why it is the way it is.
 
