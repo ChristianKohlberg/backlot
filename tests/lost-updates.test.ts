@@ -63,13 +63,22 @@ describe('a degrade during bind is never overwritten by the epilogue', () => {
     // in waitReady — exactly what the onDegraded callback does when an earlier
     // service flaps during a later one's boot. The epilogue held a snapshot from
     // before that write and used to save it back whole, resurrecting 'hot'.
-    const { cli, stateDir } = ctx('sleep 4; echo ready; sleep 300');
+    const { cli, stateDir } = ctx('sleep 6; echo ready; sleep 300');
 
     const binding = cli(['up', '--json']);
-    await new Promise((r) => setTimeout(r, 1500)); // inside waitReady
-
+    // POLL for the row rather than guessing when it exists: a fixed sleep
+    // raced daemon cold-start on loaded runners (too early -> no row), and
+    // every ms spent oversleeping ate the margin before waitReady completes.
+    // The service's 6s pre-ready delay clocks from service START, well after
+    // row creation, so landing right on the row leaves the widest window.
+    const deadline = Date.now() + 30_000;
+    let row;
+    for (;;) {
+      row = new Journal(join(stateDir, 'journal.db')).allEnvs()[0];
+      if (row || Date.now() > deadline) break;
+      await new Promise((r) => setTimeout(r, 50));
+    }
     const j = new Journal(join(stateDir, 'journal.db'));
-    const row = j.allEnvs()[0];
     expect(row, 'the bind should have created an env row by now').toBeTruthy();
     j.saveEnv({ ...row!, state: 'degraded' });
 
