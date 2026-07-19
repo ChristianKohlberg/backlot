@@ -153,7 +153,7 @@ the README/engines pin check landed with the decision; these did not.
   bind. `worker_threads` is stable and currently unused here. Same treatment for
   `bind --ref`'s `git archive | tar -x`. Closes the "different environments bind in
   parallel" caveat now documented in architecture.md.
-- [ ] **P3 · Ban non-null `!` assertions in sync.ts and engine.ts via eslint.**
+- [x] **P3 · Ban non-null `!` assertions in sync.ts and engine.ts via eslint.** FIXED 2026-07-19 (PR #14): eslint is a real devDependency with a flat config, the rule is enforced for both files, and all 14 sites became classified errors. Original entry:
   Two confirmed findings were a `!` suppressing a contract the type system had
   correctly flagged, and ~26 assertion sites remain — concentrated in the
   `getEnv(...)!` cluster where three lost-update findings already lived. (Note:
@@ -183,7 +183,7 @@ real product gap someone reading the docs would expect to work.
   which a watch-triggered sync never has — so every save stops and restarts the
   services. architecture.md now states the gap; closing it needs a source-only
   sync path that skips the service lifecycle.
-- [ ] **P2 · Decision 0016 (data states) is unimplemented.** No `states:`,
+- [x] **P2 · Decision 0016 (data states) is unimplemented.** RESOLVED 2026-07-19 by decision 0022: the doctrine is in force, the mechanisms are formally deferred with named forcing conditions — the record no longer promises unbuilt features. Original entry: No `states:`,
   no `inputs:`, no per-check `state:`, no `--state`, no snapshot/restore. The
   decision is marked Accepted, so either build it or supersede it with a new
   decision — an Accepted decision the code ignores is worse than no decision.
@@ -299,7 +299,7 @@ real product gap someone reading the docs would expect to work.
   `ensureDaemon` grants the winner a second ping window; warm-the-daemon note
   added to architecture.md §5.
 
-- [ ] **P3 · `logs <service>` on a service that has produced no output errors.** A
+- [x] **P3 · `logs <service>` on a service that has produced no output errors.** FIXED 2026-07-19 (PR #14): empty log for a silent declared service; unknown services get a work-error naming the declared ones. Original entry: A
   silent service has no `.log` file yet, so `logs` returns `no logs for service` (a
   false env-error). Should return an empty log, not fail. Trivial.
 
@@ -347,7 +347,7 @@ substrate shipping (S4). Do not pick these up without one.
   restoring from a baked template in seconds. Add a backup/restore command pair to
   Revamp's `stack.yaml` datastore. Deferred by the captain.
 
-- [ ] **Content-hash template keying.** Templates are keyed by the `create:` command
+- [x] **Content-hash template keying.** Substantially closed by bake keys + @rebake-template; the full inputs-hash version is S2, deferred by decision 0022. Original entry: Templates are keyed by the `create:` command
   string, not seed content; editing a seed needs an `@rebake-template` upkeep rule to
   invalidate. Content-hashing would remove that manual step. (Documented limitation.)
 
