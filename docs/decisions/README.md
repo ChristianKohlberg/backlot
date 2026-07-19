@@ -26,3 +26,4 @@ supersedes it and update this index — never edit a decision in place.
 | [0019](0019-service-ownership-by-tag-not-pid.md) | Service ownership is proven by tag and process group, not by a recorded pid |
 | [0020](0020-rewrite-in-go-considered-and-declined.md) | A rewrite in Go was considered and declined — the defects were design and POSIX, not language |
 | [0021](0021-quiesce-is-not-a-teardown.md) | A quiesce runs under the environment lock, not as a borrowed teardown — disk is truth, so a borrowed state is a borrowed crash contract |
+| [0022](0022-data-state-mechanisms-deferred.md) | Data-state mechanisms are deferred until a consumer forces them — 0016's doctrine stands, its unbuilt features stop pretending to be pending |
