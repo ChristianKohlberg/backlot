@@ -40,7 +40,12 @@ async function dispatch(verb: string, args: Record<string, unknown>, emit: (phas
       const jobId = engine.createJob(cwd, String(args.check));
       // Fire-and-forget — env/pool locks make it safe; the journaled verdict
       // outlives the client (decision 0015).
-      void engine.executeJob(jobId, { cwd, holder, check: String(args.check), hygiene: (args.hygiene as never) ?? undefined });
+      // Fire-and-forget by design (the verdict is journaled and outlives the
+      // client) — but a REJECTION here is process-fatal without a catch, and
+      // the job would be lost with no record of why.
+      void engine
+        .executeJob(jobId, { cwd, holder, check: String(args.check), hygiene: (args.hygiene as never) ?? undefined })
+        .catch((err) => logEvent({ level: 'error', kind: 'job', detail: `job ${jobId} failed outside the verdict path: ${String((err as Error).message ?? err)}` }));
       return { jobId, poll: `backlot job ${jobId}` };
     }
     case 'job':
@@ -237,13 +242,61 @@ async function start(): Promise<void> {
           logEvent({ level: 'error', kind: 'sweep', detail: `sweep failed: ${String((err as Error).message ?? err)}` });
         });
       }, sweepMs).unref();
-    });
+    }).catch((err) => logEvent({ level: 'error', kind: 'recover', detail: `sweeper never armed: ${String((err as Error).message ?? err)}` }));
     // Detach from the spawning CLI's lifetime.
     if (process.send) process.send('ready');
   });
 }
 
-void start();
+void start().catch((err) => {
+  // Nothing has been established yet, so there is no graceful path — but dying
+  // silently left the client waiting on a daemon that would never answer.
+  console.error(`backlot daemon failed to start: ${String((err as Error).stack ?? err)}`);
+  process.exit(1);
+});
+
+/**
+ * Runtime-level guards.
+ *
+ * Node's default for an unhandled rejection or an uncaught exception is to kill
+ * the process — which for this daemon means every environment loses its
+ * supervisor over one missed `.catch`. Four confirmed defects in the 2026-07-18
+ * review were exactly that shape (a socket 'error', an fs.watch 'error', a
+ * spawn 'error' with no 'exit', a fire-and-forget sweep).
+ *
+ * The two are handled ASYMMETRICALLY on purpose:
+ *
+ * - An unhandled REJECTION is almost always a missing `.catch` on an otherwise
+ *   contained operation. Logging and staying alive is right: the daemon keeps
+ *   supervising, and the event log names the gap.
+ * - An uncaught EXCEPTION leaves the process in an undefined state, and this
+ *   daemon owns a journal that is the machine's source of truth. Continuing
+ *   risks corrupting it. Exiting is safe BECAUSE of the crash-recovery contract
+ *   (decision 0009): services survive, and the next daemon reconciles them. So
+ *   log loudly, then die deliberately rather than limp.
+ */
+process.on('unhandledRejection', (reason) => {
+  logEvent({
+    level: 'error',
+    kind: 'internal',
+    detail: `unhandled rejection (daemon continuing): ${String((reason as Error)?.stack ?? reason)}`.slice(0, 2000),
+  });
+});
+
+process.on('uncaughtException', (err) => {
+  logEvent({
+    level: 'error',
+    kind: 'internal',
+    detail: `uncaught exception — exiting so a clean daemon can reconcile: ${String(err?.stack ?? err)}`.slice(0, 2000),
+  });
+  try {
+    if (ownsSocket) rmSync(sock, { force: true });
+    if (ownsLock) releaseSelf();
+  } catch {
+    /* best-effort */
+  }
+  process.exit(1);
+});
 
 for (const sig of ['SIGINT', 'SIGTERM'] as const) {
   process.on(sig, () => {
