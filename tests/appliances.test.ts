@@ -14,7 +14,7 @@ import { BrokerError } from '../src/core/util.js';
 import { tempDir, freePort } from './helpers.js';
 
 const root = join(import.meta.dirname, '..');
-const schema = JSON.parse(readFileSync(join(root, 'schema/stack.schema.json'), 'utf8'));
+const schema = JSON.parse(readFileSync(join(root, 'schema/backlot.schema.json'), 'utf8'));
 const ajv = new Ajv2020({ allErrors: true });
 const validateSchema = ajv.compile(schema);
 

@@ -81,14 +81,14 @@ export interface Manifest {
 
 export interface Stack {
   manifest: Manifest;
-  /** Directory containing stack.yaml — the sync source root. */
+  /** Directory containing the manifest — the sync source root. */
   root: string;
   /** Stable identity: pools are keyed by this. */
   id: string;
 }
 
 const schemaPath = () =>
-  join(dirname(fileURLToPath(import.meta.url)), '..', '..', 'schema', 'stack.schema.json');
+  join(dirname(fileURLToPath(import.meta.url)), '..', '..', 'schema', 'backlot.schema.json');
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 let validator: any;
@@ -101,18 +101,30 @@ function validate(data: unknown): void {
     validator = ajv.compile(JSON.parse(readFileSync(schemaPath(), 'utf8')));
   }
   if (!validator(data)) {
-    throw new BrokerError('work-error', `stack.yaml is invalid: ${JSON.stringify(validator.errors)}`, 'manifest');
+    throw new BrokerError('work-error', `the backlot manifest is invalid: ${JSON.stringify(validator.errors)}`, 'manifest');
   }
 }
 
-/** Walk upward from cwd to the nearest stack.yaml. */
+/** Walk upward from cwd to the nearest manifest. */
+/** backlot.yml is canonical; stack.yaml (the pre-0.6 name) stays accepted so
+ * existing consumers survive the upgrade. When both exist, backlot.yml wins —
+ * a rename, not a coin toss. */
+export const MANIFEST_NAMES = ['backlot.yml', 'stack.yaml'] as const;
+
+function manifestIn(dir: string): string | null {
+  for (const name of MANIFEST_NAMES) {
+    if (existsSync(join(dir, name))) return join(dir, name);
+  }
+  return null;
+}
+
 export function findStackRoot(from: string): string {
   let dir = resolve(from);
   for (;;) {
-    if (existsSync(join(dir, 'stack.yaml'))) return dir;
+    if (manifestIn(dir)) return dir;
     const parent = dirname(dir);
     if (parent === dir) {
-      throw new BrokerError('work-error', `no stack.yaml found from ${from} upward`, 'manifest');
+      throw new BrokerError('work-error', `no backlot.yml (or stack.yaml) found from ${from} upward`, 'manifest');
     }
     dir = parent;
   }
@@ -120,7 +132,9 @@ export function findStackRoot(from: string): string {
 
 export function loadStack(from: string): Stack {
   const root = findStackRoot(from);
-  const manifest = parse(readFileSync(join(root, 'stack.yaml'), 'utf8')) as Manifest;
+  const file = manifestIn(root);
+  if (!file) throw new BrokerError('work-error', `no backlot.yml (or stack.yaml) in ${root}`, 'manifest');
+  const manifest = parse(readFileSync(file, 'utf8')) as Manifest;
   validate(manifest);
   // Identity = absolute root + declared name; filesystem-safe. Hash the WHOLE
   // path: slicing base64url(root) kept only the last ~6 bytes, so sibling

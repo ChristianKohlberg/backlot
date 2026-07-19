@@ -152,7 +152,7 @@ describe('verdicts, outputs, and the error taxonomy', () => {
 
   it('a failing check is a work-error verdict with the check exit code', async () => {
     appendFileSync(
-      join(wt.dir, 'stack.yaml'),
+      join(wt.dir, 'backlot.yml'),
       `  fail:\n    run: node -e 'console.error("boom"); process.exit(3)'\n`,
     );
     const res = await ctx.cli(['run', 'fail', '--json'], wt.dir);
@@ -170,7 +170,7 @@ describe('verdicts, outputs, and the error taxonomy', () => {
   });
 
   it('outputs contract: env-produced files are reported, pulled only explicitly', async () => {
-    appendFileSync(join(wt.dir, 'stack.yaml'), `outputs: [generated.txt]\n`);
+    appendFileSync(join(wt.dir, 'backlot.yml'), `outputs: [generated.txt]\n`);
     await ctx.cli(['up'], wt.dir);
     await ctx.cli(['exec', 'echo produced-in-env > generated.txt'], wt.dir);
     expect(existsSync(join(wt.dir, 'generated.txt'))).toBe(false); // never written silently

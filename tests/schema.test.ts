@@ -10,12 +10,12 @@ import { parse } from 'yaml';
 import Ajv2020 from 'ajv/dist/2020.js';
 
 const root = join(import.meta.dirname, '..');
-const schema = JSON.parse(readFileSync(join(root, 'schema/stack.schema.json'), 'utf8'));
+const schema = JSON.parse(readFileSync(join(root, 'schema/backlot.schema.json'), 'utf8'));
 const ajv = new Ajv2020({ allErrors: true });
 const validate = ajv.compile(schema);
 
 const loadStack = (example: string) =>
-  parse(readFileSync(join(root, 'examples', example, 'stack.yaml'), 'utf8'));
+  parse(readFileSync(join(root, 'examples', example, 'backlot.yml'), 'utf8'));
 
 describe('stack.schema.json', () => {
   it('accepts examples/hello-web', () => {
@@ -85,6 +85,33 @@ describe('stack identity (loadStack)', () => {
       expect(a.id).not.toBe(b.id);
       // Same checkout keeps a stable id — pools must survive daemon restarts.
       expect(loadStack(join(base, 'agent-1', 'myapp')).id).toBe(a.id);
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('manifest filename (backlot.yml, stack.yaml accepted)', () => {
+  it('loads backlot.yml as the canonical manifest, preferring it over stack.yaml', async () => {
+    const { mkdtempSync, mkdirSync, writeFileSync, rmSync } = await import('node:fs');
+    const { tmpdir } = await import('node:os');
+    const { loadStack } = await import('../src/core/manifest.js');
+    const base = mkdtempSync(join(tmpdir(), 'backlot-manifest-'));
+    try {
+      const svc = 'services:\n  web:\n    run: node s.mjs\n    port: web\n';
+      // backlot.yml alone: the canonical name must work.
+      mkdirSync(join(base, 'canonical'));
+      writeFileSync(join(base, 'canonical', 'backlot.yml'), `name: canonical\n${svc}`);
+      expect(loadStack(join(base, 'canonical')).manifest.name).toBe('canonical');
+      // Both present: backlot.yml wins (the rename, not a coin toss).
+      mkdirSync(join(base, 'both'));
+      writeFileSync(join(base, 'both', 'backlot.yml'), `name: new-name\n${svc}`);
+      writeFileSync(join(base, 'both', 'stack.yaml'), `name: old-name\n${svc}`);
+      expect(loadStack(join(base, 'both')).manifest.name).toBe('new-name');
+      // stack.yaml alone: pre-rename repos keep working across the upgrade.
+      mkdirSync(join(base, 'legacy'));
+      writeFileSync(join(base, 'legacy', 'stack.yaml'), `name: legacy\n${svc}`);
+      expect(loadStack(join(base, 'legacy')).manifest.name).toBe('legacy');
     } finally {
       rmSync(base, { recursive: true, force: true });
     }

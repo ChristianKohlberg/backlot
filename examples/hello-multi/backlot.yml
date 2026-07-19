@@ -1,4 +1,4 @@
-# yaml-language-server: $schema=../../schema/stack.schema.json
+# yaml-language-server: $schema=../../schema/backlot.schema.json
 #
 # The multi-service variant fixture: everything hello-web deliberately doesn't
 # exercise — two HTTP services wired by {{services.*.url}}, depends_on ordering,
