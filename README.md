@@ -8,24 +8,13 @@
 It brokers environments; it never provides them. Local processes today, your own cloud
 sandboxes (Morph, Sprites, SSH) tomorrow — same verbs, same model.
 
-> **Status: 0.6 — hardened by use.** The local loop is complete and battle-proven:
-> daemon with **per-environment concurrency** (sync runs on a worker thread — a big
-> bind never stalls other environments), warm pool, per-stack fair leasing,
-> stat-gated bind-by-sync with **two-stage reload** (`--watch` saves and `sync`
-> project files without restarting services that declare `hot_reload`), sqlite +
-> server datastores (postgres/**mssql**/mysql) with template restore and ephemeral
-> (flush) stores, checks with verdicts/artifacts, detached submit-and-poll runs,
-> hygiene auto-escalation + degraded auto-reap, idle quiesce that survives daemon
-> crashes, **laptop-sleep pardon from the kernel's own record**, every repo command
-> bounded (nothing can wedge an environment), crash recovery, a `token` verb, an
-> MCP adapter (`backlot-mcp`) with detached jobs, and a foreign-runtime consumer
-> (Python). Proven end to end on a real .NET + Angular + MSSQL monorepo — its
-> Playwright e2e suite runs as a backlot check, and 0.6 itself was verified by a
-> driven session against that repo before release. Tested by 250+ CLI-integration
-> tests and a nightly soak harness. Not yet: a live remote substrate driver
-> (morph/ssh). New here? Start with the two-page [docs/overview.md](docs/overview.md).
-> Design in [docs/architecture.md](docs/architecture.md); decisions in
-> [docs/decisions/](docs/decisions/).
+> **Status: 0.6.** The local loop — pool, leases, bind-by-sync, data states,
+> verdicts — is complete, hardened by two full review cycles, and proven end to
+> end against a real .NET + Angular + MSSQL monorepo (its Playwright e2e suite
+> runs as a backlot check, and each release is verified by driving a real session
+> before publish). The one unbuilt milestone is the remote substrate driver
+> (Morph/SSH). Details live in the
+> [release notes](https://github.com/ChristianKohlberg/backlot/releases).
 
 ## Why
 
@@ -78,7 +67,7 @@ services:
     run: pnpm exec ng serve --port {{ports.web}}
     port: web
     ready: { http: / }
-    hot_reload: true      # ng serve watches its tree -> `sync` projects edits in seconds, no restart
+    hot_reload: true      # ng serve reloads itself -> `sync` never restarts it
 datastores:
   main:
     driver: postgres
@@ -93,24 +82,9 @@ checks:
 
 Services are commands, not containers. Backing infrastructure (your DB server) stays
 externally run — backlot probes it and classifies its absence honestly
-(`infra-error`, never blaming your code).
-
-When the repo has one blessed way to bring that infrastructure up, declare it as an
-**appliance** and backlot will *ensure* it — probe, start once machine-wide if dead,
-wait for readiness — while still never owning it (no supervision, no automatic stop;
-whatever answers the probe is adopted, no matter who started it):
-
-```yaml
-appliances:
-  postgres:
-    probe: localhost:5433
-    start: docker run -d --name dev-postgres -p 5433:5432 -e POSTGRES_PASSWORD=postgres pgvector/pgvector:pg16
-    ready: docker exec dev-postgres pg_isready -U postgres
-    stop: docker rm -f dev-postgres   # used only by `backlot appliance stop`
-```
-
-`backlot appliance ls|start|stop` manages them explicitly; binds ensure them
-implicitly. See [decision 0018](docs/decisions/0018-appliances-ensured-not-owned.md).
+(`infra-error`, never blaming your code). If the repo has one blessed way to start
+that infrastructure, declare it as an **appliance** and backlot ensures it without
+ever owning it ([decision 0018](docs/decisions/0018-appliances-ensured-not-owned.md)).
 
 ## What it is / is not
 
@@ -121,7 +95,11 @@ implicitly. See [decision 0018](docs/decisions/0018-appliances-ensured-not-owned
 | seeded, template-restored data states | CI (CI may call backlot; never the reverse) |
 | machine verdicts with a work/env/infra error taxonomy | an agent (no LLM calls, no browser driving) |
 
-Read [docs/architecture.md](docs/architecture.md) — it's short, and it *is* the product.
+## Learn more
+
+- [docs/overview.md](docs/overview.md) — the two-page tour, with diagrams. Start here.
+- [docs/architecture.md](docs/architecture.md) — the full design; it *is* the product.
+- [docs/decisions/](docs/decisions/) — why it is the way it is.
 
 ## Security model
 
