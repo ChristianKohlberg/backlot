@@ -89,7 +89,11 @@ describe('argv parser (F1/F4)', () => {
     const good = await ctx.cli(['logs', '--lines', '5', 'web'], wt);
     expect(good.exitCode, `stdout: ${good.stdout ?? ''}\nstderr: ${good.stderr ?? ''}`).toBe(0); // service resolved to 'web', logs exist
     const bad = await ctx.cli(['logs', '--lines', '5', 'nosuch'], wt);
-    expect(bad.exitCode, `stdout: ${bad.stdout ?? ''}\nstderr: ${bad.stderr ?? ''}`).toBe(2); // proves the positional really was the last token
+    // An UNDECLARED service is now a work-error naming the declared ones (the
+    // unknown-check pattern; 2026-07-19). What this test actually guards is
+    // the argv parse — the error must be about 'nosuch', the last token.
+    expect(bad.exitCode, `stdout: ${bad.stdout ?? ''}\nstderr: ${bad.stderr ?? ''}`).toBe(1);
+    expect(bad.stderr).toMatch(/nosuch/); // the positional really was the last token
   });
 
   it('rejects an unknown flag and a bad --ttl instead of silently misbehaving', async () => {
