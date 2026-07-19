@@ -303,10 +303,15 @@ real product gap someone reading the docs would expect to work.
   silent service has no `.log` file yet, so `logs` returns `no logs for service` (a
   false env-error). Should return an empty log, not fail. Trivial.
 
-## Data states / seeding (ADR-0016)
+## Data states / seeding (ADR-0016 — DEFERRED by ADR-0022, 2026-07-19)
 
-The seeding philosophy is decided in [ADR-0016](docs/decisions/0016-data-states-not-seeds-three-baselines-scenarios-in-tests.md).
-Sequenced implementation:
+The seeding philosophy is decided in [ADR-0016](docs/decisions/0016-data-states-not-seeds-three-baselines-scenarios-in-tests.md);
+its doctrine (three baselines, scenarios in tests) is in force. The mechanisms
+below are NOT active work: each waits for its forcing condition
+([ADR-0022](docs/decisions/0022-data-state-mechanisms-deferred.md)) — per-check
+selection that default_preset cannot express (S1), @rebake-template demonstrably
+failing a consumer (S2), repeated loss of hand-built repro state (S3), the remote
+substrate shipping (S4). Do not pick these up without one.
 
 - [ ] **S1 · `--state` selection + per-check `state:`.** Expose the presets already
   declared (today only `default_preset` is reachable — every other preset is dead

@@ -1,6 +1,6 @@
 # 0016. Data states, not seeds: three baselines, scenarios in tests, snapshots for the expensive middle
 
-- Status: Accepted
+- Status: Accepted — doctrine in force; mechanisms deferred by [0022](0022-data-state-mechanisms-deferred.md)
 
 ## Context
 
@@ -156,7 +156,7 @@ service bounce for a heavy one).
 - Doctrine held: backlot never produces or understands data — it names, selects, caches,
   restores. Every mechanism here is lifecycle, not content.
 
-## Follow-ups (sequenced)
+## Follow-ups (deferred by [0022](0022-data-state-mechanisms-deferred.md) until their forcing conditions occur)
 
 1. `--state` selection + per-check `state:` (exposes the presets already declared).
 2. `states:` with declared `inputs` → content-hash template keying (kills silent-stale).
