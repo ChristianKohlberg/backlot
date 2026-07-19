@@ -35,10 +35,11 @@ describe('a large bind does not block the daemon', () => {
       `name: bigtree\nservices:\n  idle: { run: "echo ready; sleep 300", ready: { log: "ready", timeout: 60 } }\n`,
     );
     // A tree big enough that enumerate+hash+copy occupies the sync phase for
-    // several seconds on ANY machine (fast CI NVMe included): 500 dirs x 80
-    // files of ~1KB — 40k files, the syscalls dominate.
+    // several seconds on ANY machine — including tmpfs-backed /tmp, where 40k
+    // files synced in ~2s: 2000 dirs x 80 files of ~1KB — 160k files, the
+    // per-file syscall+hash cost dominates.
     const payload = 'x'.repeat(1024);
-    for (let d = 0; d < 500; d++) {
+    for (let d = 0; d < 2000; d++) {
       const dir = join(wt, 'src', `mod-${d}`);
       mkdirSync(dir, { recursive: true });
       for (let f = 0; f < 80; f++) writeFileSync(join(dir, `f${f}.txt`), `${d}/${f}:${payload}`);

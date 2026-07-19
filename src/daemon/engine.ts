@@ -19,7 +19,7 @@ import { cmdTimeoutS, runBounded, runBoundedIO, LONG_CMD_TIMEOUT_S } from '../co
 import { makeDatastore, type DsHandle } from '../drivers/datastores.js';
 import { ensureAppliance, stopAppliance, probeTcp } from '../drivers/appliances.js';
 import { EnvSupervisor, killGroupVerified, reapPids } from './supervisor.js';
-import { isAlive, procScanSupported, sameProcess, scanTagged, serviceTag, startTime } from '../core/procscan.js';
+import { isAlive, processGroup, procScanSupported, sameProcess, scanTagged, serviceTag, startTime } from '../core/procscan.js';
 import { policy } from '../core/policy.js';
 import { retentionSweep } from '../core/retention.js';
 import { logEvent, recentEvents } from '../core/events.js';
@@ -523,12 +523,14 @@ export class Engine {
       say('preparing a pristine environment');
       await this.supervisor(env).stopAll();
       this.supervisors.delete(env.id);
+      const pristineSurvivors = await this.reapEnvProcesses(env);
       rmSync(dirs.tree, { recursive: true, force: true });
       rmSync(dirs.data, { recursive: true, force: true });
       mkdirSync(dirs.tree, { recursive: true });
       mkdirSync(dirs.data, { recursive: true });
       env.fingerprints = {};
       env.presets = {};
+      env.servicePids = pristineSurvivors;
       // Persist the cleared ledger NOW, not at the end of the bind. Appliances,
       // sync and upkeep all run before the epilogue, and a crash in any of them
       // used to leave the journal asserting fingerprints and presets for state
@@ -595,6 +597,9 @@ export class Engine {
     // Services must not hold open handles across a data restore or code change.
     await this.supervisor(env).stopAll();
     this.supervisors.delete(env.id);
+    // Reap any process that survived or escaped the group kill above so the
+    // port-free check below does not see a stale holder. See reapEnvProcesses.
+    await this.reapEnvProcesses(env);
 
     // Data state: create-or-restore per hygiene (probe first — infra-error, not code blame).
     const dsHandle: DsHandle = { envId: env.id, envTree: dirs.tree, dataDir: dirs.data };
@@ -658,7 +663,29 @@ export class Engine {
             await new Promise((r) => setTimeout(r, 150));
           }
           if (!free) {
-            throw new BrokerError('env-error', `port ${port} for service '${name}' is occupied by a foreign process — try 'backlot pool recycle'`, name);
+            // Try to name the holder so the error is actionable. After
+            // reapEnvProcesses ran, any remaining tagged process survived our
+            // SIGKILL (extremely unlikely) or is truly foreign (not from
+            // backlot). Either way, naming it beats a bare port number.
+            let staleHint = '';
+            if (procScanSupported()) {
+              // Earlier iterations of this start loop already launched healthy
+              // services carrying the same tag — don't name our own. Exclude
+              // by group, not just leader pid: `sh -c` forks, so the real
+              // server is a same-group sibling of the recorded leader.
+              const own = new Set(Object.values(sup.pids()).map((r) => r.pid));
+              const stale = scanTagged(stateRoot()).filter(
+                (p) => p.envId === env.id && !own.has(p.pid) && !own.has(processGroup(p.pid) ?? -1),
+              );
+              if (stale.length > 0) {
+                staleHint = ` — surviving process(es): ${stale.map((p) => `pid ${p.pid} (${p.service})`).join(', ')}; run 'backlot pool gc' to reclaim`;
+              }
+            }
+            throw new BrokerError(
+              'env-error',
+              `port ${port} for service '${name}' is occupied${staleHint || " by a foreign process — try 'backlot pool recycle' or 'backlot pool gc'"}`,
+              name,
+            );
           }
         }
         // Template the COMMANDS too — ports/urls may ride in the run line itself
@@ -682,12 +709,13 @@ export class Engine {
           clearInterval(beat);
           const survivors = await sup.stopAll();
           this.supervisors.delete(env.id);
+          const unreaped = await this.reapEnvProcesses(env, survivors);
           // Same stale-snapshot rule as the epilogue: preserve a concurrent
           // degrade, and never write back a row that has been recycled away.
           const live = this.journal.getEnv(env.id);
           if (live) {
             live.state = live.state === 'degraded' ? 'degraded' : 'warm';
-            live.servicePids = survivors;
+            live.servicePids = unreaped;
             this.journal.saveEnv(live);
           }
           throw err;
@@ -1369,6 +1397,41 @@ export class Engine {
       this.journal.saveEnv(env);
       return env;
     });
+  }
+
+  /**
+   * After a supervisor stopAll(), kill any process that survived or escaped the
+   * group signal so the port is truly free before the port-check below.
+   *
+   * Two failure modes:
+   *   (a) Recorded pid survived a previous kill (quiesce/teardown race): reapPids
+   *       retries with fresh SIGTERM→SIGKILL on all platforms.
+   *   (b) A service called setsid() / spawned a detached grandchild that inherited
+   *       the BACKLOT tag but moved to a new process group, escaping the -pgid
+   *       SIGKILL: scanTagged (Linux only) finds it by the tag in its environment
+   *       and kills the new group.
+   *
+   * Without this, a warm env whose quiesce left survivors hands out a port that
+   * is still bound — the bind then fails with "occupied by a foreign process"
+   * instead of reclaiming the escapee.
+   *
+   * Returns the entries NOT confirmed dead (reapPids contract): callers must
+   * keep those in the journal — a forgotten pid is an orphan nobody can ever
+   * reclaim, and only Linux has the tag scan to fall back on.
+   */
+  private async reapEnvProcesses(env: EnvRow, pids?: Record<string, ServicePid>): Promise<Record<string, ServicePid>> {
+    const recorded = pids ?? env.servicePids;
+    let survivors: Record<string, ServicePid> = {};
+    if (Object.keys(recorded).length > 0) {
+      survivors = await reapPids(recorded);
+    }
+    if (procScanSupported()) {
+      const orphans = scanTagged(stateRoot()).filter((p) => p.envId === env.id);
+      if (orphans.length > 0) {
+        await Promise.all(orphans.map((o) => killGroupVerified(o.pid, o.startTime)));
+      }
+    }
+    return survivors;
   }
 
   /** Slow teardown of an already-claimed ('recycling') env. */
