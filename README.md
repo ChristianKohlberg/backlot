@@ -1,5 +1,7 @@
 # backlot
 
+[![npm](https://img.shields.io/npm/v/backlot)](https://www.npmjs.com/package/backlot) [![ci](https://github.com/ChristianKohlberg/backlot/actions/workflows/ci.yml/badge.svg)](https://github.com/ChristianKohlberg/backlot/actions/workflows/ci.yml) [![release](https://img.shields.io/github/v/release/ChristianKohlberg/backlot)](https://github.com/ChristianKohlberg/backlot/releases)
+
 **backlot puts a working instance of your web application in front of a coding agent
 (or a human) — running, seeded, authenticated, provable — as a cheap, repeatable act.**
 
