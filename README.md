@@ -15,7 +15,8 @@ sandboxes (Morph, Sprites, SSH) tomorrow — same verbs, same model.
 > verb, an MCP adapter (`backlot-mcp`), and a foreign-runtime consumer (Python).
 > Proven on a real .NET + Angular + MSSQL monorepo end to end — including its
 > Playwright system-e2e suite running against backlot-provisioned environments.
-> Published: [`npm i -g backlot`](https://www.npmjs.com/package/backlot). Not yet: a live remote substrate driver (morph/ssh). Design in
+> Published: [`npm i -g backlot`](https://www.npmjs.com/package/backlot). Not yet: a live remote substrate driver (morph/ssh). New here?
+> Start with the two-page [docs/overview.md](docs/overview.md). Design in
 > [docs/architecture.md](docs/architecture.md); decisions in [docs/decisions/](docs/decisions/).
 
 ## Why

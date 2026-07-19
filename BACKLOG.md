@@ -3,6 +3,89 @@
 Known work, roughly prioritized. Committed to the repo so it survives sessions.
 Each item notes severity and where it was found.
 
+## Review sweep (2026-07-19, two parallel reviewers over src/ halves)
+
+Post-fleet-review sweep after the macOS fixes landed. Every finding below was
+verified against the code by the reviewer, and the top entries independently
+re-verified (the stack-id collision empirically). Recorded here rather than
+hot-fixed because each needs its own fails-without-it test.
+
+- [ ] **P1 · Unbounded repo-declared commands wedge an environment forever.**
+  `runBounded` (src/core/exec.ts) closed this class for datastore and appliance
+  commands, but SIX sites still run repo shell via raw `execFile('sh', ['-c'])`
+  with no timeout and no detached group: `exec` (engine.ts:1002, also missing
+  the `BACKLOT_STATE_ROOT` tag, so a hung child that outlives the daemon is
+  invisible to `pool gc`), `token` (engine.ts:1027), service `build`
+  (engine.ts:577), the `ready.cmd` probe (supervisor.ts:221), upkeep rules
+  (upkeep.ts:71), and template pruning's `drop` marker (retention.ts:119 via
+  `runQuiet`). A command that blocks on stdin or a half-up DB holds the env's
+  `busy` bit forever: the sweeper skips it, `--force` teardown refuses it, and
+  every later verb queues behind it until the daemon is restarted — the exact
+  wedge exec.ts's own docstring says was closed.
+- [ ] **P1 · Stack identity collides for sibling worktrees.** `loadStack`
+  (manifest.ts:125) keys identity on `base64url(root).slice(-8)` — only the
+  last ~6 BYTES of the path. `/work/agent-1/myapp` and `/work/agent-2/myapp`
+  (the agent-per-worktree layout this tool exists for) yield the SAME id
+  (verified: both `9teWFwcA`), silently merging their pools, journals, and
+  baked templates — cross-worktree bind thrash, and for command datastores a
+  possible wrong-schema template restore. Use a content hash of the full root.
+- [ ] **P2 · The capacity queue is global FIFO, so stacks block each other.**
+  `acquireEnv` (engine.ts:391) keeps ONE `waiting` queue for the whole engine
+  while capacity is per-stack: a waiter queued on full stack A makes stack B's
+  `up` (free capacity, would succeed instantly) poll behind it and possibly
+  report "pool at capacity" for a pool that never was; a holder's own rebind —
+  trivially satisfiable from `leaseForHolder` — also stalls behind the head.
+  Queue per stack, and let lease-holding rebinds bypass the queue.
+- [ ] **P2 · Leased-idle quiesce races an in-flight acquire, and its guard
+  cannot fire.** The sweeper's post-claim re-check (engine.ts:1362) reads
+  `lastUsedAt`, but `tryClaim` never updates it (only the bind epilogue and
+  `touch` do) — so a holder returning exactly at the idle boundary can have
+  the env flipped to `recycling` under its freshly-refreshed lease: the bind
+  throws "being recycled — retry" and `failStreak` counts an innocent env
+  toward pristine escalation. Also: quiesce borrows the `recycling` state, so
+  a daemon crash mid-quiesce makes recovery run full `teardownClaimed` —
+  deleting the env AND the live lease for what was only a heat reclaim.
+  `tryClaim` should stamp `lastUsedAt` (or the sweeper re-read the lease).
+- [ ] **P2 · `leasedIdleTtlMs` default ignores a configured `idleTtlMs`.**
+  policy.ts:95 hardcodes 60 min instead of the documented `2 × idleTtlMs`
+  (architecture.md §11). Set `BACKLOT_IDLE_TTL_MS=2h` and a LEASED env now
+  quiesces before an ABANDONED one — inverting the lease-liveness intent.
+- [ ] **P2 · `rebake` runs outside `withBakeLock`.** engine.ts:523 calls
+  `rebake` unserialized; `SqliteDs.rebake` is a recursive rm of the stack's
+  template dir. Two envs binding in parallel after a seed edit: A's rebake can
+  delete the template between B's bake and B's restore copy → ENOENT surfaces
+  as an infra-error and bumps B's `failStreak`. Take the bake lock around
+  rebake (the command-family driver self-heals via restore-retry; sqlite has
+  no retry).
+- [ ] **P2 · `backlot pull` is not idempotent.** After a successful pull, the
+  worktree hash equals the env hash but no longer equals the bind-time
+  baseline, so a second pull (agent retry, timed-out first attempt) throws
+  "changed in BOTH — refusing to overwrite" over byte-identical content
+  (sync.ts:397). Skip outputs whose worktree content already matches the env.
+- [ ] **P3 · A daemonizing `run:` burns the full readiness timeout and is
+  misclassified.** The exit-0-immediately detector (supervisor.ts:158) fires
+  in <2s and sets `expectedExit`, but `waitReady`'s early-exit needs
+  `restarts >= 3` (supervisor.ts:200), so the boot polls a dead probe for the
+  full `ready.timeout` and then reports env-error — for what is the repo's
+  own daemonizing command (a work-error), and §9 promises seconds.
+- [ ] **P3 · The submodule refusal's advertised escape hatch cannot work.**
+  sync.ts:93 throws on any gitlink before `sync.include` is consulted, and
+  include only admits single files — so the error's own remedy ("declare the
+  paths you need under sync.include") is unreachable. Carve out covered
+  gitlinks or stop advertising the hatch.
+- [ ] **P3 · Clean-slate binds cannot purge `.git`/`node_modules` droppings.**
+  `cleanUntracked` reuses `walkAll` (sync.ts:117), whose name-skip was meant
+  for source enumeration — so a check's stray `git clone` or an undeclared
+  `node_modules` survives every `--pristine` bind, contradicting "a poisoned
+  env tree self-heals on the next clean-slate bind" (§6). Empty directories
+  survive too (walkAll never emits directories).
+- [ ] **P3 · `CommandDs.ns()` lacks the 63-byte truncation defense that
+  `templateNs()` added for the same bug** (datastores.ts:250 vs :290). Long
+  stack + datastore names truncate to the same Postgres identifier, so two
+  datastores resolve to one database and a clean-slate drop of one destroys
+  the other's data — the exact failure the ns scheme's comment claims to
+  prevent.
+
 ## From the Go evaluation (2026-07, decision 0020)
 
 Declining the rewrite came with a short list of in-language fixes that close the
