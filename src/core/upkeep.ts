@@ -3,8 +3,8 @@
  * rules, evaluated per environment at bind time, direction-agnostic. Actions
  * are repo commands, or engine built-ins prefixed with @.
  */
-import { execFile } from 'node:child_process';
 import { join } from 'node:path';
+import { cmdTimeoutS, runBounded } from './exec.js';
 import { globToRegex, sha256, fileHash, BrokerError } from './util.js';
 import type { Manifest } from './manifest.js';
 
@@ -68,16 +68,18 @@ export async function runUpkeep(
         throw new BrokerError('work-error', `unknown upkeep built-in '@${builtin}'`, 'upkeep');
       }
     } else {
-      await new Promise<void>((resolve, reject) => {
-        execFile('sh', ['-c', rule.run], { cwd: envTree, maxBuffer: 16 * 1024 * 1024 }, (err, _out, stderr) => {
-          if (err) {
-            // Triggered by the binding's own change -> work-error by default (decision 0008).
-            reject(
-              new BrokerError('work-error', `upkeep rule failed: ${rule.run}`, rule.when, String(stderr).slice(0, 800)),
-            );
-          } else resolve();
-        });
-      });
+      // Bounded like every other repo-declared command: an install blocking on
+      // a half-up registry used to hold the env's busy bit until the daemon
+      // was killed.
+      const timeoutS = cmdTimeoutS();
+      const r = await runBounded(rule.run, envTree, timeoutS);
+      if (r.timedOut) {
+        throw new BrokerError('work-error', `upkeep rule timed out after ${timeoutS}s (process group killed): ${rule.run}`, rule.when, r.output.slice(-800));
+      }
+      if (r.code !== 0) {
+        // Triggered by the binding's own change -> work-error by default (decision 0008).
+        throw new BrokerError('work-error', `upkeep rule failed: ${rule.run}`, rule.when, r.output.slice(-800));
+      }
     }
     outcome.ran.push({ when: rule.when, run: rule.run });
     outcome.fingerprints[key] = hash;

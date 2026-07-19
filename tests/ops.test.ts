@@ -157,6 +157,33 @@ describe('pool policy precedence (unit)', () => {
     process.env.BACKLOT_POOL_MAX = '2';
     expect(policy().poolMax).toBe(2); // env var wins over config
   });
+
+  it('leasedIdleTtlMs defaults to 2 x the CONFIGURED idleTtlMs, not a constant', async () => {
+    // architecture.md §11: default is `2 x idleTtlMs`. A hardcoded 60min meant
+    // a user raising idleTtlMs to 2h had LEASED envs quiesce before ABANDONED
+    // ones — a leased environment reclaimed more aggressively than a forgotten
+    // one inverts the lease-liveness design.
+    process.env.BACKLOT_STATE_DIR = mkdtempSync(join(tmpdir(), 'backlot-pol2-'));
+    const savedEnv = { idle: process.env.BACKLOT_IDLE_TTL_MS, leased: process.env.BACKLOT_LEASED_IDLE_TTL_MS };
+    try {
+      delete process.env.BACKLOT_LEASED_IDLE_TTL_MS;
+      const { policy } = await import('../src/core/policy.js');
+
+      process.env.BACKLOT_IDLE_TTL_MS = String(2 * 60 * 60_000); // 2h
+      expect(policy().leasedIdleTtlMs).toBe(4 * 60 * 60_000); // 2 x idle, derived
+
+      delete process.env.BACKLOT_IDLE_TTL_MS;
+      expect(policy().leasedIdleTtlMs).toBe(60 * 60_000); // 2 x the 30min default
+
+      process.env.BACKLOT_LEASED_IDLE_TTL_MS = '123456';
+      expect(policy().leasedIdleTtlMs).toBe(123456); // explicit setting still wins
+    } finally {
+      for (const [k, v] of [['BACKLOT_IDLE_TTL_MS', savedEnv.idle], ['BACKLOT_LEASED_IDLE_TTL_MS', savedEnv.leased]] as const) {
+        if (v === undefined) delete process.env[k];
+        else process.env[k] = v;
+      }
+    }
+  });
 });
 
 describe('retention sweep (unit)', () => {

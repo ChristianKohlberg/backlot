@@ -189,18 +189,21 @@ class SqliteDs implements DsDriver {
     if (exists && !force && existsSync(dbPath)) return;
     if (this.spec.template === true) {
       const tpl = this.tplPath(preset);
-      // Serialize the bake: concurrent binds must not both run create against
-      // the same template file (vetbill-1i49).
-      await withBakeLock(tpl, async () => {
+      // Serialize bake AND restore-copy against rebake, on the STACK key:
+      // rebake deletes the whole stack template dir, so a per-template lock
+      // could not exclude it — an upkeep-triggered rebake from a sibling env
+      // used to rm the dir between this bake and the copy below (vetbill-1i49
+      // covered only the bake-vs-bake race).
+      await withBakeLock(this.stackId, async () => {
         if (!existsSync(tpl)) await this.runCreate(h.envTree, tpl, preset); // bake once
+        // The sidecars MUST go before the .db is replaced. SQLite in WAL mode
+        // recovers `-wal` frames onto whatever database file it finds, so a
+        // leftover WAL from the previous lease would be replayed over the fresh
+        // template — resurrecting the old lease's rows inside a supposedly reset
+        // store, or corrupting it outright.
+        dropSidecars(dbPath);
+        copyFileSync(tpl, dbPath, fsConstants.COPYFILE_FICLONE); // restore = CoW clone where the fs supports it
       });
-      // The sidecars MUST go before the .db is replaced. SQLite in WAL mode
-      // recovers `-wal` frames onto whatever database file it finds, so a
-      // leftover WAL from the previous lease would be replayed over the fresh
-      // template — resurrecting the old lease's rows inside a supposedly reset
-      // store, or corrupting it outright.
-      dropSidecars(dbPath);
-      copyFileSync(tpl, dbPath, fsConstants.COPYFILE_FICLONE); // restore = CoW clone where the fs supports it
     } else {
       dropSidecars(dbPath);
       await this.runCreate(h.envTree, dbPath, preset);
@@ -212,8 +215,12 @@ class SqliteDs implements DsDriver {
     rmSync(db, { force: true });
     dropSidecars(db); // an orphaned -wal outlives its database and poisons the next one
   }
-  rebake(_cwd?: string): void {
-    rmSync(join(templatesRoot(), this.stackId), { recursive: true, force: true });
+  rebake(_cwd?: string): Promise<void> {
+    // Same stack-scoped lock as ensure(): the rm spans every template of the
+    // stack, so it must wait out any in-flight bake or restore.
+    return withBakeLock(this.stackId, async () => {
+      rmSync(join(templatesRoot(), this.stackId), { recursive: true, force: true });
+    });
   }
 }
 
@@ -253,7 +260,14 @@ class CommandDs implements DsDriver {
     // resolve to the identical database: the second one's clean-slate drop
     // destroys the first's freshly seeded data, and both services are handed
     // the same url.
-    return `backlot_${h.envId}_${this.name}`.replace(/[^A-Za-z0-9_]/g, '_');
+    const raw = `backlot_${h.envId}_${this.name}`.replace(/[^A-Za-z0-9_]/g, '_');
+    // Postgres truncates identifiers at 63 bytes, and the disambiguating name
+    // sits at the END — same defense as templateNs(): trim the middle, keep a
+    // hash of the full identity so long names never collapse onto one db.
+    const LIMIT = 63;
+    if (raw.length <= LIMIT) return raw;
+    const suffix = `_${sha256(raw).slice(0, 8)}`;
+    return raw.slice(0, LIMIT - suffix.length) + suffix;
   }
   url(h: DsHandle): string {
     return template(this.spec.url!, { ns: this.ns(h) });
@@ -328,10 +342,10 @@ class CommandDs implements DsDriver {
     if (this.spec.drop) await shQuiet(template(this.spec.drop, { ns }), h.envTree); // clean slate, best-effort
     if (this.spec.template_restore) {
       const tpl = this.templateNs(preset);
-      // Serialize bake-check + bake + mark per template (vetbill-1i49):
-      // concurrent binds used to race the marker and bake the shared
-      // template twice; the loser could restore a half-baked schema.
-      await withBakeLock(tpl, async () => {
+      // Serialize bake-check + bake + mark on the STACK key (vetbill-1i49
+      // covered bake-vs-bake per template; rebake deletes the whole stack
+      // marker dir, so only a stack-scoped lock excludes it too).
+      await withBakeLock(this.stackId, async () => {
         if (existsSync(this.bakedMarker(preset))) return;
         await shQuiet(this.spec.drop ? template(this.spec.drop, { ns: tpl }) : 'true', h.envTree);
         await sh(template(create, { ns: tpl, preset }), h.envTree, `template bake failed for '${this.name}' preset '${preset}'`);
@@ -353,7 +367,7 @@ class CommandDs implements DsDriver {
         // forever — blaming the repo's restore command for an infrastructure
         // event. Drop the stale marker, bake once more, and retry.
         rmSync(this.bakedMarker(preset), { force: true });
-        await withBakeLock(tpl, async () => {
+        await withBakeLock(this.stackId, async () => {
           if (existsSync(this.bakedMarker(preset))) return;
           await shQuiet(this.spec.drop ? template(this.spec.drop, { ns: tpl }) : 'true', h.envTree);
           await sh(template(create, { ns: tpl, preset }), h.envTree, `template rebake failed for '${this.name}' preset '${preset}' (after a failed restore: ${(err as Error).message})`);
@@ -383,9 +397,14 @@ class CommandDs implements DsDriver {
     // repo (it may invoke a repo-local script or a relative tool). Running it
     // in templatesRoot() made it fail, and shQuiet swallows failures — so the
     // leak fix silently did nothing. Fall back only when no root is known.
-    const dir = join(templatesRoot(), this.stackId);
-    await dropBakedTemplates(dir, cwd ?? templatesRoot());
-    rmSync(dir, { recursive: true, force: true });
+    //
+    // Stack-scoped lock, same as the bake sections: this rm spans every
+    // marker of the stack and must wait out an in-flight bake.
+    await withBakeLock(this.stackId, async () => {
+      const dir = join(templatesRoot(), this.stackId);
+      await dropBakedTemplates(dir, cwd ?? templatesRoot());
+      rmSync(dir, { recursive: true, force: true });
+    });
   }
 }
 
