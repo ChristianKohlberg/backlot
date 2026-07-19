@@ -82,9 +82,16 @@ describe('hello-multi fixture', () => {
   it('fatal_logs semantics: web without its wiring dies loudly and fast', async () => {
     const web = startService(['node', 'web.mjs'], { cwd: example, env: { PORT: '0', API_URL: '' } });
     services.push(web);
+    // "Fast" IS the contract here — fatal_logs exists so a fatally miswired
+    // service fails the bind well before the ready budget expires (30s in this
+    // fixture's manifest) instead of burning it. So the exit deadline must stay
+    // meaningfully below 30s, but the old 5s bound also measured suite-load
+    // scheduling: a process that dies instantly on its own clock can take
+    // seconds to be SPAWNED on a saturated machine. 15s keeps the semantic
+    // (dies in half the ready budget) without failing on a busy runner.
     const start = Date.now();
     while (web.proc.exitCode === null) {
-      if (Date.now() - start > 5_000) throw new Error('expected fast exit');
+      if (Date.now() - start > 15_000) throw new Error('expected fast exit');
       await new Promise((r) => setTimeout(r, 50));
     }
     expect(web.proc.exitCode).not.toBe(0);
