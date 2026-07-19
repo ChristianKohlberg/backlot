@@ -18,6 +18,17 @@ jobs:
       - uses: actions/setup-node@v4
         with: { node-version: 22 }
       - run: corepack enable && pnpm install --frozen-lockfile || npm install
+      # The README pin and engines drifted apart once already, and the result
+      # was a documented Node version on which the daemon could not start.
+      - name: README Node pin matches package.json engines
+        run: |
+          # Compare major.minor: engines carries a patch (22.13.0) the prose does not.
+          ENGINES=$(node -p "require('./package.json').engines.node.replace(/[^0-9.]/g,'').split('.').slice(0,2).join('.')")
+          README=$(grep -oE 'Node . [0-9]+\.[0-9]+' README.md | head -1 | grep -oE '[0-9]+\.[0-9]+')
+          echo "engines=$ENGINES readme=$README"
+          [ "$ENGINES" = "$README" ] || {
+            echo "README Node pin ($README) does not match package.json engines ($ENGINES)"; exit 1;
+          }
       - run: npm run typecheck
       # The suite exercises the documented core loop (a session `up` plus a
       # `run`), which needs TWO environments: `run` always mints its own

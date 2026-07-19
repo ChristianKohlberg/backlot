@@ -44,7 +44,7 @@ backlot ctx --json         # everything an agent needs, in one blob
 backlot release            # environment returns to the pool, warm
 ```
 
-Requires Node ≥ 22.5 and git. The daemon auto-spawns on first use (unix socket,
+Requires Node ≥ 22.13 and git. The daemon auto-spawns on first use (unix socket,
 per-machine state under `~/.local/state/backlot`; isolate with `BACKLOT_STATE_DIR`).
 
 A repo opts in with one file, `stack.yaml` ([schema](schema/stack.schema.json)):

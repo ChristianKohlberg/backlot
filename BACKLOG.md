@@ -3,6 +3,30 @@
 Known work, roughly prioritized. Committed to the repo so it survives sessions.
 Each item notes severity and where it was found.
 
+## From the Go evaluation (2026-07, decision 0020)
+
+Declining the rewrite came with a short list of in-language fixes that close the
+same ground. The process-level rejection guards, the floating-promise catches and
+the README/engines pin check landed with the decision; these did not.
+
+- [ ] **P2 · Move `syncIntoEnv` onto a worker thread.** The one open
+  language-attributable item (17 synchronous fs/exec calls in one 412-line module)
+  blocks the daemon's event loop for every concurrent environment during a large
+  bind. `worker_threads` is stable and currently unused here. Same treatment for
+  `bind --ref`'s `git archive | tar -x`. Closes the "different environments bind in
+  parallel" caveat now documented in architecture.md.
+- [ ] **P3 · Ban non-null `!` assertions in sync.ts and engine.ts via eslint.**
+  Two confirmed findings were a `!` suppressing a contract the type system had
+  correctly flagged, and ~26 assertion sites remain — concentrated in the
+  `getEnv(...)!` cluster where three lost-update findings already lived. (Note:
+  `npm run lint` currently fails outright — eslint is not in devDependencies.)
+- [ ] **P3 · Guard the AF_UNIX `sun_path` limit in `socketPath()`.** A deep
+  `BACKLOT_STATE_DIR` silently truncates the socket path; client and daemon
+  truncate identically so it appears to work, which makes it a latent
+  cross-state-dir collision. Fail loudly above ~100 bytes.
+- [ ] **P3 · Suppress the `node:sqlite` ExperimentalWarning on daemon spawn** so
+  daemon.log stays signal, without hiding it from a direct CLI run.
+
 ## Promised but not implemented (2026-07-18 fleet review)
 
 The review found several documented capabilities the code does not deliver.
