@@ -1474,39 +1474,39 @@ export class Engine {
       const idleFor = now() - env.lastUsedAt;
       const quiesceAfter = leased ? LEASED_IDLE_TTL() : IDLE_TTL();
       if (env.state === 'hot' && idleFor > quiesceAfter) {
-        // Claim under the pool lock so a concurrent bind can't lease this env
-        // between the idle check and the service kill (dead-URL race).
-        // force=true only bypasses the LEASE check; claimForTeardown still
-        // refuses anything busy, so an in-flight operation is never interrupted.
-        const claimed = await this.claimForTeardown(env.id, Boolean(leased));
-        if (!claimed) continue;
-        // Re-check under the claim: a bind may have touched this environment
-        // between the idle test above and the claim, and quiescing it then
-        // stops services a live caller is about to use.
-        if (now() - claimed.lastUsedAt <= quiesceAfter) {
-          claimed.state = 'hot';
-          this.journal.saveEnv(claimed);
-          continue;
-        }
-        this.stopWatch(env.id);
-        const survivors = await this.supervisor(claimed).stopAll();
-        this.supervisors.delete(env.id);
-        const fresh = this.journal.getEnv(env.id);
-        if (fresh) {
-          fresh.state = 'warm';
-          // Anything that outlived SIGKILL stays recorded, so the next gc pass
-          // (or a later restart) can still find it instead of losing it.
-          fresh.servicePids = survivors;
-          this.journal.saveEnv(fresh);
-          if (leased) {
-            logEvent({
-              level: 'info',
-              kind: 'quiesce',
-              envId: env.id,
-              detail: `idle ${Math.round(idleFor / 60_000)}m while leased by '${leased.holder}' — services stopped, lease kept; the next verb rebinds`,
-            });
+        // Under the ENV LOCK, not a teardown claim (decision 0021): borrowing
+        // the `recycling` state published a heat reclaim to the journal as a
+        // teardown-in-progress, so a crash mid-quiesce made recovery finish
+        // the "teardown" — deleting the env AND its live lease. Under the
+        // lock, mid-quiesce state is plain `hot` with dead pids, which is the
+        // ordinary crash-recovery case (reap, mark warm, keep the lease). The
+        // lock also serializes this with binds, so the idle re-check below is
+        // finally race-free against their epilogue's lastUsedAt writes — and
+        // a bind queued behind us simply rebinds the warm env.
+        await this.envLocked(env.id, async () => {
+          const fresh = this.journal.getEnv(env.id);
+          if (!fresh || fresh.state !== 'hot') return;
+          if (now() - fresh.lastUsedAt <= quiesceAfter) return; // touched while we queued
+          this.stopWatch(env.id);
+          const survivors = await this.supervisor(fresh).stopAll();
+          this.supervisors.delete(env.id);
+          const post = this.journal.getEnv(env.id);
+          if (post) {
+            post.state = 'warm';
+            // Anything that outlived SIGKILL stays recorded, so the next gc pass
+            // (or a later restart) can still find it instead of losing it.
+            post.servicePids = survivors;
+            this.journal.saveEnv(post);
+            if (leased) {
+              logEvent({
+                level: 'info',
+                kind: 'quiesce',
+                envId: env.id,
+                detail: `idle ${Math.round(idleFor / 60_000)}m while leased by '${leased.holder}' — services stopped, lease kept; the next verb rebinds`,
+              });
+            }
           }
-        }
+        });
       }
     }
   }
