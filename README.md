@@ -8,18 +8,24 @@
 It brokers environments; it never provides them. Local processes today, your own cloud
 sandboxes (Morph, Sprites, SSH) tomorrow — same verbs, same model.
 
-> **Status: 0.4-core, gap-closing batch landed.** The local loop is complete and
-> battle-proven: daemon with **per-environment concurrency**, warm pool, leases,
-> stat-gated bind-by-sync, **`--watch` streaming**, sqlite + server datastores
-> (postgres/mssql/mysql) with template restore and **ephemeral (flush) stores**,
-> checks with verdicts/artifacts, detached submit-and-poll runs, **hygiene
-> auto-escalation + degraded auto-reap**, idle quiesce, crash recovery, a `token`
-> verb, an MCP adapter (`backlot-mcp`), and a foreign-runtime consumer (Python).
-> Proven on a real .NET + Angular + MSSQL monorepo end to end — including its
-> Playwright system-e2e suite running against backlot-provisioned environments.
-> Published: [`npm i -g backlot`](https://www.npmjs.com/package/backlot). Not yet: a live remote substrate driver (morph/ssh). New here?
-> Start with the two-page [docs/overview.md](docs/overview.md). Design in
-> [docs/architecture.md](docs/architecture.md); decisions in [docs/decisions/](docs/decisions/).
+> **Status: 0.6 — hardened by use.** The local loop is complete and battle-proven:
+> daemon with **per-environment concurrency** (sync runs on a worker thread — a big
+> bind never stalls other environments), warm pool, per-stack fair leasing,
+> stat-gated bind-by-sync with **two-stage reload** (`--watch` saves and `sync`
+> project files without restarting services that declare `hot_reload`), sqlite +
+> server datastores (postgres/**mssql**/mysql) with template restore and ephemeral
+> (flush) stores, checks with verdicts/artifacts, detached submit-and-poll runs,
+> hygiene auto-escalation + degraded auto-reap, idle quiesce that survives daemon
+> crashes, **laptop-sleep pardon from the kernel's own record**, every repo command
+> bounded (nothing can wedge an environment), crash recovery, a `token` verb, an
+> MCP adapter (`backlot-mcp`) with detached jobs, and a foreign-runtime consumer
+> (Python). Proven end to end on a real .NET + Angular + MSSQL monorepo — its
+> Playwright e2e suite runs as a backlot check, and 0.6 itself was verified by a
+> driven session against that repo before release. Tested by 250+ CLI-integration
+> tests and a nightly soak harness. Not yet: a live remote substrate driver
+> (morph/ssh). New here? Start with the two-page [docs/overview.md](docs/overview.md).
+> Design in [docs/architecture.md](docs/architecture.md); decisions in
+> [docs/decisions/](docs/decisions/).
 
 ## Why
 
@@ -38,19 +44,27 @@ the environment returns to the pool with its heat intact. ([Why not checkpointin
 
 ## Quickstart
 
+The one prerequisite: a `backlot.yml` at the repo root (the manifest — see the
+example below). Every runnable fixture in [`examples/`](examples/) ships one, so
+the fastest first contact is a checkout:
+
 ```bash
-npm i -g backlot                           # or from a checkout: npm install && npm run build && npm link
+git clone https://github.com/ChristianKohlberg/backlot && cd backlot
+npm install && npm run build && npm link   # (or, for your own repos: npm i -g backlot)
 cd examples/hello-web
 backlot up --json          # lease a warm env: sync, seed, start, print URLs + creds
 backlot run smoke --json   # bind -> run the check -> JSON verdict -> release
 backlot ctx --json         # everything an agent needs, in one blob
+backlot sync               # edit locally, project it in — seconds; hot_reload services keep running
 backlot release            # environment returns to the pool, warm
 ```
 
-Requires Node ≥ 22.13 and git. The daemon auto-spawns on first use (unix socket,
-per-machine state under `~/.local/state/backlot`; isolate with `BACKLOT_STATE_DIR`).
+For your own repo: `npm i -g backlot`, write the `backlot.yml`, then the same
+verbs. Requires Node ≥ 22.13 and git. The daemon auto-spawns on first use (unix
+socket, per-machine state under `~/.local/state/backlot`; isolate with
+`BACKLOT_STATE_DIR`).
 
-A repo opts in with one file, `backlot.yml` ([schema](schema/backlot.schema.json)):
+The manifest, by example ([schema](schema/backlot.schema.json)):
 
 ```yaml
 name: myapp
@@ -60,6 +74,11 @@ services:
     port: api
     env: { ConnectionStrings__Main: "{{datastores.main.url}}" }
     ready: { http: /health }
+  web:
+    run: pnpm exec ng serve --port {{ports.web}}
+    port: web
+    ready: { http: / }
+    hot_reload: true      # ng serve watches its tree -> `sync` projects edits in seconds, no restart
 datastores:
   main:
     driver: postgres
