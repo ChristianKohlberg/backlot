@@ -40,7 +40,9 @@ describe('hello-python fixture', () => {
       env: { PORT: String(port), DB_PATH: join(tmp.dir, 'unused.db'), PYTHONPATH: tmp.dir },
     });
     try {
-      await waitHttp(`http://127.0.0.1:${port}/health`, svc, /Traceback/, 10_000);
+      // 20s: must stay meaningfully under the 30s resolver stall being simulated,
+      // while tolerating python cold-start under full-suite load (10s flaked).
+      await waitHttp(`http://127.0.0.1:${port}/health`, svc, /Traceback/, 20_000);
     } finally {
       await svc.stop();
       tmp.cleanup();

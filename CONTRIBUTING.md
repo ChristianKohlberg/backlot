@@ -17,3 +17,16 @@ Thanks for looking at backlot. A few ground rules keep this project what it is:
 - Node ≥ 22.5, `pnpm install`, `pnpm typecheck && pnpm test` before pushing.
 - Agent-authored contributions are welcome and expected — this tool exists for
   agents. The same review bar applies to everyone.
+- **Coverage** (optional, not a CI gate — it re-runs the whole integration suite):
+  `npm run coverage` produces a text summary and `coverage/lcov.info`. Because the
+  suite drives the built CLI as a subprocess (which spawns the daemon, which spawns
+  workers), in-process instrumentation would see almost nothing; instead the script
+  sets `NODE_V8_COVERAGE` for the whole run so every spawned node process writes raw
+  V8 coverage, then `c8` merges it against `dist/` and maps it back to `src/` via
+  sourcemaps. Numbers therefore reflect what the *real* product loop executed.
+  Two known blind spots when reading them: a process that dies by SIGKILL never
+  writes its dump (so suites that SIGKILL their daemon/MCP process in cleanup
+  contribute nothing for that process's whole life — prefer a plain
+  `process.kill(pid)`, which the daemon handles gracefully), and tests that
+  import `../src/*.ts` in-process run through vitest's transform, which this
+  dist-mapped view does not count.

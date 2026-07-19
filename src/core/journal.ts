@@ -120,6 +120,31 @@ export class Journal {
     }
   }
 
+  /**
+   * One real sqlite transaction around a multi-statement write. Each of these
+   * sequences used to be N independent writes, so a daemon SIGKILLed between
+   * them left a half-state on disk — deleteEnv's env-gone-lease-left was the
+   * reviewed case. The sweeper tolerates those half-states (journals outlive
+   * releases); this stops new ones being minted. BEGIN IMMEDIATE takes the
+   * write lock up front, so the sequence can't interleave with the concurrent
+   * writers that busy_timeout exists for either.
+   */
+  private withTx<T>(fn: () => T): T {
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const out = fn();
+      this.db.exec('COMMIT');
+      return out;
+    } catch (err) {
+      try {
+        this.db.exec('ROLLBACK');
+      } catch {
+        /* sqlite may already have rolled back on error */
+      }
+      throw err;
+    }
+  }
+
   private rowToEnv(r: Record<string, unknown>): EnvRow {
     return {
       id: r.id as string,
@@ -176,8 +201,12 @@ export class Journal {
   }
 
   deleteEnv(id: string): void {
-    this.db.prepare('DELETE FROM envs WHERE id = ?').run(id);
-    this.db.prepare('DELETE FROM leases WHERE env_id = ?').run(id);
+    // Atomic: a kill between these two deletes left a lease naming an env row
+    // that no longer existed (the sweeper prunes that half-state as backstop).
+    this.withTx(() => {
+      this.db.prepare('DELETE FROM envs WHERE id = ?').run(id);
+      this.db.prepare('DELETE FROM leases WHERE env_id = ?').run(id);
+    });
   }
 
   /**
@@ -186,11 +215,15 @@ export class Journal {
    * in the journal, survives daemon restarts.
    */
   nextEnvSeq(stack: string): number {
-    this.db.prepare('INSERT INTO counters (stack, next_env) VALUES (?, 1) ON CONFLICT(stack) DO NOTHING').run(stack);
-    const row = this.db.prepare('SELECT next_env FROM counters WHERE stack = ?').get(stack) as { next_env: number };
-    const seq = row.next_env;
-    this.db.prepare('UPDATE counters SET next_env = next_env + 1 WHERE stack = ?').run(stack);
-    return seq;
+    // Atomic read-modify-write: a foreign writer landing between the SELECT
+    // and the UPDATE would hand the same "never reused" number out twice.
+    return this.withTx(() => {
+      this.db.prepare('INSERT INTO counters (stack, next_env) VALUES (?, 1) ON CONFLICT(stack) DO NOTHING').run(stack);
+      const row = this.db.prepare('SELECT next_env FROM counters WHERE stack = ?').get(stack) as { next_env: number };
+      const seq = row.next_env;
+      this.db.prepare('UPDATE counters SET next_env = next_env + 1 WHERE stack = ?').run(stack);
+      return seq;
+    });
   }
 
   /** Activity, NOT lease renewal: keeps idle reclamation honest without extending ownership. */
@@ -305,7 +338,11 @@ export class Journal {
 
   /** Shift every deadline by `ms` — the sleep pardon (decision 0009). */
   pardon(ms: number): void {
-    this.db.prepare('UPDATE leases SET expires_at = expires_at + ?').run(ms);
-    this.db.prepare('UPDATE envs SET last_used_at = last_used_at + ?').run(ms);
+    // Atomic: a kill between these left leases pardoned but idle clocks not,
+    // so a machine that slept woke to premature quiesces.
+    this.withTx(() => {
+      this.db.prepare('UPDATE leases SET expires_at = expires_at + ?').run(ms);
+      this.db.prepare('UPDATE envs SET last_used_at = last_used_at + ?').run(ms);
+    });
   }
 }
