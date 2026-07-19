@@ -250,6 +250,16 @@ Every failure is classified — the field an agent branches on mechanically:
   (every lease/idle deadline shifts by the sleep duration). There is no separate wake
   grace because degradation is judged only by a service's restart budget, not by a
   post-boot health poll — a slept service simply resumes.
+- **A lease can name its holder's process** (`--holder-pid`, `BACKLOT_HOLDER_PID`; the MCP
+  adapter supplies its own automatically). The default holder is a worktree PATH, and nothing
+  about a path can die — so a crashed agent held its environment for the whole TTL. A named
+  process is checked against its start time, and a dead holder's lease is released in seconds.
+- **A lease no longer exempts an environment from reclaiming HEAT.** Holding one used to keep
+  services (and their memory) alive for the full TTL even if nothing had touched the
+  environment since the bind. Now a leased env that goes untouched past `leasedIdleTtlMs`
+  quiesces to warm: the lease survives, only the services stop, and the next verb rebinds.
+  "Untouched" counts real use — `exec`, `ctx`, `logs`, `pull` — not just binds, so an actively
+  worked environment is never quiesced underneath its agent.
 - **Leases need no heartbeat daemon** because losing a lease is designed to be
   worthless: a binding verb refreshes the TTL (read-only verbs deliberately do not,
   so an idle agent that only polls `ctx` does not hold an environment forever);
@@ -324,6 +334,7 @@ variable > `$STATE_DIR/config.json` > built-in default.
 | Env var | config.json key | Default |
 | --- | --- | --- |
 | `BACKLOT_STATE_DIR` | — | `$XDG_STATE_HOME/backlot` (the per-machine root; 0700) |
+| `BACKLOT_LEASED_IDLE_TTL_MS` | `leasedIdleTtlMs` | `2 x idleTtlMs` — a LEASED but untouched env stops its services (keeps the lease) |
 | `BACKLOT_POOL_MAX` | `poolMax` | `min(cores/2, memGB/4)`, clamped **[2,8]** — the floor is 2 because `up` + `run` needs two envs |
 | `BACKLOT_LEASE_TTL_MS` | `sessionTtlMs` / `runTtlMs` | 30 min / 10 min |
 | `BACKLOT_IDLE_TTL_MS` | `idleTtlMs` | 30 min |

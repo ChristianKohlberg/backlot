@@ -14,6 +14,8 @@ export interface Policy {
   sessionTtlMs: number;
   runTtlMs: number;
   idleTtlMs: number;
+  /** How long a LEASED but untouched environment keeps its services running. */
+  leasedIdleTtlMs: number;
   waitMs: number;
   /** Retention knobs (task: disk sweep). */
   artifactDays: number;
@@ -28,6 +30,7 @@ interface ConfigFile {
   sessionTtlMs?: number;
   runTtlMs?: number;
   idleTtlMs?: number;
+  leasedIdleTtlMs?: number;
   waitMs?: number;
   artifactDays?: number;
   jobDays?: number;
@@ -84,6 +87,12 @@ export function policy(): Policy {
     sessionTtlMs: num('BACKLOT_LEASE_TTL_MS', f.sessionTtlMs, 30 * 60_000),
     runTtlMs: num('BACKLOT_LEASE_TTL_MS', f.runTtlMs, 10 * 60_000),
     idleTtlMs: num('BACKLOT_IDLE_TTL_MS', f.idleTtlMs, 30 * 60_000),
+    // A LEASE used to exempt an environment from idle reclamation entirely, so
+    // heat (services, and their memory) was held for as long as the lease
+    // lasted — which for a crashed agent meant the full TTL. Leased
+    // environments now quiesce too, just later: the lease survives, only the
+    // heat is reclaimed, and the next verb rebinds.
+    leasedIdleTtlMs: num('BACKLOT_LEASED_IDLE_TTL_MS', f.leasedIdleTtlMs, 2 * 30 * 60_000),
     waitMs: num('BACKLOT_WAIT_MS', f.waitMs, 60_000),
     artifactDays: num('BACKLOT_ARTIFACT_DAYS', f.artifactDays, 7),
     jobDays: num('BACKLOT_JOB_DAYS', f.jobDays, 7),
