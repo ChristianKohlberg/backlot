@@ -52,7 +52,7 @@ Kubernetes, Windows, secrets management, and dashboards are not.
 
 | Noun | What it is |
 | --- | --- |
-| **Stack** | What a repo declares in `stack.yaml`: services, datastores, seed presets, upkeep rules, checks. The only repo-specific artifact. |
+| **Stack** | What a repo declares in `backlot.yml`: services, datastores, seed presets, upkeep rules, checks. The only repo-specific artifact. |
 | **Substrate** | Where environments physically live, behind a driver: `local` (supervised processes in a directory), later `docker`, `morph`, `sprites`, `ssh`. |
 | **Environment** | A pooled slot on a substrate: its own copy of the tree, warm caches, running services, allocated ports, a datastore namespace. Durable; belongs to the pool, never to a person or task. |
 | **Binding** | A source state (ref + dirty diff) plus a data state (preset, at a hygiene level) attached to an environment. An immutable snapshot. |
@@ -196,7 +196,7 @@ before build/start:
 - **Data templates are keyed by the `create:` command string, not by seed *content***
   (v1's honest limitation): editing a seed script does not auto-invalidate the template.
   Declare an `@rebake-template <datastore>` upkeep rule triggered on the seed files to
-  invalidate it (see `examples/hello-multi/stack.yaml`). Content-hash keying is planned;
+  invalidate it (see `examples/hello-multi/backlot.yml`). Content-hash keying is planned;
   until then that upkeep rule is the mechanism.
 - Toolchain-level bumps (global.json, .nvmrc) are env-recycle events, not upkeep —
   unless the repo manages toolchains declaratively (mise/asdf) via its own rule.
@@ -354,8 +354,8 @@ surfaced by `status` and `doctor`.
 
 ## 12. The manifest
 
-One file, `stack.yaml`, at the repo root, validated by a published JSON Schema
-([`../schema/stack.schema.json`](../schema/stack.schema.json)). Everything `{{…}}` is
+One file, `backlot.yml`, at the repo root, validated by a published JSON Schema
+([`../schema/backlot.schema.json`](../schema/backlot.schema.json)). Everything `{{…}}` is
 injected by the engine — symbolic ports, datastore URLs, service URLs — which is what
 makes environments relocatable across substrates. Services are **commands, not
 containers**; backing infrastructure (a DB server) is externally run and probed.
@@ -364,7 +364,7 @@ Every command in the manifest — service `run:`/`build:`, check `run:`, upkeep,
 datastore hooks — executes under `sh`, which is **dash on Ubuntu and
 bash-running-as-sh on macOS**, the two platforms backlot tests. Write POSIX sh
 only: a bashism (`[[`, arrays, `set -o pipefail`) can pass on one leg and fail
-on the other with the same stack.yaml.
+on the other with the same backlot.yml.
 
 ```yaml
 name: myapp

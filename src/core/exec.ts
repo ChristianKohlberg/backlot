@@ -1,7 +1,7 @@
 /**
  * Bounded shell execution for repo-declared commands.
  *
- * Every datastore and appliance command comes from someone's stack.yaml, so it
+ * Every datastore and appliance command comes from someone's backlot.yml, so it
  * can hang: an appliance `start:` that forgets `-d` stays in the foreground, a
  * `psql` against a half-up server blocks on connect. Unbounded, that wedges the
  * bind forever — and because the environment stays in the daemon's `busy` set,

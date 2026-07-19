@@ -48,7 +48,7 @@ backlot release            # environment returns to the pool, warm
 Requires Node ≥ 22.13 and git. The daemon auto-spawns on first use (unix socket,
 per-machine state under `~/.local/state/backlot`; isolate with `BACKLOT_STATE_DIR`).
 
-A repo opts in with one file, `stack.yaml` ([schema](schema/stack.schema.json)):
+A repo opts in with one file, `backlot.yml` ([schema](schema/backlot.schema.json)):
 
 ```yaml
 name: myapp
@@ -106,7 +106,7 @@ Read [docs/architecture.md](docs/architecture.md) — it's short, and it *is* th
 
 Be clear-eyed about what running backlot means:
 
-- **`stack.yaml` commands execute with your privileges.** Services, seeds, upkeep
+- **`backlot.yml` commands execute with your privileges.** Services, seeds, upkeep
   rules, and checks are shell commands from the repo — exactly like `make`, npm
   scripts, or a Justfile. Cloning an untrusted repo and running `backlot up` runs
   that repo's commands as you. Review manifests you didn't write.

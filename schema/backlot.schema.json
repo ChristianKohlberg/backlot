@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://raw.githubusercontent.com/backlot-dev/backlot/main/schema/stack.schema.json",
-  "title": "backlot stack manifest (stack.yaml)",
+  "$id": "https://raw.githubusercontent.com/backlot-dev/backlot/main/schema/backlot.schema.json",
+  "title": "backlot stack manifest (backlot.yml; stack.yaml accepted pre-0.6)",
   "description": "What a repo declares so backlot can broker environments for it. Everything {{...}} is injected by the engine (symbolic ports, datastore URLs, service URLs). Policy (pool sizes, TTLs, substrates) never lives here.",
   "type": "object",
   "required": [

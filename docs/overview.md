@@ -20,7 +20,7 @@ and make *ownership* — not the environment — the disposable thing.
 
 ## How it works
 
-One `stack.yaml` at your repo root declares services, datastores, seed presets, and
+One `backlot.yml` at your repo root declares services, datastores, seed presets, and
 checks. A per-machine daemon (auto-spawned by the CLI, nothing to deploy) supervises a
 pool of environments, each with its own copy of the tree, its own ports, and its own
 datastore namespace. Verbs *lease* an environment, *sync* your worktree into it, and hand
@@ -126,6 +126,6 @@ them is your business.
 ## Where to go next
 
 - [`architecture.md`](architecture.md) — the full design, argued
-- [`../schema/stack.schema.json`](../schema/stack.schema.json) — the manifest contract;
+- [`../schema/backlot.schema.json`](../schema/backlot.schema.json) — the manifest contract;
   [`../examples/`](../examples/) — three runnable fixtures, smallest first
 - [`decisions/`](decisions/) — why it is the way it is; a recorded decision outranks code

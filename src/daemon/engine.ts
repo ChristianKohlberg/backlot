@@ -637,7 +637,7 @@ export class Engine {
     const entries = Object.entries(stack.manifest.services);
     while (started.size < entries.length) {
       const ready = entries.filter(([n, s]) => !started.has(n) && (s.depends_on ?? []).every((d) => started.has(d)));
-      if (ready.length === 0) throw new BrokerError('work-error', 'depends_on cycle in stack.yaml', 'manifest');
+      if (ready.length === 0) throw new BrokerError('work-error', 'depends_on cycle in backlot.yml', 'manifest');
       for (const [name, spec] of ready) {
         if (spec.port) {
           // The allocation loop at the top of this bind fills every declared
@@ -861,7 +861,7 @@ export class Engine {
     const stack = loadStack(opts.cwd);
     const check = stack.manifest.checks?.[opts.check];
     if (!check) {
-      throw new BrokerError('work-error', `no check '${opts.check}' in stack.yaml (have: ${Object.keys(stack.manifest.checks ?? {}).join(', ') || 'none'})`, 'manifest');
+      throw new BrokerError('work-error', `no check '${opts.check}' in backlot.yml (have: ${Object.keys(stack.manifest.checks ?? {}).join(', ') || 'none'})`, 'manifest');
     }
     // A run ALWAYS gets its own ephemeral holder — never the caller's session
     // holder — so `run` can't reset-data-wipe or delete a live `up` session
@@ -1114,7 +1114,7 @@ export class Engine {
   async token(cwd: string, role: string, holder?: string) {
     const stack = loadStack(cwd);
     const spec = stack.manifest.auth?.token;
-    if (!spec) throw new BrokerError('work-error', `stack.yaml declares no auth.token command`, 'manifest');
+    if (!spec) throw new BrokerError('work-error', `backlot.yml declares no auth.token command`, 'manifest');
     const lease = this.journal.leaseForHolder(holder ?? resolve(cwd), stack.id);
     if (!lease) throw new BrokerError('env-error', `no active lease — run 'backlot up' first`, 'lease');
     const env = this.envForLease(lease);
@@ -1138,7 +1138,7 @@ export class Engine {
     // A name the manifest never declared is the caller's mistake — name the
     // services that exist, the way an unknown check does.
     if (!stack.manifest.services[service]) {
-      throw new BrokerError('work-error', `no service '${service}' in stack.yaml (have: ${Object.keys(stack.manifest.services).join(', ')})`, service);
+      throw new BrokerError('work-error', `no service '${service}' in backlot.yml (have: ${Object.keys(stack.manifest.services).join(', ')})`, service);
     }
     const lease = this.journal.leaseForHolder(holder ?? resolve(cwd), stack.id);
     if (!lease) throw new BrokerError('env-error', `no active lease — run 'backlot up' first`, 'lease');
@@ -1189,7 +1189,7 @@ export class Engine {
     const stack = loadStack(cwd);
     const specs = Object.entries(stack.manifest.appliances ?? {}).filter(([n]) => !name || n === name);
     if (name && specs.length === 0) {
-      throw new BrokerError('work-error', `no appliance '${name}' in stack.yaml`, 'appliance');
+      throw new BrokerError('work-error', `no appliance '${name}' in backlot.yml`, 'appliance');
     }
     const results: Record<string, string> = {};
     for (const [n, spec] of specs) {
@@ -1203,7 +1203,7 @@ export class Engine {
   async applianceStop(cwd: string, name: string) {
     const stack = loadStack(cwd);
     const spec = stack.manifest.appliances?.[name];
-    if (!spec) throw new BrokerError('work-error', `no appliance '${name}' in stack.yaml`, 'appliance');
+    if (!spec) throw new BrokerError('work-error', `no appliance '${name}' in backlot.yml`, 'appliance');
     await stopAppliance(name, spec, stack.root);
     logEvent({ level: 'info', kind: 'appliance', detail: `'${name}' stopped (${spec.probe})` });
     return { stopped: name };

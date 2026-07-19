@@ -35,7 +35,7 @@ const VERSION: string = (() => {
 })();
 
 const cwdProp = {
-  cwd: { type: 'string', description: 'Worktree directory (a stack.yaml is found upward from here). REQUIRED — the MCP server has no meaningful cwd of its own.' },
+  cwd: { type: 'string', description: 'Worktree directory (a backlot.yml is found upward from here). REQUIRED — the MCP server has no meaningful cwd of its own.' },
   // Without this, every agent working in one worktree resolves to the same
   // holder (the path) and silently shares — and clobbers — a single lease.
   holder: {
@@ -53,7 +53,7 @@ const TOOLS: Tool[] = [
   },
   {
     name: 'backlot_run',
-    description: 'Run a named check from stack.yaml against a fresh binding: verdict with ok/exitCode/failure taxonomy (work-error = your code, env-error = environment, infra-error = external), artifacts dir, outputs_changed.',
+    description: 'Run a named check from backlot.yml against a fresh binding: verdict with ok/exitCode/failure taxonomy (work-error = your code, env-error = environment, infra-error = external), artifacts dir, outputs_changed.',
     inputSchema: { type: 'object', properties: { ...cwdProp, check: { type: 'string' }, hygiene: { type: 'string', enum: ['reuse', 'reset-data', 'pristine'] } }, required: ['cwd', 'check'] },
     verb: 'run',
   },
