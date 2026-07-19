@@ -266,3 +266,59 @@ describe('an ephemeral flush failure is reported, not swallowed', () => {
     await expect(ds.ensure(h, 'dev', true, true)).rejects.toThrow(/NOT reset|flush failed/);
   }, 30_000);
 });
+
+describe('command-datastore namespaces obey the 63-byte identifier limit', () => {
+  it('two long datastore names stay DISTINCT after truncation', () => {
+    // Postgres silently cuts identifiers at 63 bytes. The env id + a long
+    // datastore name overflowed that, and because the disambiguating name sat
+    // at the END, two datastores truncated to the same identifier — so one's
+    // clean-slate drop destroyed the other's data. templateNs() already got
+    // this defense; ns() needs the same one.
+    const spec = { driver: 'postgres', server: 'external', create: 'true', url: 'postgres://x/{{ns}}' } as never;
+    const h: DsHandle = {
+      envId: 'analytics-platform-backend-Ab3dEf9h-e12',
+      envTree: '/tmp/x',
+      dataDir: '/tmp/x/data',
+    };
+    const a = makeDatastore('reporting_readmodel', spec, 'stk').ns(h);
+    const b = makeDatastore('reporting_readmodel_v2', spec, 'stk').ns(h);
+    expect(a.length).toBeLessThanOrEqual(63);
+    expect(b.length).toBeLessThanOrEqual(63);
+    expect(a).not.toBe(b);
+    // Short names keep the historical readable scheme — existing databases
+    // must stay addressable across an upgrade.
+    expect(makeDatastore('app', spec, 'stk').ns({ ...h, envId: 'web-x1-e1' })).toBe('backlot_web_x1_e1_app');
+  });
+});
+
+describe('rebake serializes with an in-flight bake/restore', () => {
+  it('a concurrent rebake cannot delete the template out from under a bind', async () => {
+    // engine's upkeep pass calls rebake while OTHER envs of the same stack may
+    // be inside ensure(): unserialized, the rm of the template dir landed
+    // between a sibling's bake and its restore copy, failing an innocent bind
+    // with a spurious infra-error (and bumping its failStreak).
+    process.env.BACKLOT_STATE_DIR = mk('backlot-ds-rebake-');
+    const h = handle('rb-e1');
+    const seed = join(mk('backlot-ds-rbseed-'), 'seed.mjs');
+    writeFileSync(
+      seed,
+      `import { DatabaseSync } from 'node:sqlite';
+await new Promise((r) => setTimeout(r, 600)); // a deliberately SLOW bake
+const db = new DatabaseSync(process.argv[2]);
+db.exec('CREATE TABLE t (v TEXT)');
+db.close();`,
+    );
+    const ds = makeDatastore(
+      'app',
+      { driver: 'sqlite', file: 'app.db', create: `node ${seed} {{ns}}`, template: true } as never,
+      'stk-rebake',
+    );
+    const bind = ds.ensure(h, 'dev', false, false);
+    await new Promise((r) => setTimeout(r, 150)); // rebake lands mid-bake
+    await ds.rebake();
+    await expect(bind).resolves.toBeUndefined(); // the bind must survive
+    // And the rebake still did its job once the bake was out of the way.
+    const h2 = handle('rb-e2');
+    await expect(ds.ensure(h2, 'dev', false, false)).resolves.toBeUndefined();
+  }, 30_000);
+});

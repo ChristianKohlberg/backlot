@@ -167,6 +167,45 @@ describe('env-side droppings are swept only on a clean-slate bind', () => {
     expect(existsSync(join(env, 'build-output.bin'))).toBe(true);
   });
 
+  it('purges a stray .git and an undeclared node_modules on a clean-slate bind', () => {
+    const { src, env } = repo();
+    writeFileSync(join(src, 'tracked.txt'), 'v1');
+    syncIntoEnv(src, env, manifest);
+
+    // A check ran `git clone` and an undeclared install INSIDE the environment.
+    // walkAll's name-skip of .git/node_modules serves SOURCE enumeration, so
+    // these survived every clean-slate bind — contradicting architecture.md §6
+    // ("a poisoned env tree self-heals on the next clean-slate bind"). Empty
+    // directories survived too, since walkAll never emits directories.
+    mkdirSync(join(env, 'clone', '.git'), { recursive: true });
+    writeFileSync(join(env, 'clone', '.git', 'HEAD'), 'ref: refs/heads/main');
+    writeFileSync(join(env, 'clone', 'file.txt'), 'cloned');
+    mkdirSync(join(env, 'node_modules', 'left-pad'), { recursive: true });
+    writeFileSync(join(env, 'node_modules', 'left-pad', 'index.js'), 'x');
+    mkdirSync(join(env, 'empty-dir'), { recursive: true });
+
+    syncIntoEnv(src, env, manifest, true);
+
+    expect(existsSync(join(env, 'clone'))).toBe(false);
+    expect(existsSync(join(env, 'node_modules'))).toBe(false);
+    expect(existsSync(join(env, 'empty-dir'))).toBe(false);
+    expect(readFileSync(join(env, 'tracked.txt'), 'utf8')).toBe('v1');
+  });
+
+  it('a node_modules DECLARED under caches: still survives the sweep', () => {
+    const { src, env } = repo();
+    writeFileSync(join(src, 'tracked.txt'), 'v1');
+    const withCache = { name: 'racy', services: {}, checks: {}, caches: ['node_modules'] } as never;
+    syncIntoEnv(src, env, withCache);
+
+    mkdirSync(join(env, 'node_modules', 'left-pad'), { recursive: true });
+    writeFileSync(join(env, 'node_modules', 'left-pad', 'index.js'), 'x');
+
+    syncIntoEnv(src, env, withCache, true);
+
+    expect(readFileSync(join(env, 'node_modules', 'left-pad', 'index.js'), 'utf8')).toBe('x');
+  });
+
   it('never sweeps declared caches or sync.keep, even on a reset', () => {
     const { src, env } = repo();
     writeFileSync(join(src, 'tracked.txt'), 'v1');
@@ -226,6 +265,23 @@ describe('outputs write-back respects the worktree as source of truth', () => {
     expect(() => pullOutputs(src, env, m)).toThrow(/BOTH the environment and the worktree/);
     expect(readFileSync(join(src, 'gen.txt'), 'utf8')).toBe('edited-by-user');
   });
+
+  it('a second pull over already-pulled content is a no-op, not a conflict', () => {
+    const { src, env } = repo();
+    const m = { name: 'o', services: {}, checks: {}, outputs: ['gen.txt'] } as never;
+    writeFileSync(join(src, 'gen.txt'), 'v1');
+    syncIntoEnv(src, env, m);
+
+    writeFileSync(join(env, 'gen.txt'), 'built-in-env');
+    pullOutputs(src, env, m);
+    expect(readFileSync(join(src, 'gen.txt'), 'utf8')).toBe('built-in-env');
+
+    // An agent retry (or a retry after a timed-out first attempt) pulls again.
+    // The worktree hash now equals the env hash but differs from the bind-time
+    // baseline — byte-identical content is not a both-sides conflict.
+    expect(() => pullOutputs(src, env, m)).not.toThrow();
+    expect(readFileSync(join(src, 'gen.txt'), 'utf8')).toBe('built-in-env');
+  });
 });
 
 describe('submodules are refused, not silently omitted', () => {
@@ -247,6 +303,40 @@ describe('submodules are refused, not silently omitted', () => {
     expect(() => syncIntoEnv(src, env, manifest)).toThrow(/submodule/i);
     expect(() => syncIntoEnv(src, env, manifest)).toThrow(/vendor\/dep/);
   }, 60_000);
+
+  // `git update-index --add --cacheinfo 160000,<sha>,<path>` fabricates a
+  // gitlink without a network clone; the on-disk files under it are what
+  // sync.include projects (ls-files --others does not descend past a gitlink).
+  function gitlinkRepo() {
+    const { src, env } = repo();
+    writeFileSync(join(src, 'root.txt'), 'root');
+    execFileSync('git', ['add', 'root.txt'], { cwd: src });
+    execFileSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-qm', 'init'], { cwd: src });
+    const sha = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: src, encoding: 'utf8' }).trim();
+    execFileSync('git', ['update-index', '--add', '--cacheinfo', `160000,${sha},vendor/dep`], { cwd: src });
+    mkdirSync(join(src, 'vendor', 'dep'), { recursive: true });
+    writeFileSync(join(src, 'vendor', 'dep', 'lib.txt'), 'from submodule');
+    return { src, env };
+  }
+
+  it('admits a gitlink whose needed files are declared under sync.include', () => {
+    const { src, env } = gitlinkRepo();
+    // The refusal's own remedy: "declare the paths you need under sync.include".
+    // The gitlink check used to throw BEFORE include was consulted, so the
+    // advertised escape hatch was unreachable.
+    const m = { name: 'racy', services: {}, checks: {}, sync: { include: ['vendor/dep/lib.txt'] } } as never;
+    expect(() => syncIntoEnv(src, env, m)).not.toThrow();
+    expect(readFileSync(join(env, 'vendor', 'dep', 'lib.txt'), 'utf8')).toBe('from submodule');
+    expect(readFileSync(join(env, 'root.txt'), 'utf8')).toBe('root');
+  });
+
+  it('still refuses a gitlink with no covering include entry', () => {
+    const { src, env } = gitlinkRepo();
+    // An include elsewhere in the repo does not cover the gitlink's subtree.
+    const m = { name: 'racy', services: {}, checks: {}, sync: { include: ['root.txt'] } } as never;
+    expect(() => syncIntoEnv(src, env, m)).toThrow(/submodule/i);
+    expect(() => syncIntoEnv(src, env, m)).toThrow(/vendor\/dep/);
+  });
 });
 
 describe('case-only renames', () => {

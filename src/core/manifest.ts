@@ -1,4 +1,5 @@
 import { readFileSync, existsSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 import { dirname, join, resolve } from 'node:path';
 import { parse } from 'yaml';
 import Ajv2020 from 'ajv/dist/2020.js';
@@ -121,8 +122,10 @@ export function loadStack(from: string): Stack {
   const root = findStackRoot(from);
   const manifest = parse(readFileSync(join(root, 'stack.yaml'), 'utf8')) as Manifest;
   validate(manifest);
-  // Identity = absolute root + declared name; filesystem-safe.
-  const id = `${manifest.name}-${Buffer.from(root).toString('base64url').slice(-8)}`;
+  // Identity = absolute root + declared name; filesystem-safe. Hash the WHOLE
+  // path: slicing base64url(root) kept only the last ~6 bytes, so sibling
+  // worktrees like agent-1/myapp and agent-2/myapp collided into one pool.
+  const id = `${manifest.name}-${createHash('sha256').update(root).digest('base64url').slice(0, 8)}`;
   return { manifest, root, id };
 }
 

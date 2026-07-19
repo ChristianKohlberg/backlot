@@ -2,7 +2,7 @@
  * The engine: pool + lease + bind + run orchestration, owning all policy
  * (drivers own transport/storage; the manifest owns repo knowledge).
  */
-import { execFile, execFileSync, spawn } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { mkdirSync, rmSync, copyFileSync, readdirSync, statSync, existsSync, readFileSync, watch as fsWatch, constants as fsConstants } from 'node:fs';
@@ -14,6 +14,7 @@ import { runUpkeep, templateBakeKeys } from '../core/upkeep.js';
 import { freePort, probeFree } from '../core/ports.js';
 import { envsRoot, artifactsRoot, stateRoot } from '../core/paths.js';
 import { BrokerError, template, templateEnv, now, shortId, matchesAny, safeJoin } from '../core/util.js';
+import { cmdTimeoutS, runBounded, runBoundedIO, LONG_CMD_TIMEOUT_S } from '../core/exec.js';
 import { makeDatastore, type DsHandle } from '../drivers/datastores.js';
 import { ensureAppliance, stopAppliance, probeTcp } from '../drivers/appliances.js';
 import { EnvSupervisor, killGroupVerified, reapPids } from './supervisor.js';
@@ -119,9 +120,11 @@ export class Engine {
   private lastRetention = now();
   private lastGc = now();
   private lastSweepMono = performance.now();
-  /** FIFO tickets for capacity waiters, so an early waiter is not starved. */
+  /** FIFO tickets for capacity waiters, so an early waiter is not starved.
+   * PER STACK: capacity is per-stack, so one queue for the whole engine made
+   * a waiter on full stack A block stack B's instantly-satisfiable claim. */
   private waitTicket = 0;
-  private waiting: number[] = [];
+  private waiting = new Map<string, number[]>();
 
   // -------- concurrency: a short pool lock for claim/release bookkeeping and
   // one lock per environment for bind/exec/reset. Two environments (or two
@@ -302,7 +305,7 @@ export class Engine {
   }
 
   /** One atomic claim attempt — MUST run under the pool lock. */
-  private async tryClaim(stack: Stack, holder: string, kind: LeaseKind, hygiene: Hygiene, ttlMs: number, holderPid?: number): Promise<EnvRow | null> {
+  private async tryClaim(stack: Stack, holder: string, kind: LeaseKind, hygiene: Hygiene, ttlMs: number, holderPid?: number, onlyMine = false): Promise<EnvRow | null> {
     // A holder keeps its env: rebinding your own lease is the normal loop —
     // unless that env is being torn down or has flapped, in which case drop the
     // stale lease and fall through to a fresh claim.
@@ -315,6 +318,9 @@ export class Engine {
       }
       this.journal.deleteLease(mine.id);
     }
+    // The queue-bypass path may ONLY refresh an existing lease — claiming free
+    // capacity here would jump the FIFO the waiters are queued on.
+    if (onlyMine) return null;
     const envs = this.journal.envsForStack(stack.id);
     const free = envs
       .filter((e) => !this.journal.leaseForEnv(e.id) && e.state !== 'degraded' && e.state !== 'recycling')
@@ -364,15 +370,28 @@ export class Engine {
   /** Queue at capacity WITHOUT holding the pool lock while sleeping. */
   private async acquireEnv(stack: Stack, holder: string, kind: LeaseKind, hygiene: Hygiene, ttlMs: number, holderPid?: number): Promise<EnvRow> {
     const start = now();
+    // A holder that already holds this stack's lease consumes no capacity —
+    // rebinding only refreshes it. Sending it through the queue stalled the
+    // normal edit-sync-retest loop behind strangers waiting for expiry.
+    // onlyMine keeps the bypass honest: if the lease lapsed mid-flight this
+    // claims nothing and joins the queue like everyone else.
+    if (this.journal.leaseForHolder(holder, stack.id)) {
+      const env = await this.poolLocked(() => this.tryClaim(stack, holder, kind, hygiene, ttlMs, holderPid, true));
+      if (env) return env;
+    }
     // FIFO ticket. Without ordering, every waiter polled independently and a
     // freed environment went to whoever happened to poll first — so an early
     // waiter could time out while later arrivals were served.
     const ticket = ++this.waitTicket;
-    this.waiting.push(ticket);
+    const queue = this.waiting.get(stack.id) ?? [];
+    queue.push(ticket);
+    this.waiting.set(stack.id, queue);
     try {
       return await this.acquireQueued(stack, holder, kind, hygiene, ttlMs, start, ticket, holderPid);
     } finally {
-      this.waiting = this.waiting.filter((t) => t !== ticket);
+      const rest = (this.waiting.get(stack.id) ?? []).filter((t) => t !== ticket);
+      if (rest.length > 0) this.waiting.set(stack.id, rest);
+      else this.waiting.delete(stack.id);
     }
   }
 
@@ -387,8 +406,9 @@ export class Engine {
     holderPid?: number,
   ): Promise<EnvRow> {
     for (;;) {
-      // Only the head of the queue may claim; everyone else waits their turn.
-      const myTurn = this.waiting.length === 0 || this.waiting[0] === ticket;
+      // Only the head of THIS STACK's queue may claim; everyone else waits.
+      const queue = this.waiting.get(stack.id);
+      const myTurn = !queue || queue.length === 0 || queue[0] === ticket;
       const env = myTurn ? await this.poolLocked(() => this.tryClaim(stack, holder, kind, hygiene, ttlMs, holderPid)) : null;
       if (env) return env;
       // Refuse to burn the full wait on something that provably cannot resolve.
@@ -573,12 +593,12 @@ export class Engine {
         const beat = setInterval(() => say(`building '${name}' … ${Math.round((now() - buildStart) / 1000)}s`), 5000);
         beat.unref();
         try {
-          await new Promise<void>((resolvePromise, reject) => {
-            execFile('sh', ['-c', template(spec.build!, ctx)], { cwd: dirs.tree, maxBuffer: 32 * 1024 * 1024 }, (err, _o, stderr) => {
-              if (err) reject(new BrokerError('work-error', `build failed for service '${name}'`, name, String(stderr).slice(0, 800)));
-              else resolvePromise();
-            });
-          });
+          const buildTimeoutS = cmdTimeoutS(LONG_CMD_TIMEOUT_S);
+          const r = await runBounded(template(spec.build!, ctx), dirs.tree, buildTimeoutS);
+          if (r.timedOut) {
+            throw new BrokerError('work-error', `build for service '${name}' timed out after ${buildTimeoutS}s (process group killed; set BACKLOT_CMD_TIMEOUT_S if legitimate)`, name, r.output.slice(-800));
+          }
+          if (r.code !== 0) throw new BrokerError('work-error', `build failed for service '${name}'`, name, r.output.slice(-800));
         } finally {
           clearInterval(beat);
         }
@@ -999,14 +1019,22 @@ export class Engine {
     for (const [name, port] of Object.entries(env.ports)) extra[`BACKLOT_PORT_${name.toUpperCase()}`] = String(port);
     for (const [name, s] of Object.entries(ctx.services)) extra[`BACKLOT_URL_${name.toUpperCase()}`] = s.url;
     for (const [name, d] of Object.entries(ctx.datastores)) extra[`BACKLOT_DS_${name.toUpperCase()}`] = d.url;
-    return this.envLocked(env.id, () => {
+    return this.envLocked(env.id, async () => {
       this.assertUsable(env.id);
       this.touch(env.id);
-      return new Promise((resolvePromise) => {
-        execFile('sh', ['-c', cmd], { cwd: dirs.tree, env: { ...process.env, ...extra }, maxBuffer: 32 * 1024 * 1024 }, (err, stdout, stderr) =>
-          resolvePromise({ exitCode: err ? ((err as { code?: number }).code ?? 1) : 0, stdout: String(stdout).slice(-8000), stderr: String(stderr).slice(-8000) }),
-        );
+      // Bounded, detached, and tagged like a check: an exec blocking on stdin
+      // held the env's busy bit forever, and its untagged children were
+      // invisible to `pool gc` after a daemon crash.
+      const timeoutS = cmdTimeoutS(LONG_CMD_TIMEOUT_S);
+      const r = await runBoundedIO(cmd, dirs.tree, timeoutS, {
+        ...process.env,
+        ...extra,
+        ...serviceTag(env.id, 'exec', stateRoot()),
       });
+      if (r.timedOut) {
+        throw new BrokerError('work-error', `exec timed out after ${timeoutS}s (process group killed; set BACKLOT_CMD_TIMEOUT_S if legitimate)`, 'exec', r.stderr.slice(-800));
+      }
+      return { exitCode: r.code, stdout: r.stdout.slice(-8000), stderr: r.stderr.slice(-8000) };
     });
   }
 
@@ -1020,15 +1048,16 @@ export class Engine {
     const env = this.journal.getEnv(lease.envId)!;
     const dirs = this.envDirs(env.id);
     const ctx = { ...this.templateCtx(stack, env), role };
-    return this.envLocked(env.id, () => {
+    return this.envLocked(env.id, async () => {
       this.assertUsable(env.id);
       this.touch(env.id);
-      return new Promise((resolvePromise, reject) => {
-        execFile('sh', ['-c', template(spec, ctx)], { cwd: dirs.tree, maxBuffer: 1024 * 1024 }, (err, stdout, stderr) => {
-          if (err) reject(new BrokerError('work-error', `auth.token command failed`, 'auth', String(stderr).slice(0, 400)));
-          else resolvePromise({ token: String(stdout).trim(), role });
-        });
-      });
+      const timeoutS = cmdTimeoutS();
+      const r = await runBoundedIO(template(spec, ctx), dirs.tree, timeoutS);
+      if (r.timedOut) {
+        throw new BrokerError('work-error', `auth.token command timed out after ${timeoutS}s (process group killed)`, 'auth', r.stderr.slice(-400));
+      }
+      if (r.code !== 0) throw new BrokerError('work-error', `auth.token command failed`, 'auth', r.stderr.slice(-400));
+      return { token: r.stdout.trim(), role };
     });
   }
 

@@ -90,3 +90,64 @@ describe('pool capacity diagnostics', () => {
     expect(run.json?.ok).toBe(true);
   }, 90_000);
 });
+
+describe('the capacity queue is per-stack, and holders bypass it', () => {
+  it('a full stack A queue neither blocks stack B nor a holder rebinding its own lease', async () => {
+    // One daemon, two stacks. Stack A: POOL_MAX=1, its env leased by A1 with a
+    // short TTL, and a second holder A2 queued on the expiry. The global FIFO
+    // used to make (a) stack B's up — free capacity, instantly satisfiable —
+    // and (b) A1's own rebind — refreshes its existing lease, consumes no
+    // capacity — wait behind A2's ticket for the full expiry dance.
+    const stateDir = mkdtempSync(join(tmpdir(), 'backlot-q-'));
+    dirs.push(stateDir);
+    const mkwt = (name: string) => {
+      const wt = mkdtempSync(join(tmpdir(), `backlot-q-${name}-`));
+      dirs.push(wt);
+      writeFileSync(join(wt, 'srv.mjs'), `import{createServer}from'node:http';console.log('up');createServer((q,s)=>s.end('ok')).listen(Number(process.env.PORT));\n`);
+      writeFileSync(
+        join(wt, 'stack.yaml'),
+        `name: ${name}\nservices:\n  web: { run: node srv.mjs, port: web, env: { PORT: "{{ports.web}}" }, ready: { http: /, timeout: 20 } }\n`,
+      );
+      execFileSync('git', ['init', '-q'], { cwd: wt });
+      return wt;
+    };
+    const wtA = mkwt('qa');
+    const wtB = mkwt('qb');
+    const env = {
+      ...process.env,
+      BACKLOT_STATE_DIR: stateDir,
+      BACKLOT_POOL_MAX: '1',
+      BACKLOT_POOL_MAX_TOTAL: '4',
+      BACKLOT_LEASE_TTL_MS: '8000',
+      BACKLOT_WAIT_MS: '25000',
+      BACKLOT_SWEEP_MS: '300',
+    };
+    const cliIn = (wt: string, args: string[]) =>
+      new Promise<{ code: number; stdout: string; elapsedMs: number }>((resolve) => {
+        const started = Date.now();
+        execFile(process.execPath, [CLI, ...args, '--json'], { cwd: wt, env }, (err, out) =>
+          resolve({ code: err ? ((err as { code?: number }).code ?? 1) : 0, stdout: String(out), elapsedMs: Date.now() - started }),
+        );
+      });
+
+    const a1 = await cliIn(wtA, ['up']);
+    expect(a1.code, a1.stdout).toBe(0);
+    const a1Env = (JSON.parse(a1.stdout) as { envId: string }).envId;
+
+    const a2 = cliIn(wtA, ['up', '--holder', 'second-agent']); // queues on A1's expiry
+    await new Promise((r) => setTimeout(r, 700));
+
+    const b = await cliIn(wtB, ['up']);
+    expect(b.code, b.stdout).toBe(0);
+    expect(b.elapsedMs, `stack B waited ${b.elapsedMs}ms behind stack A's queue`).toBeLessThan(6000);
+
+    const a1Again = await cliIn(wtA, ['up']);
+    expect(a1Again.code, a1Again.stdout).toBe(0);
+    expect(a1Again.elapsedMs, `holder rebind waited ${a1Again.elapsedMs}ms behind a capacity waiter`).toBeLessThan(4000);
+    expect((JSON.parse(a1Again.stdout) as { envId: string }).envId).toBe(a1Env); // same lease, refreshed
+
+    // Fairness intact: the queued waiter is served once the lease lapses.
+    const a2r = await a2;
+    expect(a2r.code, a2r.stdout).toBe(0);
+  }, 60_000);
+});

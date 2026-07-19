@@ -4,10 +4,11 @@
  * fast-fail, restart session services with bounded backoff, and never let a
  * crash pass silently.
  */
-import { spawn, execFile, type ChildProcess } from 'node:child_process';
+import { spawn, type ChildProcess } from 'node:child_process';
 import { appendFileSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { BrokerError, now, safeJoin } from '../core/util.js';
+import { runBounded } from '../core/exec.js';
 import { stateRoot } from '../core/paths.js';
 import { groupAlive, processGroup, sameProcess, serviceTag, startTime } from '../core/procscan.js';
 import type { ReadySpec, ServiceSpec } from '../core/manifest.js';
@@ -197,6 +198,13 @@ export class EnvSupervisor {
       if (fatal && fatal.test(buf)) {
         throw new BrokerError('work-error', `service '${name}' hit a fatal log marker during boot`, name, tail(buf));
       }
+      // The daemonization detector (exit 0 in <2s) already gave up on this
+      // service — polling its dead probe for the rest of ready.timeout only
+      // delayed the verdict and then blamed the ENVIRONMENT for the repo's
+      // own backgrounding run command.
+      if (running.expectedExit && running.proc.exitCode === 0 && running.restarts === 0) {
+        throw new BrokerError('work-error', `service '${name}' exited 0 immediately — a service must stay in the FOREGROUND (it looks daemonized)`, name, tail(buf));
+      }
       if (running.proc.exitCode !== null && running.restarts >= 3) {
         throw new BrokerError('work-error', `service '${name}' exited during boot (${running.proc.exitCode})`, name, tail(buf));
       }
@@ -217,12 +225,11 @@ export class EnvSupervisor {
       } else if (ready.log) {
         if (new RegExp(ready.log).test(buf)) return;
       } else if (ready.cmd) {
-        const ok = await new Promise<boolean>((resolve) => {
-          execFile('sh', ['-c', ready.cmd!], { cwd: this.envTree, env: { ...process.env, ...env } }, (err) =>
-            resolve(!err),
-          );
-        });
-        if (ok) return;
+        // Bounded by what remains of the readiness budget: a probe command
+        // that itself hangs used to block this loop long past ready.timeout.
+        const remainingS = Math.max(1, Math.ceil((timeoutMs - (Date.now() - start)) / 1000));
+        const r = await runBounded(ready.cmd, this.envTree, remainingS, { ...process.env, ...env });
+        if (r.code === 0 && !r.timedOut) return;
       }
       if (Date.now() - start > timeoutMs) {
         throw new BrokerError('env-error', `service '${name}' not ready after ${ready.timeout ?? 120}s`, name, tail(running.buf));

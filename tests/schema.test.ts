@@ -63,3 +63,30 @@ describe('stack.schema.json', () => {
     expect(validate({ name: 'x', services: { web: { run: 'node s.mjs', port: 'Web Port' } } })).toBe(false);
   });
 });
+
+describe('stack identity (loadStack)', () => {
+  it('sibling worktrees with the same repo dir name get DISTINCT stack ids', async () => {
+    // The id used to key on base64url(root).slice(-8) — the last ~6 BYTES of
+    // the path — so /work/agent-1/myapp and /work/agent-2/myapp (the
+    // agent-per-worktree layout backlot targets) collided and silently shared
+    // one pool, one journal namespace, and one template store.
+    const { mkdtempSync, mkdirSync, writeFileSync, rmSync } = await import('node:fs');
+    const { tmpdir } = await import('node:os');
+    const { loadStack } = await import('../src/core/manifest.js');
+    const base = mkdtempSync(join(tmpdir(), 'backlot-id-'));
+    try {
+      const manifest = 'name: myapp\nservices:\n  web:\n    run: node s.mjs\n    port: web\n';
+      for (const agent of ['agent-1', 'agent-2']) {
+        mkdirSync(join(base, agent, 'myapp'), { recursive: true });
+        writeFileSync(join(base, agent, 'myapp', 'stack.yaml'), manifest);
+      }
+      const a = loadStack(join(base, 'agent-1', 'myapp'));
+      const b = loadStack(join(base, 'agent-2', 'myapp'));
+      expect(a.id).not.toBe(b.id);
+      // Same checkout keeps a stable id — pools must survive daemon restarts.
+      expect(loadStack(join(base, 'agent-1', 'myapp')).id).toBe(a.id);
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
+});

@@ -1,16 +1,19 @@
 import { createHash } from 'node:crypto';
-import { execFile } from 'node:child_process';
 import { readFileSync, existsSync, statSync } from 'node:fs';
 import * as pathMod from 'node:path';
+import { cmdTimeoutS, runBounded } from './exec.js';
 
 export const sha256 = (data: string | Buffer): string =>
   createHash('sha256').update(data).digest('hex');
 
-/** Run a shell command, swallowing failures (best-effort cleanup paths). */
+/**
+ * Run a shell command, swallowing failures (best-effort cleanup paths).
+ * Bounded: these run inside awaited sweeps, and a hung `drop` against an
+ * unreachable appliance used to stall retention forever while each later
+ * sweep piled another wedged `sh` onto the same marker.
+ */
 export const runQuiet = (cmd: string, cwd: string): Promise<void> =>
-  new Promise((resolve) => {
-    execFile('sh', ['-c', cmd], { cwd, maxBuffer: 16 * 1024 * 1024 }, () => resolve());
-  });
+  runBounded(cmd, cwd, cmdTimeoutS()).then(() => undefined);
 
 export const fileHash = (path: string): string | null => {
   try {

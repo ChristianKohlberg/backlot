@@ -79,6 +79,10 @@ function enumerate(stackRoot: string, manifest: Manifest): string[] {
   // silently absent from the environment and the build failed with a
   // work-error blaming the repo, with no hint about the cause. Fail loudly
   // instead: partial support here would be worse than an honest refusal.
+  // The escape hatch the refusal advertises: a gitlink with at least one
+  // sync.include entry beneath it is admitted — the declared files ride along
+  // via the include push below (ls-files never descends past a gitlink).
+  const include = manifest.sync?.include ?? [];
   try {
     const staged = execFileSync('git', ['-C', stackRoot, 'ls-files', '-s', '-z', '--', '.'], {
       encoding: 'utf8',
@@ -89,7 +93,11 @@ function enumerate(stackRoot: string, manifest: Manifest): string[] {
       .filter(Boolean)
       .filter((l) => l.startsWith('160000 '))
       .map((l) => l.split('\t')[1] ?? '')
-      .filter(Boolean);
+      .filter(Boolean)
+      // Only FILES beneath the gitlink count: include admits single files, so
+      // an entry naming the gitlink path itself would project nothing and
+      // recreate exactly the silent omission this refusal exists to prevent.
+      .filter((gl) => !include.some((inc) => inc.startsWith(`${gl}/`)));
     if (gitlinks.length > 0) {
       throw new BrokerError(
         'work-error',
@@ -102,7 +110,6 @@ function enumerate(stackRoot: string, manifest: Manifest): string[] {
     /* not a git repo, or ls-files unavailable — the walkAll path covers it */
   }
 
-  const include = manifest.sync?.include ?? [];
   for (const inc of include) {
     safeJoin(stackRoot, inc, 'sync.include'); // reject ../ or absolute before use
     if (isFile(join(stackRoot, inc)) && !listed.includes(inc)) listed.push(inc);
@@ -132,6 +139,51 @@ function walkAll(root: string, prefix = ''): string[] {
     else out.push(rel);
   }
   return out;
+}
+
+/**
+ * The clean-slate sweep gets its own walker: walkAll's name-skip of .git and
+ * node_modules serves SOURCE enumeration, but env-side those names are exactly
+ * the droppings a clean-slate bind must purge — a check's stray clone, an
+ * undeclared install (architecture.md §6: only declared caches: and sync.keep
+ * are protected). Empty directories are droppings too; walkAll never emits
+ * directories, so they survived every reset. A directory a protected pattern
+ * matches keeps its whole subtree; one still holding synced or protected
+ * content survives the rmdir (ENOTEMPTY). Returns the number of files removed.
+ */
+function sweepDroppings(
+  envTree: string,
+  prefix: string,
+  synced: SyncCache,
+  protectedPatterns: string[],
+): number {
+  let deleted = 0;
+  for (const name of readdirSync(join(envTree, prefix))) {
+    const rel = prefix ? `${prefix}/${name}` : name;
+    if (rel === CACHE_FILE || matchesAny(rel, protectedPatterns)) continue;
+    let st;
+    try {
+      st = lstatSync(join(envTree, rel));
+    } catch {
+      continue; // vanished mid-sweep
+    }
+    if (st.isDirectory()) {
+      deleted += sweepDroppings(envTree, rel, synced, protectedPatterns);
+      try {
+        rmdirSync(join(envTree, rel)); // throws ENOTEMPTY unless genuinely empty
+      } catch {
+        /* still holds synced or protected content */
+      }
+    } else if (!synced[rel]) {
+      try {
+        rmSync(join(envTree, rel), { force: true });
+        deleted++;
+      } catch {
+        /* unreadable — leave it */
+      }
+    }
+  }
+  return deleted;
 }
 
 const CACHE_FILE = '.backlot-synced.json';
@@ -336,17 +388,7 @@ export function syncIntoEnv(
   // service, or exec created inside the environment used to survive every bind
   // and contaminate later verdicts.
   if (cleanUntracked) {
-    for (const rel of walkAll(envTree)) {
-      if (next[rel] || rel === CACHE_FILE || matchesAny(rel, protectedPatterns)) continue;
-      try {
-        const target = safeJoin(envTree, rel, 'env dropping');
-        rmSync(target, { force: true });
-        pruneEmptyParents(envTree, target);
-        deleted++;
-      } catch {
-        /* outside the tree or unreadable — leave it */
-      }
-    }
+    deleted += sweepDroppings(envTree, '', next, protectedPatterns);
   }
 
   // Atomic: a torn cache file silently disables deletion mirroring on the next
@@ -390,6 +432,11 @@ export function pullOutputs(stackRoot: string, envTree: string, manifest: Manife
   const changed = changedOutputs(stackRoot, envTree, manifest);
   const bound = loadCache(envTree).entries;
   for (const rel of changed) {
+    // A retried pull (agent retry, or a retry after a timed-out first attempt)
+    // finds the worktree already byte-identical to the env copy — the first
+    // pull wrote it. Identical content needs no pull and is not a conflict,
+    // even though both hashes now differ from the bind-time baseline.
+    if (fileHash(join(stackRoot, rel)) === fileHash(join(envTree, rel))) continue;
     // Refuse to overwrite a worktree file that ALSO moved on since the bind.
     // The worktree is the source of truth (decision 0011); silently reverting
     // an edit the user made after binding is data loss, not a write-back.
