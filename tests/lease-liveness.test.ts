@@ -191,3 +191,38 @@ describe('pool ls makes squatting visible', () => {
     if (afterEnvs[0]?.holderAlive !== null) expect(afterEnvs[0]!.holderAlive).toBe(false);
   }, 120_000);
 });
+
+describe('a quiesce is never published as a teardown (decision 0021)', () => {
+  it('the journal never reads `recycling` during a heat reclaim, and the lease survives', async () => {
+    // Disk is truth: whatever the journal says at any instant is exactly what
+    // a daemon crash at that instant bequeaths to recovery — and recovery's
+    // contract for `recycling` is FINISH THE TEARDOWN (delete env AND lease).
+    // The quiesce path used to borrow `recycling` while stopping services, so
+    // a crash inside that window escalated a routine heat reclaim into total
+    // destruction of a live agent's environment. A TERM-ignoring service
+    // stretches the stop window to observable length.
+    const c = ctx({ BACKLOT_LEASED_IDLE_TTL_MS: '1000', BACKLOT_LEASE_TTL_MS: '600000' });
+    writeFileSync(
+      join(c.wt, 'stack.yaml'),
+      `name: lease\nservices:\n  web: { run: "trap '' TERM; echo ready; sleep 300", ready: { log: ready, timeout: 20 } }\nchecks:\n  ok: { run: "true" }\n`,
+    );
+    expect((await c.cli(['up', '--json'])).code).toBe(0);
+    const envId = c.journal().allEnvs()[0]!.id;
+
+    // Poll the published state through the idle window and the quiesce itself.
+    const seen = new Set<string>();
+    const deadline = Date.now() + 12_000;
+    for (;;) {
+      const row = c.journal().getEnv(envId);
+      if (row) seen.add(row.state);
+      if ((row?.state === 'warm' && Object.keys(row.servicePids).length === 0) || Date.now() > deadline) break;
+      await settle(50);
+    }
+
+    expect([...seen], 'a heat reclaim must never be published as a teardown').not.toContain('recycling');
+    const after = c.journal();
+    const row = after.getEnv(envId);
+    expect(row?.state).toBe('warm'); // heat reclaimed…
+    expect(after.leaseForEnv(envId)).toBeTruthy(); // …lease intact
+  }, 30_000);
+});

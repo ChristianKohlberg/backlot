@@ -38,8 +38,16 @@ reproduction.
   report "pool at capacity" for a pool that never was; a holder's own rebind —
   trivially satisfiable from `leaseForHolder` — also stalls behind the head.
   Queue per stack, and let lease-holding rebinds bypass the queue.
-- [ ] **P2 · Leased-idle quiesce races an in-flight acquire, and its guard
-  cannot fire.** PARTIALLY HELD BACK 2026-07-19: the race window (between
+- [x] **P2 · Leased-idle quiesce races an in-flight acquire, and its guard
+  cannot fire.** FIXED 2026-07-19 by decision 0021: the quiesce now runs
+  under the environment lock with NO borrowed `recycling` state. That closes
+  both halves at once — the idle re-check is serialized against bind
+  epilogues (a concurrent acquire either aborts the quiesce or rebinds the
+  warm env; nothing throws, nothing charges failStreak), and a crash
+  mid-quiesce leaves plain `hot` + dead pids, the ordinary recovery case
+  (reap, warm, lease kept). Enforced by a journal-polling invariant test:
+  `recycling` must never be published during a heat reclaim. Original
+  hold-back note: the race window (between
   tryClaim and the busy mark) is microseconds and closes only with test-only
   interleaving hooks — no honest fails-without-it reproduction exists, so per
   this repo's rules the fix waits for one. The secondary defect (quiesce
