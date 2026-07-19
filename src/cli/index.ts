@@ -9,7 +9,7 @@ import { ensureDaemon, rpc, classifyClientError, type RpcError } from './client.
 const USAGE = `backlot — puts a working instance of a web application in front of you.
 
 Usage:
-  backlot up [--watch] [--reset-data|--pristine] [--ttl <minutes>]
+  backlot up [--watch] [--reset-data|--pristine] [--ttl <minutes>] [--holder-pid <pid>]
                           session lease: sync, upkeep, start services, print context
   backlot run <check> [--pristine] [--pull] [--detach]
                           run lease: bind -> execute the check -> verdict -> release
@@ -31,6 +31,9 @@ Usage:
                           exit; doctor reports drift without acting on it
   backlot daemon stop     stop the daemon (environments are recovered on next use)
 
+--holder-pid (or BACKLOT_HOLDER_PID) ties the lease to a live process: when it exits,
+the environment returns to the pool immediately instead of waiting out the TTL.
+
 Every verb accepts --json. Long verbs (up/run/sync/bind/reset-data) show live progress
 on a terminal (stderr); force with --progress, silence with --quiet. stdout stays clean.
 Exit codes: 0 ok · 1 work-error · 2 env-error · 3 infra-error · 64 usage.`;
@@ -42,7 +45,7 @@ const verb = rawArgv[0];
 // flag's value is never mis-bound as a positional (and an inner command's own
 // flags survive) — the F1 class of argv bugs. Everything after a lone `--`, and
 // EVERYTHING for `exec`, is treated as a raw passthrough command.
-const VALUE_FLAGS = new Set(['--holder', '--ttl', '--role', '--lines', '--ref', '--spec', '--preset']);
+const VALUE_FLAGS = new Set(['--holder', '--holder-pid', '--ttl', '--role', '--lines', '--ref', '--spec', '--preset']);
 const BOOL_FLAGS = new Set(['--json', '--watch', '--reset-data', '--pristine', '--pull', '--detach', '--all', '--raw', '--progress', '--quiet']);
 
 const flagVals = new Map<string, string>();
@@ -156,6 +159,19 @@ async function main(): Promise<void> {
   await ensureDaemon();
   const cwd = process.cwd();
   const holder = flagValue('--holder');
+  // The CLI exits per invocation, so ITS pid is useless as a liveness signal.
+  // This must be the long-lived caller — the agent process, or a supervising
+  // shell. Given one, the daemon releases the lease the moment it dies instead
+  // of holding the environment for the rest of the TTL.
+  const holderPidRaw = flagValue('--holder-pid') ?? process.env.BACKLOT_HOLDER_PID;
+  let holderPid: number | undefined;
+  if (holderPidRaw !== undefined && holderPidRaw !== '') {
+    holderPid = Number(holderPidRaw);
+    if (!Number.isInteger(holderPid) || holderPid <= 0) {
+      console.error(`backlot: --holder-pid expects a process id, got '${holderPidRaw}'`);
+      process.exit(64);
+    }
+  }
 
   let res;
   switch (verb) {
@@ -169,7 +185,7 @@ async function main(): Promise<void> {
           process.exit(64);
         }
       }
-      res = await rpc('up', { cwd, holder, hygiene: hygiene(), watch: flags.has('--watch'), ttlMs }, progress);
+      res = await rpc('up', { cwd, holder, holderPid, hygiene: hygiene(), watch: flags.has('--watch'), ttlMs }, progress);
       endProgress();
       break;
     }

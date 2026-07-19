@@ -17,7 +17,7 @@ import { BrokerError, template, templateEnv, now, shortId, matchesAny, safeJoin 
 import { makeDatastore, type DsHandle } from '../drivers/datastores.js';
 import { ensureAppliance, stopAppliance, probeTcp } from '../drivers/appliances.js';
 import { EnvSupervisor, killGroupVerified, reapPids } from './supervisor.js';
-import { isAlive, procScanSupported, sameProcess, scanTagged, serviceTag } from '../core/procscan.js';
+import { isAlive, procScanSupported, sameProcess, scanTagged, serviceTag, startTime } from '../core/procscan.js';
 import { policy } from '../core/policy.js';
 import { retentionSweep } from '../core/retention.js';
 import { logEvent, recentEvents } from '../core/events.js';
@@ -27,6 +27,7 @@ const POOL_MAX = () => policy().poolMax;
 const POOL_MAX_TOTAL = () => policy().poolMaxTotal;
 const LEASE_TTL = (kind: LeaseKind) => (kind === 'session' ? policy().sessionTtlMs : policy().runTtlMs);
 const IDLE_TTL = () => policy().idleTtlMs;
+const LEASED_IDLE_TTL = () => policy().leasedIdleTtlMs;
 const WAIT_MS = () => policy().waitMs;
 const CHECK_TIMEOUT_S = 600;
 
@@ -42,6 +43,13 @@ export interface UpOptions {
   ttlMs?: number;
   /** Bind from this directory instead of the worktree (bind --ref extraction). */
   sourceRoot?: string;
+  /**
+   * The CALLER's process, so its lease can be released when it dies.
+   * The CLI exits per invocation, so this must be the long-lived agent's pid —
+   * supplied via --holder-pid or BACKLOT_HOLDER_PID, and by the MCP adapter
+   * automatically since that process outlives its tool calls.
+   */
+  holderPid?: number;
   /** Set by the daemon per-request; emits progress frames back to the client. */
   onProgress?: Progress;
 }
@@ -90,6 +98,18 @@ function runGroupCmd(
     proc.on('error', (err) => done({ exitCode: 1, output: `${out}\nspawn error: ${err.message}`.slice(-4000), timedOut }));
     proc.on('exit', (code) => done({ exitCode: code ?? 1, output: out.slice(-4000), timedOut }));
   });
+}
+
+/**
+ * Pin a lease to a live process, when the caller names one.
+ *
+ * The default holder is a worktree PATH, and nothing about a path can die — so
+ * an agent that crashed kept its environment until the TTL expired. A pid plus
+ * its start time can be checked cheaply and survives pid reuse.
+ */
+function holderIdentity(pid?: number): { holderPid?: number; holderStart?: number } {
+  if (!pid || !Number.isInteger(pid) || pid <= 0) return {};
+  return { holderPid: pid, holderStart: startTime(pid) };
 }
 
 export class Engine {
@@ -282,7 +302,7 @@ export class Engine {
   }
 
   /** One atomic claim attempt — MUST run under the pool lock. */
-  private async tryClaim(stack: Stack, holder: string, kind: LeaseKind, hygiene: Hygiene, ttlMs: number): Promise<EnvRow | null> {
+  private async tryClaim(stack: Stack, holder: string, kind: LeaseKind, hygiene: Hygiene, ttlMs: number, holderPid?: number): Promise<EnvRow | null> {
     // A holder keeps its env: rebinding your own lease is the normal loop —
     // unless that env is being torn down or has flapped, in which case drop the
     // stale lease and fall through to a fresh claim.
@@ -290,7 +310,7 @@ export class Engine {
     if (mine) {
       const env = this.journal.getEnv(mine.envId);
       if (env && env.state !== 'recycling' && env.state !== 'degraded') {
-        this.journal.saveLease({ ...mine, hygiene, expiresAt: now() + ttlMs });
+        this.journal.saveLease({ ...mine, hygiene, expiresAt: now() + ttlMs, ...holderIdentity(holderPid) });
         return env;
       }
       this.journal.deleteLease(mine.id);
@@ -304,7 +324,10 @@ export class Engine {
     const total = this.journal.allEnvs().length;
     if (!env && envs.length < POOL_MAX() && total < POOL_MAX_TOTAL()) env = await this.createEnv(stack);
     if (env) {
-      this.journal.saveLease({ id: `l-${shortId()}`, envId: env.id, kind, holder, hygiene, expiresAt: now() + ttlMs });
+      this.journal.saveLease({
+        id: `l-${shortId()}`, envId: env.id, kind, holder, hygiene, expiresAt: now() + ttlMs,
+        ...holderIdentity(holderPid),
+      });
       return env;
     }
     return null;
@@ -339,7 +362,7 @@ export class Engine {
   }
 
   /** Queue at capacity WITHOUT holding the pool lock while sleeping. */
-  private async acquireEnv(stack: Stack, holder: string, kind: LeaseKind, hygiene: Hygiene, ttlMs: number): Promise<EnvRow> {
+  private async acquireEnv(stack: Stack, holder: string, kind: LeaseKind, hygiene: Hygiene, ttlMs: number, holderPid?: number): Promise<EnvRow> {
     const start = now();
     // FIFO ticket. Without ordering, every waiter polled independently and a
     // freed environment went to whoever happened to poll first — so an early
@@ -347,7 +370,7 @@ export class Engine {
     const ticket = ++this.waitTicket;
     this.waiting.push(ticket);
     try {
-      return await this.acquireQueued(stack, holder, kind, hygiene, ttlMs, start, ticket);
+      return await this.acquireQueued(stack, holder, kind, hygiene, ttlMs, start, ticket, holderPid);
     } finally {
       this.waiting = this.waiting.filter((t) => t !== ticket);
     }
@@ -361,11 +384,12 @@ export class Engine {
     ttlMs: number,
     start: number,
     ticket: number,
+    holderPid?: number,
   ): Promise<EnvRow> {
     for (;;) {
       // Only the head of the queue may claim; everyone else waits their turn.
       const myTurn = this.waiting.length === 0 || this.waiting[0] === ticket;
-      const env = myTurn ? await this.poolLocked(() => this.tryClaim(stack, holder, kind, hygiene, ttlMs)) : null;
+      const env = myTurn ? await this.poolLocked(() => this.tryClaim(stack, holder, kind, hygiene, ttlMs, holderPid)) : null;
       if (env) return env;
       // Refuse to burn the full wait on something that provably cannot resolve.
       const blocked = await this.poolLocked(() => this.structuralCapacityBlock(stack, now() + WAIT_MS()));
@@ -702,7 +726,7 @@ export class Engine {
     const kind = opts.kind ?? 'session';
     let hygiene = opts.hygiene ?? 'reuse';
     opts.onProgress?.(`acquiring an environment (pool ${this.journal.envsForStack(stack.id).length}/${POOL_MAX()})`);
-    const env = await this.acquireEnv(stack, holder, kind, hygiene, opts.ttlMs ?? LEASE_TTL(kind));
+    const env = await this.acquireEnv(stack, holder, kind, hygiene, opts.ttlMs ?? LEASE_TTL(kind), opts.holderPid);
     // Auto-escalation (decision 0007): two consecutive bind failures on this
     // warm environment -> the next bind is pristine, whatever was asked.
     if (hygiene !== 'pristine' && env.failStreak >= 2) hygiene = 'pristine';
@@ -735,6 +759,7 @@ export class Engine {
       throw new BrokerError('env-error', `no active lease for this worktree — run 'backlot up' first`, 'lease');
     }
     const env = this.journal.getEnv(envId ?? lease!.envId)!;
+    this.touch(env.id); // asking for context means an agent is still working here
     const ctx = this.templateCtx(stack, env);
     const urls: Record<string, string> = {};
     for (const [name, s] of Object.entries(ctx.services)) urls[name] = s.url;
@@ -927,6 +952,22 @@ export class Engine {
    * already is). bindAndStart already re-checks; exec, token, and the check
    * phase did not.
    */
+  /**
+   * Record that an environment was USED, without extending its lease.
+   *
+   * lastUsedAt only moved on bind, so an agent that bound once and then ran
+   * exec/logs/ctx for an hour looked completely idle — and would be quiesced by
+   * the sweep below while actively working. Activity and ownership are
+   * different questions and are now tracked separately.
+   */
+  private touch(envId: string): void {
+    try {
+      this.journal.touchEnv(envId);
+    } catch {
+      /* the row may have been recycled — nothing to record */
+    }
+  }
+
   private assertUsable(envId: string): EnvRow {
     const fresh = this.journal.getEnv(envId);
     if (!fresh || fresh.state === 'recycling') {
@@ -960,6 +1001,7 @@ export class Engine {
     for (const [name, d] of Object.entries(ctx.datastores)) extra[`BACKLOT_DS_${name.toUpperCase()}`] = d.url;
     return this.envLocked(env.id, () => {
       this.assertUsable(env.id);
+      this.touch(env.id);
       return new Promise((resolvePromise) => {
         execFile('sh', ['-c', cmd], { cwd: dirs.tree, env: { ...process.env, ...extra }, maxBuffer: 32 * 1024 * 1024 }, (err, stdout, stderr) =>
           resolvePromise({ exitCode: err ? ((err as { code?: number }).code ?? 1) : 0, stdout: String(stdout).slice(-8000), stderr: String(stderr).slice(-8000) }),
@@ -980,6 +1022,7 @@ export class Engine {
     const ctx = { ...this.templateCtx(stack, env), role };
     return this.envLocked(env.id, () => {
       this.assertUsable(env.id);
+      this.touch(env.id);
       return new Promise((resolvePromise, reject) => {
         execFile('sh', ['-c', template(spec, ctx)], { cwd: dirs.tree, maxBuffer: 1024 * 1024 }, (err, stdout, stderr) => {
           if (err) reject(new BrokerError('work-error', `auth.token command failed`, 'auth', String(stderr).slice(0, 400)));
@@ -994,6 +1037,7 @@ export class Engine {
     const lease = this.journal.leaseForHolder(holder ?? resolve(cwd), stack.id);
     if (!lease) throw new BrokerError('env-error', `no active lease — run 'backlot up' first`, 'lease');
     const env = this.journal.getEnv(lease.envId)!;
+    this.touch(env.id);
     const logFile = join(this.envDirs(env.id).logs, `${service}.log`);
     if (!existsSync(logFile)) throw new BrokerError('env-error', `no logs for service '${service}'`, service);
     const content = readFileSync(logFile, 'utf8');
@@ -1005,6 +1049,7 @@ export class Engine {
     const lease = this.journal.leaseForHolder(holder ?? resolve(cwd), stack.id);
     if (!lease) throw new BrokerError('env-error', `no active lease — run 'backlot up' first`, 'lease');
     const env = this.journal.getEnv(lease.envId)!;
+    this.touch(env.id);
     return { pulled: pullOutputs(stack.root, this.envDirs(env.id).tree, stack.manifest) };
   }
 
@@ -1058,12 +1103,24 @@ export class Engine {
   }
 
   status() {
-    const envs = this.journal.allEnvs().map((e) => ({
-      id: e.id, stack: e.stack, state: e.state, ports: e.ports, bindCount: e.bindCount,
-      lease: this.journal.leaseForEnv(e.id) ?? null,
-      idleMs: now() - e.lastUsedAt,
-    }));
-    return { pid: process.pid, envs, poolMax: POOL_MAX(), events: recentEvents(15) };
+    const envs = this.journal.allEnvs().map((e) => {
+      const lease = this.journal.leaseForEnv(e.id) ?? null;
+      // Squatting was invisible: the lease showed a holder NAME with no way to
+      // tell whether anyone was still behind it, so a crashed agent's
+      // environment looked identical to a working one.
+      const holderAlive =
+        lease?.holderPid === undefined ? null : sameProcess(lease.holderPid, lease.holderStart);
+      return {
+        id: e.id, stack: e.stack, state: e.state, ports: e.ports, bindCount: e.bindCount,
+        lease,
+        idleMs: now() - e.lastUsedAt,
+        /** null = the holder never identified itself, so liveness is unknowable. */
+        holderAlive,
+        /** Why this environment is still holding its services, in one word. */
+        heat: e.state === 'hot' ? (now() - e.lastUsedAt > LEASED_IDLE_TTL() ? 'stale' : 'active') : 'cold',
+      };
+    });
+    return { pid: process.pid, envs, poolMax: POOL_MAX(), poolMaxTotal: POOL_MAX_TOTAL(), events: recentEvents(15) };
   }
 
   /**
@@ -1247,7 +1304,22 @@ export class Engine {
     for (const lease of this.journal.allLeases()) {
       // Never expire a lease whose env has an operation in flight (a long bind
       // under a tiny TTL must not lose its env mid-bind).
-      if (lease.expiresAt < now() && !this.busy.has(lease.envId)) {
+      if (this.busy.has(lease.envId)) continue;
+      // A holder that named its process and is now gone releases IMMEDIATELY.
+      // Waiting out the TTL meant a crashed agent's environment stayed leased —
+      // and therefore un-poolable — for up to half an hour.
+      if (lease.holderPid !== undefined && !sameProcess(lease.holderPid, lease.holderStart)) {
+        this.journal.deleteLease(lease.id);
+        this.stopWatch(lease.envId);
+        logEvent({
+          level: 'info',
+          kind: 'lease',
+          envId: lease.envId,
+          detail: `holder process ${lease.holderPid} is gone — lease released early instead of waiting out its TTL`,
+        });
+        continue;
+      }
+      if (lease.expiresAt < now()) {
         this.journal.deleteLease(lease.id);
         this.stopWatch(lease.envId);
       }
@@ -1269,15 +1341,25 @@ export class Engine {
         await this.recycleOne(env.id, true);
         continue;
       }
-      if (env.state === 'hot' && !this.journal.leaseForEnv(env.id) && now() - env.lastUsedAt > IDLE_TTL()) {
+      // A lease no longer exempts an environment from reclaiming HEAT. Holding a
+      // lease used to keep services (and their memory) alive for the whole TTL
+      // even if nothing had touched the environment since the bind — which is
+      // how a crashed agent kept multiple gigabytes for half an hour. The lease
+      // still survives; only the services stop, and the next verb rebinds.
+      const leased = this.journal.leaseForEnv(env.id);
+      const idleFor = now() - env.lastUsedAt;
+      const quiesceAfter = leased ? LEASED_IDLE_TTL() : IDLE_TTL();
+      if (env.state === 'hot' && idleFor > quiesceAfter) {
         // Claim under the pool lock so a concurrent bind can't lease this env
         // between the idle check and the service kill (dead-URL race).
-        const claimed = await this.claimForTeardown(env.id, false);
+        // force=true only bypasses the LEASE check; claimForTeardown still
+        // refuses anything busy, so an in-flight operation is never interrupted.
+        const claimed = await this.claimForTeardown(env.id, Boolean(leased));
         if (!claimed) continue;
         // Re-check under the claim: a bind may have touched this environment
         // between the idle test above and the claim, and quiescing it then
         // stops services a live caller is about to use.
-        if (now() - claimed.lastUsedAt <= IDLE_TTL()) {
+        if (now() - claimed.lastUsedAt <= quiesceAfter) {
           claimed.state = 'hot';
           this.journal.saveEnv(claimed);
           continue;
@@ -1292,6 +1374,14 @@ export class Engine {
           // (or a later restart) can still find it instead of losing it.
           fresh.servicePids = survivors;
           this.journal.saveEnv(fresh);
+          if (leased) {
+            logEvent({
+              level: 'info',
+              kind: 'quiesce',
+              envId: env.id,
+              detail: `idle ${Math.round(idleFor / 60_000)}m while leased by '${leased.holder}' — services stopped, lease kept; the next verb rebinds`,
+            });
+          }
         }
       }
     }

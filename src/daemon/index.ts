@@ -22,12 +22,13 @@ const engine = new Engine();
 async function dispatch(verb: string, args: Record<string, unknown>, emit: (phase: string) => void): Promise<unknown> {
   const cwd = String(args.cwd ?? process.cwd());
   const holder = args.holder ? String(args.holder) : undefined;
+  const holderPid = args.holderPid !== undefined ? Number(args.holderPid) : undefined;
   switch (verb) {
     case 'ping':
       return { pid: process.pid };
     case 'up':
       return engine.up({
-        cwd, holder,
+        cwd, holder, holderPid,
         hygiene: (args.hygiene as never) ?? undefined,
         watch: Boolean(args.watch),
         ttlMs: args.ttlMs ? Number(args.ttlMs) : undefined,

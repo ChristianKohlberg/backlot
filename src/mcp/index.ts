@@ -166,7 +166,13 @@ rl.on('line', (line) => {
             return respondError(id, -32602, `tool '${toolName}' requires: ${missing.join(', ')}`);
           }
           await ensureDaemon();
-          const res = await rpc(tool.verb, args);
+          // This adapter process outlives its tool calls and dies with the
+          // agent, which makes it exactly the liveness signal a lease needs —
+          // so supply it automatically unless the caller named its own.
+          const withIdentity = tool.verb === 'up' && args.holderPid === undefined
+            ? { ...args, holderPid: process.pid }
+            : args;
+          const res = await rpc(tool.verb, withIdentity);
           const text = JSON.stringify(res.ok ? res.data : { error: res.error });
           return respond(id, { content: [{ type: 'text', text }], isError: !res.ok });
         }

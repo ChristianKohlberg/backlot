@@ -54,6 +54,16 @@ export interface LeaseRow {
   holder: string;
   hygiene: Hygiene;
   expiresAt: number;
+  /**
+   * The holder's process, when the caller supplied one.
+   *
+   * `holder` is a NAME (a worktree path by default) and nothing about a name
+   * can die — so an agent that crashed held its environment until the TTL
+   * expired, exempt from idle reclamation the whole time. A pid pinned by its
+   * start time can be checked, so a dead holder's lease is released in seconds.
+   */
+  holderPid?: number;
+  holderStart?: number;
 }
 
 export class Journal {
@@ -75,7 +85,8 @@ export class Journal {
       );
       CREATE TABLE IF NOT EXISTS leases (
         id TEXT PRIMARY KEY, env_id TEXT NOT NULL, kind TEXT NOT NULL,
-        holder TEXT NOT NULL, hygiene TEXT NOT NULL, expires_at INTEGER NOT NULL
+        holder TEXT NOT NULL, hygiene TEXT NOT NULL, expires_at INTEGER NOT NULL,
+        holder_pid INTEGER, holder_start INTEGER
       );
       CREATE TABLE IF NOT EXISTS jobs (
         id TEXT PRIMARY KEY, stack_cwd TEXT NOT NULL, check_name TEXT NOT NULL,
@@ -89,6 +100,14 @@ export class Journal {
     // the daemon runs), and without a busy timeout any overlap is an immediate
     // SQLITE_BUSY rather than a short wait.
     this.db.exec('PRAGMA busy_timeout = 5000');
+    // Migrations for journals created before holder identity existed.
+    for (const col of ['holder_pid INTEGER', 'holder_start INTEGER']) {
+      try {
+        this.db.exec(`ALTER TABLE leases ADD COLUMN ${col}`);
+      } catch (err) {
+        if (!/duplicate column name/i.test(String((err as Error).message ?? err))) throw err;
+      }
+    }
     // Migration for journals created before fail_streak existed. Swallowing
     // EVERY error here hid real failures (a corrupt journal, a locked file) as
     // "column already exists", so the daemon carried on against a schema it did
@@ -174,6 +193,11 @@ export class Journal {
     return seq;
   }
 
+  /** Activity, NOT lease renewal: keeps idle reclamation honest without extending ownership. */
+  touchEnv(id: string): void {
+    this.db.prepare('UPDATE envs SET last_used_at = ? WHERE id = ?').run(Date.now(), id);
+  }
+
   /** Update just the recorded service pids (auto-restart keeps recovery honest). */
   updateServicePids(id: string, pids: Record<string, ServicePid>): void {
     this.db.prepare('UPDATE envs SET service_pids = ? WHERE id = ?').run(JSON.stringify(pids), id);
@@ -182,10 +206,12 @@ export class Journal {
   saveLease(l: LeaseRow): void {
     this.db
       .prepare(
-        `INSERT INTO leases (id, env_id, kind, holder, hygiene, expires_at) VALUES (?,?,?,?,?,?)
-         ON CONFLICT(id) DO UPDATE SET expires_at=excluded.expires_at, hygiene=excluded.hygiene`,
+        `INSERT INTO leases (id, env_id, kind, holder, hygiene, expires_at, holder_pid, holder_start)
+         VALUES (?,?,?,?,?,?,?,?)
+         ON CONFLICT(id) DO UPDATE SET expires_at=excluded.expires_at, hygiene=excluded.hygiene,
+           holder_pid=excluded.holder_pid, holder_start=excluded.holder_start`,
       )
-      .run(l.id, l.envId, l.kind, l.holder, l.hygiene, l.expiresAt);
+      .run(l.id, l.envId, l.kind, l.holder, l.hygiene, l.expiresAt, l.holderPid ?? null, l.holderStart ?? null);
   }
 
   private rowToLease(r: Record<string, unknown>): LeaseRow {
@@ -196,6 +222,8 @@ export class Journal {
       holder: r.holder as string,
       hygiene: r.hygiene as Hygiene,
       expiresAt: r.expires_at as number,
+      holderPid: (r.holder_pid as number | null) ?? undefined,
+      holderStart: (r.holder_start as number | null) ?? undefined,
     };
   }
 
