@@ -9,7 +9,8 @@ import { mkdirSync, rmSync, copyFileSync, readdirSync, statSync, existsSync, rea
 import { join, resolve } from 'node:path';
 import { Journal, type EnvRow, type LeaseRow } from '../core/journal.js';
 import { loadStack, defaultPreset, type Stack } from '../core/manifest.js';
-import { syncIntoEnv, changedOutputs, pullOutputs } from '../core/sync.js';
+import { changedOutputs, pullOutputs } from '../core/sync.js';
+import { syncIntoEnvThreaded } from '../core/sync-thread.js';
 import { runUpkeep, templateBakeKeys } from '../core/upkeep.js';
 import { freePort, probeFree } from '../core/ports.js';
 import { envsRoot, artifactsRoot, stateRoot } from '../core/paths.js';
@@ -547,7 +548,9 @@ export class Engine {
     say('syncing worktree');
     // reset-data and pristine mean "clean slate", so they also sweep env-side
     // droppings; a plain reuse bind keeps them (and keeps its build artifacts).
-    const sync = syncIntoEnv(sourceRoot ?? stack.root, dirs.tree, stack.manifest, hygiene !== 'reuse');
+    // On a worker thread: the enumerate/hash/copy of a big bind used to block
+    // the daemon's event loop, stalling every concurrent verb behind it.
+    const sync = await syncIntoEnvThreaded(sourceRoot ?? stack.root, dirs.tree, stack.manifest, hygiene !== 'reuse');
     say(`synced ${sync.files.length} files (${sync.copied} changed, ${sync.deleted} removed)`);
     if (sync.sweptDroppings > 0) {
       // The sweep removed files no sync produced — possibly the very output
@@ -1008,7 +1011,12 @@ export class Engine {
     }
     const tmp = mkdtempSync(join(tmpdir(), 'backlot-ref-'));
     try {
-      execFileSync('sh', ['-c', `git -C "${stack.root}" archive ${sha} | tar -x -C "${tmp}"`]);
+      // Bounded AND off the sync path for the same reason as the worker: a
+      // large archive extraction must not hold the event loop.
+      const r = await runBounded(`git -C "${stack.root}" archive ${sha} | tar -x -C "${tmp}"`, stack.root, cmdTimeoutS(LONG_CMD_TIMEOUT_S));
+      if (r.timedOut || r.code !== 0) {
+        throw new BrokerError('work-error', `git archive of ${sha} failed${r.timedOut ? ' (timed out)' : ''}`, 'bind', r.output.slice(-400));
+      }
       return await this.up({ cwd, holder: holder ?? resolve(cwd), kind: 'session', hygiene: 'reuse', sourceRoot: tmp });
     } finally {
       rmSync(tmp, { recursive: true, force: true });
