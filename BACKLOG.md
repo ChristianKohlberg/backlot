@@ -3,6 +3,49 @@
 Known work, roughly prioritized. Committed to the repo so it survives sessions.
 Each item notes severity and where it was found.
 
+## Dogfood findings (2026-07-19, real 0.6.0 session against the Revamp monorepo)
+
+A full driven session (cold bind, ctx, sync, an hour-equivalent watch matrix,
+run/detach, reset-data, suspend, release, recycle) on the founding consumer.
+The rewritten paths held up (watch projection flawless across atomic renames,
+deletions, storms; ports stable across six binds; teardown left zero orphans).
+What it exposed:
+
+- [ ] **P1 · `backlot sync` full-rebinds on any source change — 57s and three
+  service restarts for a one-line edit — while the watch path proves the 2s
+  projection exists.** syncLease() just calls up(), and bindAndStart's fast
+  path dies on any @source change, hitting stopAll. The sync verb should take
+  the watch-style source-only projection when no upkeep/rebake is pending and
+  services are healthy, falling back to the full bind exactly like watch does.
+  The headline loop verb is currently 25x slower than the machinery beneath it.
+- [ ] **P1 · The sleep pardon is likely inert on Apple Silicon.** It fires when
+  wall-clock outruns performance.now(), but mach_absolute_time keeps advancing
+  through real sleep on Apple Silicon — wall and mono may never diverge, making
+  decision 0009's laptop-sleep story dead code on the primary platform. Needs a
+  REAL lid-close test (human required), then likely a boot-time/uptime-based
+  detection (kern.boottime delta) instead.
+- [ ] **P2 · Cold bind measured 191s vs the ~50s 0.2 baseline — and nothing
+  says where the time went.** --progress shows phase names without durations;
+  run verdicts conflate bind time into durationMs (91.9s reported for a
+  sub-second check). Add per-phase durations to progress and the verdict
+  (bindMs vs checkMs) BEFORE diagnosing the regression; suspects include the
+  29k-file project, emulated MSSQL seeding, and dotnet build.
+- [ ] **P2 · Watch lifecycle is invisible and uncontrollable.** up --watch
+  returns immediately with nothing saying a daemon-resident watcher engaged;
+  status/pool ls carry no watching flag; no stop verb; a later plain up does
+  NOT disengage it (only release does). Surface it and give it an off switch.
+- [ ] **P2 · The event log misses the events that matter.** events.jsonl
+  recorded watch projections and recovery but no bind/upkeep/recycle/
+  lease-expiry events — an upkeep-triggered full rebind left no trace; and
+  daemon.log stayed empty all session.
+- [ ] **P3 · Old-shape datastore namespaces are unreclaimable on shared
+  servers.** The 0.6 ns scheme (name-suffixed) strands prior-shape
+  `backlot_*_e1` DBs on the shared MSSQL — no gc reaches them; pool gc or a
+  doctor hint should surface server-side orphans matching the backlot_ prefix.
+- [ ] **(Revamp-side, for the owner)** `scripts/mint-jwt.py` rejects the
+  `--json` its own manifest passes (token verb broken); one genuinely failing
+  e2e (impersonation "QA ReadOnly" banner). backlot classified both correctly.
+
 ## Review sweep (2026-07-19, two parallel reviewers over src/ halves)
 
 Post-fleet-review sweep after the macOS fixes landed. Every finding below was

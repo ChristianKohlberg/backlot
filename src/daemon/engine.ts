@@ -885,11 +885,11 @@ export class Engine {
   /**
    * The environment a lease points to. leaseForHolder JOINs envs, so the row
    * existed when the lease was resolved — but a concurrent forced teardown can
-   * delete it before this read, and deleteEnv's two statements (envs, then
-   * leases) are not one transaction, so a daemon killed between them leaves a
-   * lease naming a deleted row. Every verb that asserted `getEnv(lease.envId)!`
-   * then crashed with an unclassified TypeError instead of telling the caller
-   * what to do about it.
+   * delete it before this read (deleteEnv is one transaction now, so a torn
+   * write can no longer leave a lease naming a deleted row; journals from
+   * before that change still can, and the sweeper prunes those). Every verb
+   * that asserted `getEnv(lease.envId)!` used to crash with an unclassified
+   * TypeError instead of telling the caller what to do about it.
    */
   private envForLease(lease: LeaseRow): EnvRow {
     const env = this.journal.getEnv(lease.envId);
@@ -1490,6 +1490,24 @@ export class Engine {
     }
 
     for (const lease of this.journal.allLeases()) {
+      // A lease can name an env row that no longer exists: deleteEnv's two
+      // deletes were not one transaction before, so a daemon SIGKILLed
+      // between them left exactly this half-state (journals outlive
+      // releases, so old torn writes and corruption still can). Nothing
+      // resolves it — every read JOINs envs, so the row is invisible to
+      // holders yet squats in the journal until its TTL, and pardon() keeps
+      // shifting that deadline. Disk is truth: prune the corpse, and say so.
+      if (!this.journal.getEnv(lease.envId)) {
+        this.journal.deleteLease(lease.id);
+        this.stopWatch(lease.envId);
+        logEvent({
+          level: 'warn',
+          kind: 'lease',
+          envId: lease.envId,
+          detail: `lease ${lease.id} points at environment ${lease.envId}, which no longer exists — pruned (torn journal write)`,
+        });
+        continue;
+      }
       // Never expire a lease whose env has an operation in flight (a long bind
       // under a tiny TTL must not lose its env mid-bind).
       if (this.busy.has(lease.envId)) continue;
