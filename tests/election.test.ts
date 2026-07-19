@@ -120,8 +120,29 @@ describe('daemon singleton under a real race', () => {
     expect(pids.size).toBe(1);
 
     // And no second daemon is loitering unbound: the lock names the live one.
-    const lock = JSON.parse(readFileSync(join(stateDir, 'daemon.lock'), 'utf8')) as { pid: number };
-    expect(lock.pid).toBe([...pids][0]);
+    // Reading the lock ONCE right here assumed the election was fully settled
+    // the instant the last client answered — but candidates spawned by clients
+    // that were served early are still electing (and conceding) under load, and
+    // a claim caught mid-write parses as garbage. Poll until the claim parses
+    // AND stops changing across consecutive reads; a usurper would settle the
+    // lock on a pid other than the serving daemon's and still fail below.
+    const readLock = (): number | undefined => {
+      try {
+        return (JSON.parse(readFileSync(join(stateDir, 'daemon.lock'), 'utf8')) as { pid?: number }).pid;
+      } catch {
+        return undefined; // absent, truncated, or mid-write — not settled yet
+      }
+    };
+    const deadline = Date.now() + 30_000;
+    let lockPid = readLock();
+    let stable = 0;
+    while (stable < 3 && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 200));
+      const next = readLock();
+      stable = next !== undefined && next === lockPid ? stable + 1 : 0;
+      lockPid = next;
+    }
+    expect(lockPid).toBe([...pids][0]);
   }, 60_000);
 });
 

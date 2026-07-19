@@ -11,27 +11,42 @@ import { createRequire } from 'node:module';
 
 const MCP = join(import.meta.dirname, '..', 'dist', 'mcp', 'index.js');
 
-/** Drive the adapter over stdio the way a real MCP client does. */
-function talk(messages: unknown[], timeoutMs = 4000): Promise<Record<string, unknown>[]> {
+/**
+ * Drive the adapter over stdio the way a real MCP client does. Resolves as soon
+ * as every request id has been answered — the fixed 4s kill-and-parse window
+ * this replaces was a single-shot guess, and under suite load adapter cold
+ * start alone could eat it. These tests assert response SHAPE, not latency, so
+ * the deadline is only a backstop against a wedged adapter (resolving whatever
+ * arrived, so the assertions fail with the actual traffic in view).
+ */
+function talk(messages: unknown[], deadlineMs = 30_000): Promise<Record<string, unknown>[]> {
   const stateDir = mkdtempSync(join(tmpdir(), 'backlot-mcp-'));
+  const wanted = new Set(messages.map((m) => (m as { id?: number }).id).filter((id) => id !== undefined));
   return new Promise((resolve) => {
     const p = spawn(process.execPath, [MCP], {
       stdio: ['pipe', 'pipe', 'ignore'],
       env: { ...process.env, BACKLOT_STATE_DIR: stateDir },
     });
-    let buf = '';
-    p.stdout.on('data', (d) => (buf += String(d)));
-    for (const m of messages) p.stdin.write(JSON.stringify(m) + '\n');
-    setTimeout(() => {
+    const responses: Record<string, unknown>[] = [];
+    const finish = () => {
+      clearTimeout(backstop);
       p.kill('SIGKILL');
       rmSync(stateDir, { recursive: true, force: true });
-      resolve(
-        buf
-          .split('\n')
-          .filter((l) => l.trim())
-          .map((l) => JSON.parse(l) as Record<string, unknown>),
-      );
-    }, timeoutMs);
+      resolve(responses);
+    };
+    const backstop = setTimeout(finish, deadlineMs);
+    let buf = '';
+    p.stdout.on('data', (d) => {
+      buf += String(d);
+      let idx;
+      while ((idx = buf.indexOf('\n')) >= 0) {
+        const line = buf.slice(0, idx);
+        buf = buf.slice(idx + 1);
+        if (line.trim()) responses.push(JSON.parse(line) as Record<string, unknown>);
+      }
+      if ([...wanted].every((id) => responses.some((r) => r.id === id))) finish();
+    });
+    for (const m of messages) p.stdin.write(JSON.stringify(m) + '\n');
   });
 }
 
