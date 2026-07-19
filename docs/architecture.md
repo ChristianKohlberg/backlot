@@ -353,6 +353,14 @@ variable > `$STATE_DIR/config.json` > built-in default.
 | `BACKLOT_SWEEP_MS` | — | 15 s (lease/idle sweep cadence) |
 | `BACKLOT_RETENTION_MS` | — | 10 min (disk retention cadence) |
 
+**Advertised host.** Service URLs advertise `http://localhost:…` while port
+probing guarantees the IPv4 side (127.0.0.1 + wildcard). On dual-stack machines
+`localhost` may resolve to ::1 first; every mainstream client (browsers, curl,
+Node fetch, Python urllib) falls back to 127.0.0.1, which is why this is a
+documented caveat and not a contract change (owner decision, 2026-07-19): an
+IPv4-only service behind a `localhost` URL is reachable in practice, and
+consumers with an exotic IPv6-only client should bind their service dual-stack.
+
 The daemon writes a structured event log (`$STATE_DIR/events.jsonl`, size-capped)
 surfaced by `status` and `doctor`.
 

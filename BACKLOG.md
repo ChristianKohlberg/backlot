@@ -244,7 +244,7 @@ real product gap someone reading the docs would expect to work.
   block. Still open: progress frames are still dropped and there is no
   cancel — both need daemon-side work (a cancel path through the serialized
   queue, MCP progress notifications) and a design decision, not adapter code.
-- [ ] **P3 · Probe host and advertised host disagree.** Port probing binds
+- [x] **P3 · Probe host and advertised host disagree.** DECIDED 2026-07-19 (owner): keep advertising `localhost`, document the IPv4-only caveat (architecture §11) — every mainstream client falls back to 127.0.0.1, proven across this repo's own test history. Original entry: Port probing binds
   `127.0.0.1` (and now the wildcard) while `ctx` advertises `http://localhost:…`.
   On a dual-stack host `localhost` can resolve to `::1`, where a service bound
   only to IPv4 is not listening — so a probed-free, "ready" service can still be

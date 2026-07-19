@@ -1,0 +1,41 @@
+# The soak is the test the fixtures can't be: hours-shaped failures (leaks,
+# drift, unbounded growth) need duration, and duration has no place in the PR
+# loop — so this runs nightly and on demand, never as a merge gate. See
+# docs/soak.md and the header of scripts/soak.mjs.
+name: soak
+on:
+  schedule:
+    - cron: '17 3 * * *' # nightly, off the :00 stampede
+  workflow_dispatch:
+    inputs:
+      minutes:
+        description: 'soak duration in minutes'
+        default: '20'
+      seed:
+        description: 'SOAK_SEED (reproduce a failure; empty = fresh randomness)'
+        default: ''
+jobs:
+  soak:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 22 }
+      - run: npm install
+      - run: npm run build
+      - name: soak
+        run: node scripts/soak.mjs
+        env:
+          SOAK_MINUTES: ${{ github.event.inputs.minutes || '20' }}
+          SOAK_SEED: ${{ github.event.inputs.seed }}
+          SOAK_LOG: soak.log
+      # The log carries the ranked failure summary, the seed to reproduce, and
+      # the daemon's own account (daemon.log/events.jsonl tails) — everything a
+      # human needs before the temp dir is gone with the runner.
+      - name: upload soak log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: soak-log
+          path: soak.log
