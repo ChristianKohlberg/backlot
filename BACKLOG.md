@@ -64,34 +64,41 @@ real product gap someone reading the docs would expect to work.
   macOS, so the same stack.yaml can behave differently on the two legs backlot
   tests. Either document sh-portable-only, or pick a shell explicitly.
 
-- [ ] **P2 · hello-multi smoke is flaky in CI on BOTH legs.** Two sibling tests
-  (`hello-multi fixture > boots the full topology`, and
-  `the multi-service topology > run smoke uses the run preset`) fail
-  intermittently in GitHub Actions and have never failed locally (5/5 clean
-  runs, and 3 full-suite runs). One of them was already main's single ubuntu
-  failure before the 2026-07-18 review branch, so this predates that work.
-  Evidence from the rerun, which is the most informative capture so far:
-  `TypeError: fetch failed … SocketError: other side closed`, with
-  `localAddress: '::1' … remoteFamily: 'IPv6'` — the smoke script's HTTP call to
-  the api is accepted over IPv6 and then the socket closes mid-request, after
-  two earlier checks in the same script succeeded. The verdict is now classified
-  `env-error` with "while a service was not running", which says a supervised
-  service had exited by the time the check failed — so the question is WHICH
-  service dies and why, not whether the check logic is wrong.
-  Worth capturing the daemon's event log and the per-service logs from a failing
-  CI run before theorising further.
+- [x] **P2 · hello-multi smoke is flaky in CI on BOTH legs.** DIAGNOSED AND
+  FIXED 2026-07-19. The service that died was the api, and it died of
+  `SQLITE_BUSY`: api and worker share one sqlite file with no busy timeout, so
+  a read landing inside the worker's commit window (an exclusive lock held for
+  microseconds) threw `Error: database is locked` — uncaught inside the http
+  handler, killing the process mid-request. That is the captured signature
+  exactly: "other side closed" on a kept-alive socket, then a verdict of
+  env-error "while a service was not running". Proven two ways: hammering the
+  read/write race locally crashes the unfixed api in under a second, and a
+  20-iteration CI loop reproduced the flake on iteration 12 in the RAW fixture
+  test (no daemon), pinning it on the fixture rather than the engine. Why only
+  CI: the collision window is microseconds on a fast local machine and the
+  natural cadence is one write per 200ms; slow shared vCPUs widen both. Fixed
+  with `PRAGMA busy_timeout` on both connections (WAL was rejected: the sqlite
+  driver templates by file copy, and `-wal` sidecars would complicate that
+  contract). Regression test holds `BEGIN EXCLUSIVE` under a live api read —
+  deterministic, no race needed — and fails without the fix.
 
-- [ ] **P2 · macOS: hello-python never passes its readiness probe.** The last
-  survivor of the four macOS failures this review inherited. The service starts
-  and logs `hello-python listening on :<port>`, but `ready: { http: /health }`
-  times out after 30s, so the bind fails with an env-error. Not reproducible on
-  Linux, and not reproducible locally against an IPv4-only Node service (the
-  readiness probe now tries `127.0.0.1` as well as the advertised `localhost`,
-  which was the obvious dual-stack explanation and did NOT fix it). Needs
-  someone on a real Mac, or a debug CI run that curls the port from the runner,
-  to find out whether the socket is reachable at all. Tracked rather than
-  quarantined — an `it.skipIf` here would hide the platform gap the macOS leg
-  exists to expose.
+- [x] **P2 · macOS: hello-python never passes its readiness probe.** DIAGNOSED
+  AND FIXED 2026-07-19, by measuring on the runner itself (a debug workflow on
+  `macos-latest`): `socket.gethostbyaddr('127.0.0.1')` takes **35.016s** there —
+  the runner's resolver is broken (firewall disabled, real Homebrew Python;
+  those theories are dead). stdlib `HTTPServer.server_bind()` calls
+  `socket.getfqdn(host)`, i.e. exactly that reverse lookup, BEFORE the server
+  accepts — so the constructor stalled past the manifest's 30s readiness
+  timeout on every boot. Deterministic on the runner, invisible on any Mac with
+  working DNS, and unrelated to dual-stack (the probe never had a socket to
+  reach on ANY address). The misleading part of the evidence was the fixture's
+  own log: `server.py` printed "listening" before constructing the server, so
+  the failure quoted a socket that did not exist. Fixed by overriding
+  `server_bind` to skip the FQDN lookup (a loopback service never uses that
+  name) and printing "listening" only after the bind. Regression tests: a
+  `sitecustomize.py` that stalls `gethostbyaddr` 30s reproduces the runner
+  locally (readiness must still pass), and a squatted port must produce a
+  Traceback with NO "listening" line. Both fail without the fix.
 
 ## CI — macOS-runner failures (2026-07-11) — DIAGNOSED 2026-07-18
 

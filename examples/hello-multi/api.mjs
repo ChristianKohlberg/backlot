@@ -7,6 +7,11 @@ const PORT = Number(process.env.PORT ?? 3100);
 const DB_PATH = process.env.DB_PATH ?? './multi.db';
 
 const db = new DatabaseSync(DB_PATH);
+// The worker commits to this same file. Without a busy timeout, a read landing
+// inside a commit's exclusive-lock window throws SQLITE_BUSY — an uncaught
+// exception here, which kills the service mid-request. The window is
+// microseconds; wait it out instead of dying.
+db.exec('PRAGMA busy_timeout = 5000');
 
 createServer((req, res) => {
   if (req.url === '/health') {
