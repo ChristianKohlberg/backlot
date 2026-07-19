@@ -147,7 +147,7 @@ Declining the rewrite came with a short list of in-language fixes that close the
 same ground. The process-level rejection guards, the floating-promise catches and
 the README/engines pin check landed with the decision; these did not.
 
-- [ ] **P2 · Move `syncIntoEnv` onto a worker thread.** The one open
+- [x] **P2 · Move `syncIntoEnv` onto a worker thread.** FIXED 2026-07-19 (PR #20): per-call worker via sync-thread.ts, same BrokerError contract; bind --ref's archive extraction bounded too; red test measured a 5s status stall during a 24k-file sync, green answers in a fraction of the bind. Original entry: The one open
   language-attributable item (17 synchronous fs/exec calls in one 412-line module)
   blocks the daemon's event loop for every concurrent environment during a large
   bind. `worker_threads` is stable and currently unused here. Same treatment for
@@ -346,7 +346,7 @@ Sequenced implementation:
   string, not seed content; editing a seed needs an `@rebake-template` upkeep rule to
   invalidate. Content-hashing would remove that manual step. (Documented limitation.)
 
-- [ ] **Sync on the event loop.** `syncIntoEnv` + `git archive` (`bind --ref`) run
+- [x] **Sync on the event loop.** FIXED 2026-07-19 with the worker-thread entry above (PR #20). Original entry: `syncIntoEnv` + `git archive` (`bind --ref`) run
   synchronously on the daemon's single thread, stalling all RPCs/sweeper for the
   duration on a big repo. Matters only at fleet scale; the remote refactor touches the
   same seam. (Documented limitation.)
