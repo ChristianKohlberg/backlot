@@ -122,11 +122,11 @@
       "properties": {
         "run": {
           "type": "string",
-          "description": "The supervised process. Daemon is its parent. Executes under `sh` (dash on Ubuntu, bash-as-sh on macOS) — write POSIX sh, no bashisms."
+          "description": "The supervised process. Daemon is its parent. Executes under `sh` (dash on Ubuntu, bash-as-sh on macOS) \u2014 write POSIX sh, no bashisms."
         },
         "build": {
           "type": "string",
-          "description": "Run at bind when fingerprints demand; never during serve. Executes under `sh` (dash on Ubuntu, bash-as-sh on macOS) — write POSIX sh, no bashisms."
+          "description": "Run at bind when fingerprints demand; never during serve. Executes under `sh` (dash on Ubuntu, bash-as-sh on macOS) \u2014 write POSIX sh, no bashisms."
         },
         "watch_run": {
           "type": "string",
@@ -161,6 +161,10 @@
             "type": "string"
           },
           "description": "Services that must be ready before this one starts."
+        },
+        "hot_reload": {
+          "type": "boolean",
+          "description": "This service's run: command watches its own tree and reloads changed files itself (ng serve, dotnet watch, vite). When EVERY service declares it, `backlot sync` projects changed files without restarting services; any service without it forces the full rebind, because projecting under a non-watching process silently serves stale code."
         }
       }
     },
@@ -291,7 +295,7 @@
       "properties": {
         "run": {
           "type": "string",
-          "description": "The check command. Executes under `sh` (dash on Ubuntu, bash-as-sh on macOS) — write POSIX sh, no bashisms."
+          "description": "The check command. Executes under `sh` (dash on Ubuntu, bash-as-sh on macOS) \u2014 write POSIX sh, no bashisms."
         },
         "cwd": {
           "type": "string"

@@ -56,12 +56,17 @@ tails) to the soak log; the temp dir is kept for inspection.
 
 ## What it deliberately doesn't cover
 
-- **Real sleep.** The sweeper's sleep pardon fires only when wall-clock time
-  outruns the monotonic clock — which is what actual suspend looks like, and
-  exactly what `SIGSTOP` does *not* look like (both clocks keep advancing while
-  the process is stopped, so the engine correctly reads it as starvation, not
-  sleep). The chaos `SIGSTOP` tick therefore asserts survival and resumption,
-  not a pardon. A genuine lid-close test needs a human and a laptop.
+- **Real sleep.** The sweeper's sleep pardon has two detectors, and `SIGSTOP`
+  triggers neither: on macOS it reads the kernel's own sleep record
+  (`kern.sleeptime`/`kern.waketime`, which a stopped process does not touch —
+  the kernel records no sleep), and on Linux it fires when wall-clock time
+  outruns the monotonic clock — which is what actual suspend looks like there,
+  and exactly what `SIGSTOP` does *not* look like (both clocks keep advancing
+  while the process is stopped, so the engine correctly reads it as
+  starvation, not sleep). The chaos `SIGSTOP` tick therefore asserts survival
+  and resumption, not a pardon. The pure parsing/decision halves are
+  unit-tested (tests/sleep-pardon.test.ts), but the end-to-end proof remains
+  a genuine lid-close test: a human and a laptop.
 - **Real repos.** The fixtures are honest (git-enumerated sync, sqlite
   datastore, upkeep rules, readiness gates) but tiny; multi-gigabyte trees and
   minutes-long builds are a different experiment.

@@ -21,6 +21,7 @@ import { ensureAppliance, stopAppliance, probeTcp } from '../drivers/appliances.
 import { EnvSupervisor, killGroupVerified, reapPids } from './supervisor.js';
 import { isAlive, processGroup, procScanSupported, sameProcess, scanTagged, serviceTag, startTime } from '../core/procscan.js';
 import { policy } from '../core/policy.js';
+import { kernelSleepGap, readKernelSleepRecord } from '../core/sleep.js';
 import { retentionSweep } from '../core/retention.js';
 import { logEvent, recentEvents } from '../core/events.js';
 import type { Hygiene, LeaseKind, ServicePid } from '../core/types.js';
@@ -129,6 +130,8 @@ export class Engine {
   private lastRetention = now();
   private lastGc = now();
   private lastSweepMono = performance.now();
+  /** waketime (epoch ms) of the last kernel-recorded sleep already pardoned. */
+  private lastPardonedWake = 0;
   /** FIFO tickets for capacity waiters, so an early waiter is not starved.
    * PER STACK: capacity is per-stack, so one queue for the whole engine made
    * a waiter on full stack A block stack B's instantly-satisfiable claim. */
@@ -1097,8 +1100,28 @@ export class Engine {
   }
 
   async syncLease(cwd: string, holder?: string, onProgress?: Progress) {
-    // Rebind the existing lease with current hygiene = reuse semantics.
-    return this.up({ cwd, holder: holder ?? resolve(cwd), kind: 'session', hygiene: 'reuse', onProgress });
+    const h = holder ?? resolve(cwd);
+    // The dogfooded 57s-for-a-one-line-edit: sync used to full-rebind (stop,
+    // rebuild, restart, ready-wait) on ANY source change, defeating the dev
+    // servers' own watchers. When the lease is live and the save fires no
+    // upkeep rule, the watch projection serves the same contract in seconds —
+    // services kept, stage 2 belongs to the dev server (architecture §6).
+    const stack = loadStack(cwd);
+    // Projection is only honest when EVERY service picks the change up itself
+    // (hot_reload, owner decision 2026-07-20): under a non-watching process a
+    // projected file is silently stale code — the exact failure class the
+    // broker exists to prevent — so any undeclared service forces the rebind.
+    const allReload = Object.values(stack.manifest.services).every((svc) => svc.hot_reload === true);
+    const lease = this.journal.leaseForHolder(h, stack.id);
+    if (allReload && lease && lease.expiresAt > now()) {
+      onProgress?.('projecting worktree (services kept)');
+      if ((await this.watchProject(lease.envId, cwd, h)) === 'projected') {
+        return this.ctx(cwd, h, lease.envId);
+      }
+    }
+    // Anything projection can't honestly serve — pending upkeep/rebake, a
+    // quiesced or degraded env, a lapsed lease — takes the full bind.
+    return this.up({ cwd, holder: h, kind: 'session', hygiene: 'reuse', onProgress });
   }
 
   /** bind --ref: project a COMMITTED ref (not the worktree state) into the env. */
@@ -1516,18 +1539,57 @@ export class Engine {
     const t = now();
     const gap = t - this.lastSweep;
     const interval = Number(process.env.BACKLOT_SWEEP_MS ?? 15_000);
-    // Sleep pardon (decision 0009). A long gap in wall-clock time can mean the
-    // machine suspended — or merely that the event loop was starved (a
-    // synchronous hash of a huge tree, heavy host load). Pardoning the second
-    // case pushes every lease and idle deadline out for a machine that never
-    // slept, so leases outlive their TTL and idle envs keep their memory.
+    // Sleep pardon (decision 0009), two detectors:
     //
-    // performance.now() is MONOTONIC and does not advance while suspended, so
-    // wall-clock advancing far beyond it is the signal that distinguishes them.
+    // 1. darwin: the kernel's own record. kern.sleeptime/kern.waketime hold
+    //    the timeval of the last sleep/wake transition — a wake newer than
+    //    both the last pardoned wake and the previous sweep tick means the
+    //    machine slept SINCE that tick, and the pardon gap is exactly
+    //    waketime − sleeptime. This exists because the divergence detector
+    //    below is INERT on Apple Silicon (confirmed by a real lid-close test,
+    //    2026-07-19): mach_absolute_time keeps advancing through real sleep
+    //    there, so wall and mono never diverge. A failed sysctl read yields
+    //    null legs and simply falls through to detector 2.
+    //
+    // 2. All platforms: wall-vs-monotonic divergence. A long gap in
+    //    wall-clock time can mean the machine suspended — or merely that the
+    //    event loop was starved (a synchronous hash of a huge tree, heavy
+    //    host load). Pardoning the second case pushes every lease and idle
+    //    deadline out for a machine that never slept, so leases outlive
+    //    their TTL and idle envs keep their memory. performance.now() does
+    //    not advance while suspended on Linux, so wall-clock advancing far
+    //    beyond it is the signal that distinguishes them.
+    //
+    // One sleep, one pardon: kernelSleepGap refuses a wake at/before the
+    // previous sweep tick (so a gap detector 2 pardoned last sweep is stale
+    // to detector 1), and detector 2 is skipped on a sweep where detector 1
+    // fired (the same sleep produces both signals in the same sweep window).
     const monoGap = performance.now() - this.lastSweepMono;
     this.lastSweepMono = performance.now();
+    let pardoned = false;
+    if (process.platform === 'darwin') {
+      const rec = readKernelSleepRecord();
+      const kernelGap = kernelSleepGap({ ...rec, lastPardonedWake: this.lastPardonedWake, lastSweepWall: this.lastSweep });
+      if (kernelGap !== null && rec.waketime !== null) {
+        this.journal.pardon(kernelGap);
+        this.lastPardonedWake = rec.waketime;
+        pardoned = true;
+        logEvent({
+          level: 'info',
+          kind: 'pardon',
+          detail: `machine slept ${Math.round(kernelGap / 1000)}s — every lease/idle deadline shifted by the gap (detector: kern.sleeptime/kern.waketime)`,
+        });
+      }
+    }
     const suspended = gap - monoGap > 2 * interval;
-    if (gap > 3 * interval && suspended) this.journal.pardon(gap - interval);
+    if (!pardoned && gap > 3 * interval && suspended) {
+      this.journal.pardon(gap - interval);
+      logEvent({
+        level: 'info',
+        kind: 'pardon',
+        detail: `machine slept ~${Math.round((gap - interval) / 1000)}s — every lease/idle deadline shifted by the gap (detector: wall-vs-monotonic)`,
+      });
+    }
     this.lastSweep = t;
 
     // Orphan reclaim (~1 min cadence): a consumer that died ungracefully can

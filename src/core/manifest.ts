@@ -17,6 +17,8 @@ export interface ServiceSpec {
   run: string;
   build?: string;
   watch_run?: string;
+  /** run: self-reloads on file changes — lets `sync` project without a restart. */
+  hot_reload?: boolean;
   cwd?: string;
   port?: string;
   env?: Record<string, string>;

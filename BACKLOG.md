@@ -11,26 +11,40 @@ The rewritten paths held up (watch projection flawless across atomic renames,
 deletions, storms; ports stable across six binds; teardown left zero orphans).
 What it exposed:
 
-- [ ] **P1 · `backlot sync` full-rebinds on any source change — 57s and three
+- [x] **P1 · `backlot sync` full-rebinds on any source change — 57s and three
   service restarts for a one-line edit — while the watch path proves the 2s
-  projection exists.** syncLease() just calls up(), and bindAndStart's fast
+  projection exists.** FIXED 2026-07-20: sync routes through the watch
+  projection when every service declares the new `hot_reload: true` manifest
+  field (owner decision — backlot cannot detect self-reloading run commands,
+  so the manifest states it; any undeclared service keeps the full rebind,
+  since projecting under a non-watching process serves stale code). Revamp
+  wants `hot_reload: true` on its ng-serve/web services to collect the 2s.
+  Original entry: syncLease() just calls up(), and bindAndStart's fast
   path dies on any @source change, hitting stopAll. The sync verb should take
   the watch-style source-only projection when no upkeep/rebake is pending and
   services are healthy, falling back to the full bind exactly like watch does.
   The headline loop verb is currently 25x slower than the machinery beneath it.
-- [ ] **P1 · The sleep pardon is INERT on Apple Silicon — CONFIRMED by a real
-  lid-close test (2026-07-19).** A 3-minute lease, a pmset-verified 4m39s
-  Clamshell Sleep bracketing its expiry: on wake the sweeper released the
-  lease with no pardon and — compounding the events-gap finding — no event of
-  any kind. Cause as suspected: the pardon fires when wall-clock outruns
-  performance.now(), but mach_absolute_time advances through sleep on Apple
-  Silicon, so the divergence never appears. Fix direction: read the kernel's
-  own sleep record instead of inferring from clocks — macOS `sysctl
-  kern.sleeptime` / `kern.waketime` give the last sleep/wake instants, so the
-  sweeper can pardon exactly the kernel-reported gap (Linux keeps the
-  wall-vs-CLOCK_MONOTONIC divergence, which suspend does not advance there).
-  Decision 0009's laptop-sleep story is currently dead code on the primary
-  platform; this is the top of the next session's ledger.
+- [x] **P1 · The sleep pardon is INERT on Apple Silicon — CONFIRMED by a real
+  lid-close test (2026-07-19).** It fired only when wall-clock outran
+  performance.now(), but mach_absolute_time keeps advancing through real sleep
+  on Apple Silicon — the lid-close test showed the lease dying mid-sleep with
+  NO event of any kind: no divergence, no pardon, no log line. Decision 0009's
+  laptop-sleep story was dead code on the primary platform. FIXED 2026-07-19,
+  **pending the human lid-close re-run** (a real lid close cannot be automated;
+  docs/soak.md records the human-only protocol): darwin sweeps now read the
+  kernel's own record (`sysctl -n kern.sleeptime kern.waketime`) and pardon
+  waketime − sleeptime for a wake newer than both the last pardoned wake and
+  the previous sweep tick (guards: sleeptime < waketime, absurd gaps capped;
+  a failed sysctl falls back to the old detector — never breaks the sweep).
+  The wall-vs-mono divergence path is kept as the Linux detector and a second
+  macOS detector; the two cannot double-pardon one sleep (last pardoned
+  waketime is tracked, and a wake at/before the previous sweep tick is stale).
+  Every pardon now logs a kind `pardon` event naming the gap and the detector
+  — the confirmed test's "no event of any kind" is closed too. Parsing and
+  the pardon decision are pure exported functions (src/core/sleep.ts),
+  unit-tested red-first (tests/sleep-pardon.test.ts encodes the confirmed
+  scenario), and the parser is verified against this machine's real
+  post-sleep sysctl output.
 - [ ] **P2 · Cold bind measured 191s vs the ~50s 0.2 baseline — and nothing
   says where the time went.** --progress shows phase names without durations;
   run verdicts conflate bind time into durationMs (91.9s reported for a
