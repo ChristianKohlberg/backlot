@@ -7,6 +7,7 @@
 import { describe, it, expect, afterAll } from 'vitest';
 import { join } from 'node:path';
 import { existsSync, readFileSync, rmSync } from 'node:fs';
+import { DatabaseSync } from 'node:sqlite';
 import { tempDir, freePort, startService, waitHttp, waitLog, runCmd, type Service } from './helpers.js';
 
 const example = join(import.meta.dirname, '..', 'examples', 'hello-multi');
@@ -88,6 +89,33 @@ describe('hello-multi fixture', () => {
     }
     expect(web.proc.exitCode).not.toBe(0);
     expect(web.logs()).toMatch(/Error:/); // the manifest's fatal_logs marker
+  });
+
+  it('api survives a read landing inside a writer lock (the CI smoke flake)', async () => {
+    // The flake this pins down: api and worker share one sqlite file, and a
+    // read arriving during a commit's exclusive-lock window used to throw
+    // SQLITE_BUSY — uncaught, so the api died mid-request and the smoke check
+    // saw "other side closed". Hold the lock deterministically instead of
+    // waiting for the race.
+    const db = join(tmp, 'busy.db');
+    await seed(db, 'dev');
+    const port = await freePort();
+    const api = startService(['node', 'api.mjs'], { cwd: example, env: { PORT: String(port), DB_PATH: db } });
+    services.push(api);
+    await waitHttp(`http://localhost:${port}/health`, api, /Error:/);
+
+    const holder = new DatabaseSync(db);
+    holder.exec('BEGIN EXCLUSIVE'); // blocks new readers until COMMIT
+    try {
+      const inflight = fetch(`http://localhost:${port}/api/jobs`);
+      await new Promise((r) => setTimeout(r, 400));
+      holder.exec('COMMIT');
+      const res = await inflight; // busy_timeout waits the 400ms out
+      expect(res.status).toBe(200);
+      expect(api.proc.exitCode).toBeNull(); // and the service is still alive
+    } finally {
+      holder.close();
+    }
   });
 
   it('preset variants: demo and empty produce their declared shapes', async () => {

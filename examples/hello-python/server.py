@@ -3,6 +3,7 @@
 # model only fit Node apps, this example is where it would show.
 import json
 import os
+import socketserver
 import sqlite3
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
@@ -32,6 +33,20 @@ class Handler(BaseHTTPRequestHandler):
         return self._json({"error": "not found"}, 404)
 
 
+class Server(HTTPServer):
+    # http.server's server_bind() resolves the bound address to an FQDN via
+    # reverse DNS (socket.getfqdn -> gethostbyaddr). On a host with a broken
+    # resolver that lookup can outlast any readiness timeout (GitHub's macOS
+    # runners: 35s, measured) — for a name a loopback-only service never uses.
+    def server_bind(self):
+        socketserver.TCPServer.server_bind(self)
+        self.server_name = self.server_address[0]
+        self.server_port = self.server_address[1]
+
+
 if __name__ == "__main__":
+    server = Server(("127.0.0.1", PORT), Handler)
+    # After construction on purpose: readiness evidence quotes this line, so it
+    # must not exist before the socket does.
     print(f"hello-python listening on :{PORT} (db: {DB_PATH})", flush=True)
-    HTTPServer(("127.0.0.1", PORT), Handler).serve_forever()
+    server.serve_forever()

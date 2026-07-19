@@ -5,6 +5,9 @@ import { DatabaseSync } from 'node:sqlite';
 
 const DB_PATH = process.env.DB_PATH ?? './multi.db';
 const db = new DatabaseSync(DB_PATH);
+// Same file the api reads: without a busy timeout, an update colliding with a
+// reader's lock throws SQLITE_BUSY and kills the worker.
+db.exec('PRAGMA busy_timeout = 5000');
 
 console.log('worker ready — polling for queued jobs');
 
