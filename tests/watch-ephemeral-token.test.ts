@@ -85,6 +85,105 @@ services:
   }, 60_000);
 });
 
+/** Serves its own pid alongside the file content, so a test can tell a
+ * projected save (same process) from a service restart (new process). The
+ * per-request read IS this fixture's "dev watcher": stage 2 needs no reload. */
+const SERVE_PID = `import { createServer } from 'node:http';
+import { readFileSync } from 'node:fs';
+createServer((q, s) => s.end(process.pid + ':' + readFileSync('./message.txt', 'utf8'))).listen(Number(process.env.PORT));
+`;
+
+describe('--watch two-stage reload: an ordinary save must not bounce services', () => {
+  const ctx = makeContext();
+  const wt = mkdtempSync(join(tmpdir(), 'backlot-watch2-'));
+  afterAll(() => {
+    ctx.cleanup();
+    rmSync(wt, { recursive: true, force: true });
+  });
+
+  it('projects the file and keeps the service process — stage 2 belongs to the dev server', async () => {
+    makeStack(
+      wt,
+      `name: watchtwo
+services:
+  web: { run: node server.mjs, port: web, env: { PORT: "{{ports.web}}" }, ready: { http: /, timeout: 20 } }
+`,
+      { 'server.mjs': SERVE_PID, 'message.txt': 'v1' },
+    );
+    const up = await ctx.cli(['up', '--watch', '--json'], wt);
+    expect(up.exitCode, `stdout: ${up.stdout ?? ''}\nstderr: ${up.stderr ?? ''}`).toBe(0);
+    const url = (up.json!.urls as Record<string, string>).web!;
+    const first = await (await fetch(url)).text();
+    const pid1 = first.split(':')[0];
+    expect(first.endsWith(':v1')).toBe(true);
+
+    writeFileSync(join(wt, 'message.txt'), 'v2 — projected'); // NO sync call
+    let body = '';
+    for (let i = 0; i < 100; i++) {
+      try {
+        body = await (await fetch(url, { signal: AbortSignal.timeout(1000) })).text();
+      } catch {
+        /* transient */
+      }
+      if (body.includes('v2')) break;
+      await new Promise((r) => setTimeout(r, 300));
+    }
+    expect(body).toContain('v2 — projected');
+    // The save was projected into the env tree WITHOUT stopping the service:
+    // the same process that served v1 serves v2.
+    expect(body.split(':')[0]).toBe(pid1);
+  }, 60_000);
+});
+
+describe('--watch fallback: a save that trips an upkeep rule restarts services', () => {
+  const ctx = makeContext();
+  const wt = mkdtempSync(join(tmpdir(), 'backlot-watchup-'));
+  afterAll(() => {
+    ctx.cleanup();
+    rmSync(wt, { recursive: true, force: true });
+  });
+
+  it('takes the full bind path: the rule runs and the service pid changes', async () => {
+    makeStack(
+      wt,
+      `name: watchup
+services:
+  web: { run: node server.mjs, port: web, env: { PORT: "{{ports.web}}" }, ready: { http: /, timeout: 20 } }
+upkeep:
+  - { when: dep.lock, run: echo bumped >> ${wt}/upkeep.log }
+`,
+      { 'server.mjs': SERVE_PID, 'message.txt': 'v1', 'dep.lock': 'lock-v1' },
+    );
+    const up = await ctx.cli(['up', '--watch', '--json'], wt);
+    expect(up.exitCode, `stdout: ${up.stdout ?? ''}\nstderr: ${up.stderr ?? ''}`).toBe(0);
+    const url = (up.json!.urls as Record<string, string>).web!;
+    // The first bind runs the rule once (no prior fingerprint).
+    expect(readFileSync(join(wt, 'upkeep.log'), 'utf8').trim().split('\n')).toEqual(['bumped']);
+    const pid1 = (await (await fetch(url)).text()).split(':')[0];
+
+    writeFileSync(join(wt, 'dep.lock'), 'lock-v2'); // trips the upkeep trigger
+    let pid2 = pid1;
+    let log: string[] = [];
+    for (let i = 0; i < 100; i++) {
+      try {
+        pid2 = (await (await fetch(url, { signal: AbortSignal.timeout(1000) })).text()).split(':')[0]!;
+      } catch {
+        /* service restarting mid-bind — expected on this path */
+      }
+      log = existsSync(join(wt, 'upkeep.log'))
+        ? readFileSync(join(wt, 'upkeep.log'), 'utf8').trim().split('\n')
+        : [];
+      if (log.length >= 2 && pid2 !== pid1) break;
+      await new Promise((r) => setTimeout(r, 300));
+    }
+    // The deliberate fallback: a lockfile save genuinely needs the rule, so the
+    // watch sync hands this save to the ordinary bind path — rule applied,
+    // services restarted.
+    expect(log).toEqual(['bumped', 'bumped']);
+    expect(pid2).not.toBe(pid1);
+  }, 60_000);
+});
+
 describe('ephemeral datastores: reset = flush, create once', () => {
   const ctx = makeContext();
   const wt = mkdtempSync(join(tmpdir(), 'backlot-eph-'));

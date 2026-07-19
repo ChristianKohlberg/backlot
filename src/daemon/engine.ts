@@ -11,7 +11,7 @@ import { Journal, type EnvRow, type LeaseRow } from '../core/journal.js';
 import { loadStack, defaultPreset, type Stack } from '../core/manifest.js';
 import { changedOutputs, pullOutputs } from '../core/sync.js';
 import { syncIntoEnvThreaded } from '../core/sync-thread.js';
-import { runUpkeep, templateBakeKeys } from '../core/upkeep.js';
+import { runUpkeep, pendingUpkeep, templateBakeKeys } from '../core/upkeep.js';
 import { freePort, probeFree } from '../core/ports.js';
 import { envsRoot, artifactsRoot, stateRoot } from '../core/paths.js';
 import { BrokerError, template, templateEnv, now, shortId, matchesAny, safeJoin } from '../core/util.js';
@@ -741,7 +741,7 @@ export class Engine {
         if (f === '.git' || f.startsWith('.git/') || f.includes('/.git/') || f.startsWith('.backlot')) return;
         if (timer) clearTimeout(timer);
         timer = setTimeout(() => {
-          void this.up({ cwd, holder, kind: 'session', hygiene: 'reuse', watch: true }).catch(() => {
+          void this.watchSave(envId, cwd, holder).catch(() => {
             /* a broken edit is reported on the next explicit verb; keep watching */
           });
         }, 300);
@@ -770,6 +770,79 @@ export class Engine {
   private stopWatch(envId: string): void {
     this.watchers.get(envId)?.close();
     this.watchers.delete(envId);
+  }
+
+  /**
+   * One debounced save — the two-stage reload (architecture.md §6). Stage 1
+   * projects the changed files into the env tree source-only; stage 2 belongs
+   * to the services' own dev watchers (watch_run), so backlot must not bounce
+   * services on save.
+   *
+   * DELIBERATE FALLBACK: a save that changes what an upkeep rule or
+   * @rebake-template fingerprints (a lockfile, a migration) cannot be served by
+   * projection alone. That save is handed to the ordinary full bind path — the
+   * rule runs, the rebake happens, services restart. Restarting is honest
+   * there; silently skipping the rule would hand out an environment the
+   * manifest itself says is stale.
+   */
+  private async watchSave(envId: string, cwd: string, holder: string): Promise<void> {
+    const outcome = await this.watchProject(envId, cwd, holder);
+    if (outcome === 'fallback') {
+      // The full bind also covers every state projection can't fix on its own:
+      // a quiesced/degraded/recycled-away env, or a lapsed lease that must be
+      // re-earned through the ordinary acquire path.
+      await this.up({ cwd, holder, kind: 'session', hygiene: 'reuse', watch: true });
+    }
+  }
+
+  /**
+   * Stage 1: source-only projection, under the env lock like every other
+   * mutation (the envChains serialization keeps a concurrent manual verb from
+   * interleaving). Returns 'fallback' when this save needs the full bind.
+   */
+  private async watchProject(envId: string, cwd: string, holder: string): Promise<'projected' | 'fallback' | 'skip'> {
+    const stack = loadStack(cwd);
+    return this.envLocked(envId, async () => {
+      const env = this.journal.getEnv(envId);
+      // Teardown owns a recycling env and closes its watcher; do nothing.
+      if (!env || env.state === 'recycling') return 'skip';
+      // Only a LIVE lease still pointing at this env may mutate it from a
+      // watch event; anything else re-earns an environment via acquire.
+      const lease = this.journal.leaseForHolder(holder, stack.id);
+      if (!lease || lease.envId !== envId || lease.expiresAt <= now()) return 'fallback';
+      // Same trust conditions as bindAndStart's fast path: hot, all healthy.
+      // A quiesced or half-dead env needs services started, not just files.
+      if (env.state !== 'hot' || !this.supervisor(env).allHealthyPids()) return 'fallback';
+
+      const dirs = this.envDirs(env.id);
+      // The one sync implementation (constraint: no second copy path).
+      // cleanUntracked stays FALSE: a watch save must never sweep the env's
+      // undeclared build artifacts.
+      const sync = await syncIntoEnvThreaded(stack.root, dirs.tree, stack.manifest, false);
+      // The fallback decision: would this tree fire any upkeep rule or
+      // template rebake? (Same trigger hashes runUpkeep would compare.)
+      if (pendingUpkeep(dirs.tree, sync.files, stack.manifest, env.fingerprints).length > 0) {
+        return 'fallback';
+      }
+
+      // Epilogue on a FRESH row (the onDegraded/onPidsChanged callbacks write
+      // concurrently): record the new source identity and the activity.
+      const fresh = this.journal.getEnv(env.id);
+      if (!fresh || fresh.state !== 'hot') return 'fallback'; // degraded mid-projection
+      fresh.fingerprints['@source'] = sync.sourceHash;
+      fresh.lastUsedAt = now();
+      this.journal.saveEnv(fresh);
+      // Watch activity refreshes the lease (§6) — exactly what the old
+      // full-bind watch path did via tryClaim's re-save.
+      this.journal.saveLease({ ...lease, expiresAt: now() + LEASE_TTL(lease.kind) });
+      if (sync.copied > 0 || sync.deleted > 0) {
+        logEvent({
+          level: 'info', kind: 'watch', envId: env.id,
+          detail: `projected ${sync.copied} changed, ${sync.deleted} removed — services kept (two-stage reload)`,
+        });
+      }
+      return 'projected';
+    });
   }
 
   // ---------------------------------------------------------------- verbs

@@ -155,12 +155,16 @@ local/remote abstraction; the local substrate is enumerate-and-copy.)
   synced at start; edits mid-run cannot contaminate the verdict. New sync = new binding
   revision.
 - `--watch` sessions opt into a daemon-side debounced worktree watcher that auto-syncs
-  on save. **Known gap:** the sync runs the ordinary bind path, whose fast path requires
-  an unchanged source hash — which a watch-triggered sync never has. So every save
-  currently STOPS and restarts the environment's services rather than letting their own
-  watchers pick the change up. The intended two-stage reload (project the file, let the
-  dev-server reload it) is not implemented. Stopped on release/expiry/quiesce/recycle.
-  Watch activity refreshes the lease.
+  on save — the **two-stage reload**: stage 1 projects the changed files into the env
+  tree source-only (same sync implementation as every verb, under the env lock, never
+  sweeping untracked env files), updating the sync cache, the `@source` fingerprint and
+  `lastUsedAt`; stage 2 belongs to the services' own dev watchers (`watch_run`), which
+  pick the projected change up. Services are NOT stopped or restarted on an ordinary
+  save. **Caveat (deliberate):** a save that changes what an upkeep rule or
+  `@rebake-template` fingerprints — a lockfile, a migration — falls back to the full
+  bind path, which runs the rule and restarts services; skipping the rule silently
+  would hand out an environment the manifest says is stale. Stopped on
+  release/expiry/quiesce/recycle. Watch activity refreshes the lease.
 - The environment-side reset restores tracked files hard on every bind. A **clean-slate**
   bind (`--reset-data` or `--pristine`) additionally removes untracked env-side files —
   droppings left by a check, service, or `exec` — **except** declared `caches:`
