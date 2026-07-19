@@ -34,13 +34,14 @@ describe('a large bind does not block the daemon', () => {
       join(wt, 'backlot.yml'),
       `name: bigtree\nservices:\n  idle: { run: "echo ready; sleep 300", ready: { log: "ready", timeout: 60 } }\n`,
     );
-    // A tree big enough that enumerate+hash+copy measurably occupies the sync
-    // phase on any machine: 400 dirs x 60 files of a few hundred bytes.
-    const payload = 'x'.repeat(300);
-    for (let d = 0; d < 400; d++) {
+    // A tree big enough that enumerate+hash+copy occupies the sync phase for
+    // several seconds on ANY machine (fast CI NVMe included): 500 dirs x 80
+    // files of ~1KB — 40k files, the syscalls dominate.
+    const payload = 'x'.repeat(1024);
+    for (let d = 0; d < 500; d++) {
       const dir = join(wt, 'src', `mod-${d}`);
       mkdirSync(dir, { recursive: true });
-      for (let f = 0; f < 60; f++) writeFileSync(join(dir, `f${f}.txt`), `${d}/${f}:${payload}`);
+      for (let f = 0; f < 80; f++) writeFileSync(join(dir, `f${f}.txt`), `${d}/${f}:${payload}`);
     }
     execFileSync('git', ['init', '-q'], { cwd: wt });
     const env = { ...process.env, BACKLOT_STATE_DIR: stateDir, BACKLOT_SWEEP_MS: '500' };
@@ -65,8 +66,14 @@ describe('a large bind does not block the daemon', () => {
     expect(upRes.code, upRes.stdout).toBe(0);
     // Guard against a vacuous pass: the bind must still have been running
     // when the probe fired, or the probe measured nothing.
-    expect(upMs, `bind finished in ${upMs}ms — tree too small to prove anything`).toBeGreaterThan(1500);
+    expect(upMs, `bind finished in ${upMs}ms — tree too small to prove anything`).toBeGreaterThan(3000);
     expect(probe.code).toBe(0);
-    expect(probe.elapsedMs, `status took ${probe.elapsedMs}ms while a bind was syncing — the loop was blocked`).toBeLessThan(1500);
+    // Relative bound: a BLOCKED loop makes the probe wait out most of the
+    // remaining sync (red measured 5005ms of a ~7s bind); a free loop answers
+    // in a fraction of it even when suite-load disk thrash slows everything.
+    expect(
+      probe.elapsedMs,
+      `status took ${probe.elapsedMs}ms during a ${upMs}ms bind — the loop was blocked`,
+    ).toBeLessThan(Math.min(4000, upMs / 2));
   }, 120_000);
 });

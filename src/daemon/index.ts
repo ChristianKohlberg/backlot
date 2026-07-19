@@ -6,7 +6,7 @@
  */
 import { createServer, request } from 'node:http';
 import { existsSync, rmSync, writeFileSync, chmodSync } from 'node:fs';
-import { socketPath, pidPath } from '../core/paths.js';
+import { socketPath, pidPath, stateRoot } from '../core/paths.js';
 import { electSelf, releaseSelf } from './election.js';
 import { BrokerError } from '../core/util.js';
 import { Engine } from './engine.js';
@@ -200,6 +200,13 @@ async function start(): Promise<void> {
     process.exit(0);
   }
   ownsLock = true;
+  // The daemon inherited its cwd from whichever CLI spawned it — usually a
+  // WORKTREE, which the consumer may delete while the daemon lives on. A
+  // deleted cwd makes anything that reads it (worker_threads spawn calls
+  // uv_cwd) fail with ENOENT. Pin cwd to the state root, which the daemon
+  // owns for exactly its own lifetime; nothing daemon-side resolves against
+  // cwd (every RPC carries the client's cwd explicitly).
+  process.chdir(stateRoot());
   // Only the election winner may remove a socket, so this can no longer be a
   // live one: any daemon that could have been listening lost the lock.
   if (existsSync(sock)) rmSync(sock, { force: true }); // stale socket from a dead daemon
