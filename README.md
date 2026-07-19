@@ -44,8 +44,13 @@ the environment returns to the pool with its heat intact. ([Why not checkpointin
 
 ## Quickstart
 
+The one prerequisite: a `backlot.yml` at the repo root (the manifest — see the
+example below). Every runnable fixture in [`examples/`](examples/) ships one, so
+the fastest first contact is a checkout:
+
 ```bash
-npm i -g backlot                           # or from a checkout: npm install && npm run build && npm link
+git clone https://github.com/ChristianKohlberg/backlot && cd backlot
+npm install && npm run build && npm link   # (or, for your own repos: npm i -g backlot)
 cd examples/hello-web
 backlot up --json          # lease a warm env: sync, seed, start, print URLs + creds
 backlot run smoke --json   # bind -> run the check -> JSON verdict -> release
@@ -54,10 +59,12 @@ backlot sync               # edit locally, project it in — seconds; hot_reload
 backlot release            # environment returns to the pool, warm
 ```
 
-Requires Node ≥ 22.13 and git. The daemon auto-spawns on first use (unix socket,
-per-machine state under `~/.local/state/backlot`; isolate with `BACKLOT_STATE_DIR`).
+For your own repo: `npm i -g backlot`, write the `backlot.yml`, then the same
+verbs. Requires Node ≥ 22.13 and git. The daemon auto-spawns on first use (unix
+socket, per-machine state under `~/.local/state/backlot`; isolate with
+`BACKLOT_STATE_DIR`).
 
-A repo opts in with one file, `backlot.yml` ([schema](schema/backlot.schema.json)):
+The manifest, by example ([schema](schema/backlot.schema.json)):
 
 ```yaml
 name: myapp
