@@ -58,6 +58,24 @@ const TOOLS: Tool[] = [
     verb: 'run',
   },
   {
+    name: 'backlot_run_detach',
+    description: 'Submit a named check as a detached job (the CLI\'s `run --detach`): returns {jobId} immediately instead of blocking on a slow bind. Poll it with backlot_job; the verdict is journaled and outlives this call.',
+    inputSchema: { type: 'object', properties: { ...cwdProp, check: { type: 'string' }, hygiene: { type: 'string', enum: ['reuse', 'reset-data', 'pristine'] } }, required: ['cwd', 'check'] },
+    verb: 'run-detach',
+  },
+  {
+    name: 'backlot_job',
+    description: 'Poll a detached run by jobId: state (pending|running|done) plus, once done, the same verdict backlot_run returns (ok/exitCode/failure taxonomy).',
+    inputSchema: { type: 'object', properties: { jobId: { type: 'string', description: 'The jobId a backlot_run_detach call returned.' } }, required: ['jobId'] },
+    verb: 'job',
+  },
+  {
+    name: 'backlot_job_ls',
+    description: 'List recent detached jobs: id, check, state, ok, timestamps.',
+    inputSchema: { type: 'object', properties: {} },
+    verb: 'job-ls',
+  },
+  {
     name: 'backlot_ctx',
     description: 'The current lease context: service URLs, logins, token command, datastore connection strings, artifacts dir, recent service events.',
     inputSchema: { type: 'object', properties: { ...cwdProp }, required: ['cwd'] },

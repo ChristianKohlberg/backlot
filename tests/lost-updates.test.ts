@@ -236,3 +236,4 @@ describe('a check that fails because the environment died is not blamed on the c
     expect(failure?.message).toMatch(/environment failed/);
   }, 120_000);
 });
+

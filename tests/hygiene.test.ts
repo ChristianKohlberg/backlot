@@ -189,3 +189,80 @@ describe('sleep pardon (journal level)', () => {
     rmSync(dir, { recursive: true, force: true });
   });
 });
+
+describe('the clean-slate sweep cannot outrun the fingerprint ledger', () => {
+  const ctx = makeContext();
+  const wt = mkdtempSync(join(tmpdir(), 'backlot-ledger-'));
+  afterAll(() => {
+    ctx.cleanup();
+    rmSync(wt, { recursive: true, force: true });
+  });
+
+  it('upkeep output swept by reset-data is rebuilt, not assumed present', async () => {
+    // An upkeep rule installs into an UNDECLARED dir (no caches: entry). The
+    // reset-data sweep removes it; the ledger's unchanged trigger hash used to
+    // skip the rule anyway — so the check ran against a tree missing exactly
+    // what upkeep exists to provide.
+    writeFileSync(join(wt, 'dep.txt'), 'v1\n');
+    writeFileSync(
+      join(wt, 'stack.yaml'),
+      `name: ledger
+services:
+  idle: { run: "echo ready; sleep 300", ready: { log: "ready", timeout: 20 } }
+upkeep:
+  - { when: dep.txt, run: "mkdir -p node_modules && echo installed > node_modules/marker" }
+checks:
+  deps: { run: "test -f node_modules/marker" }
+`,
+    );
+    execFileSync('git', ['init', '-q'], { cwd: wt });
+
+    const first = await ctx.cli(['run', 'deps', '--json'], wt);
+    expect(first.exitCode, JSON.stringify(first.json)).toBe(0); // upkeep ran, marker exists
+
+    const second = await ctx.cli(['run', 'deps', '--json'], wt);
+    expect(second.exitCode, JSON.stringify(second.json)).toBe(0); // swept -> upkeep must re-run
+  }, 60_000);
+});
+
+describe('environments stranded by a stack-identity change are reaped', () => {
+  const ctx = makeContext({ BACKLOT_SWEEP_MS: '400' });
+  const wt = mkdtempSync(join(tmpdir(), 'backlot-strand-'));
+  afterAll(() => {
+    ctx.cleanup();
+    rmSync(wt, { recursive: true, force: true });
+  });
+
+  it('an unleased env whose recorded stack id no longer matches its root is recycled', async () => {
+    // The sha256 id migration left every pre-upgrade env under an id no
+    // loadStack() will ever produce again: invisible to its stack's pool but
+    // still counted against POOL_MAX_TOTAL and still holding ports — forever,
+    // because the only orphan test was "stackRoot missing".
+    writeFileSync(join(wt, 'server.mjs'), `import{createServer}from'node:http';console.log('up');createServer((q,s)=>s.end('ok')).listen(Number(process.env.PORT));\n`);
+    writeFileSync(
+      join(wt, 'stack.yaml'),
+      `name: strand\nservices:\n  web: { run: node server.mjs, port: web, env: { PORT: "{{ports.web}}" }, ready: { http: /, timeout: 20 } }\n`,
+    );
+    execFileSync('git', ['init', '-q'], { cwd: wt });
+    const up = await ctx.cli(['up', '--json'], wt);
+    expect(up.exitCode).toBe(0);
+    await ctx.cli(['release', '--json'], wt);
+
+    // Fabricate the pre-upgrade survivor: same root, an id the old scheme made.
+    const j = new Journal(join(ctx.stateDir, 'journal.db'));
+    const real = j.allEnvs()[0]!;
+    j.saveEnv({ ...real, id: 'strand-OLDID00-e1', stack: 'strand-OLDID00', ports: { web: 1 }, servicePids: {} });
+    expect(j.allEnvs().length).toBe(2);
+
+    // The sweeper must reap the stranger and keep the legitimate env.
+    const deadline = Date.now() + 15_000;
+    let ids: string[] = [];
+    for (;;) {
+      ids = new Journal(join(ctx.stateDir, 'journal.db')).allEnvs().map((e) => e.id);
+      if (!ids.includes('strand-OLDID00-e1') || Date.now() > deadline) break;
+      await new Promise((r) => setTimeout(r, 400));
+    }
+    expect(ids, `journal still holds: ${ids.join(', ')}`).not.toContain('strand-OLDID00-e1');
+    expect(ids).toContain(real.id);
+  }, 30_000);
+});

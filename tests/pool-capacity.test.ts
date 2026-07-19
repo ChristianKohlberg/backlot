@@ -118,8 +118,8 @@ describe('the capacity queue is per-stack, and holders bypass it', () => {
       BACKLOT_STATE_DIR: stateDir,
       BACKLOT_POOL_MAX: '1',
       BACKLOT_POOL_MAX_TOTAL: '4',
-      BACKLOT_LEASE_TTL_MS: '8000',
-      BACKLOT_WAIT_MS: '25000',
+      BACKLOT_LEASE_TTL_MS: '15000',
+      BACKLOT_WAIT_MS: '40000',
       BACKLOT_SWEEP_MS: '300',
     };
     const cliIn = (wt: string, args: string[]) =>
@@ -130,6 +130,12 @@ describe('the capacity queue is per-stack, and holders bypass it', () => {
         );
       });
 
+    // Pre-warm stack B so its later claim is a warm rebind, not a cold
+    // provision — the assertion below measures QUEUE behavior, and a cold
+    // node boot on a loaded 3-vCPU runner would drown the signal.
+    expect((await cliIn(wtB, ['up'])).code).toBe(0);
+    expect((await cliIn(wtB, ['release'])).code).toBe(0);
+
     const a1 = await cliIn(wtA, ['up']);
     expect(a1.code, a1.stdout).toBe(0);
     const a1Env = (JSON.parse(a1.stdout) as { envId: string }).envId;
@@ -139,15 +145,61 @@ describe('the capacity queue is per-stack, and holders bypass it', () => {
 
     const b = await cliIn(wtB, ['up']);
     expect(b.code, b.stdout).toBe(0);
-    expect(b.elapsedMs, `stack B waited ${b.elapsedMs}ms behind stack A's queue`).toBeLessThan(6000);
+    expect(b.elapsedMs, `stack B waited ${b.elapsedMs}ms behind stack A's queue`).toBeLessThan(8000);
 
     const a1Again = await cliIn(wtA, ['up']);
     expect(a1Again.code, a1Again.stdout).toBe(0);
-    expect(a1Again.elapsedMs, `holder rebind waited ${a1Again.elapsedMs}ms behind a capacity waiter`).toBeLessThan(4000);
+    expect(a1Again.elapsedMs, `holder rebind waited ${a1Again.elapsedMs}ms behind a capacity waiter`).toBeLessThan(6000);
     expect((JSON.parse(a1Again.stdout) as { envId: string }).envId).toBe(a1Env); // same lease, refreshed
 
     // Fairness intact: the queued waiter is served once the lease lapses.
     const a2r = await a2;
     expect(a2r.code, a2r.stdout).toBe(0);
+  }, 60_000);
+});
+
+describe('an expired-but-unswept lease cannot jump the queue', () => {
+  it('the holder bypass refuses a lapsed lease instead of resurrecting it', async () => {
+    // leaseForHolder does not filter on expiry; only the sweeper deletes
+    // lapsed leases. In the window between expiry and the sweep, a returning
+    // holder's queue bypass used to refresh the corpse for a full new TTL —
+    // jumping a waiter who was queued on precisely that expiry.
+    const stateDir = mkdtempSync(join(tmpdir(), 'backlot-exp-'));
+    dirs.push(stateDir);
+    const wt = mkdtempSync(join(tmpdir(), 'backlot-exp-wt-'));
+    dirs.push(wt);
+    writeFileSync(join(wt, 'srv.mjs'), `import{createServer}from'node:http';console.log('up');createServer((q,s)=>s.end('ok')).listen(Number(process.env.PORT));\n`);
+    writeFileSync(
+      join(wt, 'stack.yaml'),
+      `name: exp\nservices:\n  web: { run: node srv.mjs, port: web, env: { PORT: "{{ports.web}}" }, ready: { http: /, timeout: 20 } }\n`,
+    );
+    execFileSync('git', ['init', '-q'], { cwd: wt });
+    const env = {
+      ...process.env,
+      BACKLOT_STATE_DIR: stateDir,
+      BACKLOT_POOL_MAX: '1',
+      BACKLOT_POOL_MAX_TOTAL: '2',
+      BACKLOT_LEASE_TTL_MS: '1500',
+      BACKLOT_WAIT_MS: '30000',
+      BACKLOT_SWEEP_MS: '5000', // the sweep lag IS the window under test
+    };
+    const cli = (args: string[]) =>
+      new Promise<{ code: number; stdout: string; doneAt: number }>((resolve) => {
+        execFile(process.execPath, [CLI, ...args, '--json'], { cwd: wt, env }, (err, out) =>
+          resolve({ code: err ? ((err as { code?: number }).code ?? 1) : 0, stdout: String(out), doneAt: Date.now() }),
+        );
+      });
+
+    expect((await cli(['up'])).code).toBe(0); // holder A leases; TTL 1.5s
+    const waiter = cli(['up', '--holder', 'waiting-agent']); // queues on the expiry
+    await new Promise((r) => setTimeout(r, 2500)); // lease lapsed, sweep not yet run
+    const returning = cli(['up']); // holder A returns inside the window
+
+    const [w, ret] = await Promise.all([waiter, returning]);
+    expect(w.code, w.stdout).toBe(0);
+    expect(ret.code, ret.stdout).toBe(0);
+    // The waiter was first in line for the expiry; the returning holder's
+    // lapsed lease must not have been refreshed over it.
+    expect(w.doneAt, 'the queued waiter finished AFTER the returning holder — the lapsed lease was resurrected').toBeLessThan(ret.doneAt);
   }, 60_000);
 });

@@ -79,3 +79,20 @@ describe('streaming progress', () => {
     await run(['release']);
   }, 30_000);
 });
+
+describe('progress while queued behind a busy environment', () => {
+  it('a verb blocked on the env lock heartbeats instead of going silent', async () => {
+    // A verb that resolves to an env held by another in-flight operation used
+    // to print 'acquiring an environment' and then NOTHING until the lock
+    // freed — a legitimate wait was indistinguishable from a hang.
+    const up = await run(['up', '--json']);
+    expect(up.code, up.stdout).toBe(0);
+    const slow = run(['exec', 'sleep', '4']); // holds the env lock
+    await new Promise((r) => setTimeout(r, 500));
+    const queued = await run(['sync', '--progress', '--json']);
+    expect(queued.code, queued.stdout).toBe(0);
+    expect(queued.stderr.replace(/\r/g, '\n')).toMatch(/waiting for another operation/);
+    await slow;
+    await run(['release']);
+  }, 30_000);
+});

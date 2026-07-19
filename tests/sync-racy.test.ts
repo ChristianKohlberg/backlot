@@ -337,6 +337,18 @@ describe('submodules are refused, not silently omitted', () => {
     expect(() => syncIntoEnv(src, env, m)).toThrow(/submodule/i);
     expect(() => syncIntoEnv(src, env, m)).toThrow(/vendor\/dep/);
   });
+
+  it('an include entry that is not an existing FILE does not disarm the refusal', () => {
+    const { src, env } = gitlinkRepo();
+    // A directory entry (or a typo) beneath the gitlink would be silently
+    // dropped by the include push (files only) — admitting the gitlink on its
+    // say-so projects NOTHING, recreating the silent omission the refusal
+    // exists to prevent, now with no error at all.
+    for (const bad of ['vendor/dep', 'vendor/dep/nope.txt']) {
+      const m = { name: 'racy', services: {}, checks: {}, sync: { include: [bad] } } as never;
+      expect(() => syncIntoEnv(src, env, m), `include: ['${bad}']`).toThrow(/submodule/i);
+    }
+  });
 });
 
 describe('case-only renames', () => {
@@ -353,6 +365,22 @@ describe('case-only renames', () => {
     // On Linux these are two distinct files, so the old one must be removed.
     // On macOS APFS they are the SAME file and removing it would destroy the
     // just-synced content — which is what the probe distinguishes.
+    expect(existsSync(join(env, 'Readme.md'))).toBe(true);
+    expect(readFileSync(join(env, 'Readme.md'), 'utf8')).toBe('docs');
+  });
+
+  it('the clean-slate sweep does not eat a case-renamed file on an insensitive fs', () => {
+    const { src, env } = repo();
+    writeFileSync(join(src, 'README.md'), 'docs');
+    syncIntoEnv(src, env, manifest);
+
+    rmSync(join(src, 'README.md'));
+    writeFileSync(join(src, 'Readme.md'), 'docs');
+    // Clean-slate: on APFS the disk entry may keep the OLD casing while the
+    // sync cache holds the new key — the sweep must use the same
+    // case-insensitivity probe as the deletion mirror, or it deletes the file
+    // sync just guaranteed.
+    syncIntoEnv(src, env, manifest, true);
     expect(existsSync(join(env, 'Readme.md'))).toBe(true);
     expect(readFileSync(join(env, 'Readme.md'), 'utf8')).toBe('docs');
   });

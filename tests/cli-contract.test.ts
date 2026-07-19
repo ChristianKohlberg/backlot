@@ -99,6 +99,34 @@ describe('a wedged daemon must not hang the caller forever', () => {
   }, 60_000);
 });
 
+describe('an over-limit socket path is refused as infra, not silently truncated', () => {
+  it('exits 3 naming the sun_path limit instead of running against a truncated socket', async () => {
+    const base = mkdtempSync(join(tmpdir(), 'backlot-sun-cli-'));
+    // Deep enough that stateDir/daemon.sock exceeds AF_UNIX sun_path (104 on
+    // macOS). Unguarded, BOTH client and daemon truncate identically, so this
+    // would "work" — against a socket that collides across state dirs.
+    const stateDir = join(base, 'x'.repeat(120));
+    const wt = mkdtempSync(join(tmpdir(), 'backlot-sun-cli-wt-'));
+    dirs.push(base, stateDir, wt);
+    writeFileSync(join(wt, 'stack.yaml'), `name: sun\nservices: {}\nchecks:\n  ok: { run: "true" }\n`);
+
+    const { code, stdout } = await new Promise<{ code: number; stdout: string }>((resolve) => {
+      execFile(
+        process.execPath,
+        [CLI, 'status', '--json'],
+        { cwd: wt, env: { ...process.env, BACKLOT_STATE_DIR: stateDir } },
+        (err, out) => resolve({ code: err ? ((err as { code?: number }).code ?? 1) : 0, stdout: String(out) }),
+      );
+    });
+
+    expect(code).toBe(3); // infra-error, per the exit-code contract
+    const body = JSON.parse(stdout) as { ok: boolean; error: { class: string; message: string } };
+    expect(body.ok).toBe(false);
+    expect(body.error.class).toBe('infra-error');
+    expect(body.error.message).toMatch(/sun_path/);
+  }, 60_000);
+});
+
 describe('exec preserves argument boundaries', () => {
   it('keeps a quoted argument containing spaces as ONE argument', async () => {
     const stateDir = mkdtempSync(join(tmpdir(), 'backlot-exec-'));

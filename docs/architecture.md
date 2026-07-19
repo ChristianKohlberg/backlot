@@ -115,7 +115,10 @@ Local pools are convergence all the way down. Same verbs above the driver line.
 - **A per-machine daemon, auto-spawned by the CLI on first use** (the tmux/Docker
   pattern), speaking HTTP over a unix socket. The daemon exists because processes need
   a parent: someone must supervise services, watch readiness, expire leases, and
-  quiesce idle environments while no CLI is running.
+  quiesce idle environments while no CLI is running. Verbs fired in parallel on a
+  cold machine all race to spawn it; the singleton election keeps that safe (one
+  wins, losers concede, their clients fall through to the winner), but fleets
+  should still warm the daemon with a cheap `backlot status` before parallelizing.
 - **Concurrency lives at the environment boundary**: a short pool lock serializes
   claim/release bookkeeping; one lock per environment serializes bind/exec/reset on it.
   Different environments (and different stacks) bind in parallel — with the caveat
@@ -356,6 +359,12 @@ One file, `stack.yaml`, at the repo root, validated by a published JSON Schema
 injected by the engine — symbolic ports, datastore URLs, service URLs — which is what
 makes environments relocatable across substrates. Services are **commands, not
 containers**; backing infrastructure (a DB server) is externally run and probed.
+
+Every command in the manifest — service `run:`/`build:`, check `run:`, upkeep,
+datastore hooks — executes under `sh`, which is **dash on Ubuntu and
+bash-running-as-sh on macOS**, the two platforms backlot tests. Write POSIX sh
+only: a bashism (`[[`, arrays, `set -o pipefail`) can pass on one leg and fail
+on the other with the same stack.yaml.
 
 ```yaml
 name: myapp

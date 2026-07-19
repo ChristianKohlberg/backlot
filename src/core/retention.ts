@@ -8,7 +8,7 @@ import { join } from 'node:path';
 import { artifactsRoot, templatesRoot, envsRoot } from './paths.js';
 import { logEvent } from './events.js';
 import { runQuiet } from './util.js';
-import { parseBakedMarker } from '../drivers/datastores.js';
+import { parseBakedMarker, withBakeLock } from '../drivers/datastores.js';
 import type { Journal } from './journal.js';
 import type { Policy } from './policy.js';
 
@@ -96,35 +96,42 @@ export async function pruneTemplates(p: Policy, root = templatesRoot()): Promise
   for (const stackDir of entriesOf(root)) {
     const dir = join(root, stackDir);
     if (!existsSync(dir)) continue;
-    const files = entriesOf(dir)
-      .map((f) => {
-        try {
-          return { f, mtime: statSync(join(dir, f)).mtimeMs };
-        } catch {
-          return null;
-        }
-      })
-      .filter((x): x is { f: string; mtime: number } => x !== null)
-      .sort((a, b) => b.mtime - a.mtime);
-    for (const { f } of files.slice(p.templatesKeep)) {
-      const full = join(dir, f);
-      if (f.endsWith('.baked')) {
-        try {
-          const marker = parseBakedMarker(readFileSync(full, 'utf8'));
-          if (marker.drop) {
-            // This command came from a manifest that may no longer exist on
-            // disk. Re-executing it silently is the part that deserves a
-            // record, so the state dir stays auditable.
-            logEvent({ level: 'info', kind: 'retention', detail: `dropping baked template via persisted command from ${f}` });
-            await runQuiet(marker.drop, root);
+    // The stack-scoped bake lock (the dir name IS the stack id): pruning was
+    // the one remaining writer mutating this dir outside it, reopening the
+    // deleted-mid-restore race the lock exists to close.
+    pruned += await withBakeLock(stackDir, async () => {
+      let count = 0;
+      const files = entriesOf(dir)
+        .map((f) => {
+          try {
+            return { f, mtime: statSync(join(dir, f)).mtimeMs };
+          } catch {
+            return null;
           }
-        } catch {
-          /* unreadable marker — still prune the file */
+        })
+        .filter((x): x is { f: string; mtime: number } => x !== null)
+        .sort((a, b) => b.mtime - a.mtime);
+      for (const { f } of files.slice(p.templatesKeep)) {
+        const full = join(dir, f);
+        if (f.endsWith('.baked')) {
+          try {
+            const marker = parseBakedMarker(readFileSync(full, 'utf8'));
+            if (marker.drop) {
+              // This command came from a manifest that may no longer exist on
+              // disk. Re-executing it silently is the part that deserves a
+              // record, so the state dir stays auditable.
+              logEvent({ level: 'info', kind: 'retention', detail: `dropping baked template via persisted command from ${f}` });
+              await runQuiet(marker.drop, root);
+            }
+          } catch {
+            /* unreadable marker — still prune the file */
+          }
         }
+        rmSync(full, { force: true });
+        count++;
       }
-      rmSync(full, { force: true });
-      pruned++;
-    }
+      return count;
+    });
   }
   return pruned;
 }

@@ -99,7 +99,7 @@ export class BrokerError extends Error {
  * on an honest `../shared/.env` typo, not only a malicious manifest.
  */
 export function safeJoin(base: string, rel: string, what: string): string {
-  const { join, resolve, isAbsolute } = pathMod;
+  const { resolve, isAbsolute } = pathMod;
   if (isAbsolute(rel)) throw new BrokerError('work-error', `${what} must be a relative path, got absolute '${rel}'`, 'manifest');
   const abs = resolve(base, rel);
   const baseResolved = resolve(base);

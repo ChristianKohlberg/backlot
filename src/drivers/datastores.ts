@@ -24,7 +24,6 @@ import {
   constants as fsConstants,
 } from 'node:fs';
 import { join } from 'node:path';
-import { execFile } from 'node:child_process';
 import { connect } from 'node:net';
 import { templatesRoot } from '../core/paths.js';
 import { sha256, template, BrokerError } from '../core/util.js';

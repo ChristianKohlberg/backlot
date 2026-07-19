@@ -7,7 +7,7 @@ import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { mkdirSync, rmSync, copyFileSync, readdirSync, statSync, existsSync, readFileSync, watch as fsWatch, constants as fsConstants } from 'node:fs';
 import { join, resolve } from 'node:path';
-import { Journal, type EnvRow } from '../core/journal.js';
+import { Journal, type EnvRow, type LeaseRow } from '../core/journal.js';
 import { loadStack, defaultPreset, type Stack } from '../core/manifest.js';
 import { syncIntoEnv, changedOutputs, pullOutputs } from '../core/sync.js';
 import { runUpkeep, templateBakeKeys } from '../core/upkeep.js';
@@ -75,13 +75,21 @@ function runGroupCmd(
     const proc = spawn('sh', ['-c', cmd], { cwd, env: envVars, stdio: ['ignore', 'pipe', 'pipe'], detached: true });
     let out = '';
     let settled = false;
-    proc.stdout!.on('data', (d) => (out = (out + d.toString()).slice(-8000)));
-    proc.stderr!.on('data', (d) => (out = (out + d.toString()).slice(-8000)));
+    // stdio 'pipe' means these streams exist on every successful spawn; on a
+    // failed one there is no output to capture, so optional chaining is exact.
+    proc.stdout?.on('data', (d) => (out = (out + d.toString()).slice(-8000)));
+    proc.stderr?.on('data', (d) => (out = (out + d.toString()).slice(-8000)));
     let timedOut = false;
     const timer = setTimeout(() => {
       timedOut = true;
+      const pid = proc.pid;
+      if (pid === undefined) {
+        // The spawn failed — there is no process group, only the child object.
+        proc.kill('SIGKILL');
+        return;
+      }
       try {
-        process.kill(-proc.pid!, 'SIGKILL'); // the whole group
+        process.kill(-pid, 'SIGKILL'); // the whole group
       } catch {
         proc.kill('SIGKILL');
       }
@@ -142,26 +150,26 @@ export class Engine {
     return next;
   }
 
-  private envLocked<T>(envId: string, fn: () => Promise<T>): Promise<T> {
+  private envLocked<T>(envId: string, fn: () => Promise<T>, onWait?: (elapsedS: number) => void): Promise<T> {
     const chain = this.envChains.get(envId) ?? Promise.resolve();
-    const next = chain.then(
-      async () => {
-        this.busy.add(envId);
-        try {
-          return await fn();
-        } finally {
-          this.busy.delete(envId);
-        }
-      },
-      async () => {
-        this.busy.add(envId);
-        try {
-          return await fn();
-        } finally {
-          this.busy.delete(envId);
-        }
-      },
-    );
+    // Heartbeat while queued behind another operation on this environment: a
+    // blocked verb used to print its last phase and go SILENT until the lock
+    // freed, so a legitimate wait was indistinguishable from a hang. A free
+    // lock never emits — the closure below clears the timer before its first
+    // 1s tick can fire.
+    const waitStart = now();
+    const beat = onWait ? setInterval(() => onWait(Math.round((now() - waitStart) / 1000)), 1000) : undefined;
+    beat?.unref();
+    const run = async () => {
+      if (beat) clearInterval(beat);
+      this.busy.add(envId);
+      try {
+        return await fn();
+      } finally {
+        this.busy.delete(envId);
+      }
+    };
+    const next = chain.then(run, run);
     this.envChains.set(envId, next.catch(() => undefined));
     return next;
   }
@@ -310,7 +318,11 @@ export class Engine {
     // unless that env is being torn down or has flapped, in which case drop the
     // stale lease and fall through to a fresh claim.
     const mine = this.journal.leaseForHolder(holder, stack.id);
-    if (mine) {
+    // The bypass may only refresh a LIVE lease (see acquireEnv); a lapsed one
+    // belongs to whoever is queued on its expiry. In the queued path the
+    // holder has reached the head of the FIFO, so re-upping its own expired
+    // lease is a legitimate claim, not a resurrection.
+    if (mine && !(onlyMine && mine.expiresAt <= now())) {
       const env = this.journal.getEnv(mine.envId);
       if (env && env.state !== 'recycling' && env.state !== 'degraded') {
         this.journal.saveLease({ ...mine, hygiene, expiresAt: now() + ttlMs, ...holderIdentity(holderPid) });
@@ -370,12 +382,16 @@ export class Engine {
   /** Queue at capacity WITHOUT holding the pool lock while sleeping. */
   private async acquireEnv(stack: Stack, holder: string, kind: LeaseKind, hygiene: Hygiene, ttlMs: number, holderPid?: number): Promise<EnvRow> {
     const start = now();
-    // A holder that already holds this stack's lease consumes no capacity —
-    // rebinding only refreshes it. Sending it through the queue stalled the
-    // normal edit-sync-retest loop behind strangers waiting for expiry.
-    // onlyMine keeps the bypass honest: if the lease lapsed mid-flight this
-    // claims nothing and joins the queue like everyone else.
-    if (this.journal.leaseForHolder(holder, stack.id)) {
+    // A holder that already holds this stack's LIVE lease consumes no
+    // capacity — rebinding only refreshes it. Sending it through the queue
+    // stalled the normal edit-sync-retest loop behind strangers waiting for
+    // expiry. Expiry is checked HERE, not just in the sweeper: a lapsed lease
+    // survives in the journal until the next sweep, and refreshing that
+    // corpse would jump a waiter queued on precisely its expiry. onlyMine
+    // keeps the bypass honest: if the lease lapses mid-flight this claims
+    // nothing and joins the queue like everyone else.
+    const live = this.journal.leaseForHolder(holder, stack.id);
+    if (live && live.expiresAt > now()) {
       const env = await this.poolLocked(() => this.tryClaim(stack, holder, kind, hygiene, ttlMs, holderPid, true));
       if (env) return env;
     }
@@ -533,6 +549,14 @@ export class Engine {
     // droppings; a plain reuse bind keeps them (and keeps its build artifacts).
     const sync = syncIntoEnv(sourceRoot ?? stack.root, dirs.tree, stack.manifest, hygiene !== 'reuse');
     say(`synced ${sync.files.length} files (${sync.copied} changed, ${sync.deleted} removed)`);
+    if (sync.sweptDroppings > 0) {
+      // The sweep removed files no sync produced — possibly the very output
+      // (an undeclared node_modules, generated code) the ledger is vouching
+      // for. An unverifiable ledger re-runs upkeep rather than booting
+      // services against half a tree; declaring the output under caches:
+      // keeps both the files and the fast path.
+      env.fingerprints = {};
+    }
     const upkeep = await runUpkeep(dirs.tree, sync.files, stack.manifest, env.fingerprints);
     // Content-derived template identity (vetbill-1i49): divergent
     // migrations/seeds in this tree yield a different bake key and thus a
@@ -587,14 +611,15 @@ export class Engine {
     const ctx = this.templateCtx(stack, env);
     if (env.fingerprints['@source'] !== sync.sourceHash) {
       for (const [name, spec] of Object.entries(stack.manifest.services)) {
-        if (!spec.build) continue;
+        const build = spec.build;
+        if (!build) continue;
         say(`building '${name}'`);
         const buildStart = now();
         const beat = setInterval(() => say(`building '${name}' … ${Math.round((now() - buildStart) / 1000)}s`), 5000);
         beat.unref();
         try {
           const buildTimeoutS = cmdTimeoutS(LONG_CMD_TIMEOUT_S);
-          const r = await runBounded(template(spec.build!, ctx), dirs.tree, buildTimeoutS);
+          const r = await runBounded(template(build, ctx), dirs.tree, buildTimeoutS);
           if (r.timedOut) {
             throw new BrokerError('work-error', `build for service '${name}' timed out after ${buildTimeoutS}s (process group killed; set BACKLOT_CMD_TIMEOUT_S if legitimate)`, name, r.output.slice(-800));
           }
@@ -615,7 +640,13 @@ export class Engine {
       if (ready.length === 0) throw new BrokerError('work-error', 'depends_on cycle in stack.yaml', 'manifest');
       for (const [name, spec] of ready) {
         if (spec.port) {
-          const port = env.ports[spec.port]!;
+          // The allocation loop at the top of this bind fills every declared
+          // port key, so a miss here is a corrupted port ledger — classify it
+          // instead of crashing on the undefined a few lines down.
+          const port = env.ports[spec.port];
+          if (port === undefined) {
+            throw new BrokerError('env-error', `environment ${env.id} has no port recorded for service '${name}' — the port ledger is inconsistent; try 'backlot pool recycle'`, name);
+          }
           // Grace window: the previous holder may be this env's own just-
           // signalled service still tearing down (SIGTERM handlers, FD
           // flushes). Only after the window is the port genuinely foreign.
@@ -751,7 +782,11 @@ export class Engine {
     // warm environment -> the next bind is pristine, whatever was asked.
     if (hygiene !== 'pristine' && env.failStreak >= 2) hygiene = 'pristine';
     try {
-      const bound = await this.envLocked(env.id, () => this.bindAndStart(stack, env, hygiene, kind, opts.watch ?? false, opts.sourceRoot, opts.onProgress));
+      const bound = await this.envLocked(
+        env.id,
+        () => this.bindAndStart(stack, env, hygiene, kind, opts.watch ?? false, opts.sourceRoot, opts.onProgress),
+        (s) => opts.onProgress?.(`waiting for another operation on this environment … ${s}s`),
+      );
       if (opts.watch && kind === 'session' && !this.watchers.has(bound.id)) {
         this.startWatch(bound.id, stack.root, opts.cwd, holder);
       }
@@ -771,14 +806,39 @@ export class Engine {
     }
   }
 
+  /**
+   * The environment a lease points to. leaseForHolder JOINs envs, so the row
+   * existed when the lease was resolved — but a concurrent forced teardown can
+   * delete it before this read, and deleteEnv's two statements (envs, then
+   * leases) are not one transaction, so a daemon killed between them leaves a
+   * lease naming a deleted row. Every verb that asserted `getEnv(lease.envId)!`
+   * then crashed with an unclassified TypeError instead of telling the caller
+   * what to do about it.
+   */
+  private envForLease(lease: LeaseRow): EnvRow {
+    const env = this.journal.getEnv(lease.envId);
+    if (!env) {
+      throw new BrokerError(
+        'env-error',
+        `your lease points at environment ${lease.envId}, which no longer exists (it was recycled) — run 'backlot up' to bind a fresh one`,
+        'lease',
+      );
+    }
+    return env;
+  }
+
   ctx(cwd: string, holder?: string, envId?: string) {
     const stack = loadStack(cwd);
     const h = holder ?? resolve(cwd);
     const lease = this.journal.leaseForHolder(h, stack.id);
-    if (!lease && !envId) {
+    const targetId = envId ?? lease?.envId;
+    if (!targetId) {
       throw new BrokerError('env-error', `no active lease for this worktree — run 'backlot up' first`, 'lease');
     }
-    const env = this.journal.getEnv(envId ?? lease!.envId)!;
+    const env = this.journal.getEnv(targetId);
+    if (!env) {
+      throw new BrokerError('env-error', `environment ${targetId} no longer exists (it was recycled) — run 'backlot up' to bind a fresh one`, 'lease');
+    }
     this.touch(env.id); // asking for context means an agent is still working here
     const ctx = this.templateCtx(stack, env);
     const urls: Record<string, string> = {};
@@ -809,7 +869,11 @@ export class Engine {
     const holder = `run-${shortId()}`;
     const startedAt = now();
     const context = await this.up({ ...opts, holder, kind: 'run', hygiene: opts.hygiene ?? 'reset-data' });
-    const env = this.journal.getEnv(context.envId)!;
+    const env = this.journal.getEnv(context.envId);
+    if (!env) {
+      // Bound a moment ago, so only a concurrent forced recycle can take it.
+      throw new BrokerError('env-error', `environment ${context.envId} was recycled between bind and check — retry the run`, 'pool');
+    }
     const dirs = this.envDirs(env.id);
     const ctx = this.templateCtx(stack, env);
     try {
@@ -821,7 +885,9 @@ export class Engine {
       const runStart = now();
       const beat = setInterval(() => opts.onProgress?.(`running check '${opts.check}' … ${Math.round((now() - runStart) / 1000)}s`), 5000);
       beat.unref();
-      const res = await this.envLocked(env.id, () => {
+      const res = await this.envLocked(
+        env.id,
+        () => {
         this.assertUsable(env.id);
         return runGroupCmd(
           template(check.run, ctx),
@@ -829,7 +895,9 @@ export class Engine {
           { ...process.env, ...templateEnv(check.env, ctx), ...serviceTag(env.id, `check:${opts.check}`, stateRoot()) },
           timeoutS,
         );
-      }).finally(() => clearInterval(beat));
+        },
+        (s) => opts.onProgress?.(`waiting for another operation on this environment … ${s}s`),
+      ).finally(() => clearInterval(beat));
       const artifactsDir = this.collectArtifacts(env.id, dirs.tree, check.artifacts ?? []);
       // A check that failed because the ENVIRONMENT fell over is not the repo's
       // code being wrong. Reporting work-error there is a silently wrong
@@ -957,8 +1025,12 @@ export class Engine {
     const lease = this.journal.leaseForHolder(h, stack.id);
     if (!lease) throw new BrokerError('env-error', `no active lease — run 'backlot up' first`, 'lease');
     this.journal.saveLease({ ...lease, hygiene: 'reset-data', expiresAt: now() + LEASE_TTL(lease.kind) });
-    const env = this.journal.getEnv(lease.envId)!;
-    await this.envLocked(env.id, () => this.bindAndStart(stack, env, 'reset-data', lease.kind, false, undefined, onProgress));
+    const env = this.envForLease(lease);
+    await this.envLocked(
+      env.id,
+      () => this.bindAndStart(stack, env, 'reset-data', lease.kind, false, undefined, onProgress),
+      (s) => onProgress?.(`waiting for another operation on this environment … ${s}s`),
+    );
     return this.ctx(cwd, h);
   }
 
@@ -1012,7 +1084,7 @@ export class Engine {
     const h = holder ?? resolve(cwd);
     const lease = this.journal.leaseForHolder(h, stack.id);
     if (!lease) throw new BrokerError('env-error', `no active lease — run 'backlot up' first`, 'lease');
-    const env = this.journal.getEnv(lease.envId)!;
+    const env = this.envForLease(lease);
     const dirs = this.envDirs(env.id);
     const ctx = this.templateCtx(stack, env);
     const extra: Record<string, string> = { BACKLOT_ENV_ID: env.id };
@@ -1045,7 +1117,7 @@ export class Engine {
     if (!spec) throw new BrokerError('work-error', `stack.yaml declares no auth.token command`, 'manifest');
     const lease = this.journal.leaseForHolder(holder ?? resolve(cwd), stack.id);
     if (!lease) throw new BrokerError('env-error', `no active lease — run 'backlot up' first`, 'lease');
-    const env = this.journal.getEnv(lease.envId)!;
+    const env = this.envForLease(lease);
     const dirs = this.envDirs(env.id);
     const ctx = { ...this.templateCtx(stack, env), role };
     return this.envLocked(env.id, async () => {
@@ -1063,13 +1135,19 @@ export class Engine {
 
   logs(cwd: string, service: string, lines: number, holder?: string) {
     const stack = loadStack(cwd);
+    // A name the manifest never declared is the caller's mistake — name the
+    // services that exist, the way an unknown check does.
+    if (!stack.manifest.services[service]) {
+      throw new BrokerError('work-error', `no service '${service}' in stack.yaml (have: ${Object.keys(stack.manifest.services).join(', ')})`, service);
+    }
     const lease = this.journal.leaseForHolder(holder ?? resolve(cwd), stack.id);
     if (!lease) throw new BrokerError('env-error', `no active lease — run 'backlot up' first`, 'lease');
-    const env = this.journal.getEnv(lease.envId)!;
+    const env = this.envForLease(lease);
     this.touch(env.id);
     const logFile = join(this.envDirs(env.id).logs, `${service}.log`);
-    if (!existsSync(logFile)) throw new BrokerError('env-error', `no logs for service '${service}'`, service);
-    const content = readFileSync(logFile, 'utf8');
+    // The log file is created lazily on the first byte of output, so a silent
+    // service has none — that is an EMPTY log, not an env-error (BACKLOG P3).
+    const content = existsSync(logFile) ? readFileSync(logFile, 'utf8') : '';
     return { service, lines: content.split('\n').slice(-lines).join('\n') };
   }
 
@@ -1077,7 +1155,7 @@ export class Engine {
     const stack = loadStack(cwd);
     const lease = this.journal.leaseForHolder(holder ?? resolve(cwd), stack.id);
     if (!lease) throw new BrokerError('env-error', `no active lease — run 'backlot up' first`, 'lease');
-    const env = this.journal.getEnv(lease.envId)!;
+    const env = this.envForLease(lease);
     this.touch(env.id);
     return { pulled: pullOutputs(stack.root, this.envDirs(env.id).tree, stack.manifest) };
   }
@@ -1355,13 +1433,30 @@ export class Engine {
     }
     for (const env of this.journal.allEnvs()) {
       if (this.busy.has(env.id)) continue;
-      // An environment whose STACK no longer exists on disk can never be bound
-      // again — the repo was deleted or moved. Nothing reclaimed those, so an
-      // abandoned project's env trees and data kept their disk forever.
-      if (!existsSync(env.stackRoot) && !this.journal.leaseForEnv(env.id)) {
-        logEvent({ level: 'info', kind: 'retention', envId: env.id, detail: `stack root ${env.stackRoot} is gone — reclaiming the environment` });
-        await this.recycleOne(env.id, true);
-        continue;
+      // An environment whose STACK can never be bound again — the repo was
+      // deleted or moved, or (after an identity-scheme change or a manifest
+      // rename) its root no longer resolves to the recorded stack id — is
+      // pure leakage: invisible to any pool yet counted against
+      // POOL_MAX_TOTAL and holding its ports. A manifest that merely fails to
+      // PARSE is not proof of orphanhood (someone may be mid-edit), so only a
+      // positive id mismatch or a missing root reaps.
+      if (!this.journal.leaseForEnv(env.id)) {
+        let orphanReason: string | null = null;
+        if (!existsSync(env.stackRoot)) {
+          orphanReason = `stack root ${env.stackRoot} is gone`;
+        } else {
+          try {
+            const currentId = loadStack(env.stackRoot).id;
+            if (currentId !== env.stack) orphanReason = `stack root ${env.stackRoot} now resolves to '${currentId}', not '${env.stack}'`;
+          } catch {
+            /* unreadable manifest — ambiguous, leave the env alone */
+          }
+        }
+        if (orphanReason) {
+          logEvent({ level: 'info', kind: 'retention', envId: env.id, detail: `${orphanReason} — reclaiming the environment` });
+          await this.recycleOne(env.id, true);
+          continue;
+        }
       }
       if (env.state === 'degraded') {
         // Dead env — reap regardless of a stale lease (force), but never while an
