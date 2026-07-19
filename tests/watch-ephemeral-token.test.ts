@@ -248,3 +248,50 @@ auth:
     expect(res.json!.role).toBe('detektiv');
   }, 60_000);
 });
+
+describe('the sync VERB takes the projection path too (2026-07-19 dogfood P1)', () => {
+  const ctx = makeContext();
+  const wt = mkdtempSync(join(tmpdir(), 'backlot-syncproj-'));
+  afterAll(() => {
+    ctx.cleanup();
+    rmSync(wt, { recursive: true, force: true });
+  });
+
+  it('a plain source edit + sync is served by the SAME service process', async () => {
+    // Dogfooded on the founding monorepo: a one-line edit + `sync` took 57s
+    // and restarted all three services, while the watch machinery projected
+    // the identical edit in 2s. The headline loop verb must use the same
+    // source-only path when nothing needs a rebuild.
+    makeStack(
+      wt,
+      `name: syncproj
+services:
+  web: { run: node server.mjs, port: web, env: { PORT: "{{ports.web}}" }, ready: { http: /, timeout: 20 }, hot_reload: true }
+upkeep:
+  - { when: dep.lock, run: "echo upkept >> upkeep.log" }
+`,
+      { 'server.mjs': SERVE_PID, 'message.txt': 'v1', 'dep.lock': 'lock-v1' },
+    );
+    const up = await ctx.cli(['up', '--json'], wt);
+    expect(up.exitCode, `stdout: ${up.stdout ?? ''}\nstderr: ${up.stderr ?? ''}`).toBe(0);
+    const url = (up.json!.urls as Record<string, string>).web!;
+    const pid1 = (await (await fetch(url)).text()).split(':')[0];
+
+    writeFileSync(join(wt, 'message.txt'), 'v2 — synced');
+    const sync = await ctx.cli(['sync', '--json'], wt);
+    expect(sync.exitCode).toBe(0);
+    const after = await (await fetch(url)).text();
+    expect(after).toContain('v2 — synced'); // the edit landed…
+    expect(after.split(':')[0]).toBe(pid1); // …without a service restart
+
+    // The safety valve is shared with watch: an upkeep-trigger edit falls
+    // back to the full bind — the rule runs, a restart is allowed.
+    writeFileSync(join(wt, 'dep.lock'), 'lock-v2');
+    const sync2 = await ctx.cli(['sync', '--json'], wt);
+    expect(sync2.exitCode).toBe(0);
+    const envs = (await ctx.cli(['pool', 'ls', '--json'], wt)).json!.envs as Array<{ id: string }>;
+    const upkeepLog = join(ctx.stateDir, 'envs', envs[0]!.id, 'tree', 'upkeep.log');
+    // Two runs: the initial bind applied the rule once, the fallback re-ran it.
+    expect(readFileSync(upkeepLog, 'utf8').trim().split('\n')).toHaveLength(2);
+  }, 60_000);
+});

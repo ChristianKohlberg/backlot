@@ -154,6 +154,12 @@ local/remote abstraction; the local substrate is enumerate-and-copy.)
 - **Bindings are immutable snapshots.** A running check executes against the revision
   synced at start; edits mid-run cannot contaminate the verdict. New sync = new binding
   revision.
+- `backlot sync` takes the same source-only projection as a watch save — services
+  kept, the dev servers' own watchers reload — when EVERY service declares
+  `hot_reload: true` (its `run:` watches its own tree) and the save fires no
+  upkeep rule. Any undeclared service forces the full rebind: projecting under
+  a non-watching process silently serves stale code, the failure class this
+  broker exists to prevent (owner decision, 2026-07-20).
 - `--watch` sessions opt into a daemon-side debounced worktree watcher that auto-syncs
   on save — the **two-stage reload**: stage 1 projects the changed files into the env
   tree source-only (same sync implementation as every verb, under the env lock, never
@@ -256,7 +262,13 @@ Every failure is classified — the field an agent branches on mechanically:
   and thaw together. On wake the daemon detects the clock jump and **pardons the gap**
   (every lease/idle deadline shifts by the sleep duration). There is no separate wake
   grace because degradation is judged only by a service's restart budget, not by a
-  post-boot health poll — a slept service simply resumes.
+  post-boot health poll — a slept service simply resumes. Detection is
+  platform-specific: on macOS the sweeper reads the **kernel's own record**
+  (`kern.sleeptime`/`kern.waketime` via sysctl) because the monotonic clock keeps
+  advancing through real sleep on Apple Silicon, so clock divergence never appears
+  there; on Linux it detects wall-clock outrunning the monotonic clock (which halts
+  through suspend). One sleep is pardoned exactly once, and every pardon is logged
+  as a `pardon` event naming the gap and the detector.
 - **A lease can name its holder's process** (`--holder-pid`, `BACKLOT_HOLDER_PID`; the MCP
   adapter supplies its own automatically). The default holder is a worktree PATH, and nothing
   about a path can die — so a crashed agent held its environment for the whole TTL. A named
@@ -394,6 +406,7 @@ services:
     build: pnpm exec ng build myapp
     run:   npx serve-dist dist/myapp --proxy /api={{services.api.url}}
     watch_run: pnpm exec ng serve myapp --port {{ports.web}}
+    hot_reload: true                      # run: self-reloads -> `sync` projects, no restart
     port:  web
     ready: { http: / }
   worker:
