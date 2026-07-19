@@ -228,6 +228,76 @@ describe('env port-survivor: bind reaps tagged escapees instead of blocking', ()
    * With the fix: scanTagged finds the real holder by its BACKLOT tag (correct
    * startTime from the scan), kills it, port is free.
    */
+  /**
+   * The same-daemon scenario — the only one the daemon-restart tests above do
+   * NOT cover: on a restart, recover() already ran poolGc() and reclaimed
+   * tagged orphans of warm envs, so those tests pass even without the bind-time
+   * reap. Here the daemon STAYS ALIVE: the service spawns a detached
+   * grandchild (setsid-style escape) that binds the port and ignores SIGTERM,
+   * the idle sweeper quiesces the env (group-kill misses the grandchild), and
+   * the user re-ups before the ~60s GC cadence (disabled here to model that
+   * window — the observed incident held the port 26 minutes).
+   *
+   * Without the fix: bindAndStart's stopAll() finds nothing (env quiesced),
+   * servicePids is empty, and the port-free check fails with "port occupied by
+   * a foreign process". With the fix: reapEnvProcesses → scanTagged kills the
+   * grandchild before the check and the bind succeeds.
+   */
+  it.skipIf(!procScanSupported())(
+    'reaps an escaped grandchild on rebind after quiesce, same daemon (no restart)',
+    async () => {
+      const ctx = makeContext({ BACKLOT_IDLE_TTL_MS: '500', BACKLOT_GC_MS: '999999999' });
+      ctxList.push(ctx.cleanup);
+      const wt = mkdtempSync(join(tmpdir(), 'backlot-surv-quiesce-'));
+      dirList.push(wt);
+      // The service itself spawns the escapee: a detached grandchild in its own
+      // process group that binds the service port and ignores SIGTERM.
+      writeFileSync(
+        join(wt, 'server.mjs'),
+        `import { spawn } from 'node:child_process';
+const child = spawn(process.execPath,
+  ['--eval', "require('net').createServer().listen(Number(process.env.PORT),'127.0.0.1');process.on('SIGTERM',()=>{});"],
+  { detached: true, stdio: 'ignore', env: process.env });
+child.unref();
+console.log('up grandchild=' + child.pid);
+setInterval(() => {}, 1e6);
+`,
+      );
+      writeFileSync(
+        join(wt, 'stack.yaml'),
+        `name: quiesce\nservices:\n  web: { run: node server.mjs, port: web, env: { PORT: "{{ports.web}}" }, ready: { log: up, timeout: 20 } }\nchecks:\n  ok: { run: "true" }\n`,
+      );
+      execFileSync('git', ['init', '-q'], { cwd: wt });
+
+      const up1 = await ctx.cli(['up', '--json'], wt);
+      expect(up1.exitCode, `initial up failed: ${up1.stderr}`).toBe(0);
+
+      const logs = await ctx.cli(['logs', 'web', '--lines', '5'], wt);
+      const grandchild = Number((logs.stdout + logs.stderr).match(/grandchild=(\d+)/)?.[1]);
+      expect(grandchild, 'service must report its grandchild pid').toBeGreaterThan(0);
+      expect(alive(grandchild)).toBe(true);
+
+      const rel = await ctx.cli(['release', '--json'], wt);
+      expect(rel.exitCode, `release failed: ${rel.stderr}`).toBe(0);
+
+      // Idle sweeper quiesces the env: group-kill stops the service, the
+      // grandchild escapes (own group) and keeps the port.
+      const journalPath = join(ctx.stateDir, 'journal.db');
+      expect(
+        await waitFor(() => new Journal(journalPath).allEnvs()[0]?.state === 'warm'),
+        'env must quiesce to warm after release',
+      ).toBe(true);
+      expect(alive(grandchild), 'grandchild must survive the quiesce group-kill').toBe(true);
+
+      // Re-up on the SAME daemon. Without the bind-time reap this fails with
+      // "port occupied by a foreign process".
+      const up2 = await ctx.cli(['up', '--json'], wt);
+      expect(up2.exitCode, `second up failed — port still held by grandchild? alive=${alive(grandchild)}\nstdout: ${up2.stdout}\nstderr: ${up2.stderr}`).toBe(0);
+      expect(await waitFor(() => !alive(grandchild)), `grandchild pid ${grandchild} survived the rebind`).toBe(true);
+    },
+    60_000,
+  );
+
   it.skipIf(!procScanSupported())(
     'reaps a tagged holder even when its pid appears to be a phantom (startTime mismatch)',
     async () => {
