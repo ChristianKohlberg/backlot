@@ -18,12 +18,19 @@ What it exposed:
   the watch-style source-only projection when no upkeep/rebake is pending and
   services are healthy, falling back to the full bind exactly like watch does.
   The headline loop verb is currently 25x slower than the machinery beneath it.
-- [ ] **P1 · The sleep pardon is likely inert on Apple Silicon.** It fires when
-  wall-clock outruns performance.now(), but mach_absolute_time keeps advancing
-  through real sleep on Apple Silicon — wall and mono may never diverge, making
-  decision 0009's laptop-sleep story dead code on the primary platform. Needs a
-  REAL lid-close test (human required), then likely a boot-time/uptime-based
-  detection (kern.boottime delta) instead.
+- [ ] **P1 · The sleep pardon is INERT on Apple Silicon — CONFIRMED by a real
+  lid-close test (2026-07-19).** A 3-minute lease, a pmset-verified 4m39s
+  Clamshell Sleep bracketing its expiry: on wake the sweeper released the
+  lease with no pardon and — compounding the events-gap finding — no event of
+  any kind. Cause as suspected: the pardon fires when wall-clock outruns
+  performance.now(), but mach_absolute_time advances through sleep on Apple
+  Silicon, so the divergence never appears. Fix direction: read the kernel's
+  own sleep record instead of inferring from clocks — macOS `sysctl
+  kern.sleeptime` / `kern.waketime` give the last sleep/wake instants, so the
+  sweeper can pardon exactly the kernel-reported gap (Linux keeps the
+  wall-vs-CLOCK_MONOTONIC divergence, which suspend does not advance there).
+  Decision 0009's laptop-sleep story is currently dead code on the primary
+  platform; this is the top of the next session's ledger.
 - [ ] **P2 · Cold bind measured 191s vs the ~50s 0.2 baseline — and nothing
   says where the time went.** --progress shows phase names without durations;
   run verdicts conflate bind time into durationMs (91.9s reported for a
