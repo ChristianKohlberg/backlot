@@ -48,6 +48,27 @@ export function templateBakeKeys(manifest: Manifest, envTree: string, files: str
   );
 }
 
+/**
+ * Which rules WOULD fire for this tree — the exact trigger check runUpkeep
+ * performs, without running anything. The --watch source-only projection uses
+ * it to decide honestly between "project the files, keep the services" and
+ * falling back to the full bind path: a save that changes what a rule (or
+ * @rebake-template) fingerprints cannot be served by projection alone.
+ */
+export function pendingUpkeep(
+  envTree: string,
+  syncedFiles: string[],
+  manifest: Manifest,
+  previous: Record<string, string>,
+): string[] {
+  const pending: string[] = [];
+  for (const rule of manifest.upkeep ?? []) {
+    const key = `${rule.when} -> ${rule.run}`;
+    if (previous[key] !== triggerHash(envTree, syncedFiles, rule.when)) pending.push(key);
+  }
+  return pending;
+}
+
 export async function runUpkeep(
   envTree: string,
   syncedFiles: string[],

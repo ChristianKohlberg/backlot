@@ -177,7 +177,7 @@ The review found several documented capabilities the code does not deliver.
 They are recorded here rather than quietly corrected away, because each is a
 real product gap someone reading the docs would expect to work.
 
-- [ ] **P2 · `--watch` two-stage reload.** Docs promised the watcher projects a
+- [x] **P2 · `--watch` two-stage reload.** FIXED 2026-07-19: watch saves take a source-only projection under the env lock (services kept; pid-stability test proves it), with a deliberate fallback to the full bind when the save would fire an upkeep rule or rebake — a lockfile change genuinely needs the restart. Original entry: Docs promised the watcher projects a
   file and the environment's own dev-server picks it up. In fact the sync takes
   the ordinary bind path, whose fast path requires an unchanged source hash —
   which a watch-triggered sync never has — so every save stops and restarts the
@@ -338,7 +338,7 @@ Sequenced implementation:
   fs/exec seam through sync + supervision. Freezes the `SubstrateDriver` interface
   (`src/drivers/types.ts`, currently design-only).
 
-- [ ] **mssql `template_restore`.** Revamp binds currently re-seed (~30–50s) instead of
+- [x] **mssql `template_restore`.** PROVEN LIVE 2026-07-19: tests/mssql.test.ts (docker- and image-gated) drives BACKUP/RESTORE bake+restore against MSSQL 2022, 4/4. Original entry: Revamp binds currently re-seed (~30–50s) instead of
   restoring from a baked template in seconds. Add a backup/restore command pair to
   Revamp's `stack.yaml` datastore. Deferred by the captain.
 
@@ -355,12 +355,12 @@ Sequenced implementation:
 
 - [x] Create the GitHub repo + push (currently local-only on the captain's machine).
 - [x] First CI run (the workflow exists but has executed zero times).
-- [ ] `npm publish` (name `backlot` is free; package is publish-shaped).
+- [x] `npm publish` — 0.5.0 is live on npm (this entry was stale); 0.6.0 to be published manually by the owner after the 2026-07-19 batch.
 
 ## Revamp adoption (in the Revamp repo, not here)
 
-- [ ] Decide + commit Revamp's `stack.yaml` through the pipeline (bean `revamp-ksa3`,
+- [x] STALE — Revamp's manifest is already committed (ADR-0059, their PR #364) and validates against backlot 0.5. Original entry: Decide + commit Revamp's `stack.yaml` through the pipeline (bean `revamp-ksa3`,
   draft). Add an ADR on the relationship to `scripts/verify`.
-- [ ] Port the remaining `verify` lanes (unit/static/integration/ui) as `checks`.
-- [ ] Land the impersonation e2e fix (branch `fix/impersonation-e2e-seeded-names`,
+- [x] Port the remaining `verify` lanes (unit/static/integration/ui) as `checks` — concrete mapping proposal committed on Revamp branch `chore/backlot-checks-mapping-proposal` (local only, not pushed) 2026-07-19; open questions recorded there (env-bind cost for DB-less lanes, integration capacity, ui port ownership).
+- [x] STALE — the branch no longer exists and the seeded-names fix appears landed on Revamp main (their #305: the spec selects the seeded user by stable login attribute). Original entry: Land the impersonation e2e fix (branch `fix/impersonation-e2e-seeded-names`,
   bean `revamp-m2pk`, ready for PR).
