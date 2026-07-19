@@ -22,13 +22,7 @@ See `docs/` for decision log. Key files:
 
 Services are spawned detached (`detached: true` in `spawn`) so they outlive the daemon intentionally — this is the crash-recovery contract. The BACKLOT tag (`BACKLOT_ENV_ID`, `BACKLOT_SERVICE`, `BACKLOT_STATE_ROOT`) is injected into every service's environment and inherited by grandchildren; `scanTagged` uses it to find orphans even after the process moved to a new session.
 
-**Port-survivor bug (fixed 2026-07-19, `fm/backlot-env-reap`):** A service that called `setsid()` or spawned a detached grandchild (new process group) could escape the `-pgid SIGKILL` in `killGroupVerified`. The group leader's group became empty so `killGroupVerified` returned `true`, but the grandchild was alive in its own group holding the port. On the next `bindAndStart`, the fresh supervisor's `stopAll()` was a no-op and the port-free check failed.
-
-Fix: `engine.reapEnvProcesses(env)` is called after every `stopAll()` in `bindAndStart`. It:
-1. Re-runs `reapPids(env.servicePids)` (platform-independent) to retry kills for journal-recorded survivors.
-2. Runs `scanTagged` (Linux only) to find and kill any process still carrying this env's BACKLOT tag in its environment, regardless of process group.
-
-**Crash path:** if the daemon dies mid-teardown, the env stays in `state='recycling'`. `recover()` on next start calls `teardownClaimed` again. For `state='warm'` envs, `recover()` calls `reapPids(servicePids)`. If that leaves survivors (phantom pids from pid-reuse), the next `bindAndStart` handles them via `reapEnvProcesses`.
+Consequence: a group kill (`killGroupVerified`) is not sufficient teardown — a service that called `setsid()` or spawned a detached grandchild escapes the `-pgid` signal and can keep holding its port. `stopAll()` must therefore always be followed by a reap of journal-recorded pids plus a tag scan before trusting any port-free check. `reapEnvProcesses` in `src/daemon/engine.ts` owns this invariant (see its doc comment for the failure modes and the survivor-preservation contract); `tests/env-port-survivor.test.ts` is the regression test. Crash recovery follows the same rule: `recover()` reaps recorded pids for every journaled env and re-runs `teardownClaimed` for `state='recycling'` rows.
 
 ## Maintaining this file
 
