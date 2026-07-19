@@ -80,8 +80,8 @@ Binding converges an environment to what you asked for instead of restoring a sn
 a fingerprint ledger replays only the upkeep rules whose triggers changed (lockfile →
 install, migrations → migrate), and data states restore from baked templates in seconds.
 Hygiene is per-bind: `reuse` keeps everything (inspection), `reset-data` restores the
-data template but keeps build caches (the default for runs), `--pristine` rebuilds from
-scratch (merge-grade verdicts). Two consecutive bind failures on the same environment
+data template and keeps *declared* `caches:` while sweeping undeclared droppings (the
+default for runs), `--pristine` rebuilds from scratch (merge-grade verdicts). Two consecutive bind failures on the same environment
 auto-escalate the next bind to pristine — the standard defense against stale-cache
 heisenbugs.
 

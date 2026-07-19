@@ -8,7 +8,12 @@
  * failing loudly.
  */
 import { describe, it, expect } from 'vitest';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { makeDatastore } from '../src/drivers/datastores.js';
+import { socketPath } from '../src/core/paths.js';
+import { classifyClientError } from '../src/cli/client.js';
 import { safeJoin } from '../src/core/util.js';
 
 describe('datastore keys cannot escape the state root', () => {
@@ -22,6 +27,55 @@ describe('datastore keys cannot escape the state root', () => {
     // The command family builds .baked marker paths from the key too, which is
     // why this check had to move out of the sqlite driver.
     expect(() => makeDatastore('fine_name', pg, 'stk')).not.toThrow();
+  });
+});
+
+describe('a socket path over the AF_UNIX sun_path limit fails loudly', () => {
+  // sun_path is 104 bytes on macOS, 108 on Linux — and BOTH sides of the RPC
+  // truncate identically, so a too-deep BACKLOT_STATE_DIR *appears* to work
+  // while actually colliding with any sibling state dir sharing the prefix.
+  const withStateDir = <T>(dir: string, fn: () => T): T => {
+    const prev = process.env.BACKLOT_STATE_DIR;
+    process.env.BACKLOT_STATE_DIR = dir;
+    try {
+      return fn();
+    } finally {
+      if (prev === undefined) delete process.env.BACKLOT_STATE_DIR;
+      else process.env.BACKLOT_STATE_DIR = prev;
+    }
+  };
+
+  it('throws an error naming the limit and the offending path', () => {
+    const base = mkdtempSync(join(tmpdir(), 'backlot-sun-'));
+    const deep = join(base, 'x'.repeat(120)); // socket path lands well past 104 bytes
+    try {
+      const err = withStateDir(deep, () => {
+        let thrown: unknown;
+        try {
+          socketPath();
+        } catch (e) {
+          thrown = e;
+        }
+        return thrown;
+      });
+      expect(err, 'socketPath() must refuse a path the OS would silently truncate').toBeTruthy();
+      expect(String((err as Error).message)).toMatch(/sun_path/);
+      expect(String((err as Error).message)).toContain(deep); // names the offending path
+      // The classification contract: a bad state dir is infrastructure, never
+      // "recycle an environment".
+      expect(classifyClientError(err)).toBe('infra-error');
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
+
+  it('leaves an ordinary state dir alone', () => {
+    const base = mkdtempSync(join(tmpdir(), 'backlot-sun-ok-'));
+    try {
+      expect(withStateDir(base, () => socketPath())).toBe(join(base, 'daemon.sock'));
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
   });
 });
 

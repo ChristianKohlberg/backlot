@@ -122,11 +122,11 @@
       "properties": {
         "run": {
           "type": "string",
-          "description": "The supervised process. Daemon is its parent."
+          "description": "The supervised process. Daemon is its parent. Executes under `sh` (dash on Ubuntu, bash-as-sh on macOS) — write POSIX sh, no bashisms."
         },
         "build": {
           "type": "string",
-          "description": "Run at bind when fingerprints demand; never during serve."
+          "description": "Run at bind when fingerprints demand; never during serve. Executes under `sh` (dash on Ubuntu, bash-as-sh on macOS) — write POSIX sh, no bashisms."
         },
         "watch_run": {
           "type": "string",
@@ -290,7 +290,8 @@
       "additionalProperties": false,
       "properties": {
         "run": {
-          "type": "string"
+          "type": "string",
+          "description": "The check command. Executes under `sh` (dash on Ubuntu, bash-as-sh on macOS) — write POSIX sh, no bashisms."
         },
         "cwd": {
           "type": "string"

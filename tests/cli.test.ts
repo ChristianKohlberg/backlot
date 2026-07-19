@@ -249,3 +249,36 @@ describe('the multi-service topology (hello-multi)', () => {
     expect((res.json!.recycled as string[]).length).toBeGreaterThan(0);
   });
 });
+
+// ---------------------------------------------------------------------------
+
+describe('logs for a silent service (BACKLOG P3, 2026-07-03)', () => {
+  const ctx = makeContext();
+  // A service that boots (cmd readiness) but never writes a byte — so no
+  // .log file ever exists for it.
+  const dir = mkdtempSync(join(tmpdir(), 'backlot-wt-silent-'));
+  writeFileSync(
+    join(dir, 'stack.yaml'),
+    `name: silent\nservices:\n  quiet:\n    run: sleep 300\n    ready: { cmd: "true", timeout: 20 }\n`,
+  );
+  execFileSync('git', ['init', '-q'], { cwd: dir });
+  execFileSync('git', ['add', '-A'], { cwd: dir });
+  afterAll(async () => {
+    await ctx.cleanup();
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('a service that has produced no output has an empty log — not a false env-error', async () => {
+    const up = await ctx.cli(['up', '--json'], dir);
+    expect(up.exitCode, `stdout: ${up.stdout ?? ''}\nstderr: ${up.stderr ?? ''}`).toBe(0);
+    const res = await ctx.cli(['logs', 'quiet', '--json'], dir);
+    expect(res.exitCode, `stdout: ${res.stdout ?? ''}\nstderr: ${res.stderr ?? ''}`).toBe(0);
+    expect((res.json as { lines: string }).lines).toBe('');
+  });
+
+  it('a service the manifest never declared is still an error, naming the real ones', async () => {
+    const res = await ctx.cli(['logs', 'nope', '--json'], dir);
+    expect(res.exitCode).not.toBe(0);
+    expect(String((res.json!.error as { message: string }).message)).toContain('quiet');
+  });
+});

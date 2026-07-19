@@ -106,19 +106,34 @@ async function ping(): Promise<boolean> {
 }
 
 export async function ensureDaemon(): Promise<void> {
+  // Validate the socket path FIRST: ping() swallows every throw into "not up",
+  // which would turn socketPath()'s loud sun_path refusal into a silent spawn
+  // of a daemon bound to a truncated (colliding) socket.
+  socketPath();
   if (await ping()) return;
   const daemonEntry = join(dirname(fileURLToPath(import.meta.url)), '..', 'daemon', 'index.js');
   const log = openSync(join(stateRoot(), 'daemon.log'), 'a');
-  const child = spawn(process.execPath, [daemonEntry], {
+  // node:sqlite (the journal) prints "SQLite is an experimental feature" on
+  // every spawn, burying daemon.log's signal. Suppress ONLY that warning class,
+  // and only for the daemon we spawn — a direct CLI or daemon run still warns.
+  const child = spawn(process.execPath, ['--disable-warning=ExperimentalWarning', daemonEntry], {
     detached: true,
     stdio: ['ignore', log, log],
     env: { ...process.env },
   });
   child.unref();
-  const start = Date.now();
-  while (Date.now() - start < 10_000) {
-    if (await ping()) return;
-    await new Promise((r) => setTimeout(r, 100));
-  }
+  const pingUntil = async (deadline: number): Promise<boolean> => {
+    while (Date.now() < deadline) {
+      if (await ping()) return true;
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    return false;
+  };
+  if (await pingUntil(Date.now() + 10_000)) return;
+  // Cold-start stampede: parallel verbs on a cold state dir each spawn a
+  // daemon, the singleton election picks one, and every loser exits 0. Our
+  // child exiting CLEANLY therefore proves a winner exists somewhere — so give
+  // that winner one more window instead of failing a healthy cold start.
+  if (child.exitCode === 0 && (await pingUntil(Date.now() + 10_000))) return;
   throw new Error(`daemon did not come up — see ${join(stateRoot(), 'daemon.log')}`);
 }

@@ -221,3 +221,32 @@ describe('retention sweep (unit)', () => {
     rmSync(dir, { recursive: true, force: true });
   });
 });
+
+describe('template pruning honors the bake lock', () => {
+  it('does not delete a stack template dir while a bake/restore is in flight', async () => {
+    // pruneTemplates was the one remaining writer that mutated a stack's
+    // template dir OUTSIDE the stack-scoped bake lock — reopening the exact
+    // deleted-mid-restore race the lock was introduced to close.
+    const dir = mkdtempSync(join(tmpdir(), 'backlot-ret-lock-'));
+    process.env.BACKLOT_STATE_DIR = dir;
+    const { pruneTemplates } = await import('../src/core/retention.js');
+    const { withBakeLock } = await import('../src/drivers/datastores.js');
+    const { policy } = await import('../src/core/policy.js');
+    const root = join(dir, 'templates');
+    mkdirSync(join(root, 'stk'), { recursive: true });
+    const tpl = join(root, 'stk', 'main-dev@abc.db');
+    writeFileSync(tpl, 'baked');
+
+    let release!: () => void;
+    const held = new Promise<void>((r) => (release = r));
+    const bake = withBakeLock('stk', () => held); // an in-flight bake/restore
+    const prune = pruneTemplates({ ...policy(), templatesKeep: 0 }, root);
+    await new Promise((r) => setTimeout(r, 400));
+    expect(existsSync(tpl), 'template deleted out from under the in-flight bake').toBe(true);
+    release();
+    await bake;
+    expect(await prune).toBe(1); // after the lock frees, pruning proceeds
+    expect(existsSync(tpl)).toBe(false);
+    rmSync(dir, { recursive: true, force: true });
+  }, 15_000);
+});

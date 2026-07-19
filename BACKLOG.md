@@ -95,6 +95,44 @@ reproduction.
   the other's data — the exact failure the ns scheme's comment claims to
   prevent.
 
+## Review round 2 (2026-07-19, adversarial pass over the day's own diff)
+
+One refute-posture reviewer over `81ac100..main` (the macOS fixture fixes plus
+the sweep-fix batch) found eight defects IN THE DAY'S OWN CHANGES; all eight
+were fixed the same day, red-first where behavior changed:
+
+- [x] **P2 · Clean-slate sweep outran the fingerprint ledger.** reset-data
+  swept an undeclared upkeep output (node_modules) while the unchanged trigger
+  hash skipped the rule — services booted against half a tree. syncIntoEnv now
+  reports sweptDroppings separately from mirror deletions, and a bind whose
+  sweep removed anything clears the env's ledger before upkeep runs.
+- [x] **P2 · The sha256 id migration stranded pre-upgrade envs.** Old-id rows
+  counted against POOL_MAX_TOTAL and held ports forever (the only orphan test
+  was "stackRoot missing"). The sweeper now also reaps an unleased env whose
+  root resolves to a DIFFERENT stack id; an unparseable manifest (mid-edit) is
+  deliberately not proof of orphanhood.
+- [x] **P3 · The holder bypass resurrected expired-but-unswept leases** ahead
+  of the waiter queued on that very expiry (leaseForHolder never filtered on
+  expiresAt; the sweep lag is up to 15s). The bypass now requires a LIVE
+  lease; at the head of the queue re-upping your own lapsed lease remains a
+  legitimate claim.
+- [x] **P3 · Template pruning mutated stack template dirs outside the bake
+  lock** — the one writer left outside it, reopening the deleted-mid-restore
+  race. pruneTemplates now takes the same stack-scoped lock.
+- [x] **P3 · A sync.include entry that wasn't an existing file disarmed the
+  gitlink refusal** while projecting nothing — the silent-omission failure
+  with no error at all. Only existing FILES beneath the gitlink now count.
+- [x] **P3 · The new capacity test was timing-fragile on slow runners** (cold
+  provision inside an 8s lease window). Stack B is pre-warmed and the TTL and
+  bounds widened; the signal measured is queue behavior only.
+- [x] **P4 · sweepDroppings lacked the deletion mirror's case-insensitivity
+  guard**: on APFS a case-only rename left the OLD casing on disk, and the
+  sweep deleted the file sync had just guaranteed. Same lowered-key probe as
+  the mirror now applies.
+- [x] **P4 · docs/overview.md overpromised reset-data** ("keeps build
+  caches") after the sweep change made that true only for DECLARED caches.
+  Corrected.
+
 ## From the Go evaluation (2026-07, decision 0020)
 
 Declining the rewrite came with a short list of in-language fixes that close the
@@ -112,12 +150,18 @@ the README/engines pin check landed with the decision; these did not.
   correctly flagged, and ~26 assertion sites remain — concentrated in the
   `getEnv(...)!` cluster where three lost-update findings already lived. (Note:
   `npm run lint` currently fails outright — eslint is not in devDependencies.)
-- [ ] **P3 · Guard the AF_UNIX `sun_path` limit in `socketPath()`.** A deep
+- [x] **P3 · Guard the AF_UNIX `sun_path` limit in `socketPath()`.** A deep
   `BACKLOT_STATE_DIR` silently truncates the socket path; client and daemon
   truncate identically so it appears to work, which makes it a latent
-  cross-state-dir collision. Fail loudly above ~100 bytes.
-- [ ] **P3 · Suppress the `node:sqlite` ExperimentalWarning on daemon spawn** so
-  daemon.log stays signal, without hiding it from a direct CLI run.
+  cross-state-dir collision. Fail loudly above ~100 bytes. FIXED 2026-07-19:
+  `socketPath()` refuses paths over 103 bytes (macOS's 104-byte `sun_path`, the
+  tighter leg) naming the limit and the path; classified infra-error, verified
+  empirically (a 257-byte state dir bound a truncated colliding socket).
+- [x] **P3 · Suppress the `node:sqlite` ExperimentalWarning on daemon spawn** so
+  daemon.log stays signal, without hiding it from a direct CLI run. FIXED
+  2026-07-19: the CLI spawns the daemon with
+  `--disable-warning=ExperimentalWarning` — only that class, only for the
+  spawned daemon; direct runs still warn.
 
 ## Promised but not implemented (2026-07-18 fleet review)
 
@@ -140,10 +184,15 @@ real product gap someone reading the docs would expect to work.
   and nothing exercises the seam. The local paths hard-code local assumptions
   (process groups, /proc tags, file copies), so the first real driver will
   find the seam narrower than the spec suggests.
-- [ ] **P3 · MCP has no long-running-operation story.** Progress frames are
-  dropped, there is no cancel, and the detach/job verbs are not exposed — so an
-  agent driving a slow bind over MCP can only block. The CLI has `--detach`;
-  the adapter should surface it.
+- [x] **P3 · MCP has no long-running-operation story.** PARTLY CLOSED
+  2026-07-19: the adapter now exposes the detach/job verbs as tools —
+  `backlot_run_detach` (submit, returns `{jobId}` immediately), `backlot_job`
+  (poll by id to the journaled verdict), `backlot_job_ls` — thin over the
+  same `run-detach`/`job`/`job-ls` RPCs the CLI's `run --detach` and
+  `job <id>` use, so an agent driving a slow bind over MCP no longer has to
+  block. Still open: progress frames are still dropped and there is no
+  cancel — both need daemon-side work (a cancel path through the serialized
+  queue, MCP progress notifications) and a design decision, not adapter code.
 - [ ] **P3 · Probe host and advertised host disagree.** Port probing binds
   `127.0.0.1` (and now the wildcard) while `ctx` advertises `http://localhost:…`.
   On a dual-stack host `localhost` can resolve to `::1`, where a service bound
@@ -151,10 +200,13 @@ real product gap someone reading the docs would expect to work.
   unreachable for the consumer. Changing the advertised host is a visible
   contract change (tests and consumers expect `localhost`), so it needs a
   deliberate decision rather than a quiet swap.
-- [ ] **P3 · `/bin/sh` differs across the two supported platforms.** Service and
+- [x] **P3 · `/bin/sh` differs across the two supported platforms.** Service and
   check commands run under `sh`, which is dash on Ubuntu and bash-as-sh on
   macOS, so the same stack.yaml can behave differently on the two legs backlot
   tests. Either document sh-portable-only, or pick a shell explicitly.
+  DOCUMENTED 2026-07-19 (sh-portable-only): architecture.md §12 and the
+  schema's `run:`/`build:` descriptions now say write POSIX sh, no bashisms —
+  picking a shell would be a behavior change deserving its own decision.
 
 - [x] **P2 · hello-multi smoke is flaky in CI on BOTH legs.** DIAGNOSED AND
   FIXED 2026-07-19. The service that died was the api, and it died of
@@ -215,7 +267,11 @@ real product gap someone reading the docs would expect to work.
 
 ## Polish — found during live Revamp/parallel testing (2026-07-03)
 
-- [ ] **P1 · Progress while queued behind a busy env.** A verb (`up`/`run`/…) that
+- [x] **P1 · Progress while queued behind a busy env.** FIXED 2026-07-19:
+  `envLocked` gained a wait heartbeat ("waiting for another operation on this
+  environment … Ns", 1s cadence) threaded from up/run/reset-data's onProgress;
+  a free lock never emits. Red-first test in tests/progress.test.ts.
+  Original finding: A verb (`up`/`run`/…) that
   resolves to an environment currently held by another in-flight operation prints
   `acquiring an environment` and then goes **silent** until the env lock frees —
   because the progress emitter only fires *inside* `bindAndStart`, which is blocked on
@@ -224,13 +280,16 @@ real product gap someone reading the docs would expect to work.
   environment … Ns` heartbeat from the CLI (or daemon) while queued on the env lock.
   Small; high felt-quality on the shared-directory / fleet path.
 
-- [ ] **P2 · Retry once on a lost daemon cold-start race.** Firing several verbs in
+- [x] **P2 · Retry once on a lost daemon cold-start race.** Firing several verbs in
   parallel with **no daemon running** makes them all cold-spawn the daemon; the
   singleton guard prevents corruption (one wins the socket, losers exit 0), but the
   loser's *client* can occasionally fail its ping window instead of falling through to
   the winner. Fix: in `cli/client.ts ensureDaemon`, if our spawned daemon loses the
   race, ping again for the winner before giving up. Also document "warm the daemon
   with a cheap `backlot status` before parallelizing" for fleets. Small.
+  FIXED 2026-07-19: a spawned daemon that exited 0 proves a winner exists, so
+  `ensureDaemon` grants the winner a second ping window; warm-the-daemon note
+  added to architecture.md §5.
 
 - [ ] **P3 · `logs <service>` on a service that has produced no output errors.** A
   silent service has no `.log` file yet, so `logs` returns `no logs for service` (a
@@ -286,8 +345,8 @@ Sequenced implementation:
 
 ## Release logistics (outward-facing — captain's call)
 
-- [ ] Create the GitHub repo + push (currently local-only on the captain's machine).
-- [ ] First CI run (the workflow exists but has executed zero times).
+- [x] Create the GitHub repo + push (currently local-only on the captain's machine).
+- [x] First CI run (the workflow exists but has executed zero times).
 - [ ] `npm publish` (name `backlot` is free; package is publish-shaped).
 
 ## Revamp adoption (in the Revamp repo, not here)

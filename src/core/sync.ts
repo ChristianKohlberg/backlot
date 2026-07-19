@@ -25,6 +25,10 @@ import type { Manifest } from './manifest.js';
 export interface SyncResult {
   copied: number;
   deleted: number;
+  /** Files the CLEAN-SLATE sweep removed (droppings no sync produced) —
+   * distinct from mirror deletions: the bind must know the tree lost content
+   * the fingerprint ledger may be vouching for. */
+  sweptDroppings: number;
   files: string[];
   /** Hash of the full (path -> content hash) map: the binding's source identity. */
   sourceHash: string;
@@ -94,10 +98,12 @@ function enumerate(stackRoot: string, manifest: Manifest): string[] {
       .filter((l) => l.startsWith('160000 '))
       .map((l) => l.split('\t')[1] ?? '')
       .filter(Boolean)
-      // Only FILES beneath the gitlink count: include admits single files, so
-      // an entry naming the gitlink path itself would project nothing and
-      // recreate exactly the silent omission this refusal exists to prevent.
-      .filter((gl) => !include.some((inc) => inc.startsWith(`${gl}/`)));
+      // Only EXISTING FILES beneath the gitlink count: include admits single
+      // files, so a directory entry, a typo, or the gitlink path itself would
+      // be silently dropped by the include push below — and admitting the
+      // gitlink on its say-so recreates exactly the silent omission this
+      // refusal exists to prevent.
+      .filter((gl) => !include.some((inc) => inc.startsWith(`${gl}/`) && isFile(join(stackRoot, inc))));
     if (gitlinks.length > 0) {
       throw new BrokerError(
         'work-error',
@@ -156,6 +162,10 @@ function sweepDroppings(
   prefix: string,
   synced: SyncCache,
   protectedPatterns: string[],
+  /** Lowercased synced keys on a case-INSENSITIVE fs (same probe as the
+   * deletion mirror): a case-only rename leaves the OLD casing on disk while
+   * `synced` holds the new key, and both name the same file. */
+  syncedLower: Set<string> | null,
 ): number {
   let deleted = 0;
   for (const name of readdirSync(join(envTree, prefix))) {
@@ -168,13 +178,13 @@ function sweepDroppings(
       continue; // vanished mid-sweep
     }
     if (st.isDirectory()) {
-      deleted += sweepDroppings(envTree, rel, synced, protectedPatterns);
+      deleted += sweepDroppings(envTree, rel, synced, protectedPatterns, syncedLower);
       try {
         rmdirSync(join(envTree, rel)); // throws ENOTEMPTY unless genuinely empty
       } catch {
         /* still holds synced or protected content */
       }
-    } else if (!synced[rel]) {
+    } else if (!synced[rel] && !syncedLower?.has(rel.toLowerCase())) {
       try {
         rmSync(join(envTree, rel), { force: true });
         deleted++;
@@ -291,6 +301,9 @@ export function syncIntoEnv(
 
   let copied = 0;
   const vanished = new Set<string>();
+  /** One `path:hash` line per synced file, in enumeration order — the input to
+   * sourceHash, collected here so no later lookup has to assert non-null. */
+  const hashLines: string[] = [];
   for (const rel of files) {
     // git ls-files can't emit ../ but the sync.include path can — belt-and-suspenders
     // so neither the copy nor the deletion-mirror below can ever leave envTree.
@@ -346,7 +359,18 @@ export function syncIntoEnv(
       chmodSync(dst, srcStat.mode);
       if (!contentDiffers) copied++; // a real change was propagated
     }
-    const newDstStat = statOf(dst)!;
+    // The env copy was written (or verified) moments ago, so a missing stat
+    // here means something OUTSIDE backlot is deleting the env tree under a
+    // live sync. Carrying on would record a cache entry for a file that is not
+    // there; crashing on the undefined was an unclassified TypeError.
+    const newDstStat = statOf(dst);
+    if (!newDstStat) {
+      throw new BrokerError(
+        'env-error',
+        `just-synced file '${rel}' vanished from the environment tree — something is deleting env files concurrently; retry the bind`,
+        'sync',
+      );
+    }
     next[rel] = {
       hash: srcHash,
       srcSize: srcStat.size,
@@ -355,6 +379,7 @@ export function syncIntoEnv(
       dstMtime: newDstStat.mtime,
       mode: srcStat.mode,
     };
+    hashLines.push(`${rel}:${srcHash}`);
   }
 
   // Mirror deletions relative to the PREVIOUS binding, never touching caches/keep.
@@ -387,8 +412,10 @@ export function syncIntoEnv(
   // above only knows files the PREVIOUS sync wrote, so anything a check,
   // service, or exec created inside the environment used to survive every bind
   // and contaminate later verdicts.
+  let sweptDroppings = 0;
   if (cleanUntracked) {
-    deleted += sweepDroppings(envTree, '', next, protectedPatterns);
+    sweptDroppings = sweepDroppings(envTree, '', next, protectedPatterns, caseInsensitiveFs ? nextLower : null);
+    deleted += sweptDroppings;
   }
 
   // Atomic: a torn cache file silently disables deletion mirroring on the next
@@ -399,8 +426,8 @@ export function syncIntoEnv(
   renameSync(tmp, cachePath(envTree));
 
   const present = files.filter((f) => !vanished.has(f));
-  const sourceHash = sha256(present.map((f) => `${f}:${next[f]!.hash}`).join('\n'));
-  return { copied, deleted, files: present, sourceHash };
+  const sourceHash = sha256(hashLines.join('\n'));
+  return { copied, deleted, sweptDroppings, files: present, sourceHash };
 }
 
 /**
