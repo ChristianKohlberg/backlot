@@ -1,6 +1,6 @@
 {
   "name": "backlot",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "description": "The repo-aware environment broker: puts a working, seeded, provable instance of your web application in front of coding agents and humans — warm pools, leases, bind-by-sync. Brokers environments; never provides them.",
   "keywords": [
     "environment",
