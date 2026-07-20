@@ -465,7 +465,7 @@ design's premises (persistence over ephemerality, checkpoint/restore as table st
 None of them knows what makes a VM a *working instance of your app*: the seeded data,
 the auth story, the upkeep rules, the verdict contract. Dev-stack orchestrators (Tilt,
 Skaffold, Garden) own hot-deploy-to-Kubernetes, not leases, data states, or verdicts.
-Dagger's container-use is the nearest OSS neighbor (branch+worktree+container per
+By 2026 the wave consolidated: Gitpod rebranded to Ona and was acquired by OpenAI; Daytona pivoted to agent sandboxes; Neon's branch-per-agent Postgres sold to Databricks (~$1B) with most databases agent-created — data states validated as a category; kubernetes-sigs/agent-sandbox even ships literal SandboxWarmPool/SandboxClaim CRDs, cluster-side. A dated scored map lives in [reviews/2026-07-20-landscape.md](reviews/2026-07-20-landscape.md). Dagger's container-use is the nearest OSS neighbor (branch+worktree+container per
 agent, git as sync) but is per-task-ephemeral, local-only, and has no data/verdict
 layer.
 
