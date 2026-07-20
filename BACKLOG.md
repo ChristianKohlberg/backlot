@@ -67,6 +67,31 @@ What it exposed:
   `--json` its own manifest passes (token verb broken); one genuinely failing
   e2e (impersonation "QA ReadOnly" banner). backlot classified both correctly.
 
+## Session findings (2026-07-20)
+
+- [ ] **P2 · Daemons never self-terminate.** Five daemons found running; two were
+  legitimate (global install, a benchmark), three were leaks from aborted test
+  runs and a debug session — afterAll cleanup never runs for a killed vitest,
+  and daemons deliberately outlive their parents. An empty pool + N minutes
+  without an RPC should exit the daemon; that closes the leak class
+  structurally. Diagnose with `ps -eo pid,etime,command | grep dist/daemon`.
+- [ ] **P2 · Per-checkout pools waste warmth across worktree fleets (owner
+  decision needed).** Stack identity hashes the root path, so every
+  treehouse/worktree slot of one repo is its own stack: N slots = N cold
+  provisions, N template bakes, N env sets, all pressing POOL_MAX_TOTAL —
+  while warm envs sit one slot over. Deliberate (accidental sharing was
+  yesterday's P1 bug), but an OPT-IN shared identity (e.g. keyed by git
+  remote, `pool: per-repo`) would let fleet slots share one pool. Shared pool
+  = shared capacity and shared degradation; needs the owner's call.
+- [ ] **P3 · `backlot up --shell` (treehouse-style session ergonomics).** Open
+  a subshell with BACKLOT_HOLDER_PID set to it: `exit` returns the env to the
+  pool in seconds instead of the TTL. One flag; makes the treehouse pairing
+  feel native. Pair with a docs note: treehouse makes worktrees, backlot
+  brokers envs, the worktree path is the whole contract; pass --holder-pid so
+  a returned slot frees its env promptly. (Treehouse absorb question was
+  investigated 2026-07-20 and declined: third-party OSS, seam already whole —
+  see docs/reviews/2026-07-20-landscape.md.)
+
 ## Review sweep (2026-07-19, two parallel reviewers over src/ halves)
 
 Post-fleet-review sweep after the macOS fixes landed. Every finding below was
