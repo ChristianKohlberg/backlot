@@ -44,6 +44,15 @@ export interface UpOptions {
   kind?: LeaseKind;
   watch?: boolean;
   ttlMs?: number;
+  /**
+   * Bring up only these services (plus their transitive depends_on closure)
+   * instead of the whole app — `backlot up sherlock audit`. An empty array is
+   * the explicit "whole app" the `up` verb always sends. Undefined is DISTINCT:
+   * it means "keep the lease's current shape" and is what the internal
+   * reset-data/watch/bind rebinds pass, so a slice survives a rebind rather than
+   * silently re-expanding to the full app.
+   */
+  services?: string[];
   /** Bind from this directory instead of the worktree (bind --ref extraction). */
   sourceRoot?: string;
   /**
@@ -317,7 +326,7 @@ export class Engine {
   }
 
   /** One atomic claim attempt — MUST run under the pool lock. */
-  private async tryClaim(stack: Stack, holder: string, kind: LeaseKind, hygiene: Hygiene, ttlMs: number, holderPid?: number, onlyMine = false): Promise<EnvRow | null> {
+  private async tryClaim(stack: Stack, holder: string, kind: LeaseKind, hygiene: Hygiene, ttlMs: number, holderPid?: number, onlyMine = false): Promise<{ env: EnvRow; fresh: boolean } | null> {
     // A holder keeps its env: rebinding your own lease is the normal loop —
     // unless that env is being torn down or has flapped, in which case drop the
     // stale lease and fall through to a fresh claim.
@@ -330,7 +339,9 @@ export class Engine {
       const env = this.journal.getEnv(mine.envId);
       if (env && env.state !== 'recycling' && env.state !== 'degraded') {
         this.journal.saveLease({ ...mine, hygiene, expiresAt: now() + ttlMs, ...holderIdentity(holderPid) });
-        return env;
+        // A continuing lease keeps its shape: bindAndStart's undefined-request
+        // path preserves env.activeServices for this same holder.
+        return { env, fresh: false };
       }
       this.journal.deleteLease(mine.id);
     }
@@ -350,7 +361,13 @@ export class Engine {
         id: `l-${shortId()}`, envId: env.id, kind, holder, hygiene, expiresAt: now() + ttlMs,
         ...holderIdentity(holderPid),
       });
-      return env;
+      // fresh: true — a NEW owner. It must not inherit a previous holder's
+      // leftover activeServices, so bindAndStart treats an unspecified request
+      // on a fresh claim as the whole app. We do NOT rewrite activeServices
+      // here: it may only change AFTER the bind reconciles reality (fast path /
+      // epilogue), so an early bind failure can't strand the journal asserting
+      // a shape that isn't running.
+      return { env, fresh: true };
     }
     return null;
   }
@@ -384,7 +401,7 @@ export class Engine {
   }
 
   /** Queue at capacity WITHOUT holding the pool lock while sleeping. */
-  private async acquireEnv(stack: Stack, holder: string, kind: LeaseKind, hygiene: Hygiene, ttlMs: number, holderPid?: number): Promise<EnvRow> {
+  private async acquireEnv(stack: Stack, holder: string, kind: LeaseKind, hygiene: Hygiene, ttlMs: number, holderPid?: number): Promise<{ env: EnvRow; fresh: boolean }> {
     const start = now();
     // A holder that already holds this stack's LIVE lease consumes no
     // capacity — rebinding only refreshes it. Sending it through the queue
@@ -396,8 +413,8 @@ export class Engine {
     // nothing and joins the queue like everyone else.
     const live = this.journal.leaseForHolder(holder, stack.id);
     if (live && live.expiresAt > now()) {
-      const env = await this.poolLocked(() => this.tryClaim(stack, holder, kind, hygiene, ttlMs, holderPid, true));
-      if (env) return env;
+      const claimed = await this.poolLocked(() => this.tryClaim(stack, holder, kind, hygiene, ttlMs, holderPid, true));
+      if (claimed) return claimed;
     }
     // FIFO ticket. Without ordering, every waiter polled independently and a
     // freed environment went to whoever happened to poll first — so an early
@@ -424,13 +441,13 @@ export class Engine {
     start: number,
     ticket: number,
     holderPid?: number,
-  ): Promise<EnvRow> {
+  ): Promise<{ env: EnvRow; fresh: boolean }> {
     for (;;) {
       // Only the head of THIS STACK's queue may claim; everyone else waits.
       const queue = this.waiting.get(stack.id);
       const myTurn = !queue || queue.length === 0 || queue[0] === ticket;
-      const env = myTurn ? await this.poolLocked(() => this.tryClaim(stack, holder, kind, hygiene, ttlMs, holderPid)) : null;
-      if (env) return env;
+      const claimed = myTurn ? await this.poolLocked(() => this.tryClaim(stack, holder, kind, hygiene, ttlMs, holderPid)) : null;
+      if (claimed) return claimed;
       // Refuse to burn the full wait on something that provably cannot resolve.
       const blocked = await this.poolLocked(() => this.structuralCapacityBlock(stack, now() + WAIT_MS()));
       if (blocked) {
@@ -494,7 +511,31 @@ export class Engine {
     return sup;
   }
 
-  private async bindAndStart(stack: Stack, envSnapshot: EnvRow, hygiene: Hygiene, kind: LeaseKind, watch: boolean, sourceRoot?: string, onProgress?: Progress): Promise<EnvRow> {
+  /**
+   * The services a bind must bring up: the named ones plus the transitive
+   * `depends_on` closure of each. An unknown name is a manifest work-error,
+   * reported like the other service lookups. A depends_on cycle is tolerated
+   * here (the visit is closure-guarded) and caught by the start loop's own
+   * cycle check.
+   */
+  private resolveServiceClosure(stack: Stack, names: string[]): Set<string> {
+    const all = stack.manifest.services;
+    if (names.length === 0) return new Set(Object.keys(all)); // no selection = the whole app
+    const closure = new Set<string>();
+    const visit = (name: string) => {
+      if (closure.has(name)) return;
+      const spec = all[name];
+      if (!spec) {
+        throw new BrokerError('work-error', `no service '${name}' in backlot.yml (have: ${Object.keys(all).join(', ') || 'none'})`, 'manifest');
+      }
+      closure.add(name);
+      for (const dep of spec.depends_on ?? []) visit(dep);
+    };
+    for (const n of names) visit(n);
+    return closure;
+  }
+
+  private async bindAndStart(stack: Stack, envSnapshot: EnvRow, hygiene: Hygiene, kind: LeaseKind, watch: boolean, sourceRoot?: string, onProgress?: Progress, requestedServices?: string[], freshClaim = false): Promise<EnvRow> {
     const say = onProgress ?? (() => undefined);
     // Re-read under the env lock: the snapshot captured during acquire may be
     // stale (a concurrent degrade/pid update landed). Everything below mutates
@@ -503,6 +544,24 @@ export class Engine {
     if (env.state === 'recycling') {
       throw new BrokerError('env-error', `environment ${env.id} is being recycled — retry`, 'pool');
     }
+    // Which services this bind brings up. An explicit list wins: `up` sends []
+    // (whole app) or a slice, `run` sends []. An undefined request means "no
+    // caller preference": on a FRESH claim that is the whole app (a new owner
+    // never inherits the previous holder's slice), and on a continuing lease
+    // (reset-data/watch/bind on the same holder's env) it preserves the current
+    // shape. Because the shape is only ever read from the journal — never
+    // rewritten at claim time — an early bind failure leaves activeServices
+    // matching whatever is still running. resolveServiceClosure owns the
+    // empty->whole-app rule, so a preserved shape whose services were all removed
+    // from the manifest falls back to full rather than starting none.
+    const declaredServices = Object.keys(stack.manifest.services);
+    const requestedNames =
+      requestedServices !== undefined
+        ? requestedServices
+        : freshClaim
+          ? []
+          : env.activeServices?.filter((n) => n in stack.manifest.services) ?? [];
+    const active = this.resolveServiceClosure(stack, requestedNames);
     const dirs = this.envDirs(env.id);
     // Ports are allocated once at createEnv (decision 0004: stable for the
     // environment's lifetime). A service ADDED to the manifest afterwards had
@@ -578,11 +637,18 @@ export class Engine {
     }
 
     // Fast path: identical source, services healthy, data untouched -> reuse as-is.
+    // The running service-set must also equal the requested shape — otherwise a
+    // full env would be reused for a `up sherlock` (no saving) and a subset env
+    // for a full `up` (missing services). A mismatch falls through to a full
+    // stop + start of exactly the requested slice.
+    const runningServices = new Set(Object.keys(this.supervisor(env).pids()));
+    const shapeMatches = runningServices.size === active.size && [...active].every((n) => runningServices.has(n));
     const unchanged =
       env.fingerprints['@source'] === sync.sourceHash &&
       upkeep.ran.length === 0 &&
       env.state === 'hot' &&
       this.supervisor(env).allHealthyPids() &&
+      shapeMatches &&
       hygiene === 'reuse';
     env.fingerprints = { ...upkeep.fingerprints };
     if (unchanged) {
@@ -593,6 +659,13 @@ export class Engine {
       // the pre-bind snapshot back put dead pids there — which recovery would
       // later signal, missing the real process.
       env.servicePids = this.supervisor(env).pids();
+      // Record the shape here too. A fresh claim clears activeServices, but the
+      // fast path can still reuse an env whose running set already equals the
+      // request (up api -> release -> up api), so without this the journal would
+      // say "whole app" while only the slice runs — ctx/exec would then advertise
+      // a dead URL. shapeMatches guarantees active == the running set, so this is
+      // always truthful.
+      env.activeServices = active.size === declaredServices.length ? undefined : [...active];
       this.journal.saveEnv(env);
       return env;
     }
@@ -618,34 +691,43 @@ export class Engine {
       env.presets[name] = preset;
     }
 
-    // Builds: only when the source actually changed (fingerprint '@source').
+    // Builds: per service, gated on that service's OWN build fingerprint. A
+    // slice bind builds only its own services, so the whole-source '@source'
+    // stamp can't double as "built" — marking it would let a later
+    // `up <excluded-service>` skip that service's build and run it unbuilt (or
+    // serve stale code) even though its source changed. Each service rebuilds
+    // whenever the source moved since it was last built; '@built:*' stamps ride
+    // in env.fingerprints (runUpkeep preserves them) and pristine wipes them.
     const ctx = this.templateCtx(stack, env);
-    if (env.fingerprints['@source'] !== sync.sourceHash) {
-      for (const [name, spec] of Object.entries(stack.manifest.services)) {
-        const build = spec.build;
-        if (!build) continue;
-        say(`building '${name}'`);
-        const buildStart = now();
-        const beat = setInterval(() => say(`building '${name}' … ${Math.round((now() - buildStart) / 1000)}s`), 5000);
-        beat.unref();
-        try {
-          const buildTimeoutS = cmdTimeoutS(LONG_CMD_TIMEOUT_S);
-          const r = await runBounded(template(build, ctx), dirs.tree, buildTimeoutS);
-          if (r.timedOut) {
-            throw new BrokerError('work-error', `build for service '${name}' timed out after ${buildTimeoutS}s (process group killed; set BACKLOT_CMD_TIMEOUT_S if legitimate)`, name, r.output.slice(-800));
-          }
-          if (r.code !== 0) throw new BrokerError('work-error', `build failed for service '${name}'`, name, r.output.slice(-800));
-        } finally {
-          clearInterval(beat);
+    for (const [name, spec] of Object.entries(stack.manifest.services)) {
+      if (!active.has(name)) continue; // don't build a slice we won't start
+      const build = spec.build;
+      if (!build) continue;
+      if (env.fingerprints[`@built:${name}`] === sync.sourceHash) continue; // already built at this source
+      say(`building '${name}'`);
+      const buildStart = now();
+      const beat = setInterval(() => say(`building '${name}' … ${Math.round((now() - buildStart) / 1000)}s`), 5000);
+      beat.unref();
+      try {
+        const buildTimeoutS = cmdTimeoutS(LONG_CMD_TIMEOUT_S);
+        const r = await runBounded(template(build, ctx), dirs.tree, buildTimeoutS);
+        if (r.timedOut) {
+          throw new BrokerError('work-error', `build for service '${name}' timed out after ${buildTimeoutS}s (process group killed; set BACKLOT_CMD_TIMEOUT_S if legitimate)`, name, r.output.slice(-800));
         }
+        if (r.code !== 0) throw new BrokerError('work-error', `build failed for service '${name}'`, name, r.output.slice(-800));
+      } finally {
+        clearInterval(beat);
       }
+      env.fingerprints[`@built:${name}`] = sync.sourceHash;
     }
     env.fingerprints['@source'] = sync.sourceHash;
 
     // Start in dependency order, readiness-gated, fatal-log fast-fail.
     const sup = this.supervisor(env);
     const started = new Set<string>();
-    const entries = Object.entries(stack.manifest.services);
+    // Only the requested slice (already a depends_on closure, so every dep of a
+    // member is also here and the topological order below still resolves).
+    const entries = Object.entries(stack.manifest.services).filter(([n]) => active.has(n));
     while (started.size < entries.length) {
       const ready = entries.filter(([n, s]) => !started.has(n) && (s.depends_on ?? []).every((d) => started.has(d)));
       if (ready.length === 0) throw new BrokerError('work-error', 'depends_on cycle in backlot.yml', 'manifest');
@@ -739,11 +821,18 @@ export class Engine {
     }
     if (current.state === 'degraded') {
       env.state = 'degraded';
-      this.journal.saveEnv({ ...current, servicePids: sup.pids(), lastUsedAt: now() });
+      // Record this bind's shape alongside its pids — writing back current's
+      // pre-bind activeServices next to the just-started pids would let a reader
+      // in the degraded window filter URLs by the wrong slice.
+      const degradedShape = active.size === declaredServices.length ? undefined : [...active];
+      this.journal.saveEnv({ ...current, servicePids: sup.pids(), activeServices: degradedShape, lastUsedAt: now() });
       throw new BrokerError('env-error', `environment ${env.id} degraded during bind — a service flapped past its restart budget`, 'pool');
     }
     env.state = 'hot';
     env.servicePids = sup.pids();
+    // Remember the shape only when it is a genuine subset; a full app stays
+    // undefined so a later manifest addition isn't frozen out by a stale list.
+    env.activeServices = active.size === declaredServices.length ? undefined : [...active];
     env.bindCount += 1;
     env.lastUsedAt = now();
     env.failStreak = 0; // a successful bind clears the escalation counter
@@ -880,18 +969,24 @@ export class Engine {
 
   async up(opts: UpOptions) {
     const stack = loadStack(opts.cwd);
+    // Resolve a requested slice BEFORE acquiring an env: an unknown name is a
+    // user typo, not a bind failure, so it must not reach bindAndStart's catch
+    // (which bumps failStreak — two typos would escalate the next real bind to a
+    // pristine data wipe) or churn a pooled env. bindAndStart resolves it again
+    // authoritatively; this is just the early, side-effect-free guard.
+    if (opts.services && opts.services.length > 0) this.resolveServiceClosure(stack, opts.services);
     const holder = opts.holder ?? resolve(opts.cwd);
     const kind = opts.kind ?? 'session';
     let hygiene = opts.hygiene ?? 'reuse';
     opts.onProgress?.(`acquiring an environment (pool ${this.journal.envsForStack(stack.id).length}/${POOL_MAX()})`);
-    const env = await this.acquireEnv(stack, holder, kind, hygiene, opts.ttlMs ?? LEASE_TTL(kind), opts.holderPid);
+    const { env, fresh } = await this.acquireEnv(stack, holder, kind, hygiene, opts.ttlMs ?? LEASE_TTL(kind), opts.holderPid);
     // Auto-escalation (decision 0007): two consecutive bind failures on this
     // warm environment -> the next bind is pristine, whatever was asked.
     if (hygiene !== 'pristine' && env.failStreak >= 2) hygiene = 'pristine';
     try {
       const bound = await this.envLocked(
         env.id,
-        () => this.bindAndStart(stack, env, hygiene, kind, opts.watch ?? false, opts.sourceRoot, opts.onProgress),
+        () => this.bindAndStart(stack, env, hygiene, kind, opts.watch ?? false, opts.sourceRoot, opts.onProgress, opts.services, fresh),
         (s) => opts.onProgress?.(`waiting for another operation on this environment … ${s}s`),
       );
       if (opts.watch && kind === 'session' && !this.watchers.has(bound.id)) {
@@ -948,8 +1043,14 @@ export class Engine {
     }
     this.touch(env.id); // asking for context means an agent is still working here
     const ctx = this.templateCtx(stack, env);
+    // A subset env only reports the URLs it actually has up; a full env (active
+    // undefined) reports everything, unchanged.
+    const activeSet = env.activeServices ? new Set(env.activeServices) : null;
     const urls: Record<string, string> = {};
-    for (const [name, s] of Object.entries(ctx.services)) urls[name] = s.url;
+    for (const [name, s] of Object.entries(ctx.services)) {
+      if (activeSet && !activeSet.has(name)) continue;
+      urls[name] = s.url;
+    }
     return {
       stack: stack.manifest.name,
       envId: env.id,
@@ -975,7 +1076,9 @@ export class Engine {
     // that happens to share a --holder. Its lease is uniquely ours to delete.
     const holder = `run-${shortId()}`;
     const startedAt = now();
-    const context = await this.up({ ...opts, holder, kind: 'run', hygiene: opts.hygiene ?? 'reset-data' });
+    // services: [] forces the whole app — a check runs against the full topology,
+    // never the leftover shape of whatever pooled env it happens to reuse.
+    const context = await this.up({ ...opts, holder, kind: 'run', hygiene: opts.hygiene ?? 'reset-data', services: [] });
     const env = this.journal.getEnv(context.envId);
     if (!env) {
       // Bound a moment ago, so only a concurrent forced recycle can take it.
@@ -1221,7 +1324,14 @@ export class Engine {
     const ctx = this.templateCtx(stack, env);
     const extra: Record<string, string> = { BACKLOT_ENV_ID: env.id };
     for (const [name, port] of Object.entries(env.ports)) extra[`BACKLOT_PORT_${name.toUpperCase()}`] = String(port);
-    for (const [name, s] of Object.entries(ctx.services)) extra[`BACKLOT_URL_${name.toUpperCase()}`] = s.url;
+    // Match ctx: on a subset env only the services that are actually up get a
+    // URL, so an exec'd command doesn't dereference a service the agent was told
+    // is down (the port is stable but nothing is listening on it).
+    const activeSet = env.activeServices ? new Set(env.activeServices) : null;
+    for (const [name, s] of Object.entries(ctx.services)) {
+      if (activeSet && !activeSet.has(name)) continue;
+      extra[`BACKLOT_URL_${name.toUpperCase()}`] = s.url;
+    }
     for (const [name, d] of Object.entries(ctx.datastores)) extra[`BACKLOT_DS_${name.toUpperCase()}`] = d.url;
     return this.envLocked(env.id, async () => {
       this.assertUsable(env.id);
@@ -1352,6 +1462,8 @@ export class Engine {
       return {
         id: e.id, stack: e.stack, state: e.state, ports: e.ports, bindCount: e.bindCount,
         lease,
+        /** null = the whole app; otherwise the service slice this env is running. */
+        activeServices: e.activeServices ?? null,
         idleMs: now() - e.lastUsedAt,
         /** null = the holder never identified itself, so liveness is unknowable. */
         holderAlive,
