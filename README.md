@@ -41,12 +41,22 @@ the fastest first contact is a checkout:
 git clone https://github.com/ChristianKohlberg/backlot && cd backlot
 npm install && npm run build && npm link   # (or, for your own repos: npm i -g backlot)
 cd examples/hello-web
-backlot up --json          # lease a warm env: sync, seed, start, print URLs + creds
+backlot up --json          # lease a warm env: sync, seed, start — returns the full context blob (URLs + creds)
 backlot run smoke --json   # bind -> run the check -> JSON verdict -> release
-backlot ctx --json         # everything an agent needs, in one blob
+backlot ctx --json         # re-read that same blob later, read-only — no re-bind (up already returned it)
 backlot sync               # edit locally, project it in — seconds; hot_reload services keep running
+backlot exec <cmd>         # run an arbitrary command in the env your lease holds (raw exit, not a verdict)
 backlot release            # environment returns to the pool, warm
 ```
+
+**`run` vs `exec`.** `run <check>` is self-contained: it takes its *own*
+environment, executes a check declared in `backlot.yml`, returns a classified
+verdict (`work` / `env` / `infra` — a dead dev-server is never reported as your
+test failing) with artifacts, then releases — **no prior `up` needed**. `exec
+<cmd>` runs an arbitrary command inside the environment your `up` lease is
+already holding and hands back its raw stdout and exit code, so it **needs an
+`up` first**. Rule of thumb: **`run` to prove a change, `exec` to poke at the
+live environment.**
 
 For your own repo: `npm i -g backlot`, write the `backlot.yml`, then the same
 verbs. Requires Node ≥ 22.13 and git. The daemon auto-spawns on first use (unix
