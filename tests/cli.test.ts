@@ -4,7 +4,7 @@
  * expiry, and the multi-service topology. Each block gets an isolated state
  * dir (its own daemon), exactly how a consumer machine would look.
  */
-import { describe, it, expect, afterAll } from 'vitest';
+import { describe, it, expect, afterAll, beforeAll } from 'vitest';
 import { execFile, execFileSync } from 'node:child_process';
 import { cpSync, mkdtempSync, rmSync, writeFileSync, readFileSync, appendFileSync, existsSync, readdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -233,6 +233,48 @@ describe('the multi-service topology (hello-multi)', () => {
     expect(logs.stdout).toContain('worker ready');
   });
 
+  it('up <service> starts only its slice and genuinely stops what it excludes', async () => {
+    // Full app first: capture web's URL and confirm it actually serves.
+    let res = await ctx.cli(['up', '--json'], wt.dir);
+    expect(res.exitCode, `stdout: ${res.stdout ?? ''}\nstderr: ${res.stderr ?? ''}`).toBe(0);
+    const webUrl = (res.json!.urls as Record<string, string>).web!;
+    expect((await fetch(webUrl)).ok).toBe(true);
+
+    // `up api` — api's closure excludes web, so web must genuinely STOP (its
+    // stable port stops answering), not merely vanish from the ctx blob.
+    res = await ctx.cli(['up', 'api', '--json'], wt.dir);
+    expect(res.exitCode, `stdout: ${res.stdout ?? ''}\nstderr: ${res.stderr ?? ''}`).toBe(0);
+    let urls = res.json!.urls as Record<string, string>;
+    expect(urls.api).toBeDefined();
+    expect(urls.web).toBeUndefined(); // filtered from ctx
+    await expect(fetch(webUrl)).rejects.toThrow(); // AND the process is down
+
+    // A rebind preserves the slice: reset-data must not resurrect web.
+    res = await ctx.cli(['reset-data', '--json'], wt.dir);
+    expect(res.exitCode, `stdout: ${res.stdout ?? ''}\nstderr: ${res.stderr ?? ''}`).toBe(0);
+    await expect(fetch(webUrl)).rejects.toThrow();
+
+    // `up web` — web depends_on api, so the closure pulls api back in and serves.
+    res = await ctx.cli(['up', 'web', '--json'], wt.dir);
+    expect(res.exitCode, `stdout: ${res.stdout ?? ''}\nstderr: ${res.stderr ?? ''}`).toBe(0);
+    urls = res.json!.urls as Record<string, string>;
+    expect(urls.api).toBeDefined();
+    expect((await fetch(urls.web!)).ok).toBe(true);
+
+    // Plain `up` on this SAME live lease re-expands to the whole app: the []
+    // request overrides the preserved slice, so the excluded worker restarts.
+    // (Guards the []-vs-undefined RPC distinction the design hinges on.)
+    res = await ctx.cli(['up', '--json'], wt.dir);
+    expect(res.exitCode, `stdout: ${res.stdout ?? ''}\nstderr: ${res.stderr ?? ''}`).toBe(0);
+    const workerLogs = await ctx.cli(['logs', 'worker', '--lines', '5'], wt.dir);
+    expect(workerLogs.stdout).toContain('worker ready');
+
+    // An unknown service is a work-error naming the declared ones, not a crash.
+    const bad = await ctx.cli(['up', 'nope', '--json'], wt.dir);
+    expect(bad.exitCode).toBe(1);
+    expect((bad.json!.error as { message: string }).message).toContain("no service 'nope'");
+  });
+
   it('run smoke uses the run preset (dev), collects the artifact, verdict green', async () => {
     const res = await ctx.cli(['run', 'smoke', '--json'], wt.dir);
     expect(res.exitCode, `stdout: ${res.stdout ?? ''}\nstderr: ${res.stderr ?? ''}`).toBe(0);
@@ -247,6 +289,169 @@ describe('the multi-service topology (hello-multi)', () => {
     await ctx.cli(['release'], wt.dir);
     const res = await ctx.cli(['pool', 'recycle', '--json'], wt.dir);
     expect((res.json!.recycled as string[]).length).toBeGreaterThan(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+
+describe('a slice does not leak across a pool handoff (hello-multi)', () => {
+  const ctx = makeContext();
+  const wt = makeWorktree('hello-multi');
+  afterAll(async () => {
+    await ctx.cleanup();
+    wt.drop();
+  });
+
+  it('a released subset env hands the next holder the whole app, not the leftover slice', async () => {
+    // Holder A takes an api-only slice, then releases the env back to the pool.
+    let res = await ctx.cli(['up', 'api', '--holder', 'agentA', '--json'], wt.dir);
+    expect(res.exitCode, `stdout: ${res.stdout ?? ''}\nstderr: ${res.stderr ?? ''}`).toBe(0);
+    expect((res.json!.urls as Record<string, string>).web).toBeUndefined();
+    res = await ctx.cli(['release', '--holder', 'agentA', '--json'], wt.dir);
+    expect(res.exitCode).toBe(0);
+
+    // Holder B arrives via sync as first contact — never asked for a slice, so it
+    // must get the FULL app, not agentA's leftover api-only shape. (Regression:
+    // tryClaim used to hand the fresh claim the previous owner's activeServices.)
+    res = await ctx.cli(['sync', '--holder', 'agentB', '--json'], wt.dir);
+    expect(res.exitCode, `stdout: ${res.stdout ?? ''}\nstderr: ${res.stderr ?? ''}`).toBe(0);
+    const urls = res.json!.urls as Record<string, string>;
+    expect(urls.api).toBeDefined();
+    expect(urls.web).toBeDefined();
+  });
+
+  it('re-claiming a released slice via the fast path reports only the slice, not the whole app', async () => {
+    // sliceA runs api only, then releases — the env stays hot with just api up.
+    await ctx.cli(['up', 'api', '--holder', 'sliceA', '--json'], wt.dir);
+    await ctx.cli(['release', '--holder', 'sliceA', '--json'], wt.dir);
+    // sliceB re-claims with the SAME slice: the fast path reuses the hot env
+    // (running {api} == requested {api}). ctx must report only api — regression:
+    // the fast path skipped writing activeServices, so a fresh-claim-cleared env
+    // was journaled as "whole app" while only api ran, and ctx advertised a dead
+    // web URL.
+    const res = await ctx.cli(['up', 'api', '--holder', 'sliceB', '--json'], wt.dir);
+    expect(res.exitCode, `stdout: ${res.stdout ?? ''}\nstderr: ${res.stderr ?? ''}`).toBe(0);
+    const urls = res.json!.urls as Record<string, string>;
+    expect(urls.api).toBeDefined();
+    expect(urls.web).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+
+describe('a failed first bind on a re-claimed env keeps ctx truthful (hello-multi)', () => {
+  const ctx = makeContext();
+  const wt = makeWorktree('hello-multi');
+  afterAll(async () => {
+    await ctx.cleanup();
+    wt.drop();
+  });
+
+  it('advertises only the services actually running, even when the bind fails early', async () => {
+    // Holder A runs api only, then releases — the env stays hot with just api up.
+    await ctx.cli(['up', 'api', '--holder', 'fbA', '--json'], wt.dir);
+    await ctx.cli(['release', '--holder', 'fbA', '--json'], wt.dir);
+
+    // Break the worktree so holder B's first (full) bind fails BEFORE it stops or
+    // starts anything: a failing upkeep rule that fires on the manifest itself.
+    const mf = join(wt.dir, 'backlot.yml');
+    writeFileSync(
+      mf,
+      readFileSync(mf, 'utf8').replace(
+        '- { when: seed.mjs, run: "@rebake-template main" }',
+        '- { when: backlot.yml, run: "false" }',
+      ),
+    );
+    const failed = await ctx.cli(['up', '--holder', 'fbB', '--json'], wt.dir);
+    expect(failed.exitCode).not.toBe(0); // bind failed on the upkeep rule, before any teardown
+
+    // The env still has only api running (A's slice, never torn down). ctx must
+    // advertise api and NOT web — regression: a claim-time shape clear used to
+    // journal this env as "whole app" and advertise a dead web URL after the
+    // early failure. The shape is only ever written once the bind reconciles.
+    const res = await ctx.cli(['ctx', '--holder', 'fbB', '--json'], wt.dir);
+    expect(res.exitCode, `stdout: ${res.stdout ?? ''}\nstderr: ${res.stderr ?? ''}`).toBe(0);
+    const urls = res.json!.urls as Record<string, string>;
+    expect(urls.api).toBeDefined();
+    expect(urls.web).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+
+describe('a slice builds per service, not gated by the whole-source stamp', () => {
+  const stateDir = mkdtempSync(join(tmpdir(), 'backlot-bf-'));
+  const cliEnv = { ...process.env, BACKLOT_STATE_DIR: stateDir, BACKLOT_SWEEP_MS: '400' };
+  const wt = mkdtempSync(join(tmpdir(), 'backlot-bfwt-'));
+  const cli = (args: string[]): Promise<CliResult> =>
+    new Promise((resolve) => {
+      execFile(process.execPath, [CLI, ...args], { cwd: wt, env: cliEnv, maxBuffer: 16 * 1024 * 1024 }, (err, stdout, stderr) => {
+        let json: Record<string, unknown> | undefined;
+        try {
+          json = JSON.parse(String(stdout));
+        } catch {
+          /* non-json verb */
+        }
+        resolve({ exitCode: err ? ((err as { code?: number }).code ?? 1) : 0, stdout: String(stdout), stderr: String(stderr), json });
+      });
+    });
+
+  beforeAll(() => {
+    // `built` produces its run artifact in a build step; if the build is skipped
+    // the run command has nothing to launch. `keep` is a plain always-up service.
+    writeFileSync(
+      join(wt, 'backlot.yml'),
+      [
+        'name: buildfp',
+        'services:',
+        '  keep:',
+        '    run: node keep.js',
+        '    port: keep',
+        '    env: { PORT: "{{ports.keep}}" }',
+        '    ready: { http: / }',
+        '  built:',
+        '    build: node build.js',
+        '    run: node out/server.js',
+        '    port: built',
+        '    env: { PORT: "{{ports.built}}" }',
+        '    ready: { http: / }',
+        '',
+      ].join('\n'),
+    );
+    writeFileSync(join(wt, 'keep.js'), 'require("http").createServer((q,s)=>s.end("keep")).listen(process.env.PORT)\n');
+    writeFileSync(
+      join(wt, 'build.js'),
+      'const fs=require("fs");fs.mkdirSync("out",{recursive:true});fs.writeFileSync("out/server.js",\'require("http").createServer((q,s)=>s.end("built")).listen(process.env.PORT)\')\n',
+    );
+    execFileSync('git', ['init', '-q'], { cwd: wt });
+    execFileSync('git', ['add', '-A'], { cwd: wt });
+  });
+
+  afterAll(() => {
+    try {
+      process.kill(Number(readFileSync(join(stateDir, 'daemon.pid'), 'utf8')));
+    } catch {
+      /* daemon already gone */
+    }
+    rmSync(stateDir, { recursive: true, force: true });
+    rmSync(wt, { recursive: true, force: true });
+  });
+
+  it('up <sliceA> then up <sliceB-with-a-build> builds sliceB rather than running it unbuilt', async () => {
+    // Bring up only `keep`; `built` is excluded, so its build never runs.
+    let res = await cli(['up', 'keep', '--json']);
+    expect(res.exitCode, `stdout: ${res.stdout}\nstderr: ${res.stderr}`).toBe(0);
+    expect((res.json!.urls as Record<string, string>).built).toBeUndefined();
+
+    // Now bring up `built`. Its build MUST run (creating out/server.js) so it can
+    // serve — regression: the keep-only bind used to stamp the whole-source
+    // '@source' fingerprint as "built", so this bind skipped built's build and
+    // its run failed on the missing artifact (or served stale code).
+    res = await cli(['up', 'built', '--json']);
+    expect(res.exitCode, `stdout: ${res.stdout}\nstderr: ${res.stderr}`).toBe(0);
+    const builtUrl = (res.json!.urls as Record<string, string>).built;
+    expect(builtUrl).toBeDefined();
+    expect(await (await fetch(builtUrl!)).text()).toBe('built');
   });
 });
 

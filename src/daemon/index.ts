@@ -32,6 +32,10 @@ async function dispatch(verb: string, args: Record<string, unknown>, emit: (phas
         hygiene: (args.hygiene as never) ?? undefined,
         watch: Boolean(args.watch),
         ttlMs: args.ttlMs ? Number(args.ttlMs) : undefined,
+        // [] (not undefined) so the `up` verb always means the whole app unless
+        // a slice is named — undefined is reserved for internal shape-preserving
+        // rebinds (reset-data/watch/bind), which never come through this RPC.
+        services: Array.isArray(args.services) ? (args.services as unknown[]).map(String) : [],
         onProgress: emit,
       });
     case 'run':

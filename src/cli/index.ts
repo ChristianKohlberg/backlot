@@ -9,7 +9,9 @@ import { ensureDaemon, rpc, classifyClientError, type RpcError } from './client.
 const USAGE = `backlot — puts a working instance of a web application in front of you.
 
 Usage:
-  backlot up [--watch] [--reset-data|--pristine] [--ttl <minutes>] [--holder-pid <pid>]
+  backlot up [service...] [--watch] [--reset-data|--pristine] [--ttl <minutes>] [--holder-pid <pid>]
+                          (no service = whole app; named services start only that
+                           slice plus its depends_on closure)
                           session lease: sync, upkeep, start services, print context
   backlot run <check> [--pristine] [--pull] [--detach]
                           run lease: bind -> execute the check -> verdict -> release
@@ -185,7 +187,7 @@ async function main(): Promise<void> {
           process.exit(64);
         }
       }
-      res = await rpc('up', { cwd, holder, holderPid, hygiene: hygiene(), watch: flags.has('--watch'), ttlMs }, progress);
+      res = await rpc('up', { cwd, holder, holderPid, hygiene: hygiene(), watch: flags.has('--watch'), ttlMs, services: positional }, progress);
       endProgress();
       break;
     }
