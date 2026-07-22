@@ -238,7 +238,23 @@ async function main(): Promise<void> {
       break;
     case 'bind': {
       const ref = flagValue('--ref');
-      res = ref ? await rpc('bind-ref', { cwd, holder, ref }, progress) : await rpc('sync', { cwd, holder }, progress);
+      const ttl = flagValue('--ttl');
+      let ttlMs: number | undefined;
+      if (ttl !== undefined) {
+        ttlMs = parseTtlMinutes(ttl);
+        if (ttlMs === undefined) {
+          console.error(`backlot: --ttl expects minutes (a positive number), got '${ttl}'`);
+          process.exit(64);
+        }
+        if (!ref) {
+          // Plain `bind` (sync) has no ttl to set — accepting --ttl here would
+          // silently drop it and mislead the caller into thinking the lease was
+          // extended.
+          console.error('backlot: --ttl requires --ref (plain `bind` projects the worktree and keeps the current lease clock)');
+          process.exit(64);
+        }
+      }
+      res = ref ? await rpc('bind-ref', { cwd, holder, ref, ttlMs }, progress) : await rpc('sync', { cwd, holder }, progress);
       endProgress();
       break;
     }

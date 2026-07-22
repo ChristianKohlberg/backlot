@@ -142,6 +142,43 @@ describe('the local loop (hello-web)', () => {
 
 // ---------------------------------------------------------------------------
 
+describe('bind --ref preserves the lease clock (hello-web)', () => {
+  const ctx = makeContext();
+  const wt = makeWorktree('hello-web');
+  beforeAll(() => {
+    // bind --ref resolves a COMMIT, so the fixture needs one.
+    execFileSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-q', '-m', 'init'], { cwd: wt.dir });
+  });
+  afterAll(async () => {
+    await ctx.cleanup();
+    wt.drop();
+  });
+
+  it('re-pointing a ref keeps the existing TTL; --ttl overrides it', async () => {
+    const remainingMin = (r: CliResult) => ((r.json!.lease as { expiresAt: number }).expiresAt - Date.now()) / 60_000;
+
+    let res = await ctx.cli(['up', '--ttl', '480', '--json'], wt.dir);
+    expect(res.exitCode, `stdout: ${res.stdout}\nstderr: ${res.stderr}`).toBe(0);
+    expect(remainingMin(res)).toBeGreaterThan(470); // ~480
+    expect(remainingMin(res)).toBeLessThan(481);
+
+    // The bug: bind --ref used to reset the lease to the ~30-min default. Bounds
+    // are pinned both sides so a wrong impl that extends (not just shortens) fails.
+    res = await ctx.cli(['bind', '--ref', 'HEAD', '--json'], wt.dir);
+    expect(res.exitCode, `stdout: ${res.stdout}\nstderr: ${res.stderr}`).toBe(0);
+    expect(remainingMin(res)).toBeGreaterThan(470); // still ~480, not shortened
+    expect(remainingMin(res)).toBeLessThan(481);
+
+    // Explicit --ttl on bind sets the clock in one operation.
+    res = await ctx.cli(['bind', '--ref', 'HEAD', '--ttl', '600', '--json'], wt.dir);
+    expect(res.exitCode, `stdout: ${res.stdout}\nstderr: ${res.stderr}`).toBe(0);
+    expect(remainingMin(res)).toBeGreaterThan(590); // ~600
+    expect(remainingMin(res)).toBeLessThan(601);
+  });
+});
+
+// ---------------------------------------------------------------------------
+
 describe('verdicts, outputs, and the error taxonomy', () => {
   const ctx = makeContext();
   const wt = makeWorktree('hello-web');

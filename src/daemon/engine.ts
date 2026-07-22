@@ -1228,14 +1228,28 @@ export class Engine {
   }
 
   /** bind --ref: project a COMMITTED ref (not the worktree state) into the env. */
-  async bindRef(cwd: string, ref: string, holder?: string) {
+  async bindRef(cwd: string, ref: string, holder?: string, ttlMs?: number) {
     const stack = loadStack(cwd);
+    const h = holder ?? resolve(cwd);
     let sha: string;
     try {
       sha = execFileSync('git', ['-C', stack.root, 'rev-parse', '--verify', `${ref}^{commit}`], { encoding: 'utf8' }).trim();
     } catch {
       throw new BrokerError('work-error', `'${ref}' is not a commit in this repository`, 'bind');
     }
+    // Preserve the lease clock: `bind --ref` re-points the env at a commit — a
+    // content operation. It must not silently shorten a long lease to the
+    // default (a 480-min lease dropping to ~30 min would arm a fuse that stops
+    // the env's dev servers mid-workflow). Keep the current lease's remaining
+    // time unless --ttl was given explicitly; with no live lease yet, up()
+    // applies the default.
+    const lease = this.journal.leaseForHolder(h, stack.id);
+    // Snapshot the clock once: two now() reads could straddle the expiry instant
+    // and yield a 0/negative remaining, which — not being nullish — would write
+    // an already-lapsed lease instead of falling back to the default.
+    const t = now();
+    const remainingMs = lease ? lease.expiresAt - t : 0;
+    const keepTtlMs = ttlMs ?? (remainingMs > 0 ? remainingMs : undefined);
     const tmp = mkdtempSync(join(tmpdir(), 'backlot-ref-'));
     try {
       // Bounded AND off the sync path for the same reason as the worker: a
@@ -1244,7 +1258,7 @@ export class Engine {
       if (r.timedOut || r.code !== 0) {
         throw new BrokerError('work-error', `git archive of ${sha} failed${r.timedOut ? ' (timed out)' : ''}`, 'bind', r.output.slice(-400));
       }
-      return await this.up({ cwd, holder: holder ?? resolve(cwd), kind: 'session', hygiene: 'reuse', sourceRoot: tmp });
+      return await this.up({ cwd, holder: h, kind: 'session', hygiene: 'reuse', sourceRoot: tmp, ttlMs: keepTtlMs });
     } finally {
       rmSync(tmp, { recursive: true, force: true });
     }
