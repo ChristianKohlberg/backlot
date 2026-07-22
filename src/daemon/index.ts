@@ -57,7 +57,7 @@ async function dispatch(verb: string, args: Record<string, unknown>, emit: (phas
     case 'job-ls':
       return engine.jobList();
     case 'bind-ref':
-      return engine.bindRef(cwd, String(args.ref), holder);
+      return engine.bindRef(cwd, String(args.ref), holder, args.ttlMs ? Number(args.ttlMs) : undefined);
     case 'ctx':
       return engine.ctx(cwd, holder);
     case 'sync':
