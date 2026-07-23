@@ -58,6 +58,29 @@ already holding and hands back its raw stdout and exit code, so it **needs an
 `up` first**. Rule of thumb: **`run` to prove a change, `exec` to poke at the
 live environment.**
 
+### Partial `up`: lease one slice, not the whole app
+
+`backlot up` with **no service** brings up the whole app. Name one or more
+services and backlot starts **only that slice plus its transitive `depends_on`
+closure** — nothing else boots. This is how you lease a single vertical or a lone
+SPA without paying for the rest of the stack.
+
+Take [`examples/hello-multi`](examples/hello-multi/backlot.yml): `web`
+`depends_on: [api]`, and `worker` stands alone.
+
+```bash
+cd examples/hello-multi
+backlot up web       # starts web + api (its depends_on closure) — worker stays down
+backlot up worker    # starts worker alone — no api, no web
+backlot up           # the whole app: api + web + worker
+```
+
+Because the closure is transitive, naming a leaf pulls in everything it needs to
+run and nothing it doesn't — ideal for iterating on one frontend while its single
+backing service comes along for the ride. An unknown service name is a manifest
+work-error. All the usual flags (`--watch`, `--reset-data`/`--pristine`,
+`--ttl`, `--json`) apply to the partial form too.
+
 For your own repo: `npm i -g backlot`, write the `backlot.yml`, then the same
 verbs. Requires Node ≥ 22.13 and git. The daemon auto-spawns on first use (unix
 socket, per-machine state under `~/.local/state/backlot`; isolate with
@@ -128,6 +151,20 @@ Be clear-eyed about what running backlot means:
   is namespacing (ports, directories, database namespaces), not a security
   boundary — code in an environment runs as you, on your machine. For untrusted
   code, put the *substrate* in a sandbox (a VM, a cloud box), not your laptop.
+
+## Claude Code
+
+backlot ships an official [Claude Code](https://claude.com/claude-code) plugin —
+a stack-agnostic skill that teaches an agent the lease model and the verb table so
+it drives backlot correctly against any repo's `backlot.yml`. This repository
+doubles as its own plugin marketplace. From inside Claude Code:
+
+```
+/plugin marketplace add ChristianKohlberg/backlot
+/plugin install backlot
+```
+
+CLI-only, no MCP server — see [`plugins/backlot`](plugins/backlot/).
 
 ## License
 
