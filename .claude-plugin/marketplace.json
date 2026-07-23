@@ -1,0 +1,27 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "backlot",
+  "description": "Claude Code plugin for backlot — the repo-aware environment broker that puts a running, seeded, provable instance of your web app in front of an agent.",
+  "owner": {
+    "name": "ChristianKohlberg"
+  },
+  "plugins": [
+    {
+      "name": "backlot",
+      "description": "Lease a running, seeded, authenticated env from backlot's warm pool: bind-by-sync your worktree, run classified checks, partial/per-service up, then ctx/release. Bundles the stack-agnostic backlot skill.",
+      "source": "./plugins/backlot",
+      "category": "productivity",
+      "author": {
+        "name": "ChristianKohlberg"
+      },
+      "homepage": "https://github.com/ChristianKohlberg/backlot",
+      "keywords": [
+        "environments",
+        "dev-environment",
+        "testing",
+        "agents",
+        "broker"
+      ]
+    }
+  ]
+}

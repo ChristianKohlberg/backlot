@@ -89,6 +89,8 @@ heisenbugs.
 
 ```bash
 backlot up                  # lease an env, sync your worktree, start services
+                            # (name services — `backlot up web` — to start only
+                            #  that slice plus its depends_on closure)
 backlot ctx --json          # URLs, login creds, DB strings, recent events — all an agent needs
 # …edit code in your worktree…
 backlot sync                # project the edits in; watchers/caches do the rest
