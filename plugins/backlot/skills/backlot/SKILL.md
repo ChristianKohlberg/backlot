@@ -63,7 +63,25 @@ stderr is human progress. Exit codes are contractual: `0` ok · `1` work-error �
 | `status` | Daemon, pool, and lease overview. Per environment, `available` answers "will the next bind take this one?" — `heat: "cold"` just means quiesced, which is a **healthy free** pool entry, not a stuck one. |
 
 Adjacent: `pull` (copy declared outputs into the worktree), `appliance ls|start|stop`
-(shared backing servers), `pool ls|recycle|reconcile|gc|doctor`, `daemon stop`.
+(shared backing servers), `pool ls|recycle|reconcile|gc|doctor`, `daemon stop`,
+`update` (see below), `--version`.
+
+**If a verb fails with `infra-error` naming two versions, that is version skew.**
+Installing a new backlot does not replace the daemon already running, so the CLI
+you invoke and the daemon serving it can be different builds; backlot refuses the
+verb rather than let the old code answer it silently. The fix is one command:
+
+```bash
+backlot update            # restart the daemon onto the installed build
+backlot update --check    # report versions and who would rebind, change nothing
+```
+
+Leases survive the restart — services stop and your next verb rebinds. `update`
+refuses if an operation is in flight, and refuses a downgrade. Do **not** reach for
+`--force`: on a shared box it interrupts somebody else's `run` mid-verdict. If
+`update` refuses, wait and retry, or tell the human. backlot never installs itself,
+so if `--check` shows no skew but you expected a newer version, the package has not
+been upgraded yet — that is a human's step, and `--check` prints the command.
 
 **The pool is shared.** On a box running several agents, `pool recycle` with no
 argument targets **every** environment, not just yours. Name the one you mean —

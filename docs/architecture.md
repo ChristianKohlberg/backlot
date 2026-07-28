@@ -328,7 +328,32 @@ backlot reset-data | pull | release
 backlot status | doctor                          # pool state | active health check
 backlot pool ls|recycle [--all]|reconcile|gc|doctor
 backlot daemon stop
+backlot update [--check] [--force]               # run the INSTALLED build (below)
+backlot --version
 ```
+
+**Version skew, and `update` (decision 0024).** The CLI spawns the daemon from its
+own `dist/`, so installing a new backlot does not replace a daemon that is already
+running — it serves the old code for the rest of its life. The daemon therefore
+reports its version on `ping` (which the CLI already issues on every invocation),
+and a mismatch **refuses** every verb except `update`, `doctor` and `daemon stop`
+with `infra-error`. It refuses rather than warns because an old daemon ignores
+arguments it does not know instead of rejecting them: `up --data-only` against a
+pre-0.9.0 daemon boots the whole application and reports success, which is issue
+#41's shape — a wrong result that names the wrong subsystem.
+
+`backlot update` restarts the daemon; the autospawn then brings up the installed
+build. **Leases survive**: services stop, environments go `warm`, and each holder's
+next verb rebinds — the same transition the idle quiesce already performs (decision
+0021), which is why a live lease is reported rather than refused. What *is* refused
+is an in-flight operation (`busy` — the caller is waiting on a verdict over this
+socket) and a downgrade (an older CLI restarting a newer daemon, the direction that
+can strand journal state); `--force` overrides either. backlot never installs
+itself — it prints the upgrade command for the detected install.
+
+The journal stamps `PRAGMA user_version`, and a daemon **refuses to open a state
+root stamped newer than it understands** rather than reading a default where the
+newer build stored meaning.
 
 Every verb accepts `--json`. Exit codes: `0` ok · `1` work-error / failed check ·
 `2` env-error · `3` infra-error · `64` usage. On a failure the `--json` body is

@@ -4,8 +4,10 @@
  * human); exit codes are contractual — 0 ok, 1 work-error, 2 env-error,
  * 3 infra-error, 64 usage. See docs/architecture.md §11.
  */
-import { ensureDaemon, rpc, classifyClientError, type RpcError } from './client.js';
+import { ensureDaemon, rpc, classifyClientError, awaitDaemonGone, type RpcError } from './client.js';
 import { isAlive } from '../core/procscan.js';
+import { VERSION, versionSkew } from '../core/version.js';
+import { installKind } from './install.js';
 
 const USAGE = `backlot — puts a working instance of a web application in front of you.
 
@@ -43,6 +45,17 @@ Usage:
                           gc reclaims service processes orphaned by an ungraceful
                           exit; doctor reports drift without acting on it
   backlot daemon stop     stop the daemon (environments are recovered on next use)
+  backlot update [--check] [--force]
+                          make the RUNNING daemon be the INSTALLED build. An
+                          upgrade replaces the files on disk but not the daemon
+                          already in memory, and the socket carries no version —
+                          so a new CLI would keep being served by the old code.
+                          This restarts it. Leases SURVIVE; services stop and
+                          each holder's next verb rebinds. --check reports the
+                          versions and who would rebind, and changes nothing.
+                          backlot never installs itself: it prints the command
+                          for your install and leaves it to you.
+  backlot --version       the version of this CLI
 
 Holding an environment — two forms, and the right one depends on who you are:
 
@@ -71,7 +84,7 @@ const verb = rawArgv[0];
 // flags survive) — the F1 class of argv bugs. Everything after a lone `--`, and
 // EVERYTHING for `exec`, is treated as a raw passthrough command.
 const VALUE_FLAGS = new Set(['--holder', '--holder-pid', '--ttl', '--role', '--lines', '--ref', '--spec', '--preset']);
-const BOOL_FLAGS = new Set(['--json', '--watch', '--reset-data', '--pristine', '--pull', '--detach', '--all', '--force', '--raw', '--data-only', '--progress', '--quiet']);
+const BOOL_FLAGS = new Set(['--json', '--watch', '--reset-data', '--pristine', '--pull', '--detach', '--all', '--force', '--raw', '--data-only', '--progress', '--quiet', '--check']);
 
 const flagVals = new Map<string, string>();
 const flags = new Set<string>();
@@ -175,13 +188,46 @@ async function main(): Promise<void> {
     return;
   }
 
-  const known = ['up', 'run', 'job', 'ctx', 'sync', 'bind', 'exec', 'logs', 'token', 'reset-data', 'pull', 'release', 'status', 'doctor', 'appliance', 'pool', 'daemon'];
+  // Answered without touching the socket: "what version am I" must work when
+  // the daemon is down, wedged, or refusing to start — those are exactly the
+  // moments someone asks.
+  if (verb === '--version' || verb === '-v' || verb === 'version') {
+    // Bare string on stdout for a human and for `$(backlot --version)`; out()
+    // would JSON-quote it. --json keeps the object shape every other verb has.
+    if (json) out({ version: VERSION });
+    else console.log(VERSION);
+    return;
+  }
+
+  const known = ['up', 'run', 'job', 'ctx', 'sync', 'bind', 'exec', 'logs', 'token', 'reset-data', 'pull', 'release', 'status', 'doctor', 'appliance', 'pool', 'daemon', 'update'];
   if (!known.includes(verb)) {
     console.error(`backlot: unknown verb '${verb}'\n\n${USAGE}`);
     process.exit(64);
   }
 
-  await ensureDaemon();
+  const daemon = await ensureDaemon();
+
+  // Version skew is REFUSED, not warned about.
+  //
+  // An old daemon does not reject arguments it has never heard of — it ignores
+  // them. A 0.8.0 daemon asked for `up --data-only` boots the whole application
+  // into what the caller believes is a datastore-only lease, and says nothing.
+  // That is the shape of issue #41: a wrong result that reads as a bug in
+  // another subsystem, and there it cost ~30 agents 14 hours. A warning on
+  // stderr does not reach a --json consumer at all, so the only honest answer
+  // is to stop.
+  //
+  // infra-error (exit 3), never env-error: an agent branches on the class
+  // MECHANICALLY (decision 0010) and env-error tells it to recycle an
+  // environment, which cannot fix a daemon running the wrong code.
+  //
+  // The three verbs that can REMEDY skew are exempt, or there would be no way
+  // out of it from a script.
+  const SKEW_EXEMPT = new Set(['update', 'doctor', 'daemon']);
+  const skew = versionSkew(VERSION, daemon.version);
+  if (skew && !SKEW_EXEMPT.has(verb)) {
+    errExit({ class: 'infra-error', message: skew.message, source: 'daemon' });
+  }
   const cwd = process.cwd();
   const holder = flagValue('--holder');
   // The CLI exits per invocation, so ITS pid is useless as a liveness signal.
@@ -381,7 +427,7 @@ async function main(): Promise<void> {
       res = await rpc('status', {});
       break;
     case 'doctor':
-      res = await rpc('doctor', {});
+      res = await rpc('doctor', { cliVersion: VERSION });
       break;
     case 'appliance': {
       const sub = positional[0] ?? 'ls';
@@ -410,7 +456,7 @@ async function main(): Promise<void> {
       }
       else if (sub === 'reconcile') res = await rpc('pool-reconcile', {});
       else if (sub === 'gc') res = await rpc('pool-gc', {});
-      else if (sub === 'doctor') res = await rpc('doctor', {});
+      else if (sub === 'doctor') res = await rpc('doctor', { cliVersion: VERSION });
       else {
         console.error(`backlot pool: unknown subcommand '${sub}' (ls | recycle | reconcile | gc | doctor)`);
         process.exit(64);
@@ -423,6 +469,86 @@ async function main(): Promise<void> {
         process.exit(64);
       }
       res = await rpc('shutdown', {});
+      break;
+    }
+    case 'update': {
+      const install = installKind();
+      const planRes = await rpc('update-plan', { cliVersion: VERSION });
+      if (!planRes.ok) {
+        errExit(planRes.error);
+        return;
+      }
+      const plan = planRes.data as {
+        daemon: string;
+        daemonPid: number;
+        journalSchema: number;
+        busy: string[];
+        leases: Array<{ envId: string; holder: string; kind: string }>;
+      };
+      const report = {
+        cli: VERSION,
+        daemon: plan.daemon,
+        journalSchema: plan.journalSchema,
+        install: install.kind,
+        installRoot: install.root,
+        skew: skew ? { direction: skew.direction, message: skew.message } : null,
+        busy: plan.busy,
+        // Named, not refused: a restart keeps every lease and costs its holder
+        // one rebind. See Engine.assertRestartable for why that is not consent
+        // worth asking for — and why an in-flight operation is.
+        holdersWhoMustRebind: plan.leases,
+        upgradeHint: install.upgradeHint,
+      };
+
+      // --check is the diagnose half, and it never restarts anything. `doctor`
+      // reports skew too; this reports what a restart would DO.
+      if (flags.has('--check')) {
+        out({ ...report, restarted: false });
+        process.exit(0);
+      }
+
+      // Already the installed build: say so and stop. An update that restarts
+      // unconditionally would make `backlot update` in a script a recurring
+      // outage for every lease holder on the box, for no gain.
+      if (!skew) {
+        out({
+          ...report,
+          restarted: false,
+          note: `the running daemon is already backlot ${plan.daemon} — nothing to do. If you have not upgraded yet: ${install.upgradeHint}`,
+        });
+        process.exit(0);
+      }
+
+      const stopRes = await rpc('daemon-restart', { cliVersion: VERSION, force: flags.has('--force') });
+      if (!stopRes.ok) {
+        errExit(stopRes.error);
+        return;
+      }
+      // The result frame arrives ~50ms BEFORE the process exits, so a respawn
+      // that pings immediately would be answered by the dying daemon, conclude
+      // one is already up, and leave the old build serving — an update that
+      // reports success and changes nothing.
+      if (!(await awaitDaemonGone(plan.daemonPid))) {
+        errExit({
+          class: 'infra-error',
+          message: `the daemon accepted the restart but is still answering — it may be wedged mid-shutdown; check the log and retry`,
+          source: 'daemon',
+        });
+      }
+      // Spawned from THIS CLI's dist, which is what makes the new daemon the
+      // installed build.
+      const now = await ensureDaemon();
+      const remaining = versionSkew(VERSION, now.version);
+      if (remaining) {
+        errExit({
+          class: 'infra-error',
+          message:
+            `restarted, but the daemon now answering is ${now.version ?? 'unversioned'} rather than ${VERSION} — ` +
+            `another backlot install owns this state root (${install.root} is this one). Check which one is on your PATH.`,
+          source: 'daemon',
+        });
+      }
+      out({ ...report, restarted: true, from: plan.daemon, to: now.version, daemonPid: now.pid });
       break;
     }
     default:

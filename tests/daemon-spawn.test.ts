@@ -14,6 +14,7 @@ import { mkdtempSync, rmSync, writeFileSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { startTime } from '../src/core/procscan.js';
+import { VERSION } from '../src/core/version.js';
 
 const repo = join(import.meta.dirname, '..');
 const CLI = join(repo, 'dist', 'cli', 'index.js');
@@ -84,7 +85,11 @@ describe('a client whose spawned daemon loses the cold-start race', () => {
       req.on('data', (d) => (body += d));
       req.on('end', () => {
         res.writeHead(200, { 'content-type': 'application/x-ndjson' });
-        res.end(JSON.stringify({ type: 'result', ok: true, data: { pid: process.pid, winner: true } }) + '\n');
+        // The stand-in must answer ping the way the daemon it impersonates does,
+        // VERSION included: a daemon that reports no version is by definition an
+        // old one, and the CLI refuses to be served by it. Without this the test
+        // measures the skew gate instead of the cold-start race.
+        res.end(JSON.stringify({ type: 'result', ok: true, data: { pid: process.pid, version: VERSION, winner: true } }) + '\n');
       });
     });
     const late = setTimeout(() => winner.listen(sock), 12_000);

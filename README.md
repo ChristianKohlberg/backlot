@@ -58,6 +58,37 @@ already holding and hands back its raw stdout and exit code, so it **needs an
 `up` first**. Rule of thumb: **`run` to prove a change, `exec` to poke at the
 live environment.**
 
+### Upgrading: `backlot update` after you install
+
+Installing a new backlot replaces the files on disk. It does **not** replace the
+daemon already running — that process keeps serving the old code for as long as
+it lives, and the socket carries no version. So an upgrade is two steps:
+
+```bash
+npm i -g backlot@latest    # or whatever installed it — backlot never installs itself
+backlot update             # restart the daemon onto the build you just installed
+```
+
+Skip the second step and backlot tells you, rather than quietly serving you the
+old behaviour: every verb except `update`, `doctor` and `daemon stop` fails with
+`infra-error` (exit 3) naming both versions. That refusal is deliberate — an old
+daemon does not reject a flag it has never heard of, it *ignores* it, so
+`up --data-only` against a pre-0.9.0 daemon would boot the whole application into
+what you asked to be a database-only lease and report success.
+
+```bash
+backlot --version          # this CLI
+backlot update --check     # cli vs daemon, who would have to rebind, and the upgrade command for your install
+backlot update             # restart; no-op when the daemon is already the installed build
+```
+
+**What a restart costs.** Leases **survive** it. Services stop, environments drop
+to `warm`, and each holder's next verb rebinds — seconds, the same transition the
+idle sweeper already performs on a leased environment. `update` names every holder
+before acting. It refuses only two things: an **in-flight operation** (a `run`
+whose caller is waiting on a verdict) and a **downgrade** (an older CLI restarting
+a newer daemon). `--force` overrides either.
+
 ### Partial `up`: lease one slice, not the whole app
 
 `backlot up` with **no service** brings up the whole app. Name one or more

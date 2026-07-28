@@ -9,6 +9,8 @@ import { existsSync, rmSync, writeFileSync, chmodSync } from 'node:fs';
 import { socketPath, pidPath, stateRoot } from '../core/paths.js';
 import { electSelf, releaseSelf } from './election.js';
 import { BrokerError } from '../core/util.js';
+import { VERSION } from '../core/version.js';
+import { JOURNAL_SCHEMA_VERSION } from '../core/journal.js';
 import { Engine } from './engine.js';
 import { logEvent } from '../core/events.js';
 
@@ -25,7 +27,9 @@ async function dispatch(verb: string, args: Record<string, unknown>, emit: (phas
   const holderPid = args.holderPid !== undefined ? Number(args.holderPid) : undefined;
   switch (verb) {
     case 'ping':
-      return { pid: process.pid };
+      // The version rides on ping because the CLI already pings on EVERY
+      // invocation (ensureDaemon), so skew detection costs no extra round trip.
+      return { pid: process.pid, version: VERSION, journalSchema: JOURNAL_SCHEMA_VERSION };
     case 'up':
       return engine.up({
         cwd, holder, holderPid,
@@ -84,7 +88,23 @@ async function dispatch(verb: string, args: Record<string, unknown>, emit: (phas
     case 'status':
       return engine.status();
     case 'doctor':
-      return engine.doctor();
+      // The CLI's own version is passed in because only the CALLER knows it,
+      // and skew belongs in the diagnosis every RPC client reads — not just in
+      // the CLI that happens to have the comparison in front of it.
+      return engine.doctor(args.cliVersion === undefined ? undefined : String(args.cliVersion));
+    case 'update-plan':
+      return engine.updatePlan(args.cliVersion === undefined ? undefined : String(args.cliVersion));
+    case 'daemon-restart':
+      // The refusal lives in the ENGINE, not the CLI, so an MCP client or any
+      // other RPC caller cannot restart past an in-flight operation just by
+      // not implementing the check (the same reason the three --data-only
+      // contradictions were moved out of the CLI in 0.8.0).
+      engine.assertRestartable({
+        force: Boolean(args.force),
+        cliVersion: args.cliVersion === undefined ? undefined : String(args.cliVersion),
+      });
+      stopDaemon();
+      return { stopping: true, was: VERSION, holders: engine.leaseHolders() };
     case 'pool-recycle':
       return engine.poolRecycle({
         envId: args.envId ? String(args.envId) : undefined,
@@ -96,15 +116,7 @@ async function dispatch(verb: string, args: Record<string, unknown>, emit: (phas
     case 'pool-gc':
       return engine.poolGc();
     case 'shutdown':
-      setTimeout(async () => {
-        await engine.shutdown();
-        // Clean up what we own, exactly as the signal path does — a stale lock
-        // is recoverable (the next daemon sees a dead holder) but leaving one
-        // behind makes every restart pay a lock-break round.
-        if (ownsSocket) rmSync(sock, { force: true });
-        if (ownsLock) releaseSelf();
-        process.exit(0);
-      }, 50);
+      stopDaemon();
       return { stopping: true };
     default:
       throw new BrokerError('env-error', `daemon does not know verb '${verb}'`, 'rpc');
@@ -114,6 +126,27 @@ async function dispatch(verb: string, args: Record<string, unknown>, emit: (phas
 const sock = socketPath();
 let ownsSocket = false;
 let ownsLock = false;
+
+/**
+ * Stop this daemon after answering the caller.
+ *
+ * The 50ms delay is what lets the result frame reach the client before the
+ * process goes: exiting inside the handler leaves the CLI reading a socket that
+ * closed without a result. `backlot update` and `daemon stop` share this path
+ * on purpose — a restart is a stop plus the next verb's autospawn (decision
+ * 0009), so there is no second teardown implementation to keep in step.
+ */
+function stopDaemon(): void {
+  setTimeout(async () => {
+    await engine.shutdown();
+    // Clean up what we own, exactly as the signal path does — a stale lock
+    // is recoverable (the next daemon sees a dead holder) but leaving one
+    // behind makes every restart pay a lock-break round.
+    if (ownsSocket) rmSync(sock, { force: true });
+    if (ownsLock) releaseSelf();
+    process.exit(0);
+  }, 50);
+}
 
 /** Is a LIVE daemon already answering on the socket? (vs. a stale socket file) */
 function pingExisting(): Promise<boolean> {
