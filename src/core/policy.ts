@@ -11,6 +11,19 @@ export interface Policy {
   poolMax: number;
   /** Machine-wide ceiling across ALL stacks (the memory heuristic is per host). */
   poolMaxTotal: number;
+  /**
+   * Machine-wide ceiling for DATA-ONLY environments, counted separately.
+   *
+   * poolMax/poolMaxTotal are derived from cores and memory because they bound
+   * running services. A data-only environment starts none, opens no port and
+   * builds nothing — where the datastore is an appliance, its marginal cost is a
+   * database catalog plus a synced tree. Charging it a stack-sized slot made a
+   * test lane compete with the interactive leases people use to LOOK at the app,
+   * which is the contention `up --data-only` existed to remove (#48). This cap
+   * is therefore disk-shaped, not CPU-shaped, and there is no per-stack variant:
+   * one lane per agent on one stack is the normal case.
+   */
+  poolMaxDataOnly: number;
   sessionTtlMs: number;
   runTtlMs: number;
   idleTtlMs: number;
@@ -27,6 +40,7 @@ export interface Policy {
 interface ConfigFile {
   poolMax?: number;
   poolMaxTotal?: number;
+  poolMaxDataOnly?: number;
   sessionTtlMs?: number;
   runTtlMs?: number;
   idleTtlMs?: number;
@@ -85,6 +99,11 @@ export function policy(): Policy {
     // and tripled a budget that was calculated once for the host. This is the
     // machine-wide ceiling; raise it deliberately if the host can take it.
     poolMaxTotal: num('BACKLOT_POOL_MAX_TOTAL', f.poolMaxTotal, poolMaxHeuristic()),
+    // Deliberately NOT the cores/memory heuristic: a data-only environment runs
+    // nothing, so what bounds it is disk, not CPU or RAM. Twice the heuristic
+    // with a floor of 4 leaves room for a lane per agent without letting the
+    // trees grow without limit.
+    poolMaxDataOnly: num('BACKLOT_POOL_MAX_DATA_ONLY', f.poolMaxDataOnly, Math.max(4, 2 * poolMaxHeuristic())),
     sessionTtlMs: num('BACKLOT_LEASE_TTL_MS', f.sessionTtlMs, 30 * 60_000),
     runTtlMs: num('BACKLOT_LEASE_TTL_MS', f.runTtlMs, 10 * 60_000),
     idleTtlMs,

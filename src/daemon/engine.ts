@@ -29,6 +29,7 @@ import type { Hygiene, LeaseKind, ServicePid } from '../core/types.js';
 
 const POOL_MAX = () => policy().poolMax;
 const POOL_MAX_TOTAL = () => policy().poolMaxTotal;
+const POOL_MAX_DATA_ONLY = () => policy().poolMaxDataOnly;
 const LEASE_TTL = (kind: LeaseKind) => (kind === 'session' ? policy().sessionTtlMs : policy().runTtlMs);
 const IDLE_TTL = () => policy().idleTtlMs;
 const LEASED_IDLE_TTL = () => policy().leasedIdleTtlMs;
@@ -310,7 +311,14 @@ export class Engine {
     return { root, tree: join(root, 'tree'), data: join(root, 'data'), logs: join(root, 'logs') };
   }
 
-  private async createEnv(stack: Stack): Promise<EnvRow> {
+  /**
+   * `dataOnly` is fixed HERE, for the environment's whole life (decision 0025).
+   * Making it a per-claim property is what let the separate data-only ceiling be
+   * bypassed: the two shapes answer to different caps, and reuse is never
+   * capacity-checked, so a claim that changed the shape moved the environment
+   * between ceilings unmetered.
+   */
+  private async createEnv(stack: Stack, dataOnly: boolean): Promise<EnvRow> {
     // Monotonic, never-reused sequence — a reaped env's id can never collide
     // with a live one (the old length+1 scheme did, deterministically).
     const n = this.journal.nextEnvSeq(stack.id);
@@ -337,13 +345,14 @@ export class Engine {
       id, stack: stack.id, stackRoot: stack.root, state: 'warm', root: dirs.root,
       ports, datastoreNs: {}, fingerprints: {}, presets: {},
       bindCount: 0, createdAt: now(), lastUsedAt: now(), servicePids: {}, failStreak: 0,
+      dataOnly,
     };
     this.journal.saveEnv(env);
     return env;
   }
 
   /** One atomic claim attempt — MUST run under the pool lock. */
-  private async tryClaim(stack: Stack, holder: string, kind: LeaseKind, hygiene: Hygiene, ttlMs: number, holderPid?: number, onlyMine = false): Promise<{ env: EnvRow; fresh: boolean } | null> {
+  private async tryClaim(stack: Stack, holder: string, kind: LeaseKind, hygiene: Hygiene, ttlMs: number, dataOnly: boolean, holderPid?: number, onlyMine = false): Promise<{ env: EnvRow; fresh: boolean } | null> {
     // A holder keeps its env: rebinding your own lease is the normal loop —
     // unless that env is being torn down or has flapped, in which case drop the
     // stale lease and fall through to a fresh claim.
@@ -355,6 +364,21 @@ export class Engine {
     if (mine && !(onlyMine && mine.expiresAt <= now())) {
       const env = this.journal.getEnv(mine.envId);
       if (env && env.state !== 'recycling' && env.state !== 'degraded') {
+        // Switching your own lease between shapes stays supported (decision
+        // 0023) — but it is now a CAPACITY EVENT, because the two shapes answer
+        // to different ceilings. Converting moves this environment from one
+        // bucket to the other, and reuse is otherwise never capacity-checked, so
+        // an unmetered conversion is exactly how the cheap data-only ceiling
+        // could be spent as application capacity: take N catalog-priced
+        // environments, then turn them into full stacks for free (decision 0025).
+        if ((env.dataOnly === true) !== dataOnly && !this.convertShape(env, dataOnly)) {
+          throw new BrokerError(
+            'env-error',
+            this.capacityRefusal(stack, dataOnly, this.capacityBinding(stack.id, dataOnly) ?? 'machine', null) +
+              ` (your lease on ${env.id} would have to change shape to ${dataOnly ? 'data-only' : 'an application environment'}, which is what needs the room.)`,
+            'pool',
+          );
+        }
         this.journal.saveLease({ ...mine, hygiene, expiresAt: now() + ttlMs, ...holderIdentity(holderPid) });
         // A continuing lease keeps its shape: bindAndStart's undefined-request
         // path preserves env.activeServices for this same holder.
@@ -368,11 +392,20 @@ export class Engine {
     const envs = this.journal.envsForStack(stack.id);
     const free = envs
       .filter((e) => !this.journal.leaseForEnv(e.id) && e.state !== 'degraded' && e.state !== 'recycling')
-      .sort((a, b) => (a.state === 'hot' ? -1 : 1) - (b.state === 'hot' ? -1 : 1));
+      // Matching SHAPE first, then heat. A data-only row handed to an ordinary
+      // `up` is not wrong — it is a conversion, and conversions have to be paid
+      // for (below) — but reaching for one while a matching environment sits free
+      // would spend capacity for nothing.
+      .sort(
+        (a, b) =>
+          (((a.dataOnly === true) === dataOnly ? 0 : 1) - ((b.dataOnly === true) === dataOnly ? 0 : 1)) ||
+          ((a.state === 'hot' ? -1 : 1) - (b.state === 'hot' ? -1 : 1)),
+      );
     let env = free[0];
-    // Two ceilings: this stack's, and the machine's across every stack.
-    const total = this.journal.allEnvs().length;
-    if (!env && envs.length < POOL_MAX() && total < POOL_MAX_TOTAL()) env = await this.createEnv(stack);
+    // A free environment of the OTHER shape may only be taken if the shape it
+    // would move into has room — otherwise the conversion is unmetered capacity.
+    if (env && (env.dataOnly === true) !== dataOnly && !this.convertShape(env, dataOnly)) env = undefined;
+    if (!env && this.capacityBinding(stack.id, dataOnly) === null) env = await this.createEnv(stack, dataOnly);
     if (env) {
       this.journal.saveLease({
         id: `l-${shortId()}`, envId: env.id, kind, holder, hygiene, expiresAt: now() + ttlMs,
@@ -398,10 +431,60 @@ export class Engine {
    * advice, saw nothing change, and could not have (#47). MUST run under the
    * pool lock.
    */
-  private capacityBinding(stack: Stack): 'stack' | 'machine' | null {
-    if (this.journal.envsForStack(stack.id).length >= POOL_MAX()) return 'stack';
-    if (this.journal.allEnvs().length >= POOL_MAX_TOTAL()) return 'machine';
+  private capacityBinding(stackId: string, dataOnly: boolean): 'stack' | 'machine' | 'data-only' | null {
+    // Data-only environments are counted against their OWN machine-wide ceiling
+    // and against neither application cap (decision 0025). poolMax/poolMaxTotal
+    // are derived from cores and memory because they bound running services; a
+    // data-only environment starts none, so charging it a stack-sized slot made a
+    // test lane compete with the interactive leases people use to look at the app
+    // — the contention `up --data-only` existed to remove (#48). There is no
+    // per-stack data-only cap: a lane per agent on one stack is the normal case.
+    if (dataOnly) {
+      return this.dataOnlyEnvs().length >= POOL_MAX_DATA_ONLY() ? 'data-only' : null;
+    }
+    if (this.appEnvs(stackId).length >= POOL_MAX()) return 'stack';
+    if (this.appEnvs().length >= POOL_MAX_TOTAL()) return 'machine';
     return null;
+  }
+
+  /**
+   * Move an environment between the application and data-only buckets, if the
+   * destination has room. Returns false — changing nothing — when it does not.
+   *
+   * The write happens at CLAIM time, not after the bind, because that is what
+   * makes the accounting exact: a concurrent claim must already see this
+   * environment in its new bucket. It records intent rather than reality, which
+   * is safe — `dataOnly` says what shape the environment IS, and a bind that
+   * later fails leaves it warm with nothing running, exactly like any other
+   * failed bind. MUST run under the pool lock (tryClaim holds it).
+   */
+  private convertShape(env: EnvRow, dataOnly: boolean): boolean {
+    if ((env.dataOnly === true) === dataOnly) return true; // nothing to convert
+    // Count the destination bucket WITHOUT this environment, since it is leaving
+    // the other one: this stack's app count already excludes it when it is
+    // data-only, and vice versa, so the ordinary check is the right one.
+    if (this.capacityBinding(env.stack, dataOnly) !== null) return false;
+    env.dataOnly = dataOnly;
+    const row = this.journal.getEnv(env.id);
+    if (row) this.journal.saveEnv({ ...row, dataOnly });
+    logEvent({
+      level: 'info',
+      kind: 'pool-shape',
+      envId: env.id,
+      detail: `converted to ${dataOnly ? 'data-only' : 'an application environment'} — it now counts against the ${dataOnly ? 'BACKLOT_POOL_MAX_DATA_ONLY' : 'BACKLOT_POOL_MAX/BACKLOT_POOL_MAX_TOTAL'} ceiling`,
+    });
+    return true;
+  }
+
+  /** Application (non-data-only) environments, machine-wide or for one stack. */
+  private appEnvs(stackId?: string): EnvRow[] {
+    const rows = stackId === undefined ? this.journal.allEnvs() : this.journal.envsForStack(stackId);
+    return rows.filter((e) => e.dataOnly !== true);
+  }
+
+  /** Data-only environments, machine-wide (they have no per-stack ceiling). */
+  private dataOnlyEnvs(): EnvRow[] {
+    return this.journal.allEnvs().filter((e) => e.dataOnly === true);
   }
 
   /**
@@ -422,12 +505,15 @@ export class Engine {
    * it is never taken — if nothing is cold the caller gets a refusal naming the
    * cap that actually bound, which is still strictly better than the lockout.
    */
-  private evictionCandidates(): EnvRow[] {
+  private evictionCandidates(dataOnly: boolean): EnvRow[] {
     const floor = IDLE_TTL();
     return this.journal
       .allEnvs()
       .filter(
         (e) =>
+          // Same shape only: the two shapes answer to different ceilings, so
+          // evicting a data-only environment cannot free an application slot.
+          (e.dataOnly === true) === dataOnly &&
           e.state === 'warm' &&
           !this.busy.has(e.id) &&
           !this.journal.leaseForEnv(e.id) &&
@@ -446,10 +532,14 @@ export class Engine {
    * leased or busy, so a candidate chosen here and leased in the gap is declined
    * rather than taken — never take an environment somebody else is holding (#40).
    */
-  private async evictForMachineCapacity(stack: Stack): Promise<string | null> {
-    if ((await this.poolLocked(() => this.capacityBinding(stack))) !== 'machine') return null;
+  private async evictForMachineCapacity(stack: Stack, dataOnly: boolean): Promise<string | null> {
+    // Only a MACHINE-WIDE ceiling is worth evicting for. A per-stack block is
+    // this stack's own doing and giving up another stack's environment cannot
+    // help it; the data-only ceiling evicts on the same rule, inside its bucket.
+    const bound = await this.poolLocked(() => this.capacityBinding(stack.id, dataOnly));
+    if (bound !== 'machine' && bound !== 'data-only') return null;
     const before = this.journal.allEnvs().length;
-    for (const cand of this.evictionCandidates()) {
+    for (const cand of this.evictionCandidates(dataOnly)) {
       const idleMin = Math.round((now() - cand.lastUsedAt) / 60_000);
       if (!(await this.recycleOne(cand.id, false))) continue; // leased or busy in the gap
       logEvent({
@@ -474,11 +564,26 @@ export class Engine {
    * own ephemeral holder, so it needs a SECOND environment that the pool is not
    * allowed to create. MUST run under the pool lock.
    */
-  private structuralCapacityBlock(stack: Stack, deadline: number): { scope: 'stack' | 'machine'; detail: string } | null {
-    const envs = this.journal.envsForStack(stack.id);
-    const all = this.journal.allEnvs();
-    if (envs.length < POOL_MAX() && all.length < POOL_MAX_TOTAL()) return null; // room to grow
-    if (envs.length < POOL_MAX()) {
+  private structuralCapacityBlock(stack: Stack, dataOnly: boolean, deadline: number): { scope: 'stack' | 'machine' | 'data-only'; detail: string } | null {
+    const bound = this.capacityBinding(stack.id, dataOnly);
+    if (bound === null) return null; // room to grow
+    if (bound === 'data-only') {
+      // Same reasoning as the machine-wide case: this ceiling counts rows, so a
+      // release cannot lower it. Only an eviction or a recycle does.
+      const rows = this.dataOnlyEnvs();
+      if (rows.some((e) => e.state === 'recycling' || e.state === 'provisioning')) return null;
+      if (this.evictionCandidates(true).length > 0) return null;
+      const held = rows.map((e) => {
+        const lease = this.journal.leaseForEnv(e.id);
+        return lease
+          ? `${e.id} leased by '${lease.holder}' (${lease.kind})`
+          : `${e.id} (${e.state}, idle ${Math.round((now() - e.lastUsedAt) / 60_000)}m — too recent to evict)`;
+      });
+      return { scope: 'data-only', detail: held.join('; ') };
+    }
+    const envs = this.appEnvs(stack.id);
+    const all = this.appEnvs();
+    if (bound === 'machine') {
       // The MACHINE-WIDE cap is what bound, and waiting cannot clear it: the
       // count is of env ROWS, and releasing a lease leaves the row behind. Only
       // an eviction, an orphan reap or a degraded reap ever lowers it. So this is
@@ -487,7 +592,7 @@ export class Engine {
       // which is why a provably hopeless wait still burned the full window.
       const transient = all.some((e) => e.state === 'degraded' || e.state === 'recycling' || e.state === 'provisioning');
       // Something cold exists: the caller evicts it rather than waiting or failing.
-      if (transient || this.evictionCandidates().length > 0) return null;
+      if (transient || this.evictionCandidates(false).length > 0) return null;
       const held = all.map((e) => {
         const lease = this.journal.leaseForEnv(e.id);
         return lease
@@ -516,11 +621,20 @@ export class Engine {
    * not a count — so a stack with ZERO environments was told "pool at capacity
    * (6/6)" and pointed at the wrong knob (#47).
    */
-  private capacityRefusal(stack: Stack, scope: 'stack' | 'machine', blocking: string | null): string {
-    const mine = this.journal.envsForStack(stack.id).length;
-    const total = this.journal.allEnvs().length;
-    const counts = `this stack holds ${mine}/${POOL_MAX()} (BACKLOT_POOL_MAX), the machine holds ${total}/${POOL_MAX_TOTAL()} (BACKLOT_POOL_MAX_TOTAL)`;
+  private capacityRefusal(stack: Stack, dataOnly: boolean, scope: 'stack' | 'machine' | 'data-only', blocking: string | null): string {
+    const mine = this.appEnvs(stack.id).length;
+    const total = this.appEnvs().length;
+    const counts = `this stack holds ${mine}/${POOL_MAX()} application environments (BACKLOT_POOL_MAX), the machine holds ${total}/${POOL_MAX_TOTAL()} (BACKLOT_POOL_MAX_TOTAL)`;
     const waited = blocking === null ? ` after waiting ${Math.round(WAIT_MS() / 1000)}s` : '';
+    if (scope === 'data-only') {
+      return (
+        `pool at capacity${waited}: the DATA-ONLY cap is what refused — ${this.dataOnlyEnvs().length}/${POOL_MAX_DATA_ONLY()} data-only environments machine-wide (BACKLOT_POOL_MAX_DATA_ONLY). ` +
+        `Data-only environments are counted separately from application ones, so ${counts} is not what stopped this. ` +
+        `Releasing a lease will not help — the count is of environments, not leases — and nothing data-only was cold enough to evict.` +
+        (blocking ? ` Holding: ${blocking}.` : '') +
+        ` Raise BACKLOT_POOL_MAX_DATA_ONLY (it bounds disk, not CPU), or 'backlot pool recycle <env-id>' a lane you no longer need.`
+      );
+    }
     if (scope === 'machine') {
       return (
         `pool at capacity${waited}: the MACHINE-WIDE cap is what refused — ${counts}. ` +
@@ -539,7 +653,7 @@ export class Engine {
   }
 
   /** Queue at capacity WITHOUT holding the pool lock while sleeping. */
-  private async acquireEnv(stack: Stack, holder: string, kind: LeaseKind, hygiene: Hygiene, ttlMs: number, holderPid?: number): Promise<{ env: EnvRow; fresh: boolean }> {
+  private async acquireEnv(stack: Stack, holder: string, kind: LeaseKind, hygiene: Hygiene, ttlMs: number, dataOnly: boolean, holderPid?: number): Promise<{ env: EnvRow; fresh: boolean }> {
     const start = now();
     // A holder that already holds this stack's LIVE lease consumes no
     // capacity — rebinding only refreshes it. Sending it through the queue
@@ -551,7 +665,7 @@ export class Engine {
     // nothing and joins the queue like everyone else.
     const live = this.journal.leaseForHolder(holder, stack.id);
     if (live && live.expiresAt > now()) {
-      const claimed = await this.poolLocked(() => this.tryClaim(stack, holder, kind, hygiene, ttlMs, holderPid, true));
+      const claimed = await this.poolLocked(() => this.tryClaim(stack, holder, kind, hygiene, ttlMs, dataOnly, holderPid, true));
       if (claimed) return claimed;
     }
     // FIFO ticket. Without ordering, every waiter polled independently and a
@@ -562,7 +676,7 @@ export class Engine {
     queue.push(ticket);
     this.waiting.set(stack.id, queue);
     try {
-      return await this.acquireQueued(stack, holder, kind, hygiene, ttlMs, start, ticket, holderPid);
+      return await this.acquireQueued(stack, holder, kind, hygiene, ttlMs, dataOnly, start, ticket, holderPid);
     } finally {
       const rest = (this.waiting.get(stack.id) ?? []).filter((t) => t !== ticket);
       if (rest.length > 0) this.waiting.set(stack.id, rest);
@@ -576,6 +690,7 @@ export class Engine {
     kind: LeaseKind,
     hygiene: Hygiene,
     ttlMs: number,
+    dataOnly: boolean,
     start: number,
     ticket: number,
     holderPid?: number,
@@ -584,22 +699,22 @@ export class Engine {
       // Only the head of THIS STACK's queue may claim; everyone else waits.
       const queue = this.waiting.get(stack.id);
       const myTurn = !queue || queue.length === 0 || queue[0] === ticket;
-      const claimed = myTurn ? await this.poolLocked(() => this.tryClaim(stack, holder, kind, hygiene, ttlMs, holderPid)) : null;
+      const claimed = myTurn ? await this.poolLocked(() => this.tryClaim(stack, holder, kind, hygiene, ttlMs, dataOnly, holderPid)) : null;
       if (claimed) return claimed;
       // A machine-wide block never clears by waiting — the count is of env rows,
       // and a release leaves the row behind — so a host holding as many cold
       // worktrees as the heuristic allows locked out every new stack
       // indefinitely, while nothing was running (#46). Give up the
       // least-recently-used cold environment instead and claim its slot.
-      if (myTurn && (await this.evictForMachineCapacity(stack))) continue;
+      if (myTurn && (await this.evictForMachineCapacity(stack, dataOnly))) continue;
       // Refuse to burn the full wait on something that provably cannot resolve.
-      const blocked = await this.poolLocked(() => this.structuralCapacityBlock(stack, now() + WAIT_MS()));
+      const blocked = await this.poolLocked(() => this.structuralCapacityBlock(stack, dataOnly, now() + WAIT_MS()));
       if (blocked) {
-        throw new BrokerError('env-error', this.capacityRefusal(stack, blocked.scope, blocked.detail), 'pool');
+        throw new BrokerError('env-error', this.capacityRefusal(stack, dataOnly, blocked.scope, blocked.detail), 'pool');
       }
       if (now() - start > WAIT_MS()) {
-        const bound = (await this.poolLocked(() => this.capacityBinding(stack))) ?? 'stack';
-        throw new BrokerError('env-error', this.capacityRefusal(stack, bound, null), 'pool');
+        const bound = (await this.poolLocked(() => this.capacityBinding(stack.id, dataOnly))) ?? 'stack';
+        throw new BrokerError('env-error', this.capacityRefusal(stack, dataOnly, bound, null), 'pool');
       }
       await new Promise((r) => setTimeout(r, 500));
     }
@@ -701,11 +816,23 @@ export class Engine {
           ? []
           : env.activeServices?.filter((n) => n in stack.manifest.services) ?? [];
     // A data-only bind is the one shape `requestedNames` cannot express, because
-    // an empty selection means the whole app. It follows the same rule as the
-    // slice: an explicit request wins, a fresh claim never inherits the previous
-    // holder's shape, and a continuing lease preserves it — so `reset-data` on a
-    // data lease restores the data without suddenly booting the stack.
-    const dataOnly = requestedDataOnly !== undefined ? requestedDataOnly : freshClaim ? false : (env.dataOnly ?? false);
+    // an empty selection means the whole app — so it lives on the environment row.
+    //
+    // The ROW is now authoritative, not the request (decision 0025): the shape is
+    // fixed at createEnv and the claim only ever hands back an environment that
+    // already matches what was asked for (tryClaim filters by shape and refuses a
+    // holder trying to convert its own lease). Deriving it per-bind is what made
+    // the separate data-only ceiling bypassable, since the two shapes are counted
+    // against different caps and reuse is never capacity-checked. A request that
+    // disagrees with the row cannot reach here; asserting keeps it that way.
+    const dataOnly = env.dataOnly === true;
+    if (requestedDataOnly !== undefined && requestedDataOnly !== dataOnly) {
+      throw new BrokerError(
+        'infra-error',
+        `internal: environment ${env.id} is ${dataOnly ? 'data-only' : 'an application environment'} but the bind requested the other shape — the claim should have refused this`,
+        'pool',
+      );
+    }
     const active = dataOnly ? new Set<string>() : this.resolveServiceClosure(stack, requestedNames);
     const dirs = this.envDirs(env.id);
     // Ports are allocated once at createEnv (decision 0004: stable for the
@@ -1173,7 +1300,7 @@ export class Engine {
     const kind = opts.kind ?? 'session';
     let hygiene = opts.hygiene ?? 'reuse';
     opts.onProgress?.(`acquiring an environment (pool ${this.journal.envsForStack(stack.id).length}/${POOL_MAX()})`);
-    const { env, fresh } = await this.acquireEnv(stack, holder, kind, hygiene, opts.ttlMs ?? LEASE_TTL(kind), opts.holderPid);
+    const { env, fresh } = await this.acquireEnv(stack, holder, kind, hygiene, opts.ttlMs ?? LEASE_TTL(kind), opts.dataOnly === true, opts.holderPid);
     // Auto-escalation (decision 0007): two consecutive bind failures on this
     // warm environment -> the next bind is pristine, whatever was asked.
     if (hygiene !== 'pristine' && env.failStreak >= 2) hygiene = 'pristine';

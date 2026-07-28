@@ -135,9 +135,19 @@ environment sits at `warm` because nothing is meant to be running.
 It refuses what it cannot mean: naming a service alongside it, `--watch` (nothing
 would reload), and a manifest that declares no datastore.
 
-One current limit: a data-only environment still occupies a pool slot, so on a busy
-box raise `POOL_MAX` rather than letting test lanes compete with the interactive
-leases people use to look at the app. They are cheap — no services run in them.
+**It is priced like a catalog, not like a stack.** `POOL_MAX` and
+`POOL_MAX_TOTAL` come from `min(cores/2, memGB/4)` because they bound *running
+services* — so data-only environments are counted against their own machine-wide
+ceiling, `BACKLOT_POOL_MAX_DATA_ONLY` (default `max(4, 2 × the heuristic)`,
+disk-shaped), and against neither application cap. A test lane on every
+integration run therefore no longer competes with the interactive leases people
+use to look at the app, which was the whole point of the feature.
+
+Two consequences worth knowing. A host can hold `POOL_MAX_TOTAL` applications
+*plus* `POOL_MAX_DATA_ONLY` lanes. And switching your own lease between the two
+shapes still works in both directions, but now needs room in the shape you are
+switching *into* — otherwise the cheap ceiling would just be application capacity
+by another name ([decision 0025](docs/decisions/0025-data-only-environments-are-priced-separately.md)).
 
 ### How long you hold it: `--ttl` for agents, `--holder-pid` for shells
 
