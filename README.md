@@ -81,6 +81,33 @@ backing service comes along for the ride. An unknown service name is a manifest
 work-error. All the usual flags (`--watch`, `--reset-data`/`--pristine`,
 `--ttl`, `--json`) apply to the partial form too.
 
+### `--data-only`: lease a database, not an application
+
+A test lane usually needs one thing from an environment — a warm, seeded database
+of its own — and paying for services it never calls is what pushes people back to
+Testcontainers, where every lane starts its own container and restores a full
+backup per test collection.
+
+```bash
+backlot up --data-only --ttl 30      # seeded store, leased; no services, no builds
+backlot ctx --json                   # .datastores.main.url — point your fixture at it
+backlot reset-data                   # back to the baseline between runs
+backlot release
+```
+
+Everything else about the lease is unchanged: it is pooled, isolated per holder,
+restored from the same template, and dropped on recycle. Two lanes get two
+namespaces, so neither sees the other's writes. `ctx` reports `dataOnly: true` so a
+fixture can tell "no services by design" from "a service failed to start", and the
+environment sits at `warm` because nothing is meant to be running.
+
+It refuses what it cannot mean: naming a service alongside it, `--watch` (nothing
+would reload), and a manifest that declares no datastore.
+
+One current limit: a data-only environment still occupies a pool slot, so on a busy
+box raise `POOL_MAX` rather than letting test lanes compete with the interactive
+leases people use to look at the app. They are cheap — no services run in them.
+
 ### How long you hold it: `--ttl` for agents, `--holder-pid` for shells
 
 A lease has a TTL, and there are two ways to say when you are done with an

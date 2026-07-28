@@ -53,6 +53,22 @@ export interface UpOptions {
    * silently re-expanding to the full app.
    */
   services?: string[];
+  /**
+   * Lease the DATASTORES ONLY — no services, no builds. `backlot up --data-only`.
+   *
+   * The unit a test lane actually needs is "a warm, seeded database, leased per
+   * consumer, reset on release", which is a strict subset of an environment. Without
+   * this the only options were leasing a whole application environment (heavier than
+   * a test lane needs, and it competes with the interactive leases people use to look
+   * at the app) or building the same thing from scratch with Testcontainers — which
+   * is what everybody did, at the cost of a container start plus a full restore per
+   * test collection.
+   *
+   * Distinct from `services: []`, which has always meant "the whole app": an empty
+   * SELECTION is not the same statement as an empty SHAPE. Undefined here means
+   * "keep the lease's current shape", exactly as for `services`.
+   */
+  dataOnly?: boolean;
   /** Bind from this directory instead of the worktree (bind --ref extraction). */
   sourceRoot?: string;
   /**
@@ -535,7 +551,7 @@ export class Engine {
     return closure;
   }
 
-  private async bindAndStart(stack: Stack, envSnapshot: EnvRow, hygiene: Hygiene, kind: LeaseKind, watch: boolean, sourceRoot?: string, onProgress?: Progress, requestedServices?: string[], freshClaim = false): Promise<EnvRow> {
+  private async bindAndStart(stack: Stack, envSnapshot: EnvRow, hygiene: Hygiene, kind: LeaseKind, watch: boolean, sourceRoot?: string, onProgress?: Progress, requestedServices?: string[], freshClaim = false, requestedDataOnly?: boolean): Promise<EnvRow> {
     const say = onProgress ?? (() => undefined);
     // Re-read under the env lock: the snapshot captured during acquire may be
     // stale (a concurrent degrade/pid update landed). Everything below mutates
@@ -561,7 +577,13 @@ export class Engine {
         : freshClaim
           ? []
           : env.activeServices?.filter((n) => n in stack.manifest.services) ?? [];
-    const active = this.resolveServiceClosure(stack, requestedNames);
+    // A data-only bind is the one shape `requestedNames` cannot express, because
+    // an empty selection means the whole app. It follows the same rule as the
+    // slice: an explicit request wins, a fresh claim never inherits the previous
+    // holder's shape, and a continuing lease preserves it — so `reset-data` on a
+    // data lease restores the data without suddenly booting the stack.
+    const dataOnly = requestedDataOnly !== undefined ? requestedDataOnly : freshClaim ? false : (env.dataOnly ?? false);
+    const active = dataOnly ? new Set<string>() : this.resolveServiceClosure(stack, requestedNames);
     const dirs = this.envDirs(env.id);
     // Ports are allocated once at createEnv (decision 0004: stable for the
     // environment's lifetime). A service ADDED to the manifest afterwards had
@@ -666,6 +688,7 @@ export class Engine {
       // a dead URL. shapeMatches guarantees active == the running set, so this is
       // always truthful.
       env.activeServices = active.size === declaredServices.length ? undefined : [...active];
+      env.dataOnly = dataOnly;
       this.journal.saveEnv(env);
       return env;
     }
@@ -831,14 +854,19 @@ export class Engine {
       // pre-bind activeServices next to the just-started pids would let a reader
       // in the degraded window filter URLs by the wrong slice.
       const degradedShape = active.size === declaredServices.length ? undefined : [...active];
-      this.journal.saveEnv({ ...current, servicePids: sup.pids(), activeServices: degradedShape, lastUsedAt: now() });
+      this.journal.saveEnv({ ...current, servicePids: sup.pids(), activeServices: degradedShape, dataOnly, lastUsedAt: now() });
       throw new BrokerError('env-error', `environment ${env.id} degraded during bind — a service flapped past its restart budget`, 'pool');
     }
-    env.state = 'hot';
+    // A data-only bind leaves nothing running, which is exactly what `warm`
+    // means — services stopped, tree and datastore namespace intact. Publishing
+    // it as `hot` would make the idle sweeper try to reclaim heat that was never
+    // taken, and would tell a reader that services are up when none are.
+    env.state = dataOnly ? 'warm' : 'hot';
     env.servicePids = sup.pids();
     // Remember the shape only when it is a genuine subset; a full app stays
     // undefined so a later manifest addition isn't frozen out by a stale list.
     env.activeServices = active.size === declaredServices.length ? undefined : [...active];
+    env.dataOnly = dataOnly;
     env.bindCount += 1;
     env.lastUsedAt = now();
     env.failStreak = 0; // a successful bind clears the escalation counter
@@ -981,6 +1009,26 @@ export class Engine {
     // pristine data wipe) or churn a pooled env. bindAndStart resolves it again
     // authoritatively; this is just the early, side-effect-free guard.
     if (opts.services && opts.services.length > 0) this.resolveServiceClosure(stack, opts.services);
+    if (opts.dataOnly) {
+      // Naming services and asking for none is a contradiction, not a precedence
+      // question — guess either way and the caller gets silently the other thing.
+      if (opts.services && opts.services.length > 0) {
+        throw new BrokerError(
+          'work-error',
+          `--data-only leases the datastores with no services, so it cannot be combined with a service list (${opts.services.join(', ')})`,
+          'manifest',
+        );
+      }
+      // Without a datastore there is nothing to lease, and the caller would get a
+      // lease over an empty tree while believing they had a database.
+      if (Object.keys(stack.manifest.datastores ?? {}).length === 0) {
+        throw new BrokerError(
+          'work-error',
+          `--data-only needs at least one datastore, and backlot.yml declares none — there is nothing to lease`,
+          'manifest',
+        );
+      }
+    }
     // A lease pinned to a dead pid is released by the very next sweep, so it
     // would hand this caller's environment — and its seeded database — to
     // whoever binds next while the caller is still using it. The CLI refuses
@@ -1003,7 +1051,7 @@ export class Engine {
     try {
       const bound = await this.envLocked(
         env.id,
-        () => this.bindAndStart(stack, env, hygiene, kind, opts.watch ?? false, opts.sourceRoot, opts.onProgress, opts.services, fresh),
+        () => this.bindAndStart(stack, env, hygiene, kind, opts.watch ?? false, opts.sourceRoot, opts.onProgress, opts.services, fresh, opts.dataOnly),
         (s) => opts.onProgress?.(`waiting for another operation on this environment … ${s}s`),
       );
       if (opts.watch && kind === 'session' && !this.watchers.has(bound.id)) {
@@ -1074,6 +1122,12 @@ export class Engine {
       state: env.state,
       lease: lease ? { id: lease.id, kind: lease.kind, hygiene: lease.hygiene, expiresAt: lease.expiresAt } : null,
       urls,
+      /**
+       * True when this lease is over the DATASTORES ONLY, so `urls` is empty by
+       * design rather than because a service failed to come up — a distinction a
+       * test fixture reading this blob otherwise cannot make.
+       */
+      dataOnly: env.dataOnly === true,
       logins: stack.manifest.auth?.logins ?? null,
       /**
        * The manifest's INTERNAL hook, templated and run inside the leased
@@ -1343,7 +1397,11 @@ export class Engine {
     // the services do not. exec/token then failed against a tree with nothing
     // running, and the command's own error ("connection refused") read as the
     // repo's fault with no hint that a rebind was all it needed.
-    if (fresh.state === 'warm') {
+    // …but a DATA-ONLY environment is warm by design: no services were ever
+    // meant to run, and its tree and datastore namespace are exactly what the
+    // holder leased. Refusing it here would break `exec` on the one lease shape
+    // that has nothing else to offer.
+    if (fresh.state === 'warm' && !fresh.dataOnly) {
       throw new BrokerError(
         'env-error',
         `environment ${envId} holds your lease but its services are not running (the daemon restarted) — run 'backlot up' to rebind before exec/token`,
@@ -1543,9 +1601,11 @@ export class Engine {
          * with it. So state the conclusion instead of leaving it to be inferred.
          */
         available: !lease && e.state !== 'degraded' && e.state !== 'recycling',
+        /** Leased for its datastores only — no services were ever meant to run. */
+        dataOnly: e.dataOnly === true,
         /** Plain language for the two fields above, so no one has to infer it. */
         summary: lease
-          ? `leased by '${lease.holder}'${holderAlive === false ? ' (holder process is gone)' : ''}`
+          ? `leased by '${lease.holder}'${e.dataOnly ? ' (data only — no services)' : ''}${holderAlive === false ? ' (holder process is gone)' : ''}`
           : e.state === 'degraded'
             ? 'unusable — the next sweep reclaims it'
             : e.state === 'recycling'

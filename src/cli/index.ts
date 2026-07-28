@@ -14,6 +14,10 @@ Usage:
                           (no service = whole app; named services start only that
                            slice plus its depends_on closure)
                           session lease: sync, upkeep, start services, print context
+  backlot up --data-only  lease the DATASTORES alone — a seeded database, no
+                          services, no builds. For test lanes that need a
+                          database per run rather than a whole application.
+                          Connection strings arrive in the same ctx blob.
   backlot run <check> [--pristine] [--pull] [--detach]
                           run lease: bind -> execute the check -> verdict -> release
                           --detach: submit-and-poll — returns a jobId immediately
@@ -67,7 +71,7 @@ const verb = rawArgv[0];
 // flags survive) — the F1 class of argv bugs. Everything after a lone `--`, and
 // EVERYTHING for `exec`, is treated as a raw passthrough command.
 const VALUE_FLAGS = new Set(['--holder', '--holder-pid', '--ttl', '--role', '--lines', '--ref', '--spec', '--preset']);
-const BOOL_FLAGS = new Set(['--json', '--watch', '--reset-data', '--pristine', '--pull', '--detach', '--all', '--force', '--raw', '--progress', '--quiet']);
+const BOOL_FLAGS = new Set(['--json', '--watch', '--reset-data', '--pristine', '--pull', '--detach', '--all', '--force', '--raw', '--data-only', '--progress', '--quiet']);
 
 const flagVals = new Map<string, string>();
 const flags = new Set<string>();
@@ -222,7 +226,17 @@ async function main(): Promise<void> {
           process.exit(64);
         }
       }
-      res = await rpc('up', { cwd, holder, holderPid, hygiene: hygiene(), watch: flags.has('--watch'), ttlMs, services: positional }, progress);
+      const dataOnly = flags.has('--data-only');
+      if (dataOnly && flags.has('--watch')) {
+        // Nothing runs, so there is nothing for a watcher to reload.
+        console.error('backlot up: --watch has nothing to do under --data-only (no services run)');
+        process.exit(64);
+      }
+      res = await rpc(
+        'up',
+        { cwd, holder, holderPid, hygiene: hygiene(), watch: flags.has('--watch'), ttlMs, services: positional, dataOnly },
+        progress,
+      );
       endProgress();
       break;
     }

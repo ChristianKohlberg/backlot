@@ -84,6 +84,8 @@ export interface Context {
   envId: string;
   lease: Lease;
   urls: Record<string, string>;
+  /** True when the lease is over the datastores alone, so `urls` is empty by design. */
+  dataOnly?: boolean;
   logins?: { user: string; password: string };
   /** The manifest's internal auth.token hook, still templated — informational. */
   tokenCommand?: string;

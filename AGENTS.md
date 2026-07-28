@@ -30,6 +30,10 @@ Recorded `servicePids` hold only the **top-level service pids** — a service's 
 
 `--holder-pid` / `BACKLOT_HOLDER_PID` frees the environment the moment the named process exits, which only helps a caller that outlives the command. `BACKLOT_HOLDER_PID=$$` from an agent harness names an already-exited shell, so the lease is reclaimable on arrival: the sweeper's dead-holder rule frees the env, the next binder takes it, and the first caller is left looking at a different, unseeded store through the same URL. It presents as a stale seed template — the wrong subsystem entirely. Binds naming a dead pid are now refused (exit 64). See the lease bullet in `docs/architecture.md`.
 
+## Data-only leases
+
+`up --data-only` binds an ordinary pooled environment's **datastores only** — no services, no builds — for test lanes that need a seeded database rather than an application ([decision 0023](docs/decisions/0023-data-only-leases.md)). The sharp edge: `activeServices: []` cannot express "no services", because an empty *selection* has always meant "the whole app" in `resolveServiceClosure`. The durable flag is `EnvRow.dataOnly`, and it follows the slice's inheritance rule — explicit request wins, a fresh claim never inherits, a continuing lease preserves. Such an environment is published `warm` (nothing is running, which is what warm means), so `assertUsable` must not read warm as "the daemon restarted and lost your services". `tests/data-only-lease.test.ts` covers it.
+
 Pool commands are shared-box operations: `pool recycle` with no id targets **every** environment, and `--force` is the only thing that takes one out from under a live lease. In `status`, `heat: 'cold'` means quiesced-and-free, not stuck; the `available` and `summary` fields say so outright because reading 'cold' as 'broken' is what caused #40.
 
 ## Claude Code plugin

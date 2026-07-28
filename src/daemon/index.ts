@@ -36,6 +36,7 @@ async function dispatch(verb: string, args: Record<string, unknown>, emit: (phas
         // a slice is named — undefined is reserved for internal shape-preserving
         // rebinds (reset-data/watch/bind), which never come through this RPC.
         services: Array.isArray(args.services) ? (args.services as unknown[]).map(String) : [],
+        dataOnly: Boolean(args.dataOnly),
         onProgress: emit,
       });
     case 'run':
