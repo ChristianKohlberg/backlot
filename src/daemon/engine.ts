@@ -1156,8 +1156,12 @@ export class Engine {
     const holder = `run-${shortId()}`;
     const startedAt = now();
     // services: [] forces the whole app — a check runs against the full topology,
-    // never the leftover shape of whatever pooled env it happens to reuse.
-    const context = await this.up({ ...opts, holder, kind: 'run', hygiene: opts.hygiene ?? 'reset-data', services: [] });
+    // never the leftover shape of whatever pooled env it happens to reuse. Same
+    // reason for dataOnly: false. The ephemeral holder above already makes every
+    // claim a fresh one (which resets both), but a check silently running against
+    // an environment with no services would be a wrong verdict, so state it here
+    // rather than rely on that.
+    const context = await this.up({ ...opts, holder, kind: 'run', hygiene: opts.hygiene ?? 'reset-data', services: [], dataOnly: false });
     const env = this.journal.getEnv(context.envId);
     if (!env) {
       // Bound a moment ago, so only a concurrent forced recycle can take it.
@@ -1610,9 +1614,11 @@ export class Engine {
             ? 'unusable — the next sweep reclaims it'
             : e.state === 'recycling'
               ? 'being torn down'
-              : e.state === 'hot'
-                ? 'free, services still running — the next bind takes it immediately'
-                : 'free and quiesced — the next bind takes it and restarts its services',
+              : e.state === 'provisioning'
+                ? 'being created'
+                : e.state === 'hot'
+                  ? 'free, services still running — the next bind takes it immediately'
+                  : 'free and quiesced — the next bind takes it and restarts its services',
       };
     });
     return { pid: process.pid, envs, poolMax: POOL_MAX(), poolMaxTotal: POOL_MAX_TOTAL(), events: recentEvents(15) };
@@ -1761,8 +1767,12 @@ export class Engine {
     // that accumulated into gigabytes of unattributable RSS. Sweep by tag, then
     // by cwd for anything that scrubbed the tag. The cwd sweep is safe HERE
     // specifically because this tree is about to be removed.
+    // Live supervisor LAST: if the journal and the supervisor disagree about a
+    // service's pid (a restart landing between the onPidsChanged write and here),
+    // the thing that just tried to kill it holds the newer number, and reaping
+    // the stale one would leave the live process behind.
     const recorded = this.journal.getEnv(env.id)?.servicePids ?? env.servicePids;
-    const unresolved = await this.reapEnvProcesses(env, { ...survivors, ...recorded });
+    const unresolved = await this.reapEnvProcesses(env, { ...recorded, ...survivors });
     await this.reapEnvTree(env);
     if (Object.keys(unresolved).length > 0) {
       logEvent({
@@ -1844,9 +1854,12 @@ export class Engine {
         );
       }
       if (!(await this.recycleOne(envId, force))) {
+        // claimForTeardown declines for three reasons, and only these are left
+        // after the checks above: an operation in flight, a teardown already
+        // under way, or a lease that appeared in the gap. Never claim which.
         throw new BrokerError(
           'work-error',
-          `environment ${envId} is busy with an operation in flight and was left alone — retry once it settles`,
+          `environment ${envId} could not be claimed — it is busy, already being torn down, or was just leased; retry once it settles`,
           'pool',
         );
       }

@@ -23,7 +23,7 @@
  */
 import { describe, it, expect, afterAll } from 'vitest';
 import { execFile, execFileSync, spawn } from 'node:child_process';
-import { mkdtempSync, rmSync, writeFileSync, readFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync, readFileSync, readdirSync, readlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Journal } from '../src/core/journal.js';
@@ -394,6 +394,78 @@ describe.runIf(procScanSupported())('teardown and quiesce reap what escaped the 
 
     const reaped = await waitFor(() => !alive(untagged), 20_000);
     expect(reaped, 'an untagged process kept running inside a deleted env tree').toBe(true);
+  }, 120_000);
+
+  it('never reaps a process a person is sitting in front of, even inside the env tree', async () => {
+    // cwd is NOT proof of ownership. A developer who runs `cd <env-tree>` to look
+    // around matches the cwd sweep exactly — and matched processes are killed by
+    // GROUP, so without the controlling-terminal exclusion a teardown would take
+    // out that person's shell and every job in it. procscan's whole thesis is
+    // that skipping a sweep is safe and signalling a stranger is not.
+    const { cli, journal } = ctx();
+    const up = await cli(['up', '--json']);
+    const envId = String(up.json?.envId);
+    const envRoot = journal().getEnv(envId)!.root;
+
+    // A stand-in for the human: `script` allocates a pty and runs the payload in
+    // it, so the CHILD holds a controlling terminal while `script` itself does
+    // not. `script` stays OUTSIDE the tree and the child cd's in — which is the
+    // real topology: a developer's pty master is their terminal emulator, living
+    // well away from backlot's state, and only the shell sits in the directory.
+    // (Put the master inside the tree instead and reaping it — correctly, it has
+    // no terminal — SIGHUPs the child through the pty, which no real teardown
+    // could do.)
+    const human = spawn('script', ['-qfc', `cd ${envRoot} && sleep 120`, '/dev/null'], {
+      cwd: tmpdir(),
+      detached: true,
+      stdio: 'ignore',
+    });
+    human.unref();
+
+    /** Processes whose cwd is in the tree, split by whether a tty is attached. */
+    const inTree = () =>
+      readdirSync('/proc')
+        .map(Number)
+        .filter((p) => Number.isInteger(p) && p > 0)
+        .flatMap((p) => {
+          try {
+            if (!readlinkSync(`/proc/${p}/cwd`).startsWith(envRoot)) return [];
+            const stat = readFileSync(`/proc/${p}/stat`, 'utf8');
+            const ttyNr = Number(stat.slice(stat.lastIndexOf(')') + 2).split(' ')[4]);
+            return [{ pid: p, tty: ttyNr !== 0 }];
+          } catch {
+            return [];
+          }
+        });
+
+    const withTty = await waitFor(() => inTree().some((p) => p.tty), 15_000);
+    expect(withTty, 'the pty stand-in never reached the env tree').toBe(true);
+    const humanPids = inTree()
+      .filter((p) => p.tty)
+      .map((p) => p.pid);
+
+    // The contract, stated exactly: cwd puts these in scope, a terminal takes
+    // them back out. Anything in the tree WITHOUT a terminal stays fair game.
+    const offered = scanByCwd(envRoot).map((p) => p.pid);
+    for (const pid of humanPids) {
+      expect(offered, `scanByCwd offered up pid ${pid}, which has a controlling terminal`).not.toContain(pid);
+    }
+
+    await cli(['release', '--json']);
+    expect((await cli(['pool', 'recycle', envId, '--json'])).code).toBe(0);
+
+    // Teardown deleted the environment; the person's session is untouched.
+    expect(journal().getEnv(envId)).toBeUndefined();
+    for (const pid of humanPids) {
+      expect(alive(pid), `teardown killed pid ${pid}, which had a controlling terminal`).toBe(true);
+    }
+    for (const pid of [human.pid!, ...humanPids]) {
+      try {
+        process.kill(pid, 'SIGKILL');
+      } catch {
+        /* gone */
+      }
+    }
   }, 120_000);
 
   it('quiesce reaps escapees rather than deferring to a bind that may never come', async () => {

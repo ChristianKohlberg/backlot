@@ -210,13 +210,32 @@ export function scanTagged(stateRoot: string): TaggedProc[] {
 }
 
 /**
- * Every live process whose working directory sits inside `prefix`.
+ * Field 7 of /proc/<pid>/stat: the controlling terminal, 0 for none.
+ *
+ * Backlot spawns every service with `stdio: ['ignore', 'pipe', 'pipe']` and
+ * detached, so it and all its descendants have NO controlling terminal. A human's
+ * interactive shell always has one. That difference is the only cheap evidence
+ * available for "is a person sitting in front of this process".
+ */
+function hasControllingTty(pid: number): boolean {
+  try {
+    const stat = readFileSync(`/proc/${pid}/stat`, 'utf8');
+    const rest = stat.slice(stat.lastIndexOf(')') + 2).split(' ');
+    const ttyNr = Number(rest[4]); // field 7 == index 4 after pid and comm
+    return Number.isFinite(ttyNr) && ttyNr !== 0;
+  } catch {
+    return false; // unreadable — the caller's other guards decide
+  }
+}
+
+/**
+ * Every live process whose working directory sits inside `prefix` AND which has
+ * no controlling terminal.
  *
  * The tag scan above misses a descendant that scrubbed its environment (a
  * process launched through `env -i`, a re-exec that rebuilds environ, some
  * language runtimes' worker pools). Those still have to live SOMEWHERE, and for
- * a service backlot started that somewhere is the environment tree — which is
- * backlot-private state, so a process sitting in it is ours by construction.
+ * a service backlot started that somewhere is the environment tree.
  *
  * Linux keeps the cwd link readable after the directory is unlinked, appending
  * " (deleted)" to the target — which is precisely the shape of the leak this
@@ -224,9 +243,17 @@ export function scanTagged(stateRoot: string): TaggedProc[] {
  * environment tree that was removed a day earlier. The suffix is stripped so a
  * deleted tree still matches its prefix.
  *
- * Deliberately NOT used on the quiesce path: a warm environment's tree stays on
- * disk, and someone's shell may legitimately be sitting in it. Only teardown,
- * which is about to delete the tree anyway, may reap by cwd.
+ * The tty exclusion is not a nicety. cwd is NOT proof of ownership — a developer
+ * who runs `cd <env-tree>` to look around matches this scan exactly, and callers
+ * signal a matched process's whole GROUP, so without the exclusion a teardown
+ * would kill that person's shell and every job in it. That is the one outcome
+ * this module exists to prevent (see the header): skipping a sweep is safe,
+ * signalling a stranger's process is not. A backlot service can never be
+ * excluded by it, because it never has a terminal to begin with.
+ *
+ * Even so, deliberately NOT used on the quiesce path: a warm environment's tree
+ * stays on disk and may legitimately be occupied. Only teardown, which is about
+ * to delete the tree anyway, may reap by cwd.
  */
 export function scanByCwd(prefix: string): Array<{ pid: number; startTime: number; cwd: string }> {
   if (!procScanSupported()) return [];
@@ -250,6 +277,7 @@ export function scanByCwd(prefix: string): Array<{ pid: number; startTime: numbe
     const path = cwd.endsWith(' (deleted)') ? cwd.slice(0, -' (deleted)'.length) : cwd;
     // Prefix match on a path BOUNDARY, so `…/env-1` never matches `…/env-10`.
     if (path !== prefix && !path.startsWith(prefix.endsWith('/') ? prefix : prefix + '/')) continue;
+    if (hasControllingTty(pid)) continue; // a person is using this one
     const st = startTime(pid);
     if (st === undefined) continue; // exited between the two reads
     found.push({ pid, startTime: st, cwd });
