@@ -499,11 +499,19 @@ export class Engine {
    * keeps the ceiling meaningful, and costs the least-recently-used environment
    * one cold provision the next time it is bound.
    *
-   * Only `warm` + unleased + not busy + idle past IDLE_TTL qualifies: exactly
-   * what `status` publishes as `heat: 'cold'` and the sweeper has already
-   * quiesced. A recently released environment is the warm pool doing its job, so
-   * it is never taken — if nothing is cold the caller gets a refusal naming the
-   * cap that actually bound, which is still strictly better than the lockout.
+   * Unleased + not busy + idle past IDLE_TTL qualifies. A recently released
+   * environment is the warm pool doing its job, so it is never taken — if
+   * nothing is that idle the caller gets a refusal naming the cap that actually
+   * bound, which is still strictly better than the lockout.
+   *
+   * Deliberately NOT restricted to `warm`. Idle past IDLE_TTL is precisely what
+   * the sweeper quiesces, but it only looks every BACKLOT_SWEEP_MS (15s by
+   * default) — so an environment released and abandoned a moment ago is still
+   * `hot` while already being condemned. Requiring `warm` meant that for a whole
+   * sweep interval the caller was refused with "waiting will not help", when the
+   * next sweep would in fact have made this environment evictable. Taking a
+   * condemned `hot` environment is the same trade one step further, and
+   * recycleOne stops its services through the ordinary teardown.
    */
   private evictionCandidates(dataOnly: boolean): EnvRow[] {
     const floor = IDLE_TTL();
@@ -514,7 +522,9 @@ export class Engine {
           // Same shape only: the two shapes answer to different ceilings, so
           // evicting a data-only environment cannot free an application slot.
           (e.dataOnly === true) === dataOnly &&
-          e.state === 'warm' &&
+          // 'provisioning' is mid-creation, 'recycling' is already going, and
+          // 'degraded' is the sweeper's own to reap.
+          (e.state === 'warm' || e.state === 'hot') &&
           !this.busy.has(e.id) &&
           !this.journal.leaseForEnv(e.id) &&
           now() - e.lastUsedAt > floor,
@@ -538,17 +548,21 @@ export class Engine {
     // help it; the data-only ceiling evicts on the same rule, inside its bucket.
     const bound = await this.poolLocked(() => this.capacityBinding(stack.id, dataOnly));
     if (bound !== 'machine' && bound !== 'data-only') return null;
-    const before = this.journal.allEnvs().length;
+    const before = dataOnly ? `${this.dataOnlyEnvs().length}/${POOL_MAX_DATA_ONLY()} data-only` : `${this.appEnvs().length}/${POOL_MAX_TOTAL()} application`;
     for (const cand of this.evictionCandidates(dataOnly)) {
-      const idleMin = Math.round((now() - cand.lastUsedAt) / 60_000);
+      const human = (ms: number) => (ms >= 60_000 ? `${Math.round(ms / 60_000)}m` : `${Math.max(1, Math.round(ms / 1000))}s`);
+      const idleFor = human(now() - cand.lastUsedAt);
+      const wasState = cand.state;
       if (!(await this.recycleOne(cand.id, false))) continue; // leased or busy in the gap
       logEvent({
         level: 'info',
         kind: 'pool-evict',
         envId: cand.id,
         detail:
-          `evicted to free a machine-wide slot for stack '${stack.id}' — cold and unleased, idle ${idleMin}m ` +
-          `(machine was at ${before}/${POOL_MAX_TOTAL()}). Its next bind provisions cold.`,
+          `evicted to free a ${dataOnly ? 'data-only' : 'machine-wide'} pool slot for stack '${stack.id}' — ` +
+          `unleased and idle ${idleFor} (${wasState}, past the ${human(IDLE_TTL())} idle TTL), ` +
+          `least recently used of ${this.evictionCandidates(dataOnly).length + 1} candidate(s); the pool held ${before}. ` +
+          `Its next bind provisions cold.`,
       });
       return cand.id;
     }
