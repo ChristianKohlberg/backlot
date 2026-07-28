@@ -38,6 +38,12 @@ describe('a large bind does not block the daemon', () => {
     // several seconds on ANY machine — including tmpfs-backed /tmp, where 40k
     // files synced in ~2s: 2000 dirs x 80 files of ~1KB — 160k files, the
     // per-file syscall+hash cost dominates.
+    //
+    // Do NOT shrink this to save CI time. Measured on tmpfs (2026-07-28), the
+    // bind is 8.1s at 160k files and 4.2s at 80k — against the 3s vacuity guard
+    // below, halving the tree cuts the margin from 2.7x to 1.4x, and a machine
+    // any faster then fails the guard instead of proving anything. Building the
+    // tree is not the expensive part either (1.2s of an 8.5s run); the sync is.
     const payload = 'x'.repeat(1024);
     for (let d = 0; d < 2000; d++) {
       const dir = join(wt, 'src', `mod-${d}`);
@@ -76,5 +82,13 @@ describe('a large bind does not block the daemon', () => {
       probe.elapsedMs,
       `status took ${probe.elapsedMs}ms during a ${upMs}ms bind — the loop was blocked`,
     ).toBeLessThan(Math.min(4000, upMs / 2));
-  }, 120_000);
+    // The wall-clock ceiling is about RUNNER SPEED, not about the property under
+    // test — both assertions above are relative to the bind's own duration, so a
+    // slow machine cannot make them pass spuriously. 120s was calibrated against
+    // tmpfs and left almost nothing for a platform without it: measured on the
+    // macOS runner this test takes 94.8s and 111.3s on green runs (vs ~8.5s on
+    // tmpfs Linux), so it sat at 79-93% of budget and tipped over roughly one run
+    // in three. Three failures on this branch and two on main — including two
+    // docs-only commits, which is what proves it was never code-related.
+  }, 300_000);
 });
