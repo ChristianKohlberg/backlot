@@ -58,7 +58,7 @@ afterAll(() => {
  * "cold" (the same threshold `status` reports as `heat: 'cold'`) without waiting
  * out the real 30 minutes.
  */
-function ctx(opts: { total: number; idleTtlMs?: number }) {
+function ctx(opts: { total: number; idleTtlMs?: number; sweepMs?: number }) {
   const stateDir = mkdtempSync(join(tmpdir(), 'backlot-mcap-'));
   dirs.push(stateDir);
   const env = {
@@ -69,7 +69,7 @@ function ctx(opts: { total: number; idleTtlMs?: number }) {
     BACKLOT_IDLE_TTL_MS: String(opts.idleTtlMs ?? 250),
     // Long, so a fail-fast is unmistakable: the reported bug burned 60s.
     BACKLOT_WAIT_MS: '30000',
-    BACKLOT_SWEEP_MS: '300',
+    BACKLOT_SWEEP_MS: String(opts.sweepMs ?? 300),
   };
   const stack = (name: string) => {
     const wt = mkdtempSync(join(tmpdir(), `backlot-mcap-${name}-`));
@@ -142,7 +142,39 @@ describe('a cold, unleased environment no longer holds a machine-wide slot forev
     const evictions = c.events().filter((e) => e.kind === 'pool-evict');
     expect(evictions.length).toBe(1);
     expect(evictions[0]!.envId).toBe(envA);
-    expect(evictions[0]!.detail).toMatch(/cold and unleased/);
+    expect(evictions[0]!.detail).toMatch(/unleased and idle/);
+  }, 120_000);
+
+  it('evicts an environment the sweeper has condemned but not yet quiesced', async () => {
+    // Found by driving the real thing rather than by a test: an environment
+    // released and abandoned is idle past IDLE_TTL — which is exactly what the
+    // sweeper quiesces — but it stays `hot` until the sweep actually runs, up to
+    // BACKLOT_SWEEP_MS later (15s by default). While eviction required `warm`,
+    // the caller was refused for that whole window, and refused with "waiting
+    // will not help" when the next sweep would in fact have freed a slot.
+    //
+    // The long sweep interval here is the point: it guarantees nothing has been
+    // quiesced, so the candidate is hot-but-condemned.
+    const c = ctx({ total: 1, idleTtlMs: 200, sweepMs: 60_000 });
+    const a = c.stack('mcaph');
+    const b = c.stack('mcapi');
+
+    const upA = await c.cli(['up', '--json'], a);
+    expect(upA.code).toBe(0);
+    await c.cli(['release', '--json'], a);
+    await sleep(400); // past the idle TTL, but no sweep will have run
+
+    // Still hot — the precondition this test exists for.
+    expect(c.journal().getEnv(String(upA.json?.envId))?.state).toBe('hot');
+
+    const upB = await c.cli(['up', '--json'], b);
+    expect(upB.code, upB.stdout).toBe(0);
+    expect(c.journal().allEnvs().map((r) => r.id)).toEqual([String(upB.json?.envId)]);
+    const evicted = c.events().filter((e) => e.kind === 'pool-evict');
+    expect(evicted.length).toBe(1);
+    // The record must say it took a hot one, or the next reader will think the
+    // `warm` restriction is still in force.
+    expect(evicted[0]!.detail).toMatch(/hot/);
   }, 120_000);
 
   it('never evicts a LEASED environment, and says so in a second rather than a minute', async () => {

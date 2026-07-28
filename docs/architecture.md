@@ -150,11 +150,13 @@ That made a cold environment permanently expensive: idle reclamation quiesces *h
 not the environment, so the row survived and the machine-wide budget stayed full
 forever. A host with as many worktrees as the heuristic allows locked out every new
 stack indefinitely while nothing was running (#46). So when the machine-wide cap is
-what binds, backlot **evicts the least-recently-used cold environment** — `warm`,
-unleased, not busy, idle past `idleTtlMs` — and takes its slot. Never a leased or busy
-one, and never one released recently enough to still be doing the warm pool's job; the
-victim pays one cold provision on its next bind, and the eviction is logged as
-`pool-evict`. Excluding cold rows from the count instead (the obvious alternative)
+what binds, backlot **evicts the least-recently-used cold environment** — unleased, not
+busy, idle past `idleTtlMs` — and takes its slot. Never a leased or busy one, and never
+one released recently enough to still be doing the warm pool's job; the victim pays one
+cold provision on its next bind, and the eviction is logged as `pool-evict`. "Cold" here
+means idle past the TTL whether or not the sweeper has quiesced it yet: the sweep only
+looks every `BACKLOT_SWEEP_MS`, so a just-abandoned environment is `hot` while already
+condemned, and requiring `warm` refused the caller for that whole window. Excluding cold rows from the count instead (the obvious alternative)
 would have left nothing to stop N of them being rebound hot at once.
 
 Waiting can never clear a machine-wide block — the count is of rows, and releasing a
