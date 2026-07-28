@@ -390,21 +390,112 @@ export class Engine {
   }
 
   /**
+   * Which ceiling refuses a NEW environment for this stack right now?
+   *
+   * Named explicitly because the two caps have different remedies and every
+   * refusal used to quote the per-stack one: a caller told "raise
+   * BACKLOT_POOL_MAX" while the machine-wide cap was what bound followed that
+   * advice, saw nothing change, and could not have (#47). MUST run under the
+   * pool lock.
+   */
+  private capacityBinding(stack: Stack): 'stack' | 'machine' | null {
+    if (this.journal.envsForStack(stack.id).length >= POOL_MAX()) return 'stack';
+    if (this.journal.allEnvs().length >= POOL_MAX_TOTAL()) return 'machine';
+    return null;
+  }
+
+  /**
+   * Cold, unleased environments that can be given up to free a MACHINE-WIDE
+   * slot, least-recently-used first.
+   *
+   * Why eviction rather than just not counting them (#46's own suggestion): the
+   * caps gate environment CREATION only — rebinding an existing environment is
+   * never capacity-checked — so the row count is what bounds worst-case
+   * concurrent load. Excluding cold rows from the count would leave nothing to
+   * stop N of them being rebound hot at once. Giving the slot back for real
+   * keeps the ceiling meaningful, and costs the least-recently-used environment
+   * one cold provision the next time it is bound.
+   *
+   * Only `warm` + unleased + not busy + idle past IDLE_TTL qualifies: exactly
+   * what `status` publishes as `heat: 'cold'` and the sweeper has already
+   * quiesced. A recently released environment is the warm pool doing its job, so
+   * it is never taken — if nothing is cold the caller gets a refusal naming the
+   * cap that actually bound, which is still strictly better than the lockout.
+   */
+  private evictionCandidates(): EnvRow[] {
+    const floor = IDLE_TTL();
+    return this.journal
+      .allEnvs()
+      .filter(
+        (e) =>
+          e.state === 'warm' &&
+          !this.busy.has(e.id) &&
+          !this.journal.leaseForEnv(e.id) &&
+          now() - e.lastUsedAt > floor,
+      )
+      .sort((a, b) => a.lastUsedAt - b.lastUsedAt);
+  }
+
+  /**
+   * Free a machine-wide slot by giving up the least-recently-used cold
+   * environment. Returns the id evicted, or null if nothing qualified.
+   *
+   * MUST NOT hold the pool lock: recycleOne claims under it (the chain is not
+   * re-entrant), and the teardown that follows deletes a tree, which the pool
+   * lock must never wait on. claimForTeardown re-reads and refuses anything
+   * leased or busy, so a candidate chosen here and leased in the gap is declined
+   * rather than taken — never take an environment somebody else is holding (#40).
+   */
+  private async evictForMachineCapacity(stack: Stack): Promise<string | null> {
+    if ((await this.poolLocked(() => this.capacityBinding(stack))) !== 'machine') return null;
+    const before = this.journal.allEnvs().length;
+    for (const cand of this.evictionCandidates()) {
+      const idleMin = Math.round((now() - cand.lastUsedAt) / 60_000);
+      if (!(await this.recycleOne(cand.id, false))) continue; // leased or busy in the gap
+      logEvent({
+        level: 'info',
+        kind: 'pool-evict',
+        envId: cand.id,
+        detail:
+          `evicted to free a machine-wide slot for stack '${stack.id}' — cold and unleased, idle ${idleMin}m ` +
+          `(machine was at ${before}/${POOL_MAX_TOTAL()}). Its next bind provisions cold.`,
+      });
+      return cand.id;
+    }
+    return null;
+  }
+
+  /**
    * Is the pool full of environments whose leases outlast our whole wait?
    *
-   * If so, queueing cannot possibly succeed, and reporting "waited 60s" blames
-   * a timing problem that does not exist. This is the shape a session `up`
+   * If so, queueing cannot possibly succeed, and reporting "waited 60s" blames a
+   * timing problem that does not exist. This is the shape a session `up`
    * followed by a `run` hits on a one-environment pool: `run` always mints its
    * own ephemeral holder, so it needs a SECOND environment that the pool is not
    * allowed to create. MUST run under the pool lock.
    */
-  private structuralCapacityBlock(stack: Stack, deadline: number): string | null {
+  private structuralCapacityBlock(stack: Stack, deadline: number): { scope: 'stack' | 'machine'; detail: string } | null {
     const envs = this.journal.envsForStack(stack.id);
-    const total = this.journal.allEnvs().length;
-    if (envs.length < POOL_MAX() && total < POOL_MAX_TOTAL()) return null; // room to grow
-    // A machine-wide block can clear when ANOTHER stack releases, so only a
-    // per-stack block is structural.
-    if (envs.length < POOL_MAX()) return null;
+    const all = this.journal.allEnvs();
+    if (envs.length < POOL_MAX() && all.length < POOL_MAX_TOTAL()) return null; // room to grow
+    if (envs.length < POOL_MAX()) {
+      // The MACHINE-WIDE cap is what bound, and waiting cannot clear it: the
+      // count is of env ROWS, and releasing a lease leaves the row behind. Only
+      // an eviction, an orphan reap or a degraded reap ever lowers it. So this is
+      // structural — not, as the old guard assumed, something another stack's
+      // release will fix (#47). It said so explicitly and returned null here,
+      // which is why a provably hopeless wait still burned the full window.
+      const transient = all.some((e) => e.state === 'degraded' || e.state === 'recycling' || e.state === 'provisioning');
+      // Something cold exists: the caller evicts it rather than waiting or failing.
+      if (transient || this.evictionCandidates().length > 0) return null;
+      const held = all.map((e) => {
+        const lease = this.journal.leaseForEnv(e.id);
+        return lease
+          ? `${e.id} leased by '${lease.holder}' (${lease.kind})`
+          : `${e.id} (${e.state}, idle ${Math.round((now() - e.lastUsedAt) / 60_000)}m — too recent to evict)`;
+      });
+      return { scope: 'machine', detail: held.join('; ') };
+    }
     const holders: string[] = [];
     for (const env of envs) {
       // These resolve on their own — the sweeper reaps them and frees capacity.
@@ -414,7 +505,37 @@ export class Engine {
       if (lease.expiresAt <= deadline) return null; // it will expire in time
       holders.push(`${env.id} held by '${lease.holder}' (${lease.kind}, ${Math.round((lease.expiresAt - now()) / 60_000)}m left)`);
     }
-    return holders.join('; ');
+    return { scope: 'stack', detail: holders.join('; ') };
+  }
+
+  /**
+   * One refusal text for both throw sites, quoting real counts and the cap that
+   * actually bound.
+   *
+   * The old messages printed `(${POOL_MAX()}/${POOL_MAX()})` — the cap twice,
+   * not a count — so a stack with ZERO environments was told "pool at capacity
+   * (6/6)" and pointed at the wrong knob (#47).
+   */
+  private capacityRefusal(stack: Stack, scope: 'stack' | 'machine', blocking: string | null): string {
+    const mine = this.journal.envsForStack(stack.id).length;
+    const total = this.journal.allEnvs().length;
+    const counts = `this stack holds ${mine}/${POOL_MAX()} (BACKLOT_POOL_MAX), the machine holds ${total}/${POOL_MAX_TOTAL()} (BACKLOT_POOL_MAX_TOTAL)`;
+    const waited = blocking === null ? ` after waiting ${Math.round(WAIT_MS() / 1000)}s` : '';
+    if (scope === 'machine') {
+      return (
+        `pool at capacity${waited}: the MACHINE-WIDE cap is what refused — ${counts}. ` +
+        `Releasing a lease will not help, because the machine-wide count is of environments, not leases: the row survives a release. ` +
+        `Every environment on this box is either leased or too recently used to evict, so backlot had nothing cold to give up.` +
+        (blocking ? ` Holding: ${blocking}.` : '') +
+        ` Raise BACKLOT_POOL_MAX_TOTAL if the host can take it, or 'backlot pool recycle <env-id>' an environment you no longer need.`
+      );
+    }
+    return (
+      `pool at capacity${waited}: this STACK's cap is what refused — ${counts}. ` +
+      (blocking ? `Every environment is leased past the wait window, so queueing cannot succeed. Blocking: ${blocking}. ` : '') +
+      `A 'run' always takes its own environment, so a session lease plus a run needs BACKLOT_POOL_MAX >= 2 (currently ${POOL_MAX()}). ` +
+      `Raise BACKLOT_POOL_MAX, or release the blocking lease first.`
+    );
   }
 
   /** Queue at capacity WITHOUT holding the pool lock while sleeping. */
@@ -465,19 +586,20 @@ export class Engine {
       const myTurn = !queue || queue.length === 0 || queue[0] === ticket;
       const claimed = myTurn ? await this.poolLocked(() => this.tryClaim(stack, holder, kind, hygiene, ttlMs, holderPid)) : null;
       if (claimed) return claimed;
+      // A machine-wide block never clears by waiting — the count is of env rows,
+      // and a release leaves the row behind — so a host holding as many cold
+      // worktrees as the heuristic allows locked out every new stack
+      // indefinitely, while nothing was running (#46). Give up the
+      // least-recently-used cold environment instead and claim its slot.
+      if (myTurn && (await this.evictForMachineCapacity(stack))) continue;
       // Refuse to burn the full wait on something that provably cannot resolve.
       const blocked = await this.poolLocked(() => this.structuralCapacityBlock(stack, now() + WAIT_MS()));
       if (blocked) {
-        throw new BrokerError(
-          'env-error',
-          `pool at capacity (${POOL_MAX()}/${POOL_MAX()} for this stack, ${this.journal.allEnvs().length}/${POOL_MAX_TOTAL()} machine-wide) and every environment is leased past the wait window — queueing cannot succeed. Blocking: ${blocked}. ` +
-            `A 'run' always takes its own environment, so a session lease plus a run needs BACKLOT_POOL_MAX >= 2 (currently ${POOL_MAX()}). ` +
-            `Raise BACKLOT_POOL_MAX, or release the blocking lease first.`,
-          'pool',
-        );
+        throw new BrokerError('env-error', this.capacityRefusal(stack, blocked.scope, blocked.detail), 'pool');
       }
       if (now() - start > WAIT_MS()) {
-        throw new BrokerError('env-error', `pool at capacity (${POOL_MAX()}/${POOL_MAX()}) — waited ${Math.round(WAIT_MS() / 1000)}s; release a lease or raise BACKLOT_POOL_MAX`, 'pool');
+        const bound = (await this.poolLocked(() => this.capacityBinding(stack))) ?? 'stack';
+        throw new BrokerError('env-error', this.capacityRefusal(stack, bound, null), 'pool');
       }
       await new Promise((r) => setTimeout(r, 500));
     }

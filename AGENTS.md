@@ -36,6 +36,12 @@ Recorded `servicePids` hold only the **top-level service pids** — a service's 
 
 Pool commands are shared-box operations: `pool recycle` with no id targets **every** environment, and `--force` is the only thing that takes one out from under a live lease. In `status`, `heat: 'cold'` means quiesced-and-free, not stuck; the `available` and `summary` fields say so outright because reading 'cold' as 'broken' is what caused #40.
 
+## Two pool caps, and why the machine-wide one evicts
+
+`poolMax` is per stack, `poolMaxTotal` machine-wide, and **both gate `createEnv` only** — reuse is never capacity-checked, which is why the env *row count* is what bounds worst-case concurrent load. Idle reclamation takes heat, not the row, so cold environments used to hold machine-wide slots forever and lock out any new stack (#46). `evictForMachineCapacity` now gives up the least-recently-used cold env (`warm`, unleased, not busy, idle past `idleTtlMs`) when — and only when — the machine-wide cap is the binding one. It must run **outside the pool lock** (`poolLocked` is a non-reentrant promise chain and `recycleOne` takes it), and `claimForTeardown` re-validates, so a candidate leased in the gap is declined rather than stolen.
+
+The consequence worth remembering: **waiting can never clear a machine-wide block**, because a release leaves the row behind. `structuralCapacityBlock` therefore treats it as structural unless something is evictable or transient — the old code explicitly assumed the opposite ("another stack will release") and burned the full window (#47). `tests/pool-machine-capacity.test.ts` covers all of it.
+
 ## Version skew is a first-class failure, and the daemon outlives the install
 
 The CLI spawns the daemon from **its own `dist/`** (`ensureDaemon`), so installing a
