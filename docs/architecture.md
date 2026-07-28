@@ -140,6 +140,27 @@ Local pools are convergence all the way down. Same verbs above the driver line.
 recycled (`pristine` rebuild). Rebind from hot ≈ seconds; from warm ≈ start + ready-wait;
 pristine ≈ full provision (bounded by templates and shared caches, below).
 
+**Two caps, and eviction between them.** `poolMax` is per stack; `poolMaxTotal` is
+machine-wide, because the heuristic behind both is derived from this host's cores and
+memory and three projects would otherwise each spend the whole budget. Both gate
+environment **creation** only — rebinding an existing environment is never
+capacity-checked — so the row count is what bounds worst-case concurrent load.
+
+That made a cold environment permanently expensive: idle reclamation quiesces *heat*,
+not the environment, so the row survived and the machine-wide budget stayed full
+forever. A host with as many worktrees as the heuristic allows locked out every new
+stack indefinitely while nothing was running (#46). So when the machine-wide cap is
+what binds, backlot **evicts the least-recently-used cold environment** — `warm`,
+unleased, not busy, idle past `idleTtlMs` — and takes its slot. Never a leased or busy
+one, and never one released recently enough to still be doing the warm pool's job; the
+victim pays one cold provision on its next bind, and the eviction is logged as
+`pool-evict`. Excluding cold rows from the count instead (the obvious alternative)
+would have left nothing to stop N of them being rebound hot at once.
+
+Waiting can never clear a machine-wide block — the count is of rows, and releasing a
+lease leaves the row behind — so if nothing is evictable the refusal is immediate, and
+names the cap that actually bound plus `BACKLOT_POOL_MAX_TOTAL` (#47).
+
 ## 6. Sync — "verbs sync, watch streams"
 
 Nothing observes the consumer's worktree by default. Every action verb (`run`, `up`,
@@ -389,6 +410,7 @@ variable > `$STATE_DIR/config.json` > built-in default.
 | `BACKLOT_STATE_DIR` | — | `$XDG_STATE_HOME/backlot` (the per-machine root; 0700) |
 | `BACKLOT_LEASED_IDLE_TTL_MS` | `leasedIdleTtlMs` | `2 x idleTtlMs` — a LEASED but untouched env stops its services (keeps the lease) |
 | `BACKLOT_POOL_MAX` | `poolMax` | `min(cores/2, memGB/4)`, clamped **[2,8]** — the floor is 2 because `up` + `run` needs two envs |
+| `BACKLOT_POOL_MAX_TOTAL` | `poolMaxTotal` | same heuristic, **machine-wide across every stack**. When this is what binds, a cold unleased env is evicted rather than the caller refused |
 | `BACKLOT_LEASE_TTL_MS` | `sessionTtlMs` / `runTtlMs` | 30 min / 10 min |
 | `BACKLOT_IDLE_TTL_MS` | `idleTtlMs` | 30 min |
 | `BACKLOT_WAIT_MS` | `waitMs` | 60 s (queue-at-capacity timeout) |
