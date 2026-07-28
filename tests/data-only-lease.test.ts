@@ -113,31 +113,51 @@ function notes(dbPath: string): string[] {
   }
 }
 
-/** Real service processes for this state root, by tag — never a cmdline grep. */
-const serviceCount = (stateDir: string): number => scanTagged(stateDir).length;
+/**
+ * Service processes this environment has running, counted portably.
+ *
+ * NOT `scanTagged`: orphan scanning reads other processes' environments and is
+ * Linux-only by design, so on macOS it returns an empty list unconditionally —
+ * which silently turns every "no services" assertion vacuous and fails every
+ * "services are up" one. The journal records each service pid on all platforms,
+ * and liveness is a signal-0 away.
+ */
+function liveServices(journal: () => Journal, envId: string): number {
+  const recorded = journal().getEnv(envId)?.servicePids ?? {};
+  return Object.values(recorded).filter((r) => {
+    try {
+      process.kill(r.pid, 0);
+      return true;
+    } catch {
+      return false;
+    }
+  }).length;
+}
 
 describe('a data-only lease hands over a seeded store and nothing else', () => {
   it('seeds the datastore, starts no services, and says so in the context blob', async () => {
-    const { cli, stateDir, journal } = ctx();
+    const { cli, journal } = ctx();
 
     const up = await cli(['up', '--data-only', '--ttl', '10', '--json']);
     expect(up.code, up.stderr).toBe(0);
+    const id = String(up.json?.envId);
 
     // The whole point: a real, seeded database at its session preset.
     const url = (up.json?.datastores as Record<string, { url: string }>).main.url;
     expect(notes(url)).toEqual(['one', 'two', 'three']);
 
     // And none of the weight a test lane was paying for.
-    expect(serviceCount(stateDir), 'a data-only lease started services').toBe(0);
+    expect(liveServices(journal, id), 'a data-only lease started services').toBe(0);
     expect(up.json?.urls).toEqual({});
     // `urls: {}` alone is ambiguous — it is also what a failed service looks
     // like. A fixture reading this blob has to be able to tell.
     expect(up.json?.dataOnly).toBe(true);
     // `warm` is the honest state: nothing is running, everything else is intact.
     expect(up.json?.state).toBe('warm');
-
-    const envId = String(up.json?.envId);
-    expect(journal().getEnv(envId)?.dataOnly).toBe(true);
+    expect(journal().getEnv(id)?.dataOnly).toBe(true);
+    // The journal must not claim service pids it never started, or recovery
+    // would later go signalling them.
+    expect(journal().getEnv(id)?.servicePids).toEqual({});
   }, 120_000);
 
   it('lets exec run against the lease, even though the env is warm', async () => {
@@ -156,8 +176,9 @@ describe('a data-only lease hands over a seeded store and nothing else', () => {
     // The between-runs move for a test lane. A shape-preserving rebind reads the
     // env's recorded shape, and an empty shape has always resolved to "the whole
     // app" — so without a durable data-only flag this booted the stack.
-    const { cli, stateDir } = ctx();
+    const { cli, journal } = ctx();
     const up = await cli(['up', '--data-only', '--json']);
+    const id = String(up.json?.envId);
     const url = (up.json?.datastores as Record<string, { url: string }>).main.url;
 
     // Dirty the store the way a test run would.
@@ -170,7 +191,7 @@ describe('a data-only lease hands over a seeded store and nothing else', () => {
     expect(reset.code, reset.stderr).toBe(0);
     expect(reset.json?.dataOnly).toBe(true);
     expect(reset.json?.urls).toEqual({});
-    expect(serviceCount(stateDir), 'reset-data booted the app on a data-only lease').toBe(0);
+    expect(liveServices(journal, id), 'reset-data booted the app on a data-only lease').toBe(0);
     // Back to the baseline, which is the other half of "reset on release".
     expect(notes(url)).toEqual(['one', 'two', 'three']);
   }, 120_000);
@@ -206,7 +227,7 @@ describe('a data-only environment does not leak its shape to the next holder', (
     // activeServices is deliberately not inherited across owners, and dataOnly
     // must follow the same rule — otherwise one lane's data lease would silently
     // turn the next agent's `up` into a service-less environment.
-    const { cli, stateDir, journal } = ctx();
+    const { cli, journal } = ctx();
     const first = await cli(['up', '--data-only', '--json']);
     const envId = String(first.json?.envId);
     await cli(['release', '--json']);
@@ -217,26 +238,27 @@ describe('a data-only environment does not leak its shape to the next holder', (
     expect(second.json?.dataOnly).toBe(false);
     expect(second.json?.state).toBe('hot');
     expect(Object.keys(second.json?.urls as object).length).toBeGreaterThan(0);
-    expect(serviceCount(stateDir)).toBeGreaterThan(0);
+    expect(liveServices(journal, envId), 'the next holder inherited a service-less env').toBeGreaterThan(0);
     expect(journal().getEnv(envId)?.dataOnly).toBe(false);
   }, 120_000);
 
   it('an explicit full up on the same lease starts the services, and back again stops them', async () => {
-    const { cli, stateDir } = ctx();
-    expect((await cli(['up', '--data-only', '--json'])).code).toBe(0);
-    expect(serviceCount(stateDir)).toBe(0);
+    const { cli, journal } = ctx();
+    const first = await cli(['up', '--data-only', '--json']);
+    const id = String(first.json?.envId);
+    expect(liveServices(journal, id)).toBe(0);
 
     const full = await cli(['up', '--json']);
     expect(full.code, full.stderr).toBe(0);
     expect(full.json?.dataOnly).toBe(false);
-    expect(serviceCount(stateDir), 'an explicit full up did not start services').toBeGreaterThan(0);
+    expect(liveServices(journal, id), 'an explicit full up did not start services').toBeGreaterThan(0);
 
     // And back: an explicit request always wins over the recorded shape.
     const back = await cli(['up', '--data-only', '--json']);
     expect(back.code, back.stderr).toBe(0);
     expect(back.json?.dataOnly).toBe(true);
     expect(back.json?.urls).toEqual({});
-    expect(serviceCount(stateDir), 'returning to data-only left services running').toBe(0);
+    expect(liveServices(journal, id), 'returning to data-only left services running').toBe(0);
   }, 120_000);
 });
 
