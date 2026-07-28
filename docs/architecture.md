@@ -273,6 +273,15 @@ Every failure is classified — the field an agent branches on mechanically:
   adapter supplies its own automatically). The default holder is a worktree PATH, and nothing
   about a path can die — so a crashed agent held its environment for the whole TTL. A named
   process is checked against its start time, and a dead holder's lease is released in seconds.
+  **This makes it a form for callers that outlive the command, and `--ttl` the form for
+  agents.** A bind naming an ALREADY-dead pid is refused outright (exit 64), because such a
+  lease is released by the next sweep: the environment would go back in the pool while its
+  caller was still using it, and the next bind — a `run` defaulting to the `empty` preset, or
+  another agent — would hand that caller a different, unseeded store through the same URL.
+  The pattern that produced this in the field was `BACKLOT_HOLDER_PID=$$ backlot up` from an
+  agent harness, where every command gets a fresh shell, so `$$` is already gone. It presented
+  as a stale seed template and cost hours in the wrong subsystem; refusing at bind time is
+  the whole fix.
 - **A lease no longer exempts an environment from reclaiming HEAT.** Holding one used to keep
   services (and their memory) alive for the full TTL even if nothing had touched the
   environment since the bind. Now a leased env that goes untouched past `leasedIdleTtlMs`

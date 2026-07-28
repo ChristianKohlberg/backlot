@@ -29,9 +29,15 @@ not just to read or edit code.
     the pool, binds, executes one declared check, returns a classified verdict,
     and releases automatically. No prior `up` needed.
 - **Releasing is a non-event.** `release` (or just letting the lease's TTL lapse)
-  returns the env to the pool with its heat intact. Tie the lease to a live
-  process with `--holder-pid <pid>` (or `BACKLOT_HOLDER_PID`) so it frees the
-  instant that process exits.
+  returns the env to the pool with its heat intact.
+- **How long you hold it: use `--ttl <minutes>`.** That is the form for you.
+  There is a second form, `--holder-pid <pid>` / `BACKLOT_HOLDER_PID`, which ties
+  the lease to a process so it frees the instant that process exits — it is for
+  interactive shells and long-lived supervisors only. **Do not write
+  `BACKLOT_HOLDER_PID=$$ backlot up`:** each of your commands runs in a fresh
+  shell, so `$$` names a shell that has already exited, and backlot refuses the
+  bind (exit 64) rather than give you a lease that is reclaimable on arrival.
+  If you pass a pid, it must be a process you know outlives the command.
 
 ## Verbs
 
@@ -41,19 +47,25 @@ stderr is human progress. Exit codes are contractual: `0` ok · `1` work-error �
 
 | Verb | What it does |
 | --- | --- |
-| `up [service...]` | Session lease: sync, upkeep, start services, print context. **No service = the whole app. Named services start only that slice plus its transitive `depends_on` closure** (see below). Flags: `--watch`, `--reset-data`\|`--pristine`, `--ttl <minutes>`, `--holder-pid <pid>`. |
+| `up [service...]` | Session lease: sync, upkeep, start services, print context. **No service = the whole app. Named services start only that slice plus its transitive `depends_on` closure** (see below). Flags: `--watch`, `--reset-data`\|`--pristine`, `--ttl <minutes>` (**the lease form for agents**), `--holder-pid <pid>` (interactive shells only — see above). |
 | `run <check>` | Run lease: bind → execute the check declared in `backlot.yml` → classified verdict → release. `--pristine` rebuilds from scratch; `--pull` copies declared outputs back; `--detach` returns a `jobId` immediately (poll with `job <jobId>`). |
 | `ctx` | Re-read the consumer **context blob** (service URLs, login creds, connection strings, recent events) for the env your lease holds — read-only, no re-bind. `up` already returned this once. |
-| `release` | Release the current lease; the environment stays warm in the pool. |
+| `release` | Release the current lease; the environment stays warm in the pool. On `{"released": false}` read the `reason` — a lease is keyed by the directory that bound it, so releasing from elsewhere matches nothing. |
 | `sync` | Project the current worktree state into the leased env — seconds; `hot_reload` services keep running, others restart as needed. |
 | `exec <cmd...>` | Run an arbitrary command inside the env your lease holds; hands back raw stdout + exit code (not a verdict). Needs an `up` first. |
 | `logs <service> [--lines N]` | Tail a service's logs from the leased env. |
 | `reset-data` | Restore the data template on the current lease (fresh seeded state, declared caches kept). |
-| `token --role <r>` | Mint an auth token via the stack's `auth.token` hook — for authenticating as a given role. |
-| `status` | Daemon, pool, and lease overview. |
+| `token --role <r>` | Mint an auth token via the stack's `auth.token` hook — for authenticating as a given role. Prints JSON (`{token, role}`); **add `--raw` for the bare token**, which is what an `Authorization` header wants. Piping the JSON into a header gets you a 401 that looks like a permissions problem. |
+| `status` | Daemon, pool, and lease overview. Per environment, `available` answers "will the next bind take this one?" — `heat: "cold"` just means quiesced, which is a **healthy free** pool entry, not a stuck one. |
 
 Adjacent: `pull` (copy declared outputs into the worktree), `appliance ls|start|stop`
 (shared backing servers), `pool ls|recycle|reconcile|gc|doctor`, `daemon stop`.
+
+**The pool is shared.** On a box running several agents, `pool recycle` with no
+argument targets **every** environment, not just yours. Name the one you mean —
+`pool recycle <env-id>` — and never reach for `--force`, which is the only thing
+that takes an environment somebody else still holds a lease on. A pool whose
+entries show `heat: "cold"` is not stuck; it is idle and ready.
 
 ### Partial / per-service `up`
 
@@ -87,8 +99,8 @@ flags apply to the partial form.
    that.
 2. Use partial `up` to lease just the slice you're working on; don't boot the
    whole app to iterate on one frontend.
-3. `release` when you stop, or pass `--holder-pid` so the lease frees itself —
-   holding a lease keeps a pooled env out of circulation.
+3. `release` when you stop, and size `--ttl` to the work — holding a lease keeps a
+   pooled env out of circulation. Never `--holder-pid $$`; see the lease model above.
 4. Branch on the **class** of a failure, not just the exit code: `work-error` is
    yours to fix, `env-error` is the environment (backlot recycles it), and
    `infra-error` is something external — don't "fix" healthy code because a DB

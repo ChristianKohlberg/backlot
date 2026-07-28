@@ -85,7 +85,10 @@ async function dispatch(verb: string, args: Record<string, unknown>, emit: (phas
     case 'doctor':
       return engine.doctor();
     case 'pool-recycle':
-      return engine.poolRecycle(Boolean(args.all));
+      return engine.poolRecycle({
+        envId: args.envId ? String(args.envId) : undefined,
+        force: Boolean(args.force ?? args.all),
+      });
     case 'pool-reconcile':
       // Local substrate: reconcile = doctor + reap anything degraded/stuck.
       return engine.poolReconcile();

@@ -242,9 +242,17 @@ describe('env port-survivor: bind reaps tagged escapees instead of blocking', ()
    * servicePids is empty, and the port-free check fails with "port occupied by
    * a foreign process". With the fix: reapEnvProcesses → scanTagged kills the
    * grandchild before the check and the bind succeeds.
+   *
+   * UPDATED for issue #34: the quiesce path now reaps too, so the grandchild
+   * dies at the quiesce rather than surviving until the next bind. This test
+   * used to ASSERT that survival as its intermediate state, which was exactly
+   * the leak — a quiesced env can sit cold for hours, and the escapee held its
+   * port and its memory for all of it. The end state it checks is unchanged and
+   * now arrives sooner. The bind-time reap it was written for is still exercised
+   * by the daemon-restart cases below, where the in-memory supervisor is empty.
    */
   it.skipIf(!procScanSupported())(
-    'reaps an escaped grandchild on rebind after quiesce, same daemon (no restart)',
+    'reaps an escaped grandchild at quiesce, and the rebind still succeeds',
     async () => {
       const ctx = makeContext({ BACKLOT_IDLE_TTL_MS: '500', BACKLOT_GC_MS: '999999999' });
       ctxList.push(ctx.cleanup);
@@ -280,17 +288,20 @@ setInterval(() => {}, 1e6);
       const rel = await ctx.cli(['release', '--json'], wt);
       expect(rel.exitCode, `release failed: ${rel.stderr}`).toBe(0);
 
-      // Idle sweeper quiesces the env: group-kill stops the service, the
-      // grandchild escapes (own group) and keeps the port.
+      // Idle sweeper quiesces the env. The group-kill misses the grandchild
+      // (own process group), so the quiesce's own reap has to catch it — GC is
+      // disabled here precisely to prove the quiesce did it and not the sweep.
       const journalPath = join(ctx.stateDir, 'journal.db');
       expect(
         await waitFor(() => new Journal(journalPath).allEnvs()[0]?.state === 'warm'),
         'env must quiesce to warm after release',
       ).toBe(true);
-      expect(alive(grandchild), 'grandchild must survive the quiesce group-kill').toBe(true);
+      expect(
+        await waitFor(() => !alive(grandchild)),
+        `grandchild pid ${grandchild} outlived the quiesce, still holding the service port`,
+      ).toBe(true);
 
-      // Re-up on the SAME daemon. Without the bind-time reap this fails with
-      // "port occupied by a foreign process".
+      // And the rebind is clean — the port was never left occupied.
       const up2 = await ctx.cli(['up', '--json'], wt);
       expect(up2.exitCode, `second up failed — port still held by grandchild? alive=${alive(grandchild)}\nstdout: ${up2.stdout}\nstderr: ${up2.stderr}`).toBe(0);
       expect(await waitFor(() => !alive(grandchild)), `grandchild pid ${grandchild} survived the rebind`).toBe(true);
