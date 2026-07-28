@@ -473,18 +473,51 @@ async function main(): Promise<void> {
     }
     case 'update': {
       const install = installKind();
+      // THE case this verb exists for is an old daemon — and an old daemon has
+      // never heard of `update-plan`. Calling it unconditionally made `update`
+      // fail with "daemon does not know verb 'update-plan'" against every
+      // pre-0.9.0 daemon, which is every daemon anyone was running when 0.9.0
+      // shipped: the one situation it was built to fix was the one it could not.
+      //
+      // (The tests missed it because BACKLOT_FAKE_VERSION runs THIS code while
+      // claiming an old version, so the stand-in always knew the new verbs — the
+      // same "a stand-in must model the thing it stands in for" lesson as the
+      // ping stand-ins, not applied here. tests/daemon-update.test.ts now drives
+      // a stub that answers the way an old daemon really does.)
+      const legacyVerb = (e: RpcError) => /does not know verb/i.test(e.message);
       const planRes = await rpc('update-plan', { cliVersion: VERSION });
-      if (!planRes.ok) {
+      if (!planRes.ok && !legacyVerb(planRes.error)) {
         errExit(planRes.error);
         return;
       }
-      const plan = planRes.data as {
+      const legacy = !planRes.ok;
+      // An old daemon cannot describe its own state, but `status` is a verb every
+      // version has — enough to name the holders who will have to rebind, and to
+      // learn the pid to wait on.
+      let plan: {
         daemon: string;
-        daemonPid: number;
-        journalSchema: number;
+        daemonPid?: number;
+        journalSchema?: number;
         busy: string[];
         leases: Array<{ envId: string; holder: string; kind: string }>;
       };
+      if (legacy) {
+        const st = await rpc('status', {});
+        const s = (st.ok ? st.data : {}) as {
+          pid?: number;
+          envs?: Array<{ id?: string; lease?: { holder?: string; kind?: string } | null }>;
+        };
+        plan = {
+          daemon: 'pre-0.9.0',
+          daemonPid: s.pid,
+          busy: [], // unknowable: no old daemon can be asked what is in flight
+          leases: (s.envs ?? [])
+            .filter((e) => e.lease)
+            .map((e) => ({ envId: String(e.id), holder: String(e.lease?.holder), kind: String(e.lease?.kind) })),
+        };
+      } else {
+        plan = planRes.data as typeof plan;
+      }
       const report = {
         cli: VERSION,
         daemon: plan.daemon,
@@ -498,6 +531,13 @@ async function main(): Promise<void> {
         // worth asking for — and why an in-flight operation is.
         holdersWhoMustRebind: plan.leases,
         upgradeHint: install.upgradeHint,
+        ...(legacy
+          ? {
+              note:
+                `the running daemon predates 'update-plan', so it cannot report what is in flight — ` +
+                `the in-flight refusal cannot apply here, and the restart proceeds as 'daemon stop' always has`,
+            }
+          : {}),
       };
 
       // --check is the diagnose half, and it never restarts anything. `doctor`
@@ -519,7 +559,13 @@ async function main(): Promise<void> {
         process.exit(0);
       }
 
-      const stopRes = await rpc('daemon-restart', { cliVersion: VERSION, force: flags.has('--force') });
+      // `daemon-restart` carries the refusals (in-flight, downgrade). An old
+      // daemon has neither the verb nor anything to refuse WITH, so fall back to
+      // `shutdown` — which every version has, and which is exactly what
+      // `daemon stop` has always done. Without this fallback there is no way out
+      // of skew for the daemon that most needs one.
+      let stopRes = await rpc('daemon-restart', { cliVersion: VERSION, force: flags.has('--force') });
+      if (!stopRes.ok && legacyVerb(stopRes.error)) stopRes = await rpc('shutdown', {});
       if (!stopRes.ok) {
         errExit(stopRes.error);
         return;

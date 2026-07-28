@@ -23,6 +23,7 @@
  */
 import { describe, it, expect, afterAll } from 'vitest';
 import { execFile, execFileSync, spawn } from 'node:child_process';
+import { createServer } from 'node:http';
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -251,6 +252,89 @@ describe('backlot update', () => {
     expect(again.code).toBe(0);
     expect(String((again.json as { envId?: string }).envId)).toBe(envId);
   });
+});
+
+describe('a daemon that predates `update` itself', () => {
+  /**
+   * A stand-in that answers the way a REAL pre-0.9.0 daemon does: `ping` without
+   * a version, `status` in the old shape, the daemon's own "does not know verb"
+   * error for anything newer, and `shutdown` by actually closing the socket.
+   *
+   * This is the case `backlot update` exists for, and the case it failed. The
+   * fake-version tests could never catch it: BACKLOT_FAKE_VERSION runs THIS build
+   * while claiming an old version, so the stand-in always knew `update-plan`.
+   * Shipped 0.9.0 therefore could not update any daemon anyone was running —
+   * `backlot update` died with "daemon does not know verb 'update-plan'".
+   */
+  function oldDaemon(sock: string, onShutdown: () => void) {
+    // A pid that really dies on shutdown. `update` waits for the OLD daemon's
+    // process to be gone as well as its socket (the election lock is released
+    // between the two, and a respawn inside that window concedes) — so reporting
+    // the test runner's own pid, which never exits, would model a daemon that
+    // shut down but stayed alive. This child stands in for the daemon process.
+    const proc = spawn('sleep', ['60'], { stdio: 'ignore' });
+    const server = createServer((req, res) => {
+      let body = '';
+      req.on('data', (d) => (body += d));
+      req.on('end', () => {
+        const verb = String((JSON.parse(body || '{}') as { verb?: string }).verb);
+        res.writeHead(200, { 'content-type': 'application/x-ndjson' });
+        const send = (frame: unknown) => res.end(JSON.stringify(frame) + '\n');
+        if (verb === 'ping') return send({ type: 'result', ok: true, data: { pid: proc.pid } });
+        if (verb === 'status') {
+          return send({
+            type: 'result',
+            ok: true,
+            data: { pid: proc.pid, envs: [{ id: 'old-e1', lease: { holder: '/some/worktree', kind: 'session' } }] },
+          });
+        }
+        if (verb === 'shutdown') {
+          send({ type: 'result', ok: true, data: { stopping: true } });
+          // Real shutdown removes the socket and exits; closing is the stand-in's
+          // equivalent, and it is what lets the NEW daemon take the socket.
+          setTimeout(() => {
+            proc.kill('SIGKILL');
+            onShutdown();
+          }, 30);
+          return;
+        }
+        // Verbatim from the daemon's dispatch default.
+        send({ type: 'result', ok: false, error: { class: 'env-error', message: `daemon does not know verb '${verb}'`, source: 'rpc' } });
+      });
+    });
+    return server;
+  }
+
+  it('is still updated, by falling back to the verbs it does have', async () => {
+    const { cli, stateDir } = ctx();
+    const sock = join(stateDir, 'daemon.sock');
+    const server = oldDaemon(sock, () => server.close());
+    await new Promise<void>((r) => server.listen(sock, r));
+    cleanups.push(() => server.close());
+
+    // --check must report rather than blow up on the unknown verb.
+    const checked = await cli(['update', '--check', '--json']);
+    expect(checked.code, checked.stdout).toBe(0);
+    const c = checked.json as Record<string, unknown>;
+    expect(c.daemon).toBe('pre-0.9.0');
+    expect(c.restarted).toBe(false);
+    // `status` exists in every version, so the holders are still named.
+    expect(c.holdersWhoMustRebind).toEqual([{ envId: 'old-e1', holder: '/some/worktree', kind: 'session' }]);
+    expect(String(c.note)).toMatch(/cannot report what is in flight/);
+
+    // And the real thing: restart via `shutdown`, then the autospawn brings up
+    // THIS build.
+    const done = await cli(['update', '--json']);
+    expect(done.code, done.stdout).toBe(0);
+    const d = done.json as Record<string, unknown>;
+    expect(d.restarted).toBe(true);
+    expect(d.from).toBe('pre-0.9.0');
+    expect(d.to).toBe(PKG_VERSION);
+
+    // Proof it is a real daemon now, not the stub: a verb the stub refuses works.
+    const after = await cli(['update', '--check', '--json']);
+    expect((after.json as Record<string, unknown>).daemon).toBe(PKG_VERSION);
+  }, 120_000);
 });
 
 describe('the MCP adapter refuses skew too', () => {
