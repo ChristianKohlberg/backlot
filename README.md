@@ -81,6 +81,59 @@ backing service comes along for the ride. An unknown service name is a manifest
 work-error. All the usual flags (`--watch`, `--reset-data`/`--pristine`,
 `--ttl`, `--json`) apply to the partial form too.
 
+### `--data-only`: lease a database, not an application
+
+A test lane usually needs one thing from an environment — a warm, seeded database
+of its own — and paying for services it never calls is what pushes people back to
+Testcontainers, where every lane starts its own container and restores a full
+backup per test collection.
+
+```bash
+backlot up --data-only --ttl 30      # seeded store, leased; no services, no builds
+backlot ctx --json                   # .datastores.main.url — point your fixture at it
+backlot reset-data                   # back to the baseline between runs
+backlot release
+```
+
+Everything else about the lease is unchanged: it is pooled, isolated per holder,
+restored from the same template, and dropped on recycle. Two lanes get two
+namespaces, so neither sees the other's writes. `ctx` reports `dataOnly: true` so a
+fixture can tell "no services by design" from "a service failed to start", and the
+environment sits at `warm` because nothing is meant to be running.
+
+It refuses what it cannot mean: naming a service alongside it, `--watch` (nothing
+would reload), and a manifest that declares no datastore.
+
+One current limit: a data-only environment still occupies a pool slot, so on a busy
+box raise `POOL_MAX` rather than letting test lanes compete with the interactive
+leases people use to look at the app. They are cheap — no services run in them.
+
+### How long you hold it: `--ttl` for agents, `--holder-pid` for shells
+
+A lease has a TTL, and there are two ways to say when you are done with an
+environment:
+
+```bash
+backlot up --ttl 45                       # agents, scripts, CI: hold it for 45 minutes
+BACKLOT_HOLDER_PID=$$ backlot up          # an interactive shell: hold it until THIS shell exits
+```
+
+**`--ttl` is the form for anything automated.** `--holder-pid <pid>` (or
+`BACKLOT_HOLDER_PID`) pins the lease to a process so the environment returns to
+the pool the instant that process exits instead of waiting out the TTL — which is
+only useful if the process genuinely outlives the command.
+
+It does **not** work from an agent harness, because those run each command in a
+fresh shell: by the time `backlot up` returns, the `$$` it was given is a shell
+that has already exited. Backlot refuses such a bind (exit `64`) rather than
+create a lease that is reclaimable the moment it exists — otherwise the sweeper
+frees the environment while you are still using it, the next bind takes it, and
+you are quietly looking at somebody else's database through the same URL.
+
+`backlot release` hands the environment back early. If it answers
+`{"released": false}`, read the `reason`: a lease is keyed by the directory that
+bound it, so releasing from a different worktree matches nothing.
+
 For your own repo: `npm i -g backlot`, write the `backlot.yml`, then the same
 verbs. Requires Node ≥ 22.13 and git. The daemon auto-spawns on first use (unix
 socket, per-machine state under `~/.local/state/backlot`; isolate with

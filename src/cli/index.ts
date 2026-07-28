@@ -5,6 +5,7 @@
  * 3 infra-error, 64 usage. See docs/architecture.md §11.
  */
 import { ensureDaemon, rpc, classifyClientError, type RpcError } from './client.js';
+import { isAlive } from '../core/procscan.js';
 
 const USAGE = `backlot — puts a working instance of a web application in front of you.
 
@@ -13,6 +14,10 @@ Usage:
                           (no service = whole app; named services start only that
                            slice plus its depends_on closure)
                           session lease: sync, upkeep, start services, print context
+  backlot up --data-only  lease the DATASTORES alone — a seeded database, no
+                          services, no builds. For test lanes that need a
+                          database per run rather than a whole application.
+                          Connection strings arrive in the same ctx blob.
   backlot run <check> [--pristine] [--pull] [--detach]
                           run lease: bind -> execute the check -> verdict -> release
                           --detach: submit-and-poll — returns a jobId immediately
@@ -22,19 +27,37 @@ Usage:
   backlot exec <cmd...>   run a command inside the leased environment
   backlot logs <service> [--lines N]
   backlot reset-data      restore the data template on the current lease
-  backlot token --role <r>  mint an auth token via the stack's auth.token hook
+  backlot token --role <r> [--raw]
+                          mint an auth token via the stack's auth.token hook.
+                          Default output is JSON ({token, role}); --raw prints the
+                          bare token, which is what an Authorization header wants
   backlot pull            copy declared outputs back into the worktree
   backlot release         release the current lease (environment stays warm)
   backlot status          daemon, pool, and lease overview
   backlot appliance ls|start|stop [name]
                           shared backing servers: probe, ensure up, explicit stop
-  backlot pool ls|recycle [--all]|reconcile|gc|doctor
+  backlot pool ls|recycle [<env-id>] [--force]|reconcile|gc|doctor
+                          recycle with an env-id recycles exactly that one; with
+                          none, the whole pool. A LEASED environment is never
+                          taken without --force (--all is the old spelling).
                           gc reclaims service processes orphaned by an ungraceful
                           exit; doctor reports drift without acting on it
   backlot daemon stop     stop the daemon (environments are recovered on next use)
 
---holder-pid (or BACKLOT_HOLDER_PID) ties the lease to a live process: when it exits,
-the environment returns to the pool immediately instead of waiting out the TTL.
+Holding an environment — two forms, and the right one depends on who you are:
+
+  --ttl <minutes>          THE FORM FOR AGENTS AND SCRIPTS. The lease lives for the
+                           stated time no matter what process asked for it.
+  --holder-pid <pid>       For an interactive shell, or any caller that OUTLIVES the
+  (BACKLOT_HOLDER_PID)     command. Ties the lease to that process so the environment
+                           returns to the pool the moment it exits, rather than
+                           waiting out the TTL.
+
+'BACKLOT_HOLDER_PID=$$ backlot up' works at a shell prompt and CANNOT work from an
+agent harness: each command runs in a fresh shell, so '$$' names a process that has
+already exited. Such a lease would be reclaimable the instant it was created — the
+environment would be handed to the next caller while you were still using it — so
+backlot refuses the bind instead. Use --ttl.
 
 Every verb accepts --json. Long verbs (up/run/sync/bind/reset-data) show live progress
 on a terminal (stderr); force with --progress, silence with --quiet. stdout stays clean.
@@ -48,7 +71,7 @@ const verb = rawArgv[0];
 // flags survive) — the F1 class of argv bugs. Everything after a lone `--`, and
 // EVERYTHING for `exec`, is treated as a raw passthrough command.
 const VALUE_FLAGS = new Set(['--holder', '--holder-pid', '--ttl', '--role', '--lines', '--ref', '--spec', '--preset']);
-const BOOL_FLAGS = new Set(['--json', '--watch', '--reset-data', '--pristine', '--pull', '--detach', '--all', '--raw', '--progress', '--quiet']);
+const BOOL_FLAGS = new Set(['--json', '--watch', '--reset-data', '--pristine', '--pull', '--detach', '--all', '--force', '--raw', '--data-only', '--progress', '--quiet']);
 
 const flagVals = new Map<string, string>();
 const flags = new Set<string>();
@@ -165,12 +188,28 @@ async function main(): Promise<void> {
   // This must be the long-lived caller — the agent process, or a supervising
   // shell. Given one, the daemon releases the lease the moment it dies instead
   // of holding the environment for the rest of the TTL.
+  const holderPidSource = flagValue('--holder-pid') !== undefined ? '--holder-pid' : 'BACKLOT_HOLDER_PID';
   const holderPidRaw = flagValue('--holder-pid') ?? process.env.BACKLOT_HOLDER_PID;
   let holderPid: number | undefined;
   if (holderPidRaw !== undefined && holderPidRaw !== '') {
     holderPid = Number(holderPidRaw);
     if (!Number.isInteger(holderPid) || holderPid <= 0) {
-      console.error(`backlot: --holder-pid expects a process id, got '${holderPidRaw}'`);
+      console.error(`backlot: ${holderPidSource} expects a process id, got '${holderPidRaw}'`);
+      process.exit(64);
+    }
+    // A holder that is ALREADY dead is worse than no holder at all: the daemon
+    // releases such a lease on its very next sweep, so the environment goes
+    // back in the pool while the caller is still using it — and the next bind
+    // hands that caller's database to somebody else, silently. The pattern
+    // that produces this is `BACKLOT_HOLDER_PID=$$ backlot up` from an agent
+    // harness, which runs every command in a fresh shell: `$$` is a shell that
+    // has already exited. Refuse, and name the form that works.
+    if (!isAlive(holderPid)) {
+      console.error(
+        `backlot: ${holderPidSource} ${holderPid} is not a live process — the lease would be reclaimable the moment it is created.\n` +
+          `  If this came from '$$': each agent command runs in a fresh shell, so that shell is already gone.\n` +
+          `  Use 'backlot ${verb} --ttl <minutes>' instead; ${holderPidSource} is for interactive shells that outlive the command.`,
+      );
       process.exit(64);
     }
   }
@@ -187,7 +226,17 @@ async function main(): Promise<void> {
           process.exit(64);
         }
       }
-      res = await rpc('up', { cwd, holder, holderPid, hygiene: hygiene(), watch: flags.has('--watch'), ttlMs, services: positional }, progress);
+      const dataOnly = flags.has('--data-only');
+      if (dataOnly && flags.has('--watch')) {
+        // Nothing runs, so there is nothing for a watcher to reload.
+        console.error('backlot up: --watch has nothing to do under --data-only (no services run)');
+        process.exit(64);
+      }
+      res = await rpc(
+        'up',
+        { cwd, holder, holderPid, hygiene: hygiene(), watch: flags.has('--watch'), ttlMs, services: positional, dataOnly },
+        progress,
+      );
       endProgress();
       break;
     }
@@ -308,9 +357,20 @@ async function main(): Promise<void> {
       res = await rpc('reset-data', { cwd, holder }, progress);
       endProgress();
       break;
-    case 'token':
+    case 'token': {
       res = await rpc('token', { cwd, holder, role: flagValue('--role') ?? 'admin' });
+      // --raw prints the bare token and nothing else. The wrapper's default is a
+      // JSON object, but a manifest's own auth.token script prints the bare
+      // string — so the documented "prints the plaintext token on stdout"
+      // described the script, not this command, and callers piped
+      // `{"token":"tk_…","role":"human"}` straight into an Authorization header
+      // and read the resulting 401 as a permissions problem.
+      if (res?.ok && flags.has('--raw')) {
+        console.log(String((res.data as { token: string }).token));
+        process.exit(0);
+      }
       break;
+    }
     case 'pull':
       res = await rpc('pull', { cwd, holder });
       break;
@@ -343,7 +403,11 @@ async function main(): Promise<void> {
     case 'pool': {
       const sub = positional[0] ?? 'ls';
       if (sub === 'ls') res = await rpc('status', {});
-      else if (sub === 'recycle') res = await rpc('pool-recycle', { all: flags.has('--all') });
+      else if (sub === 'recycle') {
+        // The env id used to be parsed and then dropped, so `recycle <env-id>`
+        // recycled the WHOLE pool — the opposite of what naming one asks for.
+        res = await rpc('pool-recycle', { envId: positional[1], force: flags.has('--force') || flags.has('--all') });
+      }
       else if (sub === 'reconcile') res = await rpc('pool-reconcile', {});
       else if (sub === 'gc') res = await rpc('pool-gc', {});
       else if (sub === 'doctor') res = await rpc('doctor', {});

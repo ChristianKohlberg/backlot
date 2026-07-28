@@ -53,6 +53,16 @@ export interface EnvRow {
    * a fresh `up` re-declares it.
    */
   activeServices?: string[];
+  /**
+   * This environment was bound for its DATASTORES ONLY — no services, by design.
+   *
+   * `activeServices: []` cannot express this: an empty selection has always meant
+   * "the whole app" (see `resolveServiceClosure`), so without a separate flag a
+   * shape-preserving rebind — `reset-data` on a data lease is the one that
+   * matters — would read the empty shape and boot the entire stack. A fresh claim
+   * never inherits it; only the request sets it.
+   */
+  dataOnly?: boolean;
 }
 
 export interface LeaseRow {
@@ -135,6 +145,15 @@ export class Journal {
       const msg = String((err as Error).message ?? err);
       if (!/duplicate column name/i.test(msg)) throw err;
     }
+    // Migration for journals created before data-only binds. 0 (the default for
+    // existing rows) is correct: every environment that already existed was
+    // bound with its services.
+    try {
+      this.db.exec('ALTER TABLE envs ADD COLUMN data_only INTEGER NOT NULL DEFAULT 0');
+    } catch (err) {
+      const msg = String((err as Error).message ?? err);
+      if (!/duplicate column name/i.test(msg)) throw err;
+    }
   }
 
   /**
@@ -179,25 +198,27 @@ export class Journal {
       servicePids: parseServicePids(r.service_pids as string),
       failStreak: (r.fail_streak as number) ?? 0,
       activeServices: r.active_services ? (JSON.parse(r.active_services as string) as string[]) : undefined,
+      dataOnly: Boolean(r.data_only),
     };
   }
 
   saveEnv(e: EnvRow): void {
     this.db
       .prepare(
-        `INSERT INTO envs (id, stack, stack_root, state, root, ports, datastore_ns, fingerprints, presets, bind_count, created_at, last_used_at, service_pids, fail_streak, active_services)
-         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        `INSERT INTO envs (id, stack, stack_root, state, root, ports, datastore_ns, fingerprints, presets, bind_count, created_at, last_used_at, service_pids, fail_streak, active_services, data_only)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
          ON CONFLICT(id) DO UPDATE SET state=excluded.state, ports=excluded.ports,
            datastore_ns=excluded.datastore_ns, fingerprints=excluded.fingerprints,
            presets=excluded.presets, bind_count=excluded.bind_count,
            last_used_at=excluded.last_used_at, service_pids=excluded.service_pids,
-           fail_streak=excluded.fail_streak, active_services=excluded.active_services`,
+           fail_streak=excluded.fail_streak, active_services=excluded.active_services,
+           data_only=excluded.data_only`,
       )
       .run(
         e.id, e.stack, e.stackRoot, e.state, e.root,
         JSON.stringify(e.ports), JSON.stringify(e.datastoreNs), JSON.stringify(e.fingerprints),
         JSON.stringify(e.presets), e.bindCount, e.createdAt, e.lastUsedAt, JSON.stringify(e.servicePids),
-        e.failStreak, e.activeServices ? JSON.stringify(e.activeServices) : null,
+        e.failStreak, e.activeServices ? JSON.stringify(e.activeServices) : null, e.dataOnly ? 1 : 0,
       );
   }
 
