@@ -36,6 +36,32 @@ Recorded `servicePids` hold only the **top-level service pids** — a service's 
 
 Pool commands are shared-box operations: `pool recycle` with no id targets **every** environment, and `--force` is the only thing that takes one out from under a live lease. In `status`, `heat: 'cold'` means quiesced-and-free, not stuck; the `available` and `summary` fields say so outright because reading 'cold' as 'broken' is what caused #40.
 
+## Version skew is a first-class failure, and the daemon outlives the install
+
+The CLI spawns the daemon from **its own `dist/`** (`ensureDaemon`), so installing a
+new backlot never replaces a daemon that is already running — it serves old code for
+the rest of its life, and an old daemon *ignores* arguments it does not know rather
+than rejecting them. `ping` therefore carries the daemon's version, and a mismatch
+**refuses** every verb except `update`, `doctor` and `daemon stop` with
+`infra-error`. `backlot update` is the remedy: it restarts the daemon (shared code
+path with `daemon stop`), and the next verb's autospawn is what makes the new daemon
+the installed build. Leases survive; an in-flight (`busy`) operation and a downgrade
+are the only refusals. See [decision 0024](docs/decisions/0024-updating-the-running-daemon.md)
+and `tests/daemon-update.test.ts`.
+
+Two sharp edges. **`src/core/version.ts` is the only source of version truth** — a
+second one already drifted (the MCP adapter shipped 0.4.0 while the package was
+0.5.0); `BACKLOT_FAKE_VERSION` exists solely so a test can make a daemon claim a
+different version than its CLI. **Any test that stands in for the daemon must answer
+`ping` with `VERSION`**, or the CLI treats the stand-in as an old daemon and refuses
+before the behaviour under test ever runs (this broke `cli-contract` and
+`daemon-spawn` when the gate landed).
+
+`JOURNAL_SCHEMA_VERSION` (`src/core/journal.ts`) is stamped into `PRAGMA
+user_version`; a daemon refuses to open a journal stamped newer than it understands.
+Bump it only when a change makes an older daemon **misread** this journal — the
+additive `ALTER TABLE` migrations are not bumps.
+
 ## Claude Code plugin
 
 The repo doubles as its own Claude Code plugin marketplace (docs/config only — it

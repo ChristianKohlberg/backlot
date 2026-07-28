@@ -13,6 +13,7 @@ import { mkdtempSync, rmSync, writeFileSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { classifyClientError } from '../src/cli/client.js';
+import { VERSION } from '../src/core/version.js';
 
 const repo = join(import.meta.dirname, '..');
 const CLI = join(repo, 'dist', 'cli', 'index.js');
@@ -69,7 +70,10 @@ describe('a wedged daemon must not hang the caller forever', () => {
         const verb = (JSON.parse(body || '{}') as { verb?: string }).verb;
         if (verb === 'ping') {
           res.writeHead(200, { 'content-type': 'application/x-ndjson' });
-          res.end(JSON.stringify({ type: 'result', ok: true, data: {} }) + '\n');
+          // VERSION included: a daemon reporting no version is an OLD daemon as
+          // far as the CLI is concerned, and it refuses before ever issuing the
+          // verb that hangs — which would leave the wedge untested.
+          res.end(JSON.stringify({ type: 'result', ok: true, data: { version: VERSION } }) + '\n');
           return;
         }
         res.writeHead(200, { 'content-type': 'application/x-ndjson' }); // ...and then nothing

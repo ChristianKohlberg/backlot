@@ -7,7 +7,8 @@ import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { mkdirSync, rmSync, copyFileSync, readdirSync, statSync, existsSync, readFileSync, watch as fsWatch, constants as fsConstants } from 'node:fs';
 import { join, resolve } from 'node:path';
-import { Journal, type EnvRow, type LeaseRow } from '../core/journal.js';
+import { Journal, JOURNAL_SCHEMA_VERSION, type EnvRow, type LeaseRow } from '../core/journal.js';
+import { VERSION, compareVersions, versionSkew } from '../core/version.js';
 import { loadStack, defaultPreset, type Stack } from '../core/manifest.js';
 import { changedOutputs, pullOutputs } from '../core/sync.js';
 import { syncIntoEnvThreaded } from '../core/sync-thread.js';
@@ -1630,12 +1631,100 @@ export class Engine {
     return { pid: process.pid, envs, poolMax: POOL_MAX(), poolMaxTotal: POOL_MAX_TOTAL(), events: recentEvents(15) };
   }
 
+  /** Who a restart would make rebind: every live lease, named. */
+  leaseHolders(): Array<{ envId: string; holder: string; kind: string }> {
+    return this.journal.allLeases().map((l) => ({ envId: l.envId, holder: l.holder, kind: l.kind }));
+  }
+
+  /**
+   * What a `backlot update` restart would cost, without doing it.
+   *
+   * Reported rather than inferred by the CLI because the two facts that decide
+   * whether a restart is safe — which environments are BUSY, and who holds a
+   * lease — only exist in the daemon's memory and journal.
+   */
+  updatePlan(cliVersion?: string) {
+    const skew = cliVersion === undefined ? null : versionSkew(cliVersion, VERSION);
+    return {
+      daemon: VERSION,
+      cli: cliVersion ?? null,
+      daemonPid: process.pid,
+      journalSchema: JOURNAL_SCHEMA_VERSION,
+      skew,
+      // An in-flight operation is the one thing a restart genuinely interrupts.
+      busy: [...this.busy],
+      // A lease is NOT an obstacle — see assertRestartable — but the holders
+      // are reported so a caller on a shared box knows who has to rebind.
+      leases: this.leaseHolders(),
+    };
+  }
+
+  /**
+   * Refuse a restart that would destroy work, and allow the one that costs only
+   * a rebind.
+   *
+   * BUSY is the refusal. A `run` is executed detached so the check itself
+   * survives the daemon (see runGroupCmd), but the CALLER is blocked on this
+   * socket waiting for a verdict — restarting hands it a dead connection and no
+   * result. Every other reclaim path already treats busy as inviolable
+   * (claimForTeardown, both sweeper branches, pool gc, and shutdown's own reap
+   * since 0.8.0), so this one does too.
+   *
+   * A LIVE LEASE is deliberately NOT a refusal. A restart stops services, keeps
+   * the lease, and the holder's next verb rebinds — which is exactly what the
+   * idle quiesce already does to leased environments without anyone's consent,
+   * and what assertUsable already tells the holder to do ("run 'backlot up' to
+   * rebind"). Refusing here would mean an update on any busy shared box always
+   * needs --force, and a flag you always pass is a flag that stops meaning
+   * anything: that habituation is what made issue #40 destructive. Holders are
+   * named in the plan instead.
+   *
+   * A DOWNGRADE is refused separately. Restarting from an older CLI replaces a
+   * newer daemon with older code, which is the direction that strands state —
+   * the journal stamp exists because of exactly that (JOURNAL_SCHEMA_VERSION).
+   */
+  assertRestartable(opts: { force: boolean; cliVersion?: string }): void {
+    const { force, cliVersion } = opts;
+    if (force) return;
+    const busy = [...this.busy];
+    if (busy.length > 0) {
+      throw new BrokerError(
+        'work-error',
+        `an operation is in flight on ${busy.join(', ')} — restarting now would drop the caller waiting on its verdict; ` +
+          `retry once it settles, or pass --force if you mean to interrupt it`,
+        'daemon',
+      );
+    }
+    if (cliVersion !== undefined) {
+      const order = compareVersions(cliVersion, VERSION);
+      if (order !== undefined && order < 0) {
+        throw new BrokerError(
+          'work-error',
+          `this CLI is backlot ${cliVersion} but the running daemon is ${VERSION} — restarting would DOWNGRADE the daemon, ` +
+            `which is the direction that can strand journal state; invoke the newer CLI, or pass --force if you mean to roll back`,
+          'daemon',
+        );
+      }
+    }
+  }
+
   /**
    * doctor: actively check for the failure shapes the review surfaced —
-   * orphaned ports, journal/reality pid divergence, envs stuck recycling.
+   * orphaned ports, journal/reality pid divergence, envs stuck recycling, and a
+   * CLI talking to a daemon that is not the installed build.
    */
-  async doctor() {
+  async doctor(cliVersion?: string) {
     const issues: Array<{ level: string; envId?: string; issue: string }> = [];
+    // Skew first: it changes how every other finding should be read, since a
+    // stale daemon's answers describe the old build's behaviour.
+    const skew = cliVersion === undefined ? null : versionSkew(cliVersion, VERSION);
+    if (skew) issues.push({ level: 'error', issue: skew.message });
+    if (VERSION === 'unknown') {
+      issues.push({
+        level: 'warn',
+        issue: `this build cannot read its own version (package.json missing or unreadable beside dist/) — skew with a CLI cannot be detected`,
+      });
+    }
     for (const env of this.journal.allEnvs()) {
       if (env.state === 'recycling') issues.push({ level: 'warn', envId: env.id, issue: 'stuck in recycling (a daemon likely died mid-teardown; restart reconciles)' });
       // Journal says these pids run — are they actually alive, and still ours?
@@ -1666,7 +1755,7 @@ export class Engine {
       }
     }
     logEvent({ level: issues.length ? 'warn' : 'info', kind: 'doctor', detail: `${issues.length} issue(s)` });
-    return { ok: issues.length === 0, issues, events: recentEvents(20) };
+    return { ok: issues.length === 0, issues, version: VERSION, journalSchema: JOURNAL_SCHEMA_VERSION, events: recentEvents(20) };
   }
 
   /**

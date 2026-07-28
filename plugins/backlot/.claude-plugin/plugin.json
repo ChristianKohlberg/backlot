@@ -1,6 +1,6 @@
 {
   "name": "backlot",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Teaches an agent to drive backlot — the repo-aware environment broker — against any repo's backlot.yml: lease a warm, seeded, authenticated env by bind-by-sync, run classified checks, partial/per-service up, then ctx/release. CLI-only, no MCP server; bundles the stack-agnostic backlot skill.",
   "author": {
     "name": "ChristianKohlberg"

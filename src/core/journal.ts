@@ -4,7 +4,27 @@
  */
 import { DatabaseSync } from 'node:sqlite';
 import { journalPath } from './paths.js';
+import { BrokerError } from './util.js';
 import type { EnvState, Hygiene, LeaseKind, ServicePid } from './types.js';
+
+/**
+ * The journal schema this build understands, stamped into `PRAGMA user_version`.
+ *
+ * Bump it when a change makes an OLDER daemon misread this journal — not for
+ * every additive column. The additive migrations below are deliberately not
+ * bumps: an old daemon selecting a known subset of columns reads a newer
+ * journal correctly.
+ *
+ * What this exists to stop is the DOWNGRADE, which has already cost once. The
+ * sha256 env-id migration stranded pre-upgrade rows that then counted against
+ * POOL_MAX_TOTAL and held their ports forever (BACKLOG.md), because nothing on
+ * disk said which build wrote them. A running example of the same shape:
+ * `data_only` defaults to 0, so a 0.7.0 daemon re-binding a 0.8.0 data-only
+ * environment reads "not data-only" and boots the whole application into a
+ * test lane's database. Disk is truth (decision 0009), so the truth has to say
+ * what wrote it.
+ */
+export const JOURNAL_SCHEMA_VERSION = 1;
 
 /**
  * service_pids was once `{"web": 1234}` and is now
@@ -89,6 +109,26 @@ export class Journal {
 
   constructor(path = journalPath()) {
     this.db = new DatabaseSync(path);
+    // Concurrent readers exist (tests and tools open the journal directly while
+    // the daemon runs), and without a busy timeout any overlap is an immediate
+    // SQLITE_BUSY rather than a short wait. Set before the first read below.
+    this.db.exec('PRAGMA busy_timeout = 5000');
+    // Refuse a journal from the FUTURE before touching it. A newer backlot may
+    // have written rows whose semantics this build does not know, and the
+    // failure mode is silent: we would read a default where the newer build
+    // stored meaning, then write that misreading back as truth. Checked before
+    // any DDL so a journal we do not understand is never modified at all.
+    const stamped = Number(
+      (this.db.prepare('PRAGMA user_version').get() as { user_version?: number } | undefined)?.user_version ?? 0,
+    );
+    if (stamped > JOURNAL_SCHEMA_VERSION) {
+      throw new BrokerError(
+        'infra-error',
+        `journal at ${path} was written by a newer backlot (schema ${stamped}; this build understands ${JOURNAL_SCHEMA_VERSION}) — ` +
+          `run the newer backlot, upgrade this one, or point BACKLOT_STATE_DIR at a different state root`,
+        'journal',
+      );
+    }
     this.db.exec('PRAGMA journal_mode = WAL');
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS envs (
@@ -115,10 +155,6 @@ export class Journal {
         stack TEXT PRIMARY KEY, next_env INTEGER NOT NULL DEFAULT 1
       );
     `);
-    // Concurrent readers exist (tests and tools open the journal directly while
-    // the daemon runs), and without a busy timeout any overlap is an immediate
-    // SQLITE_BUSY rather than a short wait.
-    this.db.exec('PRAGMA busy_timeout = 5000');
     // Migrations for journals created before holder identity existed.
     for (const col of ['holder_pid INTEGER', 'holder_start INTEGER']) {
       try {
@@ -154,6 +190,12 @@ export class Journal {
       const msg = String((err as Error).message ?? err);
       if (!/duplicate column name/i.test(msg)) throw err;
     }
+    // Stamp LAST: every migration above has run, so the stamp means "this
+    // journal has the schema that number describes" rather than "a build with
+    // that number opened it". 0 covers both a fresh journal and one written
+    // before stamping existed, and the idempotent ALTERs above bring either to
+    // 1 — so there is nothing to do for it beyond recording the fact.
+    if (stamped < JOURNAL_SCHEMA_VERSION) this.db.exec(`PRAGMA user_version = ${JOURNAL_SCHEMA_VERSION}`);
   }
 
   /**

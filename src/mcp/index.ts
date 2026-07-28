@@ -8,8 +8,8 @@
  * Every tool result is the same JSON the CLI's --json emits, as text content.
  */
 import { createInterface } from 'node:readline';
-import { createRequire } from 'node:module';
 import { ensureDaemon, rpc } from '../cli/client.js';
+import { VERSION } from '../core/version.js';
 
 const PROTOCOL = '2025-06-18';
 
@@ -19,20 +19,6 @@ interface Tool {
   inputSchema: Record<string, unknown>;
   verb: string;
 }
-
-/**
- * Read from package.json rather than a literal: the hardcoded value had already
- * drifted (0.4.0 while the package shipped 0.5.0), so clients were told the
- * wrong version of the tool they were driving.
- */
-const VERSION: string = (() => {
-  try {
-    const require = createRequire(import.meta.url);
-    return (require('../../package.json') as { version?: string }).version ?? '0.0.0';
-  } catch {
-    return '0.0.0';
-  }
-})();
 
 const cwdProp = {
   cwd: { type: 'string', description: 'Worktree directory (a backlot.yml is found upward from here). REQUIRED — the MCP server has no meaningful cwd of its own.' },
