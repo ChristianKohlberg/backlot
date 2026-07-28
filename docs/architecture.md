@@ -161,6 +161,22 @@ Waiting can never clear a machine-wide block — the count is of rows, and relea
 lease leaves the row behind — so if nothing is evictable the refusal is immediate, and
 names the cap that actually bound plus `BACKLOT_POOL_MAX_TOTAL` (#47).
 
+**A third ceiling, for data-only environments.** `poolMax`/`poolMaxTotal` bound
+*application* environments, because the heuristic behind them measures cores and
+memory — running services. A data-only environment (`up --data-only`) starts none, so
+it is counted against `poolMaxDataOnly` instead: disk-shaped, machine-wide, and
+charged against neither application cap. Otherwise a test lane invoked on every
+integration run competes with the interactive leases people use to look at the app,
+which is the contention `--data-only` existed to remove (#48).
+
+The shape therefore lives on the environment row, and **changing it is a capacity
+event**: a claim may still convert an environment between shapes — a holder switching
+its own lease both ways stays supported — but only when the destination ceiling has
+room, and the move is logged as `pool-shape`. Unmetered, the conversion would make the
+cheap ceiling into application capacity, since reuse is never capacity-checked
+(decision 0025). Eviction is bucketed for the same reason: a data-only request can
+only give up a cold data-only environment.
+
 ## 6. Sync — "verbs sync, watch streams"
 
 Nothing observes the consumer's worktree by default. Every action verb (`run`, `up`,
@@ -410,7 +426,8 @@ variable > `$STATE_DIR/config.json` > built-in default.
 | `BACKLOT_STATE_DIR` | — | `$XDG_STATE_HOME/backlot` (the per-machine root; 0700) |
 | `BACKLOT_LEASED_IDLE_TTL_MS` | `leasedIdleTtlMs` | `2 x idleTtlMs` — a LEASED but untouched env stops its services (keeps the lease) |
 | `BACKLOT_POOL_MAX` | `poolMax` | `min(cores/2, memGB/4)`, clamped **[2,8]** — the floor is 2 because `up` + `run` needs two envs |
-| `BACKLOT_POOL_MAX_TOTAL` | `poolMaxTotal` | same heuristic, **machine-wide across every stack**. When this is what binds, a cold unleased env is evicted rather than the caller refused |
+| `BACKLOT_POOL_MAX_TOTAL` | `poolMaxTotal` | same heuristic, **machine-wide across every stack**, application envs only. When this is what binds, a cold unleased env is evicted rather than the caller refused |
+| `BACKLOT_POOL_MAX_DATA_ONLY` | `poolMaxDataOnly` | `max(4, 2 x heuristic)` — data-only envs, machine-wide, counted against neither application cap (decision 0025) |
 | `BACKLOT_LEASE_TTL_MS` | `sessionTtlMs` / `runTtlMs` | 30 min / 10 min |
 | `BACKLOT_IDLE_TTL_MS` | `idleTtlMs` | 30 min |
 | `BACKLOT_WAIT_MS` | `waitMs` | 60 s (queue-at-capacity timeout) |

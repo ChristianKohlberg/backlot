@@ -42,6 +42,8 @@ Pool commands are shared-box operations: `pool recycle` with no id targets **eve
 
 The consequence worth remembering: **waiting can never clear a machine-wide block**, because a release leaves the row behind. `structuralCapacityBlock` therefore treats it as structural unless something is evictable or transient — the old code explicitly assumed the opposite ("another stack will release") and burned the full window (#47). `tests/pool-machine-capacity.test.ts` covers all of it.
 
+There is a **third ceiling**: `poolMaxDataOnly` for data-only environments, which are charged against neither application cap ([decision 0025](docs/decisions/0025-data-only-environments-are-priced-separately.md)) — the app caps measure cores and memory, and a data lease runs nothing. So `poolMax`/`poolMaxTotal` now mean *application* environments (`appEnvs()`), and every capacity decision buckets by shape, eviction included. The sharp edge: because reuse is never capacity-checked, **changing an environment's shape is a capacity event** — `convertShape` moves the row between buckets only if the destination has room, and writes it at claim time so a concurrent claim sees the new bucket. Unmetered, that conversion turns the cheap ceiling into application capacity. Pinning the shape instead is simpler and was rejected: it silently removes 0023's supported both-ways lease switching (`tests/data-only-lease.test.ts` catches this — heed it).
+
 ## Version skew is a first-class failure, and the daemon outlives the install
 
 The CLI spawns the daemon from **its own `dist/`** (`ensureDaemon`), so installing a

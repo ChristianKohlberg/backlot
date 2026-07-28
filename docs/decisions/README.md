@@ -29,3 +29,4 @@ supersedes it and update this index — never edit a decision in place.
 | [0022](0022-data-state-mechanisms-deferred.md) | Data-state mechanisms are deferred until a consumer forces them — 0016's doctrine stands, its unbuilt features stop pretending to be pending |
 | [0023](0023-data-only-leases.md) | A lease may cover the datastores alone (`up --data-only`) — the environment is unbundled downward, not split into a second pool |
 | [0024](0024-updating-the-running-daemon.md) | `backlot update` reconciles the running daemon to the installed build — version skew is refused, and backlot never installs itself |
+| [0025](0025-data-only-environments-are-priced-separately.md) | A data-only environment answers to its own ceiling, and changing an environment's shape is a metered capacity event |
