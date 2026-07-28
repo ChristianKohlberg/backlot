@@ -421,6 +421,17 @@ describe.runIf(procScanSupported())('teardown and quiesce reap what escaped the 
       stdio: 'ignore',
     });
     human.unref();
+    // Register teardown NOW, not at the end of the body: an assertion failure
+    // below skips the rest of the test, and these are deliberately outside every
+    // reaper the suite has — so a failed run used to leave a live pty behind and
+    // interfere with later runs, which reads as an unrelated flake.
+    cleanups.push(() => {
+      try {
+        process.kill(human.pid!, 'SIGKILL');
+      } catch {
+        /* gone */
+      }
+    });
 
     /** Processes whose cwd is in the tree, split by whether a tty is attached. */
     const inTree = () =>
@@ -443,6 +454,15 @@ describe.runIf(procScanSupported())('teardown and quiesce reap what escaped the 
     const humanPids = inTree()
       .filter((p) => p.tty)
       .map((p) => p.pid);
+    cleanups.push(() => {
+      for (const pid of humanPids) {
+        try {
+          process.kill(pid, 'SIGKILL');
+        } catch {
+          /* gone */
+        }
+      }
+    });
 
     // The contract, stated exactly: cwd puts these in scope, a terminal takes
     // them back out. Anything in the tree WITHOUT a terminal stays fair game.
@@ -459,9 +479,48 @@ describe.runIf(procScanSupported())('teardown and quiesce reap what escaped the 
     for (const pid of humanPids) {
       expect(alive(pid), `teardown killed pid ${pid}, which had a controlling terminal`).toBe(true);
     }
-    for (const pid of [human.pid!, ...humanPids]) {
+    // Teardown of both stand-ins is registered above, so it runs even if an
+    // assertion here throws.
+  }, 120_000);
+
+  it('a stopping daemon does not reap the in-flight check it is still owed a verdict for', async () => {
+    // The eager shutdown reap must respect `busy`, the invariant every other
+    // reclaim path already keeps ("an in-flight operation is NEVER interrupted —
+    // not even by --force"). A check runs DETACHED precisely so it can outlive
+    // the daemon, and it carries its environment's tag — so an unguarded tag
+    // scan on shutdown kills the very process a caller is polling for.
+    const { cli, wt, stateDir, journal } = ctx();
+    writeFileSync(
+      join(wt, 'stack.yaml'),
+      `name: agentlease\nservices:\n  web: { run: node srv.mjs, port: web, env: { PORT: "{{ports.web}}" }, ready: { log: ready, timeout: 20 } }\n` +
+        `checks:\n  slow: { run: "sleep 45" }\n`,
+    );
+    expect((await cli(['up', '--json'])).code).toBe(0);
+
+    const submitted = await cli(['run', 'slow', '--detach', '--json']);
+    expect(String(submitted.json?.jobId ?? '')).not.toBe('');
+
+    // Wait until the check's own tagged process is actually up, so the assertion
+    // below is about the reap and not about a race with the spawn.
+    const checkUp = await waitFor(() => scanTagged(stateDir).some((p) => p.service.startsWith('check:')), 20_000);
+    expect(checkUp, 'the detached check never started').toBe(true);
+    const checkPids = scanTagged(stateDir)
+      .filter((p) => p.service.startsWith('check:'))
+      .map((p) => p.pid);
+
+    const envId = journal().allEnvs()[0]!.id;
+    expect(journal().getEnv(envId)).toBeTruthy();
+
+    // A graceful stop, which is where the new eager reap runs.
+    expect((await cli(['daemon', 'stop', '--json'])).code).toBe(0);
+    await settle(1500);
+
+    for (const pid of checkPids) {
+      expect(alive(pid), `daemon stop killed in-flight check pid ${pid}`).toBe(true);
+    }
+    for (const pid of checkPids) {
       try {
-        process.kill(pid, 'SIGKILL');
+        process.kill(-pid, 'SIGKILL');
       } catch {
         /* gone */
       }

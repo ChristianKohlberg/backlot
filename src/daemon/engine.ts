@@ -1028,6 +1028,12 @@ export class Engine {
           'manifest',
         );
       }
+      // The CLI refuses this too, but the guards above are here precisely so that
+      // every client of the RPC gets them; leaving one of the three behind in the
+      // CLI would be an arbitrary gap. A watcher exists to reload services.
+      if (opts.watch) {
+        throw new BrokerError('work-error', `--watch has nothing to reload under --data-only, which runs no services`, 'manifest');
+      }
     }
     // A lease pinned to a dead pid is released by the very next sweep, so it
     // would hand this caller's environment — and its seeded database — to
@@ -2121,7 +2127,13 @@ export class Engine {
       // env can carry recorded survivors too, which is why this is not gated on
       // `hot`. reapEnvProcesses returns what it could NOT confirm dead, and
       // that — never an assumption — is what the next daemon life inherits.
-      const unreaped = await this.reapEnvProcesses(env, survivors.get(env.id) ?? env.servicePids);
+      const recorded = survivors.get(env.id) ?? env.servicePids;
+      // …except an in-flight operation, which is never interrupted — the rule
+      // claimForTeardown, the sweeper and pool gc all already keep. A check runs
+      // DETACHED so it can outlive the daemon (see runGroupCmd), and it carries
+      // this env's tag, so the tag scan inside reapEnvProcesses would kill the
+      // very process the caller is still waiting on a verdict from.
+      const unreaped = this.busy.has(env.id) ? recorded : await this.reapEnvProcesses(env, recorded);
       const fresh = this.journal.getEnv(env.id);
       if (!fresh) continue; // recycled underneath us — nothing to write back
       if (fresh.state === 'hot') fresh.state = 'warm';
