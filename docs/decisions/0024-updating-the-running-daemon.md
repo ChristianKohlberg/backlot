@@ -31,7 +31,12 @@ one of them:
 2. **Skew is refused, not warned about.** Any verb other than `update`, `doctor`
    and `daemon stop` fails with `infra-error` (exit 3) when the daemon's version
    differs from the CLI's. A daemon that reports no version is treated as old,
-   because at the protocol level that is indistinguishable from agreement.
+   because at the protocol level that is indistinguishable from agreement. **The
+   MCP adapter refuses on the same rule** — that is the surface an agent drives,
+   and it cannot see a message on stderr at all — with `backlot_doctor` exempt.
+   There is deliberately **no MCP tool that restarts the daemon**: an agent must
+   not take a shared box's daemon out from under other holders, so the refusal
+   names the command for a human instead.
 
 3. **`backlot update` restarts the daemon**; the next verb's autospawn brings up
    the installed build. It refuses an in-flight operation and refuses a

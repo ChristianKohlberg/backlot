@@ -9,7 +9,7 @@
  */
 import { createInterface } from 'node:readline';
 import { ensureDaemon, rpc } from '../cli/client.js';
-import { VERSION } from '../core/version.js';
+import { VERSION, versionSkew } from '../core/version.js';
 
 const PROTOCOL = '2025-06-18';
 
@@ -169,13 +169,42 @@ rl.on('line', (line) => {
           if (missing.length > 0) {
             return respondError(id, -32602, `tool '${toolName}' requires: ${missing.join(', ')}`);
           }
-          await ensureDaemon();
+          const daemon = await ensureDaemon();
+          // Version skew is refused here too, and this is the surface where it
+          // matters MOST: the caller is an agent, it cannot see a warning on
+          // stderr, and an old daemon answers an argument it does not know by
+          // ignoring it (decision 0024). The CLI's gate lives in its own main(),
+          // so relying on that would leave every MCP client unprotected.
+          //
+          // `doctor` is exempt for the same reason it is in the CLI — it is how
+          // you diagnose this — but there is deliberately no MCP tool that
+          // RESTARTS the daemon: an agent must not take a shared box's daemon
+          // out from under other holders. The remedy names the human command.
+          const skew = versionSkew(VERSION, daemon.version);
+          if (skew && tool.verb !== 'doctor') {
+            return respond(id, {
+              content: [
+                {
+                  type: 'text',
+                  text: JSON.stringify({
+                    error: { class: 'infra-error', message: skew.message, source: 'daemon' },
+                  }),
+                },
+              ],
+              isError: true,
+            });
+          }
           // This adapter process outlives its tool calls and dies with the
           // agent, which makes it exactly the liveness signal a lease needs —
           // so supply it automatically unless the caller named its own.
           const withIdentity = tool.verb === 'up' && args.holderPid === undefined
             ? { ...args, holderPid: process.pid }
-            : args;
+            : tool.verb === 'doctor'
+              // Only the caller knows its own version, so doctor cannot report
+              // skew unless it is told — and doctor is the one tool that still
+              // answers under skew, which makes it the one that must say so.
+              ? { ...args, cliVersion: VERSION }
+              : args;
           const res = await rpc(tool.verb, withIdentity);
           const text = JSON.stringify(res.ok ? res.data : { error: res.error });
           return respond(id, { content: [{ type: 'text', text }], isError: !res.ok });

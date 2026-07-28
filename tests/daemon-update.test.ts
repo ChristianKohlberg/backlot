@@ -22,7 +22,7 @@
  * and that an in-flight operation is never interrupted.
  */
 import { describe, it, expect, afterAll } from 'vitest';
-import { execFile, execFileSync } from 'node:child_process';
+import { execFile, execFileSync, spawn } from 'node:child_process';
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -251,6 +251,63 @@ describe('backlot update', () => {
     expect(again.code).toBe(0);
     expect(String((again.json as { envId?: string }).envId)).toBe(envId);
   });
+});
+
+describe('the MCP adapter refuses skew too', () => {
+  /** Drive the adapter over stdio against a state root we control. */
+  function talk(stateDir: string, messages: unknown[], deadlineMs = 30_000): Promise<Record<string, unknown>[]> {
+    const MCP = join(repo, 'dist', 'mcp', 'index.js');
+    const wanted = new Set(messages.map((m) => (m as { id?: number }).id).filter((id) => id !== undefined));
+    return new Promise((resolve) => {
+      const env = { ...process.env, BACKLOT_STATE_DIR: stateDir };
+      delete env.BACKLOT_FAKE_VERSION; // the ADAPTER is this build; only the daemon is faked
+      const p = spawn(process.execPath, [MCP], { stdio: ['pipe', 'pipe', 'ignore'], env });
+      const responses: Record<string, unknown>[] = [];
+      const finish = () => {
+        clearTimeout(backstop);
+        p.kill('SIGKILL');
+        resolve(responses);
+      };
+      const backstop = setTimeout(finish, deadlineMs);
+      let buf = '';
+      p.stdout.on('data', (d) => {
+        buf += String(d);
+        let idx;
+        while ((idx = buf.indexOf('\n')) >= 0) {
+          const line = buf.slice(0, idx);
+          buf = buf.slice(idx + 1);
+          if (line.trim()) responses.push(JSON.parse(line) as Record<string, unknown>);
+        }
+        if ([...wanted].every((id) => responses.some((r) => r.id === id))) finish();
+      });
+      for (const m of messages) p.stdin.write(JSON.stringify(m) + '\n');
+    });
+  }
+
+  it('errors on a tool call under skew, and still answers doctor', async () => {
+    // This is the surface that matters most: the caller is an agent, it never
+    // sees stderr, and the CLI's gate lives in the CLI's own main() — so relying
+    // on that would leave every MCP client unprotected.
+    const { cli, stateDir } = ctx();
+    await cli(['status', '--json'], { fakeVersion: '0.7.0' });
+
+    const out = await talk(stateDir, [
+      { jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'backlot_status', arguments: {} } },
+      { jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'backlot_doctor', arguments: {} } },
+    ]);
+
+    const status = out.find((m) => m.id === 1)?.result as { isError?: boolean; content: Array<{ text: string }> };
+    expect(status.isError).toBe(true);
+    const err = JSON.parse(status.content[0]!.text) as { error: { class: string; message: string } };
+    expect(err.error.class).toBe('infra-error');
+    expect(err.error.message).toMatch(/0\.7\.0/);
+
+    // doctor is exempt — it is how you diagnose this — and reports the skew.
+    const doc = out.find((m) => m.id === 2)?.result as { isError?: boolean; content: Array<{ text: string }> };
+    expect(doc.isError).toBeFalsy();
+    const issues = (JSON.parse(doc.content[0]!.text) as { issues: Array<{ issue: string }> }).issues;
+    expect(issues.some((i) => /0\.7\.0/.test(i.issue))).toBe(true);
+  }, 60_000);
 });
 
 describe('an in-flight operation is never interrupted', () => {

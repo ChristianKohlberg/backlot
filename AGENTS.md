@@ -46,8 +46,11 @@ than rejecting them. `ping` therefore carries the daemon's version, and a mismat
 `infra-error`. `backlot update` is the remedy: it restarts the daemon (shared code
 path with `daemon stop`), and the next verb's autospawn is what makes the new daemon
 the installed build. Leases survive; an in-flight (`busy`) operation and a downgrade
-are the only refusals. See [decision 0024](docs/decisions/0024-updating-the-running-daemon.md)
-and `tests/daemon-update.test.ts`.
+are the only refusals. **The MCP adapter enforces the same gate on its own** — the
+CLI's lives in `main()`, so an MCP client would otherwise be unprotected — and there
+is deliberately no MCP tool that restarts the daemon. See
+[decision 0024](docs/decisions/0024-updating-the-running-daemon.md) and
+`tests/daemon-update.test.ts`.
 
 Two sharp edges. **`src/core/version.ts` is the only source of version truth** — a
 second one already drifted (the MCP adapter shipped 0.4.0 while the package was
