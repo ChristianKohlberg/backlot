@@ -52,13 +52,13 @@ afterAll(() => {
 /**
  * One daemon, several stacks, and a machine-wide cap of `total`.
  *
- * The stacks declare NO services: capacity accounting is about environment rows,
- * and paying for service startup in a test about counting would only make it
- * slower and flakier. A short idle TTL is what makes a released environment
- * "cold" (the same threshold `status` reports as `heat: 'cold'`) without waiting
- * out the real 30 minutes.
+ * The stacks declare the cheapest service the schema allows (it requires one):
+ * capacity accounting is about environment rows, so paying for a real dev server
+ * in a test about counting would only make it slower. A short idle TTL is what
+ * makes a released environment "cold" — the same threshold `status` reports as
+ * `heat: 'cold'` — without waiting out the real 30 minutes.
  */
-function ctx(opts: { total: number; idleTtlMs?: number; sweepMs?: number }) {
+function ctx(opts: { total: number; idleTtlMs?: number; sweepMs?: number; stubbornService?: boolean }) {
   const stateDir = mkdtempSync(join(tmpdir(), 'backlot-mcap-'));
   dirs.push(stateDir);
   const env = {
@@ -79,7 +79,13 @@ function ctx(opts: { total: number; idleTtlMs?: number; sweepMs?: number }) {
       // The cheapest manifest the schema allows (it requires at least one
       // service): a shell that announces readiness and idles. No port, no build,
       // no datastore — none of which capacity accounting counts.
-      `name: ${name}\nservices:\n  idle: { run: "echo ready; sleep 300", ready: { log: ready, timeout: 20 } }\nchecks:\n  ok: { run: "true" }\n`,
+      //
+      // `stubbornService` traps SIGTERM and sits there, so a teardown cannot
+      // finish until the kill escalates — which is what makes "a quiesce is in
+      // flight" a deterministic condition rather than a race.
+      opts.stubbornService
+        ? `name: ${name}\nservices:\n  idle: { run: "trap 'sleep 30' TERM; echo ready; sleep 300", ready: { log: ready, timeout: 20 } }\nchecks:\n  ok: { run: "true" }\n`
+        : `name: ${name}\nservices:\n  idle: { run: "echo ready; sleep 300", ready: { log: ready, timeout: 20 } }\nchecks:\n  ok: { run: "true" }\n`,
     );
     execFileSync('git', ['init', '-q'], { cwd: wt });
     return wt;
@@ -175,6 +181,36 @@ describe('a cold, unleased environment no longer holds a machine-wide slot forev
     // The record must say it took a hot one, or the next reader will think the
     // `warm` restriction is still in force.
     expect(evicted[0]!.detail).toMatch(/hot/);
+  }, 120_000);
+
+  it('waits out a quiesce in flight instead of refusing as if it were permanent', async () => {
+    // The CI failure this exists for. The idle quiesce runs under the ENVIRONMENT
+    // LOCK, which marks the environment `busy`, and decision 0021 deliberately
+    // keeps its mid-quiesce state as plain `hot`. So while the sweeper reclaims
+    // heat from the only candidate, that candidate is briefly unevictable — and
+    // the machine-wide refusal, whose whole claim is that waiting cannot help,
+    // fired on a condition that clears in milliseconds. It reproduced on the
+    // macOS runner, where teardown is slower (SIGTERM, then a verified SIGKILL).
+    //
+    // Made deterministic by a service that STALLS on SIGTERM: the quiesce cannot
+    // complete until the kill escalates, so it is reliably in flight while the
+    // second stack asks for a slot.
+    const c = ctx({ total: 1, idleTtlMs: 250, stubbornService: true });
+    const a = c.stack('mcapj');
+    const b = c.stack('mcapk');
+
+    const upA = await c.cli(['up', '--json'], a);
+    expect(upA.code).toBe(0);
+    await c.cli(['release', '--json'], a);
+    // Long enough for the sweeper to START quiescing, far too short for the
+    // stubborn service to have finished dying.
+    await sleep(600);
+
+    const upB = await c.cli(['up', '--json'], b);
+    // The contract: wait for the quiesce, then take the slot. Never an immediate
+    // "queueing cannot succeed" — that was a lie about a transient state.
+    expect(upB.code, upB.stdout).toBe(0);
+    expect(c.journal().allEnvs().map((r) => r.id)).toEqual([String(upB.json?.envId)]);
   }, 120_000);
 
   it('never evicts a LEASED environment, and says so in a second rather than a minute', async () => {

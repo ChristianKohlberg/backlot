@@ -570,6 +570,48 @@ export class Engine {
   }
 
   /**
+   * Is some environment about to become claimable on its own?
+   *
+   * `busy` is the one that matters here and was missed: the idle quiesce runs
+   * under the environment lock, which marks it busy, and decision 0021 keeps its
+   * mid-quiesce state as plain `hot` on purpose. So the sweeper reclaiming heat
+   * from the only candidate made it briefly unevictable — and the machine-wide
+   * refusal, which tells the caller that waiting cannot help, fired on a
+   * condition that clears in milliseconds. It reproduced on the macOS runner,
+   * where teardown is slower (services get SIGTERM, then a verified SIGKILL).
+   *
+   * The other three are transient for the reasons the per-stack branch already
+   * gives: the sweeper reaps them and frees capacity.
+   */
+  private transientlyUnclaimable(rows: EnvRow[]): boolean {
+    return rows.some(
+      (e) =>
+        this.busy.has(e.id) ||
+        e.state === 'degraded' ||
+        e.state === 'recycling' ||
+        e.state === 'provisioning',
+    );
+  }
+
+  /**
+   * Why this environment could not be given up, per environment.
+   *
+   * It used to say "too recent to evict" for every unleased row, which is the
+   * defect #47 was about in miniature: a message that names one cause for four
+   * different situations sends the reader after the wrong one. (It cost an hour
+   * here, diagnosing a CI failure whose real cause was `busy`.)
+   */
+  private notEvictableBecause(e: EnvRow): string {
+    const lease = this.journal.leaseForEnv(e.id);
+    if (lease) return `leased by '${lease.holder}' (${lease.kind})`;
+    if (this.busy.has(e.id)) return `${e.state}, an operation is in flight on it`;
+    if (e.state !== 'warm' && e.state !== 'hot') return `state ${e.state}`;
+    const idleMs = now() - e.lastUsedAt;
+    const human = (ms: number) => (ms >= 60_000 ? `${Math.round(ms / 60_000)}m` : `${Math.max(1, Math.round(ms / 1000))}s`);
+    return `${e.state}, idle ${human(idleMs)} — inside the ${human(IDLE_TTL())} idle TTL, so too recent to evict`;
+  }
+
+  /**
    * Is the pool full of environments whose leases outlast our whole wait?
    *
    * If so, queueing cannot possibly succeed, and reporting "waited 60s" blames a
@@ -585,15 +627,8 @@ export class Engine {
       // Same reasoning as the machine-wide case: this ceiling counts rows, so a
       // release cannot lower it. Only an eviction or a recycle does.
       const rows = this.dataOnlyEnvs();
-      if (rows.some((e) => e.state === 'recycling' || e.state === 'provisioning')) return null;
-      if (this.evictionCandidates(true).length > 0) return null;
-      const held = rows.map((e) => {
-        const lease = this.journal.leaseForEnv(e.id);
-        return lease
-          ? `${e.id} leased by '${lease.holder}' (${lease.kind})`
-          : `${e.id} (${e.state}, idle ${Math.round((now() - e.lastUsedAt) / 60_000)}m — too recent to evict)`;
-      });
-      return { scope: 'data-only', detail: held.join('; ') };
+      if (this.transientlyUnclaimable(rows) || this.evictionCandidates(true).length > 0) return null;
+      return { scope: 'data-only', detail: rows.map((e) => `${e.id} (${this.notEvictableBecause(e)})`).join('; ') };
     }
     const envs = this.appEnvs(stack.id);
     const all = this.appEnvs();
@@ -604,16 +639,8 @@ export class Engine {
       // structural — not, as the old guard assumed, something another stack's
       // release will fix (#47). It said so explicitly and returned null here,
       // which is why a provably hopeless wait still burned the full window.
-      const transient = all.some((e) => e.state === 'degraded' || e.state === 'recycling' || e.state === 'provisioning');
-      // Something cold exists: the caller evicts it rather than waiting or failing.
-      if (transient || this.evictionCandidates(false).length > 0) return null;
-      const held = all.map((e) => {
-        const lease = this.journal.leaseForEnv(e.id);
-        return lease
-          ? `${e.id} leased by '${lease.holder}' (${lease.kind})`
-          : `${e.id} (${e.state}, idle ${Math.round((now() - e.lastUsedAt) / 60_000)}m — too recent to evict)`;
-      });
-      return { scope: 'machine', detail: held.join('; ') };
+      if (this.transientlyUnclaimable(all) || this.evictionCandidates(false).length > 0) return null;
+      return { scope: 'machine', detail: all.map((e) => `${e.id} (${this.notEvictableBecause(e)})`).join('; ') };
     }
     const holders: string[] = [];
     for (const env of envs) {
