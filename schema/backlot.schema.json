@@ -82,21 +82,19 @@
       "additionalProperties": false,
       "properties": {
         "logins": {
-          "type": "object",
-          "required": [
-            "user",
-            "password"
-          ],
-          "additionalProperties": false,
-          "properties": {
-            "user": {
-              "type": "string"
+          "oneOf": [
+            {
+              "$ref": "#/$defs/login"
             },
-            "password": {
-              "type": "string"
+            {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "$ref": "#/$defs/login"
+              }
             }
-          },
-          "description": "A seeded login consumers may use. Dev-grade by definition."
+          ],
+          "description": "Seeded login(s) consumers may use. Dev-grade by definition. A single object is one login; a list declares several, and the FIRST is the primary one `ctx.logins` reports."
         },
         "token": {
           "type": "string",
@@ -113,6 +111,30 @@
     }
   },
   "$defs": {
+    "login": {
+      "type": "object",
+      "required": [
+        "user",
+        "password"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "user": {
+          "type": "string"
+        },
+        "password": {
+          "type": "string"
+        },
+        "role": {
+          "type": "string",
+          "description": "The role this login stands for, matching the {{role}} an `auth.token` hook takes. Informational."
+        },
+        "description": {
+          "type": "string",
+          "description": "What this login is FOR — the scope or permissions it exercises, so a consumer can pick the right one without reading the seed."
+        }
+      }
+    },
     "service": {
       "type": "object",
       "required": [

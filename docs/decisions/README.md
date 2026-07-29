@@ -30,3 +30,4 @@ supersedes it and update this index — never edit a decision in place.
 | [0023](0023-data-only-leases.md) | A lease may cover the datastores alone (`up --data-only`) — the environment is unbundled downward, not split into a second pool |
 | [0024](0024-updating-the-running-daemon.md) | `backlot update` reconciles the running daemon to the installed build — version skew is refused, and backlot never installs itself |
 | [0025](0025-data-only-environments-are-priced-separately.md) | A data-only environment answers to its own ceiling, and changing an environment's shape is a metered capacity event |
+| [0026](0026-a-stack-may-advertise-several-logins.md) | A stack may advertise several logins — `ctx.logins` stays the primary, `allLogins` carries the set |

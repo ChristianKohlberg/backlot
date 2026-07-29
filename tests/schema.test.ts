@@ -64,6 +64,56 @@ describe('stack.schema.json', () => {
   });
 });
 
+describe('auth.logins (one login or several)', () => {
+  const withAuth = (logins: unknown) => ({
+    name: 'x',
+    services: { web: { run: 'node s.mjs' } },
+    auth: { logins },
+  });
+
+  it('still accepts the single-object form', () => {
+    // The original shape. A stack that never grows a second login must not have
+    // to change to keep validating.
+    expect(validate(withAuth({ user: 'qa-admin', password: 'p' }))).toBe(true);
+  });
+
+  it('accepts a list, with role and description per entry', () => {
+    const ok = validate(
+      withAuth([
+        { user: 'qa-admin', password: 'p', role: 'admin', description: 'all rights, all branches' },
+        { user: 'qa-readonly', password: 'p', description: 'read-only' },
+      ]),
+    );
+    expect(validate.errors ?? []).toEqual([]);
+    expect(ok).toBe(true);
+  });
+
+  it('rejects an empty list, a bad entry, and unknown keys (typo protection)', () => {
+    // An empty list says "logins are declared" while declaring none — a manifest
+    // bug, not a way to express "no logins" (that is omitting the key).
+    expect(validate(withAuth([]))).toBe(false);
+    expect(validate(withAuth([{ user: 'qa-admin' }]))).toBe(false);
+    expect(validate(withAuth([{ user: 'qa-admin', password: 'p', purpose: 'typo' }]))).toBe(false);
+    expect(validate(withAuth({ user: 'qa-admin', password: 'p', roles: ['admin'] }))).toBe(false);
+  });
+});
+
+describe('normalizeLogins', () => {
+  it('gives one shape for both manifest forms, preserving order', async () => {
+    const { normalizeLogins } = await import('../src/core/manifest.js');
+    const one = { user: 'qa-admin', password: 'p' };
+    const many = [one, { user: 'qa-readonly', password: 'p', description: 'read-only' }];
+    // Omitted is [] — not undefined — so a caller can enumerate without a guard.
+    expect(normalizeLogins(undefined)).toEqual([]);
+    // A single-object manifest reports exactly one entry, so `allLogins` never
+    // makes a consumer branch on which form the manifest used.
+    expect(normalizeLogins(one)).toEqual([one]);
+    // Manifest order is the contract: entry 0 is what ctx reports as `logins`.
+    expect(normalizeLogins(many)).toEqual(many);
+    expect(normalizeLogins(many)[0]).toBe(one);
+  });
+});
+
 describe('stack identity (loadStack)', () => {
   it('sibling worktrees with the same repo dir name get DISTINCT stack ids', async () => {
     // The id used to key on base64url(root).slice(-8) — the last ~6 BYTES of

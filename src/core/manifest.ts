@@ -68,6 +68,34 @@ export interface UpkeepRule {
   run: string;
 }
 
+/**
+ * A seeded, dev-grade login the stack advertises to consumers. `role` names the
+ * `{{role}}` an `auth.token` hook would take; `description` says what the login is
+ * FOR, so a consumer picks the right one without reading the seed.
+ */
+export interface Login {
+  user: string;
+  password: string;
+  role?: string;
+  description?: string;
+}
+
+/**
+ * `auth.logins` accepts a single login (the original form) or a list. The list's
+ * FIRST entry is the primary one — see `normalizeLogins`.
+ */
+export type LoginsSpec = Login | Login[];
+
+/**
+ * One shape for consumers regardless of which form the manifest used: `[]` when no
+ * login is declared, otherwise every declared login in order. A single-object
+ * manifest yields exactly one entry, so callers never branch on the manifest form.
+ */
+export function normalizeLogins(spec: LoginsSpec | undefined): Login[] {
+  if (!spec) return [];
+  return Array.isArray(spec) ? spec : [spec];
+}
+
 export interface Manifest {
   name: string;
   services: Record<string, ServiceSpec>;
@@ -77,7 +105,7 @@ export interface Manifest {
   sync?: { keep?: string[]; include?: string[] };
   outputs?: string[];
   upkeep?: UpkeepRule[];
-  auth?: { logins?: { user: string; password: string }; token?: string };
+  auth?: { logins?: LoginsSpec; token?: string };
   checks?: Record<string, CheckSpec>;
 }
 

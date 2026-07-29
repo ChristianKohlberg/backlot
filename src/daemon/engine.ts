@@ -9,7 +9,7 @@ import { mkdirSync, rmSync, copyFileSync, readdirSync, statSync, existsSync, rea
 import { join, resolve } from 'node:path';
 import { Journal, JOURNAL_SCHEMA_VERSION, type EnvRow, type LeaseRow } from '../core/journal.js';
 import { VERSION, compareVersions, versionSkew } from '../core/version.js';
-import { loadStack, defaultPreset, type Stack } from '../core/manifest.js';
+import { loadStack, defaultPreset, normalizeLogins, type Stack } from '../core/manifest.js';
 import { changedOutputs, pullOutputs } from '../core/sync.js';
 import { syncIntoEnvThreaded } from '../core/sync-thread.js';
 import { runUpkeep, pendingUpkeep, templateBakeKeys } from '../core/upkeep.js';
@@ -1425,7 +1425,14 @@ export class Engine {
        * test fixture reading this blob otherwise cannot make.
        */
       dataOnly: env.dataOnly === true,
-      logins: stack.manifest.auth?.logins ?? null,
+      /**
+       * `logins` stays the PRIMARY login even for a stack that declares a list, so
+       * a consumer reading `ctx.logins.user` is unaffected by the manifest growing
+       * more of them; `allLogins` carries the full set. Both are null/omitted when
+       * the stack declares none.
+       */
+      logins: normalizeLogins(stack.manifest.auth?.logins)[0] ?? null,
+      allLogins: normalizeLogins(stack.manifest.auth?.logins),
       /**
        * The manifest's INTERNAL hook, templated and run inside the leased
        * environment — not something to run by hand. It still carries its
