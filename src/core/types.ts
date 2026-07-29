@@ -3,6 +3,8 @@
  * Persisted in the per-machine SQLite journal; the daemon's memory is a cache.
  */
 
+import type { Login } from './manifest.js';
+
 export type EnvState = 'provisioning' | 'hot' | 'warm' | 'degraded' | 'recycling';
 
 export type Hygiene = 'reuse' | 'reset-data' | 'pristine';
@@ -86,7 +88,18 @@ export interface Context {
   urls: Record<string, string>;
   /** True when the lease is over the datastores alone, so `urls` is empty by design. */
   dataOnly?: boolean;
-  logins?: { user: string; password: string };
+  /**
+   * The PRIMARY login — the first one the manifest declares. Kept singular so a
+   * consumer written against the one-login form keeps reading `logins.user`
+   * unchanged when a stack grows a list; `allLogins` is where the rest live.
+   */
+  logins?: Login;
+  /**
+   * Every login the stack declares, in manifest order, `logins` first. Present
+   * whenever any login is declared — a single-login stack reports one entry, so a
+   * consumer that wants to enumerate never branches on the manifest form.
+   */
+  allLogins?: Login[];
   /** The manifest's internal auth.token hook, still templated — informational. */
   tokenCommand?: string;
   /** How a CONSUMER actually mints a token: `backlot token --role <role> --raw`. */
