@@ -8,7 +8,7 @@
 It brokers environments; it never provides them. Local processes today, your own cloud
 sandboxes (Morph, Sprites, SSH) tomorrow — same verbs, same model.
 
-> **Status: 0.6.** The local loop — pool, leases, bind-by-sync, data states,
+> **Status: 0.10.** The local loop — pool, leases, bind-by-sync, data states,
 > verdicts — is complete, hardened by two full review cycles, and proven end to
 > end against a real .NET + Angular + MSSQL monorepo (its Playwright e2e suite
 > runs as a backlot check, and each release is verified by driving a real session

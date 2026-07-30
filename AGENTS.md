@@ -78,14 +78,15 @@ additive `ALTER TABLE` migrations are not bumps.
 A merged fix does not reach consumers until this happens — `main` can sit ahead of
 the newest npm version for a while (the multi-login work landed as #59 but shipped
 in 0.10.0, several days later), and every consumer on the old version keeps hitting
-the bug in the meantime. There is **no publish automation**: `ci.yml` only runs
-typecheck/test, there is no `release.yml`, and past releases (`22469d7`, `c46944e`)
-were `npm publish`ed manually by the owner after the version-bump PR merged. A
-release-prep commit only ever touches `package.json` and `package-lock.json`
-(`"version"` in both places), titled `chore: X.Y.Z — version bump for the release`
-with a body naming what shipped since the last tag; follow semver off what actually
-changed (additive/back-compat = minor, fix-only = patch) rather than defaulting to
-patch.
+the bug in the meantime. There is **no publish automation**: `ci.yml` has no publish
+job (typecheck, test, the README Node-pin check and the `hello-web` smoke) and there
+is no `release.yml`, so after the version-bump PR merges the owner does the rest by
+hand — `npm publish`, the annotated `vX.Y.Z` tag on the merge commit (`v0.9.1` →
+`cc2339d`), and the GitHub release notes. A release-prep commit only ever touches
+`package.json` and `package-lock.json` (`"version"` in both places, e.g. `22469d7`,
+`c46944e`), titled `chore: X.Y.Z — version bump for the release` with a body naming
+what shipped since the last tag; follow semver off what actually changed
+(additive/back-compat = minor, fix-only = patch) rather than defaulting to patch.
 
 ## Claude Code plugin
 
