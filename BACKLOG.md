@@ -449,7 +449,9 @@ substrate shipping (S4). Do not pick these up without one.
 
 - [x] Create the GitHub repo + push (currently local-only on the captain's machine).
 - [x] First CI run (the workflow exists but has executed zero times).
-- [x] `npm publish` — 0.5.0 is live on npm (this entry was stale); 0.6.0 to be published manually by the owner after the 2026-07-19 batch.
+- [x] `npm publish` — backlot is live on npm. Every release since is cut by hand; the
+  convention lives in the "Cutting a release" section of [AGENTS.md](AGENTS.md), which
+  owns it. Do not restate version state here — it goes stale on every release.
 
 ## Revamp adoption (in the Revamp repo, not here)
 
