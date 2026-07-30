@@ -53,7 +53,7 @@ stderr is human progress. Exit codes are contractual: `0` ok · `1` work-error �
 | `up [service...]` | Session lease: sync, upkeep, start services, print context. **No service = the whole app. Named services start only that slice plus its transitive `depends_on` closure** (see below). Flags: `--watch`, `--reset-data`\|`--pristine`, `--ttl <minutes>` (**the lease form for agents**), `--holder-pid <pid>` (interactive shells only — see above), `--data-only` (see below). |
 | `up --data-only` | Lease the **datastores alone** — a seeded database, no services, no builds. For a test lane that needs a database per run rather than a whole application: read `.datastores.<name>.url` from `ctx` and point your fixture at it, `reset-data` between runs. `ctx` reports `dataOnly: true`, and the env sits at `warm` because nothing is meant to run. Cannot be combined with a service name or `--watch`. Counted against its own machine-wide ceiling, not the application pool caps — a test lane does not compete with interactive leases. |
 | `run <check>` | Run lease: bind → execute the check declared in `backlot.yml` → classified verdict → release. `--pristine` rebuilds from scratch; `--pull` copies declared outputs back; `--detach` returns a `jobId` immediately (poll with `job <jobId>`). |
-| `ctx` | Re-read the consumer **context blob** (service URLs, login creds, connection strings, recent events) for the env your lease holds — read-only, no re-bind. `up` already returned this once. |
+| `ctx` | Re-read the consumer **context blob** (service URLs, login creds, connection strings, recent events) for the env your lease holds — read-only, no re-bind. `up` already returned this once. **A stack may advertise several logins: `logins` is the primary one, `allLogins` is the whole set** — see below. |
 | `release` | Release the current lease; the environment stays warm in the pool. On `{"released": false}` read the `reason` — a lease is keyed by the directory that bound it, so releasing from elsewhere matches nothing. |
 | `sync` | Project the current worktree state into the leased env — seconds; `hot_reload` services keep running, others restart as needed. |
 | `exec <cmd...>` | Run an arbitrary command inside the env your lease holds; hands back raw stdout + exit code (not a verdict). Needs an `up` first. |
@@ -105,6 +105,28 @@ backlot up                # whole app
 Naming a leaf service transitively pulls in exactly what it needs and nothing it
 doesn't. An unknown service name is a manifest work-error. All the usual `up`
 flags apply to the partial form.
+
+### Logins: read `allLogins`, don't default to the admin
+
+`ctx` reports `logins` — the **primary** login, a single object — and `allLogins`,
+**every** login the stack declares, in manifest order (`logins` is entry 0, so a
+one-login stack reports the same object in both and you never branch on the shape).
+Each entry may carry a `role` (the value `token --role <r>` wants) and a
+`description` saying what that login is *for*.
+
+**Read the roster before you pick.** Driving everything as the admin account is the
+one choice that can never surface a permission or scoping bug — if you are proving
+that a restricted user is denied something, or that a scoped user sees only their own
+data, you need the login whose `description` says so. If `allLogins` has one entry,
+that is the stack's answer and there is nothing to choose.
+
+```bash
+backlot ctx --json | jq '.allLogins'      # who exists, and what each one is for
+backlot token --role auditor --raw        # a token for one of them, if the stack declares the hook
+```
+
+backlot does not create or verify these logins — the stack's seed does. An absent or
+empty `allLogins` means the manifest declares none, not that the seed failed.
 
 ## `run` vs `exec`
 

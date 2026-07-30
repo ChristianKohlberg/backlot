@@ -203,6 +203,11 @@ datastores:
     template: true
 upkeep:
   - { when: pnpm-lock.yaml, run: pnpm install --frozen-lockfile }
+auth:
+  logins:                 # one object, or a list — the first entry is the primary
+    - { user: qa-admin,    password: Demo!1234, role: admin, description: "all rights, all branches" }
+    - { user: qa-readonly, password: Demo!1234, description: "read-only, proves a denied write" }
+  token: scripts/mint-token --role {{role}} --json
 checks:
   e2e: { run: pnpm e2e, artifacts: [test-results/**] }
 ```
@@ -212,6 +217,33 @@ externally run — backlot probes it and classifies its absence honestly
 (`infra-error`, never blaming your code). If the repo has one blessed way to start
 that infrastructure, declare it as an **appliance** and backlot ensures it without
 ever owning it ([decision 0018](docs/decisions/0018-appliances-ensured-not-owned.md)).
+
+### Several logins, each with a purpose
+
+Most seeded stacks have more than one account, and the difference matters: an admin
+login is the one account that can never expose a scoping bug. `auth.logins` therefore
+takes **either a single login (unchanged) or a list**, and each login may carry a
+`role` — the `{{role}}` your `auth.token` hook takes — and a `description` saying what
+it is *for*, so a consumer picks the right one without reading your seed script.
+
+`ctx` reports both, and the redundancy is the point — nothing has to ask which form
+the manifest used:
+
+```jsonc
+{
+  "logins":    { "user": "qa-admin", "password": "Demo!1234", "role": "admin", "description": "all rights, all branches" },
+  "allLogins": [ /* every declared login, in manifest order — `logins` is entry 0 */ ]
+}
+```
+
+`logins` stays **the primary login**, always a single object, always the manifest's
+first entry, so anything reading `ctx.logins.user` is untouched when a stack grows a
+list. A single-login stack reports the same object in both places. An empty list is
+rejected — omitting the key remains how a stack says it has no logins
+([decision 0026](docs/decisions/0026-a-stack-may-advertise-several-logins.md)).
+
+Backlot does not create these logins, verify them, or know what a role means: the seed
+makes them, the manifest declares what exists, `ctx` reports it.
 
 ## What it is / is not
 

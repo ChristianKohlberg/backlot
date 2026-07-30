@@ -508,8 +508,8 @@ upkeep:
   - { when: "glob(db/migrate/**)", run: bin/rails db:migrate }
 auth:
   logins:                                 # one object, or a list; first = primary
-    - { user: qa-admin,    password: Demo!1234, role: admin, description: all rights, all branches }
-    - { user: qa-readonly, password: Demo!1234, description: read-only, proves a denied write }
+    - { user: qa-admin,    password: Demo!1234, role: admin, description: "all rights, all branches" }
+    - { user: qa-readonly, password: Demo!1234, description: "read-only, proves a denied write" }
   token:  scripts/mint-token --role {{role}} --json
 checks:
   e2e:
