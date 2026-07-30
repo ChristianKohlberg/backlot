@@ -68,6 +68,13 @@ different version than its CLI. **Any test that stands in for the daemon must an
 before the behaviour under test ever runs (this broke `cli-contract` and
 `daemon-spawn` when the gate landed).
 
+Skew reaches the **manifest** too, as of the `auth.logins` list form
+([0026](docs/decisions/0026-a-stack-may-advertise-several-logins.md)): a stack using it
+fails validation on a pre-0.10.0 backlot with `the backlot manifest is invalid`, which
+reads as a broken manifest rather than an old install. Hence the singular
+`{user, password}` form must keep validating indefinitely, and `ctx.logins` must stay a
+single object (the primary, manifest entry 0) — `allLogins` is where the set lives.
+
 `JOURNAL_SCHEMA_VERSION` (`src/core/journal.ts`) is stamped into `PRAGMA
 user_version`; a daemon refuses to open a journal stamped newer than it understands.
 Bump it only when a change makes an older daemon **misread** this journal — the
