@@ -73,6 +73,20 @@ user_version`; a daemon refuses to open a journal stamped newer than it understa
 Bump it only when a change makes an older daemon **misread** this journal — the
 additive `ALTER TABLE` migrations are not bumps.
 
+## Cutting a release
+
+A merged fix does not reach consumers until this happens — `main` can sit ahead of
+the newest npm version for a while (the multi-login work landed as #59 but shipped
+in 0.10.0, several days later), and every consumer on the old version keeps hitting
+the bug in the meantime. There is **no publish automation**: `ci.yml` only runs
+typecheck/test, there is no `release.yml`, and past releases (`22469d7`, `c46944e`)
+were `npm publish`ed manually by the owner after the version-bump PR merged. A
+release-prep commit only ever touches `package.json` and `package-lock.json`
+(`"version"` in both places), titled `chore: X.Y.Z — version bump for the release`
+with a body naming what shipped since the last tag; follow semver off what actually
+changed (additive/back-compat = minor, fix-only = patch) rather than defaulting to
+patch.
+
 ## Claude Code plugin
 
 The repo doubles as its own Claude Code plugin marketplace (docs/config only — it
