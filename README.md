@@ -284,9 +284,11 @@ Be clear-eyed about what running backlot means:
   **unauthenticated** — anyone with the link reaches the service. Stacks that
   must never be published set `preview.forbidden: true` in `backlot.yml`. The
   tunnel lives as long as your **lease**, not as long as a service process: a
-  `sync`, a rebind or an idle quiesce leaves it up, and `--reset-data` leaves the
-  *same* URL serving *new* data (the bind says so, and `ctx` reports it in
-  `previewNotice`). `backlot preview stop` and `backlot release` both end it.
+  `sync`, a rebind or an idle quiesce leaves it up. A bind tears it down if the
+  manifest starts forbidding preview, if the previewed service drops out of the
+  running set, or if its port moves — and if `--reset-data` leaves the *same* URL
+  serving *new* data, it says so in the bind's `previewNotice`. `backlot preview
+  stop` and `backlot release` both end it.
 
 ## Claude Code
 

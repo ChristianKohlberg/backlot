@@ -360,10 +360,23 @@ export class Journal {
       );
   }
 
-  clearLeasePreview(id: string): void {
-    this.db
-      .prepare('UPDATE leases SET preview_service=NULL, preview_url=NULL, preview_pid=NULL, preview_start=NULL, preview_port=NULL WHERE id=?')
-      .run(id);
+  /**
+   * Forget a lease's preview tunnel — compare-and-swap on the pid.
+   *
+   * Every caller reached here holding a lease SNAPSHOT, so an unconditional
+   * clear let a slow one wipe the record of a tunnel someone else had already
+   * published in its place. That pid is then unnameable, and an unnameable
+   * preview pid is a public, unauthenticated URL that serves forever. Passing
+   * the pid that was actually stopped makes a stale caller a no-op; the
+   * pid-less form is only for a row that is being deleted outright.
+   */
+  clearLeasePreview(id: string, stoppedPid?: number): void {
+    const cols = 'preview_service=NULL, preview_url=NULL, preview_pid=NULL, preview_start=NULL, preview_port=NULL';
+    if (stoppedPid === undefined) {
+      this.db.prepare(`UPDATE leases SET ${cols} WHERE id=?`).run(id);
+      return;
+    }
+    this.db.prepare(`UPDATE leases SET ${cols} WHERE id=? AND preview_pid=?`).run(id, stoppedPid);
   }
 
   private rowToLease(r: Record<string, unknown>): LeaseRow {

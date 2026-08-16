@@ -75,7 +75,7 @@ function ctx(extraEnv: Record<string, string> = {}, stackExtra = '') {
   );
   writeFileSync(
     join(wt, 'stack.yaml'),
-    `name: previewtest\nservices:\n  web: { run: node srv.mjs, port: web, env: { PORT: "{{ports.web}}" }, ready: { log: ready, timeout: 20 } }\n${stackExtra}`,
+    `name: previewtest\nservices:\n  web: { run: node srv.mjs, port: web, env: { PORT: "{{ports.web}}" }, ready: { log: ready, timeout: 20 } }\n  api: { run: node srv.mjs, port: api, env: { PORT: "{{ports.api}}" }, ready: { log: ready, timeout: 20 } }\n${stackExtra}`,
   );
   execFileSync('git', ['init', '-q'], { cwd: wt });
   const fake = makeFakeCloudflared(stateDir);
@@ -277,6 +277,56 @@ describe('preview tunnels', () => {
     const status = await cli(['status', '--json']);
     expect(status.code).toBe(0);
     expect(await goneWithin(pid, 10_000)).toBe(true);
+  });
+
+  // Nothing brings the service back this lease, so the URL would publish a port
+  // with nothing behind it — the same rule `preview <out-of-slice>` is refused by.
+  it('tears the tunnel down when a bind drops the previewed service from the slice', async () => {
+    const { cli, stateDir } = ctx();
+    await cli(['up', '--json']);
+    await cli(['preview', 'web', '--json']);
+    const pid = tunnelPid(stateDir);
+    const narrowed = await cli(['up', 'api', '--json']);
+    expect(narrowed.code).toBe(0);
+    expect(narrowed.json?.previewUrls).toEqual({});
+    expect(String(narrowed.json?.previewNotice)).toMatch(/env-error: service 'web' is not in this bind's running set/);
+    expect(await goneWithin(pid, 10_000)).toBe(true);
+  });
+
+  // The kill switch has to act on what is already published, not merely refuse
+  // the next publish — README presents it as "must never be published".
+  it('tears the tunnel down when the manifest starts forbidding preview', async () => {
+    const { cli, wt, stateDir } = ctx();
+    await cli(['up', '--json']);
+    await cli(['preview', 'web', '--json']);
+    const pid = tunnelPid(stateDir);
+    writeFileSync(join(wt, 'stack.yaml'), readFileSync(join(wt, 'stack.yaml'), 'utf8') + 'preview:\n  forbidden: true\n');
+    const again = await cli(['up', '--json']);
+    expect(again.code).toBe(0);
+    expect(again.json?.previewUrls).toEqual({});
+    expect(String(again.json?.previewNotice)).toMatch(/work-error: backlot.yml now sets preview.forbidden/);
+    expect(await goneWithin(pid, 10_000)).toBe(true);
+  });
+
+  // A quiesced env is `warm` and its tunnel outlives the quiesce by design, so
+  // the tag scan sees a tagged process with no live env. Reporting that as an
+  // orphan is a permanent error naming a remedy (`pool gc`) that skips this pid.
+  it('doctor does not call a quiesced lease-scoped tunnel an orphan', async () => {
+    const { cli, stateDir } = ctx({ BACKLOT_LEASED_IDLE_TTL_MS: '400', BACKLOT_IDLE_TTL_MS: '400' });
+    await cli(['up', '--json']);
+    await cli(['preview', 'web', '--json']);
+    const pid = tunnelPid(stateDir);
+    let quiesced = false;
+    const deadline = Date.now() + 15_000;
+    while (Date.now() < deadline && !quiesced) {
+      const pool = (await cli(['pool', 'ls', '--json'])).json;
+      quiesced = JSON.stringify(pool).includes('"warm"');
+    }
+    expect(quiesced).toBe(true);
+    expect(alive(pid)).toBe(true);
+    const doc = await cli(['doctor', '--json']);
+    const issues = (doc.json?.issues ?? []) as Array<{ issue: string }>;
+    expect(issues.some((i) => /orphaned process .*preview:/.test(i.issue))).toBe(false);
   });
 
   // The tunnel's pid lives on the LEASE row, and teardown deletes that row

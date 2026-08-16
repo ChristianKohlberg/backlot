@@ -31,15 +31,30 @@ Scoped to the lease means scoped to the lease and **not** to the service
 incarnation it publishes. A `sync`, a rebind, or an idle quiesce restarts or
 stops services while the lease continues, and the tunnel survives all of them —
 ports are stable for an environment's lifetime ([0004](0004-watchers-never-move-bindings-move.md)), so
-it is aimed at the same place when the services come back. Two things do break
-that, and neither may be silent:
+it is aimed at the same place when the services come back. Four things do break
+that, and none of them may be silent. The bind is the boundary that notices,
+because it is where the manifest is re-read and the running set decided; it
+**reports** rather than throws, since the bind itself is legitimate and failing
+it would strand the caller. Three tear the tunnel down:
 
-- **The service moves to a different local port** (its `port` key was renamed;
-  existing keys are never reassigned). The tunnel would publish a stale port, so
-  the bind tears it down and reports it.
-- **`--reset-data` or `--pristine` runs under a live preview.** The public URL is
-  unchanged but now serves different data. The bind keeps the tunnel and warns,
-  in the phase stream and in the context blob's `previewNotice`.
+- **`preview.forbidden` is now set** (work-error class). The kill switch has to
+  act on what is already published, not only refuse the next `preview`.
+- **The previewed service left the running set** (env-error class) — a narrowed
+  slice (`up api`) or a conversion to `--data-only`. Unlike a quiesce, nothing
+  brings it back this lease, so the URL would publish a port with nothing behind
+  it. `previewStart` already refuses an out-of-slice service; this is the same
+  rule applied to a tunnel that is already up.
+- **The service moved to a different local port** (env-error class; its `port`
+  key was renamed — existing keys are never reassigned).
+
+One keeps the tunnel and warns:
+
+- **`--reset-data` or `--pristine` under a live preview.** The public URL is
+  unchanged but now serves different data.
+
+The message rides back on the **bind's own result** as `previewNotice` (`up`,
+`sync`, `reset-data`), not through shared state a later unrelated `ctx` read
+could consume first.
 
 Because the tunnel outlives service restarts, the process-tag reclaim paths
 (`reapEnvProcesses`' scan and `pool gc`) must **skip** a preview pid a live lease
@@ -59,8 +74,8 @@ with fixed dev credentials or a known signing key must set `preview.forbidden`.
 ## Consequences
 
 - New verbs: `preview`, `preview-stop` (CLI: `backlot preview …`, `backlot preview stop`).
-- `ctx` gains `previewUrls` (parallel to local `urls`) and a one-shot
-  `previewNotice` for what the last bind did to a live preview.
+- `ctx` gains `previewUrls` (parallel to local `urls`); a bind's response adds
+  `previewNotice` when that bind invalidated or reclassified a live preview.
 - Journal `leases` table gains nullable preview columns (additive migration).
 - Publisher adapters live in `src/drivers/preview.ts`; stable named tunnels can
   be added without reworking the verb.

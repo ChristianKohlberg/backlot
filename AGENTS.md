@@ -43,10 +43,19 @@ reclaim paths must **skip it** — `reapEnvProcesses`' scan filters out the pid 
 env's live lease records, and `poolGc` skips every leased preview pid. Do NOT
 "simplify" those filters away: without them Linux shoots the tunnel at a boundary
 where macOS keeps it, and that platform split is the whole bug class this feature
-had to close. Two bind outcomes do invalidate a tunnel and are handled in
-`reconcilePreviewForBind`: the previewed service moving to a different local port
-(torn down), and `--reset-data`/`--pristine` leaving the *same* public URL over
-*new* data (kept, and reported through `ctx.previewNotice`). `tests/preview-tunnel.test.ts`
+had to close, and all three of them (`pool gc`, the scan, doctor's orphan report)
+must agree on `leasedPreviewPids()` or one will act on what another calls healthy.
+
+`reconcilePreviewForBind` owns what a bind does to a live tunnel: it tears it
+down when `preview.forbidden` appears, when the previewed service leaves the
+running set (a narrowed slice or `--data-only` — nothing brings it back this
+lease), or when its local port moves; `--reset-data`/`--pristine` keeps it and
+warns that the *same* public URL now serves *new* data. It **never throws** — the
+bind is legitimate — and the message rides back on the bind's own result as
+`previewNotice`, not through shared state a later `ctx` read could drain first.
+Both preview verbs re-read the lease *inside* `envLocked`, and
+`clearLeasePreview` is a compare-and-swap on the pid, so no stale snapshot can
+forget a tunnel someone else just published. `tests/preview-tunnel.test.ts`
 covers all of it.
 
 ## Leases: `--ttl` is the agent form, `--holder-pid` is not
