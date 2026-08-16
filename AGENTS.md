@@ -46,16 +46,18 @@ where macOS keeps it, and that platform split is the whole bug class this featur
 had to close, and all three of them (`pool gc`, the scan, doctor's orphan report)
 must agree on `leasedPreviewPids()` or one will act on what another calls healthy.
 
-`reconcilePreviewForBind` owns what a bind does to a live tunnel: it tears it
+`reconcilePreviewForBind` owns what a bind **and a `sync`/`--watch` projection**
+do to a live tunnel: it tears it
 down when `preview.forbidden` appears, when the previewed service leaves the
 running set (a narrowed slice or `--data-only` — nothing brings it back this
 lease), or when its local port moves; `--reset-data`/`--pristine` keeps it and
 warns that the *same* public URL now serves *new* data. It **never throws** — the
 bind is legitimate — and the message rides back on the bind's own result as
 `previewNotice`, not through shared state a later `ctx` read could drain first.
-Both preview verbs re-read the lease *inside* `envLocked`, and
-`clearLeasePreview` is a compare-and-swap on the pid, so no stale snapshot can
-forget a tunnel someone else just published. `tests/preview-tunnel.test.ts`
+Both preview verbs re-read the lease *inside* `envLocked`, `clearLeasePreview` is
+a compare-and-swap on the pid, and `endLease` re-reads between the stop and the
+delete (it cannot take the env lock — `tryClaim` calls it under the pool lock),
+so no stale snapshot can forget a tunnel someone else just published. `tests/preview-tunnel.test.ts`
 covers all of it.
 
 ## Leases: `--ttl` is the agent form, `--holder-pid` is not

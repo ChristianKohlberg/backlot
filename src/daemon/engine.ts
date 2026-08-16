@@ -1302,9 +1302,18 @@ export class Engine {
       fresh.fingerprints['@source'] = sync.sourceHash;
       fresh.lastUsedAt = now();
       this.journal.saveEnv(fresh);
+      // A projection re-reads the manifest and refreshes the lease clock, so a
+      // watcher can keep a lease alive for days — and `preview.forbidden` added
+      // in that window used to take effect only on the next FULL bind, leaving
+      // the stack published the whole time. Same reconcile as a bind, against
+      // what is actually running.
+      await this.reconcilePreviewForBind(fresh, stack, 'reuse', new Set(Object.keys(this.supervisor(fresh).pids())), () => undefined);
       // Watch activity refreshes the lease (§6) — exactly what the old
-      // full-bind watch path did via tryClaim's re-save.
-      this.journal.saveLease({ ...lease, expiresAt: now() + LEASE_TTL(lease.kind) });
+      // full-bind watch path did via tryClaim's re-save. Re-read first: the
+      // reconcile above may have cleared preview columns this snapshot still
+      // carries, and saveLease writes the whole row.
+      const held = this.journal.leaseForEnv(env.id) ?? lease;
+      this.journal.saveLease({ ...held, expiresAt: now() + LEASE_TTL(held.kind) });
       if (sync.copied > 0 || sync.deleted > 0) {
         logEvent({
           level: 'info', kind: 'watch', envId: env.id,
@@ -1961,9 +1970,31 @@ export class Engine {
     );
   }
 
-  /** Release a lease and reap its preview tunnel first. */
+  /**
+   * Release a lease and reap its preview tunnel first.
+   *
+   * Re-read between the stop and the delete. `release` and the sweeper hold no
+   * env lock, and the stop blocks in `killGroupVerified` for up to ~4s — long
+   * enough for a concurrent `preview` to take the env lock, publish, and write
+   * its pid onto this very row. Deleting the row on the strength of the old
+   * snapshot then orphaned the NEW tunnel: no lease names it, `pool gc` skips
+   * nothing it can see, and `preview stop` has nothing left to stop. Taking the
+   * env lock here instead would nest it inside the pool lock (tryClaim calls
+   * this) and stall every claim machine-wide for the length of a bind.
+   */
   private async endLease(lease: LeaseRow): Promise<void> {
-    await this.stopPreviewForLease(lease);
+    let row: LeaseRow | undefined = lease;
+    for (let attempt = 0; attempt < 4 && row?.previewPid; attempt++) {
+      const stopped = row.previewPid;
+      await this.stopPreviewForLease(row);
+      const fresh = this.journal.leaseForEnv(lease.envId);
+      if (!fresh || fresh.id !== lease.id || fresh.previewPid === stopped) break;
+      row = fresh;
+    }
+    const last = this.journal.leaseForEnv(lease.envId);
+    if (last?.id === lease.id && last.previewPid) {
+      logEvent({ level: 'error', kind: 'preview', envId: lease.envId, detail: this.unreapedPreview(last) });
+    }
     this.journal.deleteLease(lease.id);
     this.stopWatch(lease.envId);
   }
@@ -2748,7 +2779,7 @@ export class Engine {
       // publish in flight has already killed the pid this row still names.
       if (lease.previewPid && !sameProcess(lease.previewPid, lease.previewStart)) {
         const service = lease.previewService ?? 'unknown';
-        this.journal.clearLeasePreview(lease.id);
+        this.journal.clearLeasePreview(lease.id, lease.previewPid);
         lease.previewPid = undefined;
         lease.previewStart = undefined;
         lease.previewUrl = undefined;

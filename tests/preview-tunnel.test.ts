@@ -66,7 +66,23 @@ setInterval(emit, 500);
   return wrapper;
 }
 
-function ctx(extraEnv: Record<string, string> = {}, stackExtra = '') {
+/** A tunnel that records its pid and then never publishes a URL — the slow-network case. */
+function makeMuteCloudflared(dir: string): string {
+  const script = join(dir, 'mute-cloudflared.mjs');
+  writeFileSync(
+    script,
+    `import { writeFileSync } from 'node:fs';
+writeFileSync(process.env.FAKE_PREVIEW_PIDFILE, String(process.pid));
+setTimeout(() => {}, 3600_000);
+`,
+  );
+  const wrapper = join(dir, 'mute-cloudflared');
+  writeFileSync(wrapper, `#!/bin/sh\nexec ${process.execPath} ${script} "$@"\n`);
+  chmodSync(wrapper, 0o755);
+  return wrapper;
+}
+
+function ctx(extraEnv: Record<string, string> = {}, stackExtra = '', hotReload = false, mute = false) {
   const stateDir = mkdtempSync(join(tmpdir(), 'backlot-preview-'));
   const wt = mkdtempSync(join(tmpdir(), 'backlot-preview-wt-'));
   writeFileSync(
@@ -75,15 +91,15 @@ function ctx(extraEnv: Record<string, string> = {}, stackExtra = '') {
   );
   writeFileSync(
     join(wt, 'stack.yaml'),
-    `name: previewtest\nservices:\n  web: { run: node srv.mjs, port: web, env: { PORT: "{{ports.web}}" }, ready: { log: ready, timeout: 20 } }\n  api: { run: node srv.mjs, port: api, env: { PORT: "{{ports.api}}" }, ready: { log: ready, timeout: 20 } }\n${stackExtra}`,
+    `name: previewtest\nservices:\n  web: { run: node srv.mjs, port: web, env: { PORT: "{{ports.web}}" }, ready: { log: ready, timeout: 20 }${hotReload ? ', hot_reload: true' : ''} }\n  api: { run: node srv.mjs, port: api, env: { PORT: "{{ports.api}}" }, ready: { log: ready, timeout: 20 }${hotReload ? ', hot_reload: true' : ''} }\n${stackExtra}`,
   );
   execFileSync('git', ['init', '-q'], { cwd: wt });
-  const fake = makeFakeCloudflared(stateDir);
+  const cloudflared = mute ? makeMuteCloudflared(stateDir) : makeFakeCloudflared(stateDir);
   const env = {
     ...process.env,
     BACKLOT_STATE_DIR: stateDir,
     BACKLOT_SWEEP_MS: '300',
-    BACKLOT_CLOUDFLARED: fake,
+    BACKLOT_CLOUDFLARED: cloudflared,
     FAKE_PREVIEW_URL: FAKE_URL,
     FAKE_PREVIEW_PIDFILE: join(stateDir, 'tunnel.pid'),
     ...extraEnv,
@@ -327,6 +343,33 @@ describe('preview tunnels', () => {
     const doc = await cli(['doctor', '--json']);
     const issues = (doc.json?.issues ?? []) as Array<{ issue: string }>;
     expect(issues.some((i) => /orphaned process .*preview:/.test(i.issue))).toBe(false);
+  });
+
+  // Giving up on the WAIT is not giving up on the PROCESS: a merely slow tunnel
+  // publishes its URL right after the timeout, and with no pid ever returned
+  // there is no lease row, no gc entry and no `preview stop` that could name it.
+  it('kills the tunnel process when it times out before publishing a URL', async () => {
+    const { cli, stateDir } = ctx({ BACKLOT_PREVIEW_START_TIMEOUT_MS: '700' }, '', false, true);
+    await cli(['up', '--json']);
+    const prev = await cli(['preview', 'web', '--json']);
+    expect(prev.code).toBe(2);
+    expect(String(prev.stderr + prev.stdout)).toMatch(/timed out waiting for cloudflared/);
+    expect(await goneWithin(tunnelPid(stateDir), 5000)).toBe(true);
+  });
+
+  // A projection re-reads the manifest and refreshes the lease clock, so under
+  // a watcher the kill switch would otherwise not take effect for days.
+  it('honours preview.forbidden on a projecting sync, not only on a full bind', async () => {
+    const { cli, wt, stateDir } = ctx({}, '', true);
+    await cli(['up', '--json']);
+    await cli(['preview', 'web', '--json']);
+    const pid = tunnelPid(stateDir);
+    writeFileSync(join(wt, 'stack.yaml'), readFileSync(join(wt, 'stack.yaml'), 'utf8') + 'preview:\n  forbidden: true\n');
+    writeFileSync(join(wt, 'note.txt'), 'edited\n');
+    const synced = await cli(['sync', '--json']);
+    expect(synced.code).toBe(0);
+    expect(synced.json?.previewUrls).toEqual({});
+    expect(await goneWithin(pid, 10_000)).toBe(true);
   });
 
   // The tunnel's pid lives on the LEASE row, and teardown deletes that row

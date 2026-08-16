@@ -93,9 +93,12 @@ export interface Context {
    */
   previewUrls?: Record<string, string>;
   /**
-   * What the last bind did to a live preview — a port move that tore the tunnel
-   * down, or a data reset that left the same public URL serving new content.
-   * Present once, on the first context read after that bind.
+   * What a bind did to a live preview, returned on that bind's OWN response
+   * (`up`, `sync`, `reset-data`) — never on a plain `ctx` read, which cannot
+   * know which bind a notice belongs to. Set when the bind tore the tunnel down
+   * (the manifest now forbids preview, the previewed service left the running
+   * set, or its local port moved) or when `--reset-data`/`--pristine` left the
+   * same public URL serving new content.
    */
   previewNotice?: string;
   /** True when the lease is over the datastores alone, so `urls` is empty by design. */

@@ -33,9 +33,12 @@ stops services while the lease continues, and the tunnel survives all of them �
 ports are stable for an environment's lifetime ([0004](0004-watchers-never-move-bindings-move.md)), so
 it is aimed at the same place when the services come back. Four things do break
 that, and none of them may be silent. The bind is the boundary that notices,
-because it is where the manifest is re-read and the running set decided; it
-**reports** rather than throws, since the bind itself is legitimate and failing
-it would strand the caller. Three tear the tunnel down:
+because it is where the manifest is re-read and the running set decided — and so
+is the `--watch`/`sync` **projection**, which re-reads the manifest and refreshes
+the lease clock without rebinding, so a kill switch flipped under a watcher must
+not wait days for the next full bind. It **reports** rather than throws, since
+the bind itself is legitimate and failing it would strand the caller. Three tear
+the tunnel down:
 
 - **`preview.forbidden` is now set** (work-error class). The kill switch has to
   act on what is already published, not only refuse the next `preview`.
@@ -78,6 +81,9 @@ with fixed dev credentials or a known signing key must set `preview.forbidden`.
   `previewNotice` when that bind invalidated or reclassified a live preview.
 - Journal `leases` table gains nullable preview columns (additive migration).
 - Publisher adapters live in `src/drivers/preview.ts`; stable named tunnels can
-  be added without reworking the verb.
+  be added without reworking the verb. An adapter **owns the process it spawned
+  until it returns a pid** — if `start` throws, it must already have killed it,
+  because nothing downstream can reap a tunnel whose pid was never recorded.
+  `BACKLOT_PREVIEW_START_TIMEOUT_MS` overrides the wait for a URL (default 45s).
 - Not addressed: authenticated preview (Cloudflare Access), stable hostnames, or
   remote-substrate `expose` — those are separate publisher implementations.

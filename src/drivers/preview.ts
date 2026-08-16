@@ -5,7 +5,7 @@
  * URLs for remote substrates. Preview is an explicit, opt-in verb that publishes
  * one service port to the internet for human inspection.
  */
-import { spawn } from 'node:child_process';
+import { spawn, type ChildProcess } from 'node:child_process';
 import { appendFileSync, mkdirSync, readFileSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
@@ -22,6 +22,11 @@ export interface PreviewPublisher {
   /**
    * Start a supervised tunnel to `localUrl`. The process is spawned detached with
    * backlot tags so `pool gc` and lease teardown can reap it.
+   *
+   * An adapter OWNS the process it spawned until it hands back a pid: if it
+   * throws, it must already have killed it. Nothing downstream can clean up a
+   * tunnel whose pid was never returned, and a live one is a public,
+   * unauthenticated URL with no record anywhere.
    */
   start(opts: {
     envId: string;
@@ -38,7 +43,11 @@ export interface PreviewPublisher {
 }
 
 const URL_RE = /https:\/\/[^\s]+trycloudflare\.com/;
-const START_TIMEOUT_MS = 45_000;
+/** How long to wait for a quick tunnel to publish its URL before giving up. */
+const startTimeoutMs = (): number => {
+  const raw = Number(process.env.BACKLOT_PREVIEW_START_TIMEOUT_MS);
+  return Number.isFinite(raw) && raw > 0 ? raw : 45_000;
+};
 
 function cloudflaredBin(): string {
   const override = process.env.BACKLOT_CLOUDFLARED?.trim();
@@ -57,6 +66,17 @@ function cloudflaredAvailable(bin: string): boolean {
     return true;
   } catch {
     return false;
+  }
+}
+
+/** Kill a tunnel process this adapter spawned but is about to stop tracking. */
+async function abandon(proc: ChildProcess): Promise<void> {
+  const pid = proc.pid;
+  if (pid === undefined) return;
+  try {
+    await killGroupVerified(pid, startTime(pid));
+  } catch {
+    /* never started, or already gone */
   }
 }
 
@@ -98,29 +118,43 @@ class CloudflareQuickPublisher implements PreviewPublisher {
     proc.stdout?.on('data', sink);
     proc.stderr?.on('data', sink);
 
-    const url = await new Promise<string>((resolve, reject) => {
-      const deadline = now() + START_TIMEOUT_MS;
-      const poll = () => {
-        const m = URL_RE.exec(buf);
-        if (m) return resolve(m[0]);
-        if (proc.exitCode !== null) {
-          return reject(
-            new BrokerError('env-error', `cloudflared exited before publishing a URL (exit ${proc.exitCode})`, 'preview', buf.slice(-2000)),
-          );
-        }
-        if (now() > deadline) {
-          return reject(new BrokerError('env-error', 'timed out waiting for cloudflared to publish a preview URL', 'preview', buf.slice(-2000)));
-        }
-        setTimeout(poll, 100).unref();
-      };
-      proc.on('error', (err) =>
-        reject(new BrokerError('env-error', `failed to start cloudflared: ${err.message}`, 'preview')),
-      );
-      poll();
-    });
+    let url: string;
+    try {
+      url = await new Promise<string>((resolve, reject) => {
+        const deadline = now() + startTimeoutMs();
+        const poll = () => {
+          const m = URL_RE.exec(buf);
+          if (m) return resolve(m[0]);
+          if (proc.exitCode !== null) {
+            return reject(
+              new BrokerError('env-error', `cloudflared exited before publishing a URL (exit ${proc.exitCode})`, 'preview', buf.slice(-2000)),
+            );
+          }
+          if (now() > deadline) {
+            return reject(new BrokerError('env-error', 'timed out waiting for cloudflared to publish a preview URL', 'preview', buf.slice(-2000)));
+          }
+          setTimeout(poll, 100).unref();
+        };
+        proc.on('error', (err) =>
+          reject(new BrokerError('env-error', `failed to start cloudflared: ${err.message}`, 'preview')),
+        );
+        poll();
+      });
+    } catch (err) {
+      // Giving up on the WAIT is not giving up on the PROCESS. A tunnel that
+      // was merely slow publishes its URL a second after the timeout, and with
+      // no pid returned there is no lease record, no `pool gc` entry and no
+      // `preview stop` that could ever name it — a public, unauthenticated URL
+      // serving until the host reboots.
+      await abandon(proc);
+      throw err;
+    }
 
     const pid = proc.pid;
-    if (!pid) throw new BrokerError('env-error', 'cloudflared started without a pid', 'preview');
+    if (!pid) {
+      await abandon(proc);
+      throw new BrokerError('env-error', 'cloudflared started without a pid', 'preview');
+    }
     return { url, pid: { pid, startTime: startTime(pid) } };
   }
 
