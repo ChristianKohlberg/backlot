@@ -273,7 +273,10 @@ describe('preview tunnels', () => {
   // The publisher name is a seam: checking cloudflared on behalf of a stack
   // that names another provider tells it to install a tool it does not use.
   it('doctor reports the publisher the manifest actually names', async () => {
-    const { cli } = ctx({}, 'preview:\n  publisher: some-future-adapter\n');
+    // A path that does not exist, so the DEFAULT publisher's prerequisite would
+    // fail — the absence of a cloudflared issue is then real evidence that
+    // doctor never checked a publisher this stack does not use.
+    const { cli } = ctx({ BACKLOT_CLOUDFLARED: '/nonexistent/cloudflared' }, 'preview:\n  publisher: some-future-adapter\n');
     await cli(['up', '--json']);
     const doc = await cli(['doctor', '--json']);
     const issues = (doc.json?.issues ?? []) as Array<{ level: string; issue: string }>;
@@ -403,6 +406,26 @@ describe('preview tunnels', () => {
     const second = await cli(['preview', 'api', '--json']);
     expect(second.code).toBe(2);
     expect(String(second.stderr + second.stdout)).toMatch(/preview requires cloudflared/);
+    expect(alive(pid)).toBe(true);
+    const c = await cli(['ctx', '--json']);
+    expect(c.json?.previewUrls).toEqual({ web: FAKE_URL });
+  });
+
+  // The teardown's own justification ("not in this bind's running set") is only
+  // true once the bind commits that set — a bind that fails leaves the old shape
+  // in the journal, so the next `up` brings the service back to a killed tunnel.
+  it('keeps the tunnel when the bind that would have narrowed the slice fails', async () => {
+    const { cli, wt, stateDir } = ctx();
+    await cli(['up', '--json']);
+    await cli(['preview', 'web', '--json']);
+    const pid = tunnelPid(stateDir);
+    writeFileSync(join(wt, 'boom.mjs'), `process.exit(1);\n`);
+    writeFileSync(
+      join(wt, 'stack.yaml'),
+      readFileSync(join(wt, 'stack.yaml'), 'utf8').replace('api: { run: node srv.mjs', 'api: { run: node boom.mjs'),
+    );
+    const narrowed = await cli(['up', 'api', '--json']);
+    expect(narrowed.code).not.toBe(0);
     expect(alive(pid)).toBe(true);
     const c = await cli(['ctx', '--json']);
     expect(c.json?.previewUrls).toEqual({ web: FAKE_URL });

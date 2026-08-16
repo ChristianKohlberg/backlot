@@ -51,7 +51,10 @@ do to a live tunnel: it tears it
 down when `preview.forbidden` appears, when the previewed service leaves the
 running set (a narrowed slice or `--data-only` — nothing brings it back this
 lease), or when its local port moves (a bind only — a projection allocates
-nothing, and it judges the slice by the env's durable shape, not by live pids); `--reset-data`/`--pristine` keeps it and
+nothing, and it judges the slice by the env's durable shape, not by live pids);
+the slice and port causes are reconciled at the bind's **epilogue**, once the
+shape they judge against is committed, while `forbidden` is enforced up front so
+a failed bind cannot leave a stack published; `--reset-data`/`--pristine` keeps it and
 warns that the *same* public URL now serves *new* data. It **never throws** — the
 bind is legitimate — and the message rides back on the bind's own result as
 `previewNotice`, not through shared state a later `ctx` read could drain first.

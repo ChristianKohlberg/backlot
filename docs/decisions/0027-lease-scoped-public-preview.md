@@ -41,7 +41,12 @@ the bind itself is legitimate and failing it would strand the caller. Three tear
 the tunnel down:
 
 - **`preview.forbidden` is now set** (work-error class). The kill switch has to
-  act on what is already published, not only refuse the next `preview`.
+  act on what is already published, not only refuse the next `preview` — and it
+  acts as soon as the manifest is read, not at the epilogue like the rest, so a
+  bind that fails later cannot leave a forbidden stack public. The other two are
+  reconciled once the bind has COMMITTED its shape: judged from the requested
+  slice at the top, a bind that then failed tore a tunnel down against a change
+  that never happened.
 - **The previewed service left the running set** (env-error class) — a narrowed
   slice (`up api`) or a conversion to `--data-only`. Unlike a quiesce, nothing
   brings it back this lease, so the URL would publish a port with nothing behind

@@ -913,12 +913,12 @@ export class Engine {
       }
     }
     if (addedPort) this.journal.saveEnv(env);
-    // Carried back on this bind's OWN result. A shared map was drained by
-    // whichever ctx() read happened first — an unrelated one, most of the time,
-    // since the reconcile runs here and `up` only reads context minutes later —
-    // and a bind that threw afterwards left its notice to be delivered against
-    // some later, unrelated read.
-    const previewNotice = await this.reconcilePreviewForBind(env, stack, active, say, { hygiene, portsReallocated: true });
+    // The kill switch depends on the MANIFEST alone, which has already been
+    // re-read — so it acts here, before anything else can fail. A stack that
+    // forbids preview must not stay published because a bind's ready probe
+    // timed out. Every other reason to invalidate a tunnel depends on what this
+    // bind commits, and is reconciled at the epilogue instead.
+    const forbiddenNotice = await this.enforcePreviewForbidden(env, stack, say);
     if (hygiene === 'pristine') {
       say('preparing a pristine environment');
       await this.supervisor(env).stopAll();
@@ -1006,7 +1006,10 @@ export class Engine {
       env.activeServices = active.size === declaredServices.length ? undefined : [...active];
       env.dataOnly = dataOnly;
       this.journal.saveEnv(env);
-      return { env, previewNotice };
+      return {
+        env,
+        previewNotice: forbiddenNotice ?? (await this.reconcilePreviewForBind(env, stack, active, say, { hygiene, portsReallocated: true })),
+      };
     }
 
     // Services must not hold open handles across a data restore or code change.
@@ -1187,7 +1190,10 @@ export class Engine {
     env.lastUsedAt = now();
     env.failStreak = 0; // a successful bind clears the escalation counter
     this.journal.saveEnv(env);
-    return { env, previewNotice };
+    return {
+      env,
+      previewNotice: forbiddenNotice ?? (await this.reconcilePreviewForBind(env, stack, active, say, { hygiene, portsReallocated: true })),
+    };
   }
 
   // ---------------------------------------------------------------- watch
@@ -2480,6 +2486,14 @@ export class Engine {
    * 0004). A data reset does not: the tunnel keeps serving, which is precisely
    * why it has to be said out loud.
    *
+   * Runs at the bind's EPILOGUE, once the shape it judges against is committed.
+   * From the top of the bind it was reading a REQUESTED slice that the epilogue
+   * had not written yet, so a bind that then failed its ready probe left the
+   * tunnel torn down against a slice change that never happened — and dropped
+   * the report with the thrown error. `preview.forbidden` is the exception and
+   * is enforced early by `enforcePreviewForbidden`: it depends on the manifest,
+   * not on the bind.
+   *
    * Never throws. The bind that narrowed the slice or wiped the data is a
    * legitimate operation and failing it would strand the caller in a loop (and
    * bump failStreak into a pristine escalation); the classified message is the
@@ -2493,6 +2507,28 @@ export class Engine {
    * key, so before one runs the service is still listening where the tunnel
    * points and a mismatch means nothing yet.
    */
+  /**
+   * Tear down a live preview the moment the manifest forbids one.
+   *
+   * Unconditional and early, unlike the rest of the reconcile: this is the
+   * security kill switch README and ADR 0027 present as taking effect, and it
+   * would be worthless if a stack stayed published whenever the bind that read
+   * the flag went on to fail.
+   */
+  private async enforcePreviewForbidden(env: EnvRow, stack: Stack, say: Progress): Promise<string | undefined> {
+    if (!stack.manifest.preview?.forbidden) return undefined;
+    const lease = this.journal.leaseForEnv(env.id);
+    if (!lease?.previewPid || !lease.previewService) return undefined;
+    const url = lease.previewUrl ?? 'the preview tunnel';
+    const confirmed = await this.stopPreviewForLease(lease);
+    const detail = confirmed
+      ? `work-error: backlot.yml now sets preview.forbidden, and a stack that forbids preview must not stay published — ${url} has been torn down`
+      : `work-error: backlot.yml now sets preview.forbidden but the tunnel could NOT be confirmed dead — ${url} may still be serving, unauthenticated`;
+    logEvent({ level: 'error', kind: 'preview', envId: env.id, detail });
+    say(detail);
+    return detail;
+  }
+
   private async reconcilePreviewForBind(
     env: EnvRow,
     stack: Stack,
