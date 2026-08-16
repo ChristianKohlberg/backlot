@@ -444,4 +444,37 @@ describe('preview tunnels', () => {
     expect(rec.code).toBe(0);
     expect(await goneWithin(pid, 10_000)).toBe(true);
   });
+
+  // A lapsed TTL ends the lease without anyone asking, and the tunnel is scoped
+  // to the LEASE — an agent that wandered off must not leave a public,
+  // unauthenticated URL serving for as long as the host stays up.
+  it('a lapsed TTL reaps the tunnel with the lease it was scoped to', async () => {
+    const { cli, stateDir } = ctx();
+    await cli(['up', '--json']);
+    const prev = await cli(['preview', 'web', '--ttl', '0.05', '--json']);
+    expect(prev.code).toBe(0);
+    const pid = tunnelPid(stateDir);
+    expect(alive(pid)).toBe(true);
+    expect(await goneWithin(pid, 20_000)).toBe(true);
+    const c = await cli(['ctx', '--json']);
+    expect(c.json?.previewUrls ?? {}).toEqual({});
+  });
+
+  // A graceful daemon stop leaves the LEASE standing (that is the contract) but
+  // nothing is left to supervise a published URL, so the tunnel goes with it.
+  it('a graceful daemon stop reaps the tunnel even though the lease survives', async () => {
+    const { cli, stateDir } = ctx();
+    await cli(['up', '--json']);
+    await cli(['preview', 'web', '--json']);
+    const pid = tunnelPid(stateDir);
+    expect(alive(pid)).toBe(true);
+    const stopped = await cli(['daemon', 'stop', '--json']);
+    expect(stopped.code).toBe(0);
+    expect(await goneWithin(pid, 15_000)).toBe(true);
+    // The lease is still ours on the next verb (a new daemon autospawns), and it
+    // no longer advertises a URL that stopped answering.
+    const c = await cli(['ctx', '--json']);
+    expect(c.code).toBe(0);
+    expect(c.json?.previewUrls ?? {}).toEqual({});
+  });
 });

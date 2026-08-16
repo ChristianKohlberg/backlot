@@ -60,6 +60,7 @@ stderr is human progress. Exit codes are contractual: `0` ok · `1` work-error �
 | `logs <service> [--lines N]` | Tail a service's logs from the leased env. |
 | `reset-data` | Restore the data template on the current lease (fresh seeded state, declared caches kept). |
 | `token --role <r>` | Mint an auth token via the stack's `auth.token` hook — for authenticating as a given role. Prints JSON (`{token, role}`); **add `--raw` for the bare token**, which is what an `Authorization` header wants. Piping the JSON into a header gets you a 401 that looks like a permissions problem. |
+| `preview <service>` | Publish **one** service from your lease on a public quick tunnel (needs `cloudflared`) so a human on another machine can look at it. The URL is **unauthenticated — anyone with the link reaches the app**, so only run it when you were asked to share, and end it with `preview stop` (releasing the lease also does). Opt-in per invocation; a stack may forbid it in `backlot.yml` (work-error). It is scoped to the **lease**, not the services: a `sync` or a rebind leaves it up, and a bind that invalidated it says so in `previewNotice`. |
 | `status` | Daemon, pool, and lease overview. Per environment, `available` answers "will the next bind take this one?" — `heat: "cold"` just means quiesced, which is a **healthy free** pool entry, not a stuck one. |
 
 Adjacent: `pull` (copy declared outputs into the worktree), `appliance ls|start|stop`

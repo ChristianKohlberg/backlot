@@ -1283,7 +1283,6 @@ export class Engine {
   ): Promise<{ outcome: 'projected' | 'fallback' | 'skip'; previewNotice?: string }> {
     const stack = loadStack(cwd);
     return this.envLocked(envId, async () => {
-      let previewNotice: string | undefined;
       const env = this.journal.getEnv(envId);
       // Teardown owns a recycling env and closes its watcher; do nothing.
       if (!env || env.state === 'recycling') return { outcome: 'skip' };
@@ -1322,7 +1321,7 @@ export class Engine {
       const shape = fresh.dataOnly
         ? new Set<string>()
         : this.resolveServiceClosure(stack, fresh.activeServices?.filter((n) => n in stack.manifest.services) ?? []);
-      previewNotice = await this.reconcilePreviewForBind(fresh, stack, shape, () => undefined, {
+      const previewNotice = await this.reconcilePreviewForBind(fresh, stack, shape, () => undefined, {
         hygiene: 'reuse',
         portsReallocated: false,
       });

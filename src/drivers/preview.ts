@@ -6,7 +6,7 @@
  * one service port to the internet for human inspection.
  */
 import { spawn, type ChildProcess } from 'node:child_process';
-import { appendFileSync, mkdirSync, readFileSync, existsSync } from 'node:fs';
+import { appendFileSync, mkdirSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { BrokerError, now } from '../core/util.js';

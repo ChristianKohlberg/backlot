@@ -364,6 +364,7 @@ backlot exec <cmd...>                            # run anything inside the lease
 backlot logs <service> [--lines N]               # supervised service logs
 backlot token --role <r>                         # mint a token via auth.token
 backlot reset-data | pull | release
+backlot preview <service> [--ttl <minutes>] | preview stop   # publish one service publicly (below)
 backlot status | doctor                          # pool state | active health check
 backlot pool ls|recycle [--all]|reconcile|gc|doctor
 backlot daemon stop
@@ -412,6 +413,19 @@ environment), login credentials, a token-mint hook, datastore connection strings
 artifact directory, hygiene state, and recent service events. An agent holding this
 blob needs nothing else from backlot.
 
+**Public preview (decision 0027).** `backlot preview <service>` publishes one leased
+service through a preview **publisher** adapter (default: a Cloudflare quick tunnel via
+`cloudflared`, an env-error when absent) and reports the URL in `ctx.previewUrls`;
+`backlot preview stop` ends it. It is opt-in per invocation and **scoped to the lease,
+not to the service incarnation** — a `sync`, a rebind or an idle quiesce leaves the
+tunnel up, while `release`, TTL lapse, teardown, `shutdown` and crash recovery all reap
+it. A bind — or a `sync`/`--watch` projection, which re-reads the manifest without
+allocating anything — that invalidates the tunnel (the manifest now sets
+`preview.forbidden`, the previewed service left the running set, or, binds only, its port
+moved) or merely reclassifies it (`--reset-data` under a live preview) says so in that
+bind's `previewNotice` rather than failing. The URL is **public and unauthenticated** —
+see README §Security model.
+
 **Division of labor** (the bug-fix loop): the agent thinks, edits, greps, and commits
 in its own worktree with its own harness — backlot is where the code *runs*, never
 where the agent *works*. Fast unit tests that need no system don't pay the broker tax
@@ -438,6 +452,9 @@ variable > `$STATE_DIR/config.json` > built-in default.
 | `BACKLOT_LOG_CAP_BYTES` | `logCapBytes` | 5 MB |
 | `BACKLOT_TEMPLATES_KEEP` | `templatesKeep` | 4 per stack |
 | `BACKLOT_SWEEP_MS` | — | 15 s (lease/idle sweep cadence) |
+| `BACKLOT_PREVIEW_PUBLISHER` | — | `cloudflare-quick` — the preview publisher adapter. The one knob a stack outranks: the manifest's `preview.publisher` wins over it |
+| `BACKLOT_CLOUDFLARED` | — | `cloudflared` off `PATH` — the binary that publisher runs |
+| `BACKLOT_PREVIEW_START_TIMEOUT_MS` | — | 45 s (wait for a quick tunnel to publish its URL) |
 | `BACKLOT_RETENTION_MS` | — | 10 min (disk retention cadence) |
 
 **Advertised host.** Service URLs advertise `http://localhost:…` while port
@@ -516,6 +533,9 @@ checks:
     run: pnpm e2e
     env: { API_PORT: "{{ports.api}}", SPA_PORT: "{{ports.web}}" }
     artifacts: [test-results/**]
+preview:
+  publisher: cloudflare-quick             # which adapter `backlot preview` publishes through
+  # forbidden: true                       # ...or refuse public preview outright (work-error)
 ```
 
 What the manifest deliberately does **not** contain: pool sizes, TTLs, capacity math,
@@ -523,7 +543,7 @@ substrate names. Those are engine policy and user config, never repo knowledge.
 
 ## 13. Driver seams
 
-Two thin interfaces (see [`driver-spec.md`](driver-spec.md) and
+Three thin interfaces (see [`driver-spec.md`](driver-spec.md) and
 [`../src/drivers/types.ts`](../src/drivers/types.ts)); thinness is what "never own
 compute" looks like in code.
 
@@ -533,6 +553,10 @@ degrades gracefully — local has no checkpoint; Morph/Sprites do.
 
 **Datastore** (~5 verbs + capabilities): `create(ns, preset)`, `drop(ns)`, `url(ns)`;
 optional `templateBake/templateRestore`; `ephemeral` stores implement reset as flush.
+
+**Preview publisher** (3 verbs): `checkPrerequisite`, `start(localUrl) → {url, pid}`,
+`stop(pid)` — how a leased service is published to the internet, deliberately *not* the
+substrate's `expose` (decision 0027).
 
 ## 14. Landscape position
 
