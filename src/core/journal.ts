@@ -107,6 +107,8 @@ export interface LeaseRow {
   previewUrl?: string;
   previewPid?: number;
   previewStart?: number;
+  /** Local port the tunnel was published against, so a rebind can spot drift. */
+  previewPort?: number;
 }
 
 export class Journal {
@@ -168,7 +170,7 @@ export class Journal {
         if (!/duplicate column name/i.test(String((err as Error).message ?? err))) throw err;
       }
     }
-    for (const col of ['preview_service TEXT', 'preview_url TEXT', 'preview_pid INTEGER', 'preview_start INTEGER']) {
+    for (const col of ['preview_service TEXT', 'preview_url TEXT', 'preview_pid INTEGER', 'preview_start INTEGER', 'preview_port INTEGER']) {
       try {
         this.db.exec(`ALTER TABLE leases ADD COLUMN ${col}`);
       } catch (err) {
@@ -333,12 +335,13 @@ export class Journal {
     this.db
       .prepare(
         `INSERT INTO leases (id, env_id, kind, holder, hygiene, expires_at, holder_pid, holder_start,
-           preview_service, preview_url, preview_pid, preview_start)
-         VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+           preview_service, preview_url, preview_pid, preview_start, preview_port)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
          ON CONFLICT(id) DO UPDATE SET expires_at=excluded.expires_at, hygiene=excluded.hygiene,
            holder_pid=excluded.holder_pid, holder_start=excluded.holder_start,
            preview_service=excluded.preview_service, preview_url=excluded.preview_url,
-           preview_pid=excluded.preview_pid, preview_start=excluded.preview_start`,
+           preview_pid=excluded.preview_pid, preview_start=excluded.preview_start,
+           preview_port=excluded.preview_port`,
       )
       .run(
         l.id,
@@ -353,12 +356,13 @@ export class Journal {
         l.previewUrl ?? null,
         l.previewPid ?? null,
         l.previewStart ?? null,
+        l.previewPort ?? null,
       );
   }
 
   clearLeasePreview(id: string): void {
     this.db
-      .prepare('UPDATE leases SET preview_service=NULL, preview_url=NULL, preview_pid=NULL, preview_start=NULL WHERE id=?')
+      .prepare('UPDATE leases SET preview_service=NULL, preview_url=NULL, preview_pid=NULL, preview_start=NULL, preview_port=NULL WHERE id=?')
       .run(id);
   }
 
@@ -376,6 +380,7 @@ export class Journal {
       previewUrl: (r.preview_url as string | null) ?? undefined,
       previewPid: (r.preview_pid as number | null) ?? undefined,
       previewStart: (r.preview_start as number | null) ?? undefined,
+      previewPort: (r.preview_port as number | null) ?? undefined,
     };
   }
 

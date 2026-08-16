@@ -92,6 +92,12 @@ export interface Context {
    * the service. Empty when no preview is active on this lease.
    */
   previewUrls?: Record<string, string>;
+  /**
+   * What the last bind did to a live preview — a port move that tore the tunnel
+   * down, or a data reset that left the same public URL serving new content.
+   * Present once, on the first context read after that bind.
+   */
+  previewNotice?: string;
   /** True when the lease is over the datastores alone, so `urls` is empty by design. */
   dataOnly?: boolean;
   /**

@@ -285,10 +285,15 @@ export class Engine {
     }
     for (const id of this.busy) live.add(id);
 
+    // A preview tunnel recorded on a live lease is accounted for by that lease,
+    // whatever heat its environment is in — a quiesced env keeps both.
+    const leasedPreviews = new Set<number>();
+    for (const l of this.journal.allLeases()) if (l.previewPid) leasedPreviews.add(l.previewPid);
+
     const reclaimed: Array<{ pid: number; envId: string; service: string }> = [];
     let skipped = 0;
     for (const proc of tagged) {
-      if (live.has(proc.envId)) {
+      if (live.has(proc.envId) || leasedPreviews.has(proc.pid)) {
         skipped++;
         continue;
       }
@@ -300,14 +305,6 @@ export class Engine {
     if (reclaimed.length) {
       // A reclaimed process may have been the one the journal was still
       // tracking — drop those records so doctor() doesn't report drift.
-      // Preview tunnels are tracked on the lease, and recover()'s dead-preview
-      // sweep runs BEFORE this gc, so without this a restart left ctx reporting
-      // a URL for a tunnel gc had just killed.
-      for (const lease of this.journal.allLeases()) {
-        if (lease.previewPid && reclaimed.some((r) => r.pid === lease.previewPid)) {
-          this.journal.clearLeasePreview(lease.id);
-        }
-      }
       for (const env of this.journal.allEnvs()) {
         const keep = Object.fromEntries(
           Object.entries(env.servicePids).filter(([, rec]) => !reclaimed.some((r) => r.pid === rec.pid)),
@@ -370,6 +367,9 @@ export class Engine {
   }
 
   /** One atomic claim attempt — MUST run under the pool lock. */
+  /** One-shot bind notices about a live preview, drained by the next ctx() read. */
+  private previewNotices = new Map<string, string>();
+
   private async tryClaim(stack: Stack, holder: string, kind: LeaseKind, hygiene: Hygiene, ttlMs: number, dataOnly: boolean, holderPid?: number, onlyMine = false): Promise<{ env: EnvRow; fresh: boolean } | null> {
     // A holder keeps its env: rebinding your own lease is the normal loop —
     // unless that env is being torn down or has flapped, in which case drop the
@@ -917,6 +917,7 @@ export class Engine {
       }
     }
     if (addedPort) this.journal.saveEnv(env);
+    await this.reconcilePreviewForBind(env, stack, hygiene, say);
     if (hygiene === 'pristine') {
       say('preparing a pristine environment');
       await this.supervisor(env).stopAll();
@@ -1438,6 +1439,8 @@ export class Engine {
     }
     const previewUrls: Record<string, string> = {};
     if (lease?.previewService && lease.previewUrl) previewUrls[lease.previewService] = lease.previewUrl;
+    const previewNotice = this.previewNotices.get(env.id);
+    this.previewNotices.delete(env.id);
     return {
       stack: stack.manifest.name,
       envId: env.id,
@@ -1445,6 +1448,12 @@ export class Engine {
       lease: lease ? { id: lease.id, kind: lease.kind, hygiene: lease.hygiene, expiresAt: lease.expiresAt } : null,
       urls,
       previewUrls,
+      /**
+       * What the last bind did to a live preview: the public URL is unchanged
+       * but what sits behind it is not, so this is the only place a caller
+       * learns that the link they shared now serves something else.
+       */
+      previewNotice,
       /**
        * True when this lease is over the DATASTORES ONLY, so `urls` is empty by
        * design rather than because a service failed to come up — a distinction a
@@ -2000,8 +2009,13 @@ export class Engine {
         localUrl: `http://127.0.0.1:${localPort}`,
         logDir: dirs.logs,
       });
+      // Identity, not mere existence: `pub.start` can take up to 45s holding only
+      // this env's lock, and a concurrent release + `up` in that window hands the
+      // holder a DIFFERENT lease on a DIFFERENT environment. Writing the tunnel
+      // onto that row would advertise env A's port as env B's preview and leave
+      // env A to return to the pool publishing the next holder's services.
       const freshLease = this.journal.leaseForHolder(h, stack.id);
-      if (!freshLease) {
+      if (!freshLease || freshLease.id !== lease.id) {
         if (!(await pub.stop(pid))) {
           logEvent({
             level: 'error',
@@ -2010,12 +2024,17 @@ export class Engine {
             detail: `the lease lapsed mid-publish and the new tunnel (pid ${pid.pid}) outlived its kill — ${url} may still be serving, unauthenticated`,
           });
         }
-        throw new BrokerError('env-error', 'lease lapsed while starting preview — retry after binding again', 'lease');
+        throw new BrokerError(
+          'env-error',
+          `the lease this preview was published for ${freshLease ? 'was replaced' : 'lapsed'} while cloudflared was starting — retry after binding again`,
+          'lease',
+        );
       }
       freshLease.previewService = service;
       freshLease.previewUrl = url;
       freshLease.previewPid = pid.pid;
       freshLease.previewStart = pid.startTime;
+      freshLease.previewPort = localPort;
       // The lease clock only ever moves on a SUCCESSFUL publish, like every
       // other verb that takes --ttl: `preview nosuchservice --ttl 60` used to
       // extend the lease and then fail.
@@ -2324,38 +2343,62 @@ export class Engine {
    * reclaim, and only Linux has the tag scan to fall back on.
    */
   private async reapEnvProcesses(env: EnvRow, pids?: Record<string, ServicePid>): Promise<Record<string, ServicePid>> {
-    // The preview tunnel is a managed process of this env too, but its pid lives
-    // on the LEASE row, not in servicePids — so neither the reap below nor the
-    // lease-deleting paths saw it. Only the tag scan did, and that is Linux-only:
-    // on macOS a quiesce, a force-recycle or a daemon stop left a public,
-    // unauthenticated URL serving forever, with its record deleted alongside the
-    // lease. This is the earliest boundary every env-level stop already shares
-    // (bind, quiesce, teardownClaimed, shutdown), and clearing here is also what
-    // keeps ctx from advertising a tunnel the tag scan just shot.
-    const lease = this.journal.leaseForEnv(env.id);
-    if (lease?.previewPid) {
-      const service = lease.previewService;
-      if (await this.stopPreviewForLease(lease)) {
-        logEvent({
-          level: 'info',
-          kind: 'preview',
-          envId: env.id,
-          detail: `the preview tunnel for '${service ?? 'unknown'}' went with the services it published — run 'backlot preview ${service ?? '<service>'}' again to republish`,
-        });
-      }
-    }
     const recorded = pids ?? env.servicePids;
     let survivors: Record<string, ServicePid> = {};
     if (Object.keys(recorded).length > 0) {
       survivors = await reapPids(recorded);
     }
     if (procScanSupported()) {
-      const orphans = scanTagged(stateRoot()).filter((p) => p.envId === env.id);
+      // A preview tunnel carries this env's tag but belongs to the LEASE, not to
+      // the service incarnation it publishes (decision 0027). Stopping services
+      // — a rebind, a quiesce — must leave it alone, and the tag scan is the one
+      // place that would otherwise shoot it on Linux while macOS kept it, which
+      // is the platform split the reap must never have. Its owner reaps it when
+      // the lease ends.
+      const leasedPreview = this.journal.leaseForEnv(env.id)?.previewPid;
+      const orphans = scanTagged(stateRoot()).filter((p) => p.envId === env.id && p.pid !== leasedPreview);
       if (orphans.length > 0) {
         await Promise.all(orphans.map((o) => killGroupVerified(o.pid, o.startTime)));
       }
     }
     return survivors;
+  }
+
+  /**
+   * Reconcile a live preview against the environment this bind just produced.
+   *
+   * The tunnel outlives service restarts, so the two ways a bind can invalidate
+   * it are both about what is now BEHIND the unchanged public URL: the service
+   * moved to a different local port (a renamed port key — existing keys are
+   * never reassigned, decision 0004), or the data under it was replaced. The
+   * first leaves the tunnel aimed at a stale port, so it is torn down; the
+   * second keeps serving, which is precisely why it has to be said out loud.
+   */
+  private async reconcilePreviewForBind(env: EnvRow, stack: Stack, hygiene: Hygiene, say: Progress): Promise<void> {
+    const lease = this.journal.leaseForEnv(env.id);
+    if (!lease?.previewPid || !lease.previewService) return;
+    const service = lease.previewService;
+    const portKey = stack.manifest.services[service]?.port;
+    const port = portKey ? env.ports[portKey] : undefined;
+    if (port !== lease.previewPort) {
+      const url = lease.previewUrl ?? 'the preview tunnel';
+      const confirmed = await this.stopPreviewForLease(lease);
+      const detail = confirmed
+        ? `service '${service}' moved from port ${lease.previewPort} to ${port ?? 'no port at all'}, so its preview tunnel was aimed at a stale port — ${url} has been torn down; run 'backlot preview ${service}' again for a new URL`
+        : `service '${service}' moved from port ${lease.previewPort} to ${port ?? 'no port at all'} and its preview tunnel could NOT be confirmed dead — ${url} may still be serving a stale port, unauthenticated`;
+      logEvent({ level: 'error', kind: 'preview', envId: env.id, detail });
+      this.previewNotices.set(env.id, detail);
+      say(detail);
+      return;
+    }
+    if (hygiene !== 'reuse') {
+      const detail =
+        `the preview tunnel for '${service}' is still published at ${lease.previewUrl ?? 'its URL'} — this ${hygiene} bind replaced the data behind it,` +
+        ` so that PUBLIC, unauthenticated URL now serves different content. Run 'backlot preview stop' if that must not be visible.`;
+      logEvent({ level: 'warn', kind: 'preview', envId: env.id, detail });
+      this.previewNotices.set(env.id, detail);
+      say(detail);
+    }
   }
 
   /**
@@ -2392,6 +2435,11 @@ export class Engine {
   /** Slow teardown of an already-claimed ('recycling') env. */
   private async teardownClaimed(env: EnvRow): Promise<void> {
     this.stopWatch(env.id);
+    // deleteEnv drops the lease row by raw SQL, taking the only record of its
+    // preview tunnel with it — so the tunnel has to be reaped here, while it can
+    // still be named. Teardown outranks the lease: --force is what took it.
+    const lease = this.journal.leaseForEnv(env.id);
+    if (lease?.previewPid) await this.stopPreviewForLease(lease);
     const survivors = await this.supervisor(env).stopAll();
     this.supervisors.delete(env.id);
     // After a daemon restart the in-memory supervisor is EMPTY, so stopAll is a
@@ -2618,7 +2666,14 @@ export class Engine {
       }
     }
 
-    for (const lease of this.journal.allLeases()) {
+    for (const snapshot of this.journal.allLeases()) {
+      // allLeases() is ONE snapshot and this body awaits — endLease blocks in
+      // killGroupVerified for seconds. In that window a holder can release and
+      // rebind, or republish a preview, so a later entry may already describe a
+      // lease that no longer exists. Acting on the snapshot killed the pid it
+      // remembered and then deleted the row that named the LIVE one.
+      const lease = this.journal.leaseForEnv(snapshot.envId);
+      if (!lease || lease.id !== snapshot.id) continue;
       // A lease can name an env row that no longer exists: deleteEnv's two
       // deletes were not one transaction before, so a daemon SIGKILLed
       // between them left exactly this half-state (journals outlive
@@ -2636,27 +2691,29 @@ export class Engine {
         });
         continue;
       }
+      // Never expire a lease whose env has an operation in flight (a long bind
+      // under a tiny TTL must not lose its env mid-bind).
+      if (this.busy.has(lease.envId)) continue;
       // A quick tunnel is best-effort: cloudflared drops it on network churn and
       // exits on its own, and nothing else looks while the daemon is up — so ctx
       // kept advertising a URL that had stopped answering an hour earlier, and
-      // `preview stop` reported success for a corpse. Same predicate recovery
-      // uses, on the live cadence.
+      // `preview stop` reported success for a corpse. Below the busy guard: a
+      // publish in flight has already killed the pid this row still names.
       if (lease.previewPid && !sameProcess(lease.previewPid, lease.previewStart)) {
+        const service = lease.previewService ?? 'unknown';
         this.journal.clearLeasePreview(lease.id);
         lease.previewPid = undefined;
         lease.previewStart = undefined;
         lease.previewUrl = undefined;
         lease.previewService = undefined;
+        lease.previewPort = undefined;
         logEvent({
           level: 'warn',
           kind: 'preview',
           envId: lease.envId,
-          detail: `the preview tunnel for '${lease.previewService ?? 'unknown'}' exited on its own — its URL is no longer published`,
+          detail: `the preview tunnel for '${service}' exited on its own — its URL is no longer published; run 'backlot preview ${service}' again for a new one`,
         });
       }
-      // Never expire a lease whose env has an operation in flight (a long bind
-      // under a tiny TTL must not lose its env mid-bind).
-      if (this.busy.has(lease.envId)) continue;
       // A holder that named its process and is now gone releases IMMEDIATELY.
       // Waiting out the TTL meant a crashed agent's environment stayed leased —
       // and therefore un-poolable — for up to half an hour.
@@ -2765,6 +2822,13 @@ export class Engine {
 
   async shutdown(): Promise<void> {
     for (const id of [...this.watchers.keys()]) this.stopWatch(id);
+    // Leases survive a daemon stop; their tunnels do not. Nothing supervises a
+    // published, unauthenticated URL once this process is gone, and the reap can
+    // no longer ride on the service reap below — the tunnel outlives service
+    // restarts by design now.
+    for (const lease of this.journal.allLeases()) {
+      if (lease.previewPid) await this.stopPreviewForLease(lease);
+    }
     const survivors = new Map<string, Record<string, ServicePid>>();
     for (const [id, sup] of this.supervisors) survivors.set(id, await sup.stopAll());
     for (const env of this.journal.allEnvs()) {

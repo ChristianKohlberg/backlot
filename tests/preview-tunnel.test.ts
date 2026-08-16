@@ -178,24 +178,60 @@ describe('preview tunnels', () => {
     expect(await goneWithin(pid, 5000)).toBe(true);
   });
 
-  // Every env-level stop reaps the tunnel, and the record must go with it.
-  // A rebind kills the tunnel (its process is tagged with the env), so a ctx
-  // that still advertised the URL was pointing the world at a dead endpoint.
-  it('a rebind that restarts services reaps the tunnel and clears it from ctx', async () => {
+  // Preview is scoped to the LEASE, not to the service incarnation it publishes.
+  // Ports are stable for an environment's lifetime (decision 0004), so a rebind
+  // that merely restarts services leaves the tunnel pointing at the same place.
+  it('survives a rebind that restarts the services it publishes', async () => {
     const { cli, wt, stateDir } = ctx();
     await cli(['up', '--json']);
     await cli(['preview', 'web', '--json']);
     const pid = tunnelPid(stateDir);
-    expect(alive(pid)).toBe(true);
     writeFileSync(
       join(wt, 'srv.mjs'),
       `import{createServer}from'node:http';console.log('ready');createServer((q,s)=>s.end('ok2')).listen(Number(process.env.PORT));\n`,
     );
     const again = await cli(['up', '--json']);
     expect(again.code).toBe(0);
-    expect(await goneWithin(pid, 10_000)).toBe(true);
+    expect(again.json?.previewUrls).toEqual({ web: FAKE_URL });
+    expect(alive(pid)).toBe(true);
     const c = await cli(['ctx', '--json']);
-    expect(c.json?.previewUrls).toEqual({});
+    expect(c.json?.previewUrls).toEqual({ web: FAKE_URL });
+  });
+
+  // …but a tunnel aimed at a port the service no longer listens on publishes
+  // nothing, so that one IS torn down — and said out loud, because the URL was
+  // already shared with someone.
+  it('tears the tunnel down when the previewed service moves to another port', async () => {
+    const { cli, wt, stateDir } = ctx();
+    await cli(['up', '--json']);
+    await cli(['preview', 'web', '--json']);
+    const pid = tunnelPid(stateDir);
+    writeFileSync(
+      join(wt, 'stack.yaml'),
+      `name: previewtest\nservices:\n  web: { run: node srv.mjs, port: frontend, env: { PORT: "{{ports.frontend}}" }, ready: { log: ready, timeout: 20 } }\n`,
+    );
+    const again = await cli(['up', '--json']);
+    expect(again.code).toBe(0);
+    expect(again.json?.previewUrls).toEqual({});
+    expect(String(again.json?.previewNotice)).toMatch(/moved from port .* torn down/);
+    expect(await goneWithin(pid, 10_000)).toBe(true);
+  });
+
+  // The URL does not change when the data behind it does, so nothing about the
+  // link tells the person holding it that it now serves a different database.
+  it('warns that the unchanged public URL serves new data after a reset', async () => {
+    const { cli, stateDir } = ctx();
+    await cli(['up', '--json']);
+    await cli(['preview', 'web', '--json']);
+    const pid = tunnelPid(stateDir);
+    const again = await cli(['up', '--reset-data', '--json']);
+    expect(again.code).toBe(0);
+    expect(again.json?.previewUrls).toEqual({ web: FAKE_URL });
+    expect(String(again.json?.previewNotice)).toMatch(/reset-data bind replaced the data behind it/);
+    expect(alive(pid)).toBe(true);
+    // One-shot: the next read is not still reporting a bind that already happened.
+    const c = await cli(['ctx', '--json']);
+    expect(c.json?.previewNotice).toBeUndefined();
   });
 
   // A quick tunnel is best-effort and exits on its own; nothing looked while

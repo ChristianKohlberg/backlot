@@ -282,7 +282,11 @@ Be clear-eyed about what running backlot means:
 - **Public preview URLs are world-readable.** `backlot preview` publishes the
   chosen service through a quick tunnel (Cloudflare by default). The URL is
   **unauthenticated** — anyone with the link reaches the service. Stacks that
-  must never be published set `preview.forbidden: true` in `backlot.yml`.
+  must never be published set `preview.forbidden: true` in `backlot.yml`. The
+  tunnel lives as long as your **lease**, not as long as a service process: a
+  `sync`, a rebind or an idle quiesce leaves it up, and `--reset-data` leaves the
+  *same* URL serving *new* data (the bind says so, and `ctx` reports it in
+  `previewNotice`). `backlot preview stop` and `backlot release` both end it.
 
 ## Claude Code
 

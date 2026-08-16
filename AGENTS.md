@@ -26,6 +26,29 @@ Consequence: a group kill (`killGroupVerified`) is not sufficient teardown — a
 
 Recorded `servicePids` hold only the **top-level service pids** — a service's own children were never on the books, so the tag scan is the only thing that finds them. For anything that also scrubbed the tag, `reapEnvTree` reaps by cwd (`scanByCwd`, which matches a `(deleted)` cwd too). That path is **teardown-only**: a quiesced env keeps its tree on disk and someone's shell may legitimately be sitting in it.
 
+## The preview tunnel is scoped to the lease, not to the services it publishes
+
+`backlot preview` journals its tunnel on the **lease row** (`preview_*`), not in
+`env.servicePids` — so none of the service-reap machinery above owns it, and the
+lifetime rule is deliberately different ([decision 0027](docs/decisions/0027-lease-scoped-public-preview.md)).
+A rebind, a `sync` or an idle quiesce restarts or stops services while the lease
+continues, and the tunnel **survives all of them**; ports are stable for an
+environment's lifetime, so it is aimed at the same place when the services return.
+It is reaped only when the lease ends (`release`, TTL lapse, dead holder, the
+sweeper's torn-row prune), at `teardownClaimed` (before `deleteEnv` drops the row
+that names it), at `shutdown()`, and in `recover()`.
+
+The sharp edge: because the tunnel outlives service restarts, the tag-based
+reclaim paths must **skip it** — `reapEnvProcesses`' scan filters out the pid the
+env's live lease records, and `poolGc` skips every leased preview pid. Do NOT
+"simplify" those filters away: without them Linux shoots the tunnel at a boundary
+where macOS keeps it, and that platform split is the whole bug class this feature
+had to close. Two bind outcomes do invalidate a tunnel and are handled in
+`reconcilePreviewForBind`: the previewed service moving to a different local port
+(torn down), and `--reset-data`/`--pristine` leaving the *same* public URL over
+*new* data (kept, and reported through `ctx.previewNotice`). `tests/preview-tunnel.test.ts`
+covers all of it.
+
 ## Leases: `--ttl` is the agent form, `--holder-pid` is not
 
 `--holder-pid` / `BACKLOT_HOLDER_PID` frees the environment the moment the named process exits, which only helps a caller that outlives the command. `BACKLOT_HOLDER_PID=$$` from an agent harness names an already-exited shell, so the lease is reclaimable on arrival: the sweeper's dead-holder rule frees the env, the next binder takes it, and the first caller is left looking at a different, unseeded store through the same URL. It presents as a stale seed template — the wrong subsystem entirely. Binds naming a dead pid are now refused (exit 64). See the lease bullet in `docs/architecture.md`.
