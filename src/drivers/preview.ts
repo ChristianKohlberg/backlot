@@ -17,7 +17,7 @@ import type { ServicePid } from '../core/types.js';
 
 export interface PreviewPublisher {
   readonly name: string;
-  /** infra-error when the external tool is missing; env-error when misconfigured. */
+  /** env-error when the external tool is missing or misconfigured. */
   checkPrerequisite(): void;
   /**
    * Start a supervised tunnel to `localUrl`. The process is spawned detached with
@@ -29,7 +29,12 @@ export interface PreviewPublisher {
     localUrl: string;
     logDir: string;
   }): Promise<{ url: string; pid: ServicePid }>;
-  stop(rec: ServicePid): Promise<void>;
+  /**
+   * Returns true only when the tunnel is CONFIRMED gone. A false verdict must
+   * keep the caller's record (reapPids' contract): a forgotten preview pid is a
+   * public, unauthenticated URL nobody can ever name again.
+   */
+  stop(rec: ServicePid): Promise<boolean>;
 }
 
 const URL_RE = /https:\/\/[^\s]+trycloudflare\.com/;
@@ -119,8 +124,8 @@ class CloudflareQuickPublisher implements PreviewPublisher {
     return { url, pid: { pid, startTime: startTime(pid) } };
   }
 
-  async stop(rec: ServicePid): Promise<void> {
-    await killGroupVerified(rec.pid, rec.startTime);
+  async stop(rec: ServicePid): Promise<boolean> {
+    return killGroupVerified(rec.pid, rec.startTime);
   }
 }
 

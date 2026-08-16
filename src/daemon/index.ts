@@ -80,7 +80,6 @@ async function dispatch(verb: string, args: Record<string, unknown>, emit: (phas
     case 'release':
       return engine.release(cwd, holder);
     case 'preview':
-      if (args.stop) return engine.previewStop(cwd, holder);
       return engine.previewStart(cwd, String(args.service), holder, args.ttlMs ? Number(args.ttlMs) : undefined);
     case 'preview-stop':
       return engine.previewStop(cwd, holder);

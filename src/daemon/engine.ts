@@ -296,6 +296,14 @@ export class Engine {
     if (reclaimed.length) {
       // A reclaimed process may have been the one the journal was still
       // tracking — drop those records so doctor() doesn't report drift.
+      // Preview tunnels are tracked on the lease, and recover()'s dead-preview
+      // sweep runs BEFORE this gc, so without this a restart left ctx reporting
+      // a URL for a tunnel gc had just killed.
+      for (const lease of this.journal.allLeases()) {
+        if (lease.previewPid && reclaimed.some((r) => r.pid === lease.previewPid)) {
+          this.journal.clearLeasePreview(lease.id);
+        }
+      }
       for (const env of this.journal.allEnvs()) {
         const keep = Object.fromEntries(
           Object.entries(env.servicePids).filter(([, rec]) => !reclaimed.some((r) => r.pid === rec.pid)),
@@ -1867,25 +1875,55 @@ export class Engine {
     }
   }
 
-  /** Stop and clear any lease-scoped preview tunnel recorded on this lease. */
-  private async stopPreviewForLease(lease: LeaseRow): Promise<void> {
-    if (!lease.previewPid) return;
-    let pubName = DEFAULT_PREVIEW_PUBLISHER;
+  /**
+   * Stop and clear any lease-scoped preview tunnel recorded on this lease.
+   *
+   * Teardown may NEVER be blocked by a manifest edit: `preview.publisher` is
+   * re-read from disk on every call, so a name that resolved at start can be a
+   * typo by the time the sweeper gets here — and an unknown name throws a
+   * work-error. Thrown from the sweeper's lease loop that aborted every tick,
+   * so TTL expiry, dead-holder release and eviction stopped daemon-wide. The
+   * teardown path therefore falls back to the default publisher instead.
+   *
+   * Returns false when the tunnel could NOT be confirmed dead. The record is
+   * kept in that case (reapPids' contract): a forgotten preview pid is a
+   * public, unauthenticated URL nobody can ever name again.
+   */
+  private async stopPreviewForLease(lease: LeaseRow): Promise<boolean> {
+    if (!lease.previewPid) return true;
+    let pub = resolvePreviewPublisher(DEFAULT_PREVIEW_PUBLISHER);
     const env = this.journal.getEnv(lease.envId);
     if (env) {
       try {
-        pubName = this.previewPublisherName(loadStack(env.stackRoot));
+        pub = resolvePreviewPublisher(this.previewPublisherName(loadStack(env.stackRoot)));
       } catch {
-        /* stack root unreadable — still reap the tunnel */
+        /* stack root unreadable, or the manifest now names an unknown publisher — still reap the tunnel */
       }
     }
-    const pub = resolvePreviewPublisher(pubName);
+    let stopped = false;
     try {
-      await pub.stop({ pid: lease.previewPid, startTime: lease.previewStart });
-    } catch {
-      /* best-effort — the process may already be gone */
+      stopped = await pub.stop({ pid: lease.previewPid, startTime: lease.previewStart });
+    } catch (err) {
+      logEvent({
+        level: 'warn',
+        kind: 'preview',
+        envId: lease.envId,
+        detail: `stopping the preview tunnel failed: ${String((err as Error).message ?? err)}`,
+      });
+    }
+    if (!stopped) {
+      logEvent({
+        level: 'warn',
+        kind: 'preview',
+        envId: lease.envId,
+        detail:
+          `preview tunnel pid ${lease.previewPid} outlived the stop — the PUBLIC url may still be live.` +
+          ` The record is kept so 'backlot pool gc' can still reclaim it.`,
+      });
+      return false;
     }
     this.journal.clearLeasePreview(lease.id);
+    return true;
   }
 
   /** Release a lease and reap its preview tunnel first. */
@@ -1902,10 +1940,6 @@ export class Engine {
     const lease = this.journal.leaseForHolder(h, stack.id);
     if (!lease) {
       throw new BrokerError('env-error', `no active lease for this worktree — run 'backlot up' first`, 'lease');
-    }
-    if (ttlMs !== undefined && ttlMs > 0) {
-      lease.expiresAt = now() + ttlMs;
-      this.journal.saveLease(lease);
     }
     const env = this.envForLease(lease);
     if (env.dataOnly) {
@@ -1950,6 +1984,10 @@ export class Engine {
       freshLease.previewUrl = url;
       freshLease.previewPid = pid.pid;
       freshLease.previewStart = pid.startTime;
+      // The lease clock only ever moves on a SUCCESSFUL publish, like every
+      // other verb that takes --ttl: `preview nosuchservice --ttl 60` used to
+      // extend the lease and then fail.
+      if (ttlMs !== undefined && ttlMs > 0) freshLease.expiresAt = now() + ttlMs;
       this.journal.saveLease(freshLease);
       this.touch(env.id);
       logEvent({ level: 'info', kind: 'preview', envId: env.id, detail: `published '${service}' at ${url}` });
@@ -1966,7 +2004,13 @@ export class Engine {
     }
     if (!lease.previewPid) return { stopped: false };
     const service = lease.previewService;
-    await this.stopPreviewForLease(lease);
+    if (!(await this.stopPreviewForLease(lease))) {
+      throw new BrokerError(
+        'infra-error',
+        `the preview tunnel (pid ${lease.previewPid}) could not be confirmed dead — the public URL may still be live; 'backlot pool gc' reclaims it by tag`,
+        'preview',
+      );
+    }
     logEvent({ level: 'info', kind: 'preview', envId: lease.envId, detail: `stopped preview for '${service ?? 'unknown'}'` });
     return { stopped: true, service };
   }
@@ -2245,6 +2289,16 @@ export class Engine {
    * reclaim, and only Linux has the tag scan to fall back on.
    */
   private async reapEnvProcesses(env: EnvRow, pids?: Record<string, ServicePid>): Promise<Record<string, ServicePid>> {
+    // The preview tunnel is a managed process of this env too, but its pid lives
+    // on the LEASE row, not in servicePids — so neither the reap below nor the
+    // lease-deleting paths saw it. Only the tag scan did, and that is Linux-only:
+    // on macOS a quiesce, a force-recycle or a daemon stop left a public,
+    // unauthenticated URL serving forever, with its record deleted alongside the
+    // lease. This is the earliest boundary every env-level stop already shares
+    // (bind, quiesce, teardownClaimed, shutdown), and clearing here is also what
+    // keeps ctx from advertising a tunnel the tag scan just shot.
+    const lease = this.journal.leaseForEnv(env.id);
+    if (lease?.previewPid) await this.stopPreviewForLease(lease);
     const recorded = pids ?? env.servicePids;
     let survivors: Record<string, ServicePid> = {};
     if (Object.keys(recorded).length > 0) {

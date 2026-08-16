@@ -6,7 +6,7 @@ import { execFile, execFileSync } from 'node:child_process';
 import { mkdtempSync, rmSync, writeFileSync, readFileSync, chmodSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { procScanSupported, scanTagged } from '../src/core/procscan.js';
+import { scanTagged } from '../src/core/procscan.js';
 
 const repo = join(import.meta.dirname, '..');
 const CLI = join(repo, 'dist', 'cli', 'index.js');
@@ -17,11 +17,43 @@ afterAll(() => {
   for (const c of cleanups) c();
 });
 
+/**
+ * Liveness of a pid this process did not spawn. The tunnel is a child of the
+ * DAEMON, so signal 0 is the only cross-platform verdict available here — the
+ * tag scan these tests used to assert on is Linux-only and silently passes
+ * "nothing is running" on macOS.
+ */
+function alive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function goneWithin(pid: number, ms: number): Promise<boolean> {
+  const deadline = Date.now() + ms;
+  while (Date.now() < deadline) {
+    if (!alive(pid)) return true;
+    await new Promise((r) => setTimeout(r, 50));
+  }
+  return !alive(pid);
+}
+
+function tunnelPid(stateDir: string): number {
+  const raw = Number(readFileSync(join(stateDir, 'tunnel.pid'), 'utf8').trim());
+  expect(Number.isInteger(raw) && raw > 0).toBe(true);
+  return raw;
+}
+
 function makeFakeCloudflared(dir: string): string {
   const script = join(dir, 'fake-cloudflared.mjs');
   writeFileSync(
     script,
-    `const u = process.env.FAKE_PREVIEW_URL || '${FAKE_URL}';
+    `import { writeFileSync } from 'node:fs';
+const u = process.env.FAKE_PREVIEW_URL || '${FAKE_URL}';
+writeFileSync(process.env.FAKE_PREVIEW_PIDFILE, String(process.pid));
 setTimeout(() => {}, 3600_000);
 const emit = () => console.error('INF |  ' + u);
 emit();
@@ -53,6 +85,7 @@ function ctx(extraEnv: Record<string, string> = {}, stackExtra = '') {
     BACKLOT_SWEEP_MS: '300',
     BACKLOT_CLOUDFLARED: fake,
     FAKE_PREVIEW_URL: FAKE_URL,
+    FAKE_PREVIEW_PIDFILE: join(stateDir, 'tunnel.pid'),
     ...extraEnv,
   };
   const cli = (args: string[], cwd = wt) =>
@@ -79,6 +112,11 @@ function ctx(extraEnv: Record<string, string> = {}, stackExtra = '') {
       } catch {
         /* gone */
       }
+    }
+    try {
+      process.kill(tunnelPid(stateDir), 'SIGKILL');
+    } catch {
+      /* never started, or already gone */
     }
     rmSync(stateDir, { recursive: true, force: true });
     rmSync(wt, { recursive: true, force: true });
@@ -115,26 +153,62 @@ describe('preview tunnels', () => {
     expect(String(prev.stderr + prev.stdout)).toMatch(/cloudflared|env-error/i);
   });
 
-  it('preview stop clears the tunnel', async () => {
+  it('preview stop kills the tunnel and drops it from ctx', async () => {
     const { cli, stateDir } = ctx();
     await cli(['up', '--json']);
     await cli(['preview', 'web', '--json']);
-    expect(scanTagged(stateDir).some((p) => p.service.startsWith('preview:'))).toBe(true);
+    const pid = tunnelPid(stateDir);
+    expect(alive(pid)).toBe(true);
     const stop = await cli(['preview', 'stop', '--json']);
     expect(stop.code).toBe(0);
     expect(stop.json?.stopped).toBe(true);
-    expect(scanTagged(stateDir).some((p) => p.service.startsWith('preview:'))).toBe(false);
+    expect(await goneWithin(pid, 5000)).toBe(true);
+    const c = await cli(['ctx', '--json']);
+    expect(c.json?.previewUrls).toEqual({});
   });
 
   it('release reaps the tunnel process — nothing survives the lease', async () => {
-    if (!procScanSupported()) return;
     const { cli, stateDir } = ctx();
     await cli(['up', '--json']);
     await cli(['preview', 'web', '--json']);
-    expect(scanTagged(stateDir).filter((p) => p.service.startsWith('preview:')).length).toBeGreaterThan(0);
+    const pid = tunnelPid(stateDir);
+    expect(alive(pid)).toBe(true);
     const rel = await cli(['release', '--json']);
     expect(rel.code).toBe(0);
-    await new Promise((r) => setTimeout(r, 500));
-    expect(scanTagged(stateDir).filter((p) => p.service.startsWith('preview:')).length).toBe(0);
+    expect(await goneWithin(pid, 5000)).toBe(true);
+  });
+
+  // Every env-level stop reaps the tunnel, and the record must go with it.
+  // A rebind kills the tunnel (its process is tagged with the env), so a ctx
+  // that still advertised the URL was pointing the world at a dead endpoint.
+  it('a rebind that restarts services reaps the tunnel and clears it from ctx', async () => {
+    const { cli, wt, stateDir } = ctx();
+    await cli(['up', '--json']);
+    await cli(['preview', 'web', '--json']);
+    const pid = tunnelPid(stateDir);
+    expect(alive(pid)).toBe(true);
+    writeFileSync(
+      join(wt, 'srv.mjs'),
+      `import{createServer}from'node:http';console.log('ready');createServer((q,s)=>s.end('ok2')).listen(Number(process.env.PORT));\n`,
+    );
+    const again = await cli(['up', '--json']);
+    expect(again.code).toBe(0);
+    expect(await goneWithin(pid, 10_000)).toBe(true);
+    const c = await cli(['ctx', '--json']);
+    expect(c.json?.previewUrls).toEqual({});
+  });
+
+  // The tunnel's pid lives on the LEASE row, and teardown deletes that row
+  // outright — so before the reap moved to reapEnvProcesses, a force-recycle
+  // left the public URL serving with nothing left that could ever name it.
+  it('a forced recycle reaps the tunnel before the lease row is deleted', async () => {
+    const { cli, stateDir } = ctx();
+    await cli(['up', '--json']);
+    await cli(['preview', 'web', '--json']);
+    const pid = tunnelPid(stateDir);
+    expect(alive(pid)).toBe(true);
+    const rec = await cli(['pool', 'recycle', '--force', '--json']);
+    expect(rec.code).toBe(0);
+    expect(await goneWithin(pid, 10_000)).toBe(true);
   });
 });
