@@ -69,15 +69,31 @@ function cloudflaredAvailable(bin: string): boolean {
   }
 }
 
-/** Kill a tunnel process this adapter spawned but is about to stop tracking. */
-async function abandon(proc: ChildProcess): Promise<void> {
+/**
+ * Kill a tunnel process this adapter spawned but is about to stop tracking.
+ *
+ * Returns the pid when it could NOT be confirmed dead. That is the one outcome
+ * worth saying out loud: no pid was ever returned, so no lease row records it
+ * and `pool gc` has nothing to reclaim it by — the caller must put it in the
+ * error it is about to throw, or a live public URL leaves no trace at all.
+ */
+async function abandon(proc: ChildProcess): Promise<number | undefined> {
   const pid = proc.pid;
-  if (pid === undefined) return;
+  if (pid === undefined) return undefined;
   try {
-    await killGroupVerified(pid, startTime(pid));
+    return (await killGroupVerified(pid, startTime(pid))) ? undefined : pid;
   } catch {
-    /* never started, or already gone */
+    return pid;
   }
+}
+
+/** Append the surviving pid to an error's detail, so the operator can find it. */
+function withSurvivor(err: unknown, pid: number | undefined): unknown {
+  if (pid === undefined || !(err instanceof BrokerError)) return err;
+  const warning =
+    `the cloudflared process (pid ${pid}) could NOT be confirmed dead and was never recorded anywhere —` +
+    ` it may still be serving a PUBLIC, unauthenticated URL; kill it by hand`;
+  return new BrokerError(err.klass, err.message, err.source, `${err.logExcerpt ? `${err.logExcerpt}\n` : ''}${warning}`);
 }
 
 class CloudflareQuickPublisher implements PreviewPublisher {
@@ -146,14 +162,12 @@ class CloudflareQuickPublisher implements PreviewPublisher {
       // no pid returned there is no lease record, no `pool gc` entry and no
       // `preview stop` that could ever name it — a public, unauthenticated URL
       // serving until the host reboots.
-      await abandon(proc);
-      throw err;
+      throw withSurvivor(err, await abandon(proc));
     }
 
     const pid = proc.pid;
     if (!pid) {
-      await abandon(proc);
-      throw new BrokerError('env-error', 'cloudflared started without a pid', 'preview');
+      throw withSurvivor(new BrokerError('env-error', 'cloudflared started without a pid', 'preview'), await abandon(proc));
     }
     return { url, pid: { pid, startTime: startTime(pid) } };
   }

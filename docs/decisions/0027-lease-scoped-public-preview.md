@@ -48,7 +48,14 @@ the tunnel down:
   it. `previewStart` already refuses an out-of-slice service; this is the same
   rule applied to a tunnel that is already up.
 - **The service moved to a different local port** (env-error class; its `port`
-  key was renamed — existing keys are never reassigned).
+  key was renamed — existing keys are never reassigned). Only a real bind
+  allocates for a renamed key, so a projection skips this one: until then the
+  service is still listening exactly where the tunnel points.
+
+The running set a reconcile judges against is the environment's **durable
+shape**, never the supervisor's live pid map — a service in restart backoff is
+absent from that map for a second, and reading it as "left the slice" would kill
+a tunnel the restart makes correct again.
 
 One keeps the tunnel and warns:
 

@@ -918,7 +918,7 @@ export class Engine {
     // since the reconcile runs here and `up` only reads context minutes later —
     // and a bind that threw afterwards left its notice to be delivered against
     // some later, unrelated read.
-    const previewNotice = await this.reconcilePreviewForBind(env, stack, hygiene, active, say);
+    const previewNotice = await this.reconcilePreviewForBind(env, stack, active, say, { hygiene, portsReallocated: true });
     if (hygiene === 'pristine') {
       say('preparing a pristine environment');
       await this.supervisor(env).stopAll();
@@ -1256,7 +1256,7 @@ export class Engine {
    * manifest itself says is stale.
    */
   private async watchSave(envId: string, cwd: string, holder: string): Promise<void> {
-    const outcome = await this.watchProject(envId, cwd, holder);
+    const { outcome } = await this.watchProject(envId, cwd, holder);
     if (outcome === 'fallback') {
       // The full bind also covers every state projection can't fix on its own:
       // a quiesced/degraded/recycled-away env, or a lapsed lease that must be
@@ -1270,19 +1270,24 @@ export class Engine {
    * mutation (the envChains serialization keeps a concurrent manual verb from
    * interleaving). Returns 'fallback' when this save needs the full bind.
    */
-  private async watchProject(envId: string, cwd: string, holder: string): Promise<'projected' | 'fallback' | 'skip'> {
+  private async watchProject(
+    envId: string,
+    cwd: string,
+    holder: string,
+  ): Promise<{ outcome: 'projected' | 'fallback' | 'skip'; previewNotice?: string }> {
     const stack = loadStack(cwd);
     return this.envLocked(envId, async () => {
+      let previewNotice: string | undefined;
       const env = this.journal.getEnv(envId);
       // Teardown owns a recycling env and closes its watcher; do nothing.
-      if (!env || env.state === 'recycling') return 'skip';
+      if (!env || env.state === 'recycling') return { outcome: 'skip' };
       // Only a LIVE lease still pointing at this env may mutate it from a
       // watch event; anything else re-earns an environment via acquire.
       const lease = this.journal.leaseForHolder(holder, stack.id);
-      if (!lease || lease.envId !== envId || lease.expiresAt <= now()) return 'fallback';
+      if (!lease || lease.envId !== envId || lease.expiresAt <= now()) return { outcome: 'fallback' };
       // Same trust conditions as bindAndStart's fast path: hot, all healthy.
       // A quiesced or half-dead env needs services started, not just files.
-      if (env.state !== 'hot' || !this.supervisor(env).allHealthyPids()) return 'fallback';
+      if (env.state !== 'hot' || !this.supervisor(env).allHealthyPids()) return { outcome: 'fallback' };
 
       const dirs = this.envDirs(env.id);
       // The one sync implementation (constraint: no second copy path).
@@ -1292,35 +1297,46 @@ export class Engine {
       // The fallback decision: would this tree fire any upkeep rule or
       // template rebake? (Same trigger hashes runUpkeep would compare.)
       if (pendingUpkeep(dirs.tree, sync.files, stack.manifest, env.fingerprints).length > 0) {
-        return 'fallback';
+        return { outcome: 'fallback' };
       }
 
       // Epilogue on a FRESH row (the onDegraded/onPidsChanged callbacks write
       // concurrently): record the new source identity and the activity.
       const fresh = this.journal.getEnv(env.id);
-      if (!fresh || fresh.state !== 'hot') return 'fallback'; // degraded mid-projection
+      if (!fresh || fresh.state !== 'hot') return { outcome: 'fallback' }; // degraded mid-projection
       fresh.fingerprints['@source'] = sync.sourceHash;
       fresh.lastUsedAt = now();
       this.journal.saveEnv(fresh);
       // A projection re-reads the manifest and refreshes the lease clock, so a
       // watcher can keep a lease alive for days — and `preview.forbidden` added
       // in that window used to take effect only on the next FULL bind, leaving
-      // the stack published the whole time. Same reconcile as a bind, against
-      // what is actually running.
-      await this.reconcilePreviewForBind(fresh, stack, 'reuse', new Set(Object.keys(this.supervisor(fresh).pids())), () => undefined);
+      // the stack published the whole time. The shape is this environment's
+      // DURABLE one, not the supervisor's live pids: nothing here restarted a
+      // service, so a pid missing during a restart backoff is not a slice change.
+      const shape = fresh.dataOnly
+        ? new Set<string>()
+        : this.resolveServiceClosure(stack, fresh.activeServices?.filter((n) => n in stack.manifest.services) ?? []);
+      previewNotice = await this.reconcilePreviewForBind(fresh, stack, shape, () => undefined, {
+        hygiene: 'reuse',
+        portsReallocated: false,
+      });
       // Watch activity refreshes the lease (§6) — exactly what the old
-      // full-bind watch path did via tryClaim's re-save. Re-read first: the
-      // reconcile above may have cleared preview columns this snapshot still
-      // carries, and saveLease writes the whole row.
-      const held = this.journal.leaseForEnv(env.id) ?? lease;
-      this.journal.saveLease({ ...held, expiresAt: now() + LEASE_TTL(held.kind) });
+      // full-bind watch path did via tryClaim's re-save. Re-read: the reconcile
+      // above may have cleared preview columns this snapshot still carries, and
+      // saveLease is an upsert — falling back to the snapshot would RESURRECT a
+      // lease a concurrent `release` deleted while we were projecting, leaving
+      // the environment leased for a full TTL after `released: true`.
+      const held = this.journal.leaseForEnv(env.id);
+      if (held && held.id === lease.id) {
+        this.journal.saveLease({ ...held, expiresAt: now() + LEASE_TTL(held.kind) });
+      }
       if (sync.copied > 0 || sync.deleted > 0) {
         logEvent({
           level: 'info', kind: 'watch', envId: env.id,
           detail: `projected ${sync.copied} changed, ${sync.deleted} removed — services kept (two-stage reload)`,
         });
       }
-      return 'projected';
+      return { outcome: 'projected', previewNotice };
     });
   }
 
@@ -1642,8 +1658,9 @@ export class Engine {
     const lease = this.journal.leaseForHolder(h, stack.id);
     if (allReload && lease && lease.expiresAt > now()) {
       onProgress?.('projecting worktree (services kept)');
-      if ((await this.watchProject(lease.envId, cwd, h)) === 'projected') {
-        return this.ctx(cwd, h, lease.envId);
+      const projected = await this.watchProject(lease.envId, cwd, h);
+      if (projected.outcome === 'projected') {
+        return { ...this.ctx(cwd, h, lease.envId), previewNotice: projected.previewNotice };
       }
     }
     // Anything projection can't honestly serve — pending upkeep/rebake, a
@@ -2436,13 +2453,21 @@ export class Engine {
    * legitimate operation and failing it would strand the caller in a loop (and
    * bump failStreak into a pristine escalation); the classified message is the
    * report, and it rides back on the bind's own result.
+   *
+   * `active` must be the DURABLE shape this environment is bound to, never the
+   * supervisor's live pid map: a service in restart backoff is missing from
+   * that map for a second and would be read as "left the slice", killing a
+   * tunnel the restart makes correct again. `portsReallocated` is false on the
+   * projection path — only a real bind fills `env.ports` for a renamed port
+   * key, so before one runs the service is still listening where the tunnel
+   * points and a mismatch means nothing yet.
    */
   private async reconcilePreviewForBind(
     env: EnvRow,
     stack: Stack,
-    hygiene: Hygiene,
     active: Set<string>,
     say: Progress,
+    opts: { hygiene: Hygiene; portsReallocated: boolean },
   ): Promise<string | undefined> {
     const lease = this.journal.leaseForEnv(env.id);
     if (!lease?.previewPid || !lease.previewService) return undefined;
@@ -2455,7 +2480,7 @@ export class Engine {
       ? { klass: 'work-error', why: `backlot.yml now sets preview.forbidden, and a stack that forbids preview must not stay published` }
       : !active.has(service)
         ? { klass: 'env-error', why: `service '${service}' is not in this bind's running set${active.size ? ` (${[...active].map((n) => `'${n}'`).join(', ')})` : ' (this lease is data-only)'}, so its preview would publish a port with nothing behind it for the rest of the lease` }
-        : port !== lease.previewPort
+        : opts.portsReallocated && port !== lease.previewPort
           ? { klass: 'env-error', why: `service '${service}' moved from port ${lease.previewPort} to ${port ?? 'no port at all'}, so its preview tunnel is aimed at a stale port` }
           : null;
 
@@ -2468,9 +2493,9 @@ export class Engine {
       say(detail);
       return detail;
     }
-    if (hygiene !== 'reuse') {
+    if (opts.hygiene !== 'reuse') {
       const detail =
-        `the preview tunnel for '${service}' is still published at ${url} — this ${hygiene} bind replaced the data behind it,` +
+        `the preview tunnel for '${service}' is still published at ${url} — this ${opts.hygiene} bind replaced the data behind it,` +
         ` so that PUBLIC, unauthenticated URL now serves different content. Run 'backlot preview stop' if that must not be visible.`;
       logEvent({ level: 'warn', kind: 'preview', envId: env.id, detail });
       say(detail);

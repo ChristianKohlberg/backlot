@@ -369,7 +369,27 @@ describe('preview tunnels', () => {
     const synced = await cli(['sync', '--json']);
     expect(synced.code).toBe(0);
     expect(synced.json?.previewUrls).toEqual({});
+    expect(String(synced.json?.previewNotice)).toMatch(/work-error: backlot.yml now sets preview.forbidden/);
     expect(await goneWithin(pid, 10_000)).toBe(true);
+  });
+
+  // A projection restarts nothing and allocates nothing: the renamed port key
+  // only takes effect at the next full bind, so until then the service is still
+  // listening exactly where the tunnel points.
+  it('keeps the tunnel on a projecting sync that only renames the port key', async () => {
+    const { cli, wt, stateDir } = ctx({}, '', true);
+    await cli(['up', '--json']);
+    await cli(['preview', 'web', '--json']);
+    const pid = tunnelPid(stateDir);
+    writeFileSync(
+      join(wt, 'stack.yaml'),
+      readFileSync(join(wt, 'stack.yaml'), 'utf8').replace('port: web, env: { PORT: "{{ports.web}}" }', 'port: frontend, env: { PORT: "{{ports.frontend}}" }'),
+    );
+    const synced = await cli(['sync', '--json']);
+    expect(synced.code).toBe(0);
+    expect(synced.json?.previewUrls).toEqual({ web: FAKE_URL });
+    expect(synced.json?.previewNotice).toBeUndefined();
+    expect(alive(pid)).toBe(true);
   });
 
   // The tunnel's pid lives on the LEASE row, and teardown deletes that row
