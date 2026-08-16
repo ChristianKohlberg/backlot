@@ -241,10 +241,14 @@ export class Engine {
       this.journal.saveEnv(env);
       envs++;
     }
+    // Crash recovery reaps the tunnel like any other managed process. Clearing
+    // records for tunnels that were ALREADY dead is not that: the kill was left
+    // to poolGc, which no-ops off Linux, so a SIGKILLed daemon on macOS came
+    // back, stopped the services, and left the public URL serving a dead port
+    // until the lease finally lapsed. killGroupVerified is cross-platform and
+    // already reports a pid that is gone (or no longer ours) as reaped.
     for (const lease of this.journal.allLeases()) {
-      if (lease.previewPid && !sameProcess(lease.previewPid, lease.previewStart)) {
-        this.journal.clearLeasePreview(lease.id);
-      }
+      if (lease.previewPid) await this.stopPreviewForLease(lease);
     }
     const jobs = this.journal.failStaleJobs();
     logEvent({
@@ -398,7 +402,12 @@ export class Engine {
         // path preserves env.activeServices for this same holder.
         return { env, fresh: false };
       }
-      this.endLease(mine);
+      // Awaited: endLease became async when it grew a tunnel reap, and the
+      // floating promise let the claim below write a SECOND lease row for this
+      // same (holder, stack) while the kill was still running. leaseForHolder
+      // has no ORDER BY, so every reader in that window resolved to the dead
+      // row — including the run-lease cleanup, which then ended the wrong one.
+      await this.endLease(mine);
     }
     // The queue-bypass path may ONLY refresh an existing lease — claiming free
     // capacity here would jump the FIFO the waiters are queued on.
@@ -1912,18 +1921,29 @@ export class Engine {
       });
     }
     if (!stopped) {
-      logEvent({
-        level: 'warn',
-        kind: 'preview',
-        envId: lease.envId,
-        detail:
-          `preview tunnel pid ${lease.previewPid} outlived the stop — the PUBLIC url may still be live.` +
-          ` The record is kept so 'backlot pool gc' can still reclaim it.`,
-      });
+      logEvent({ level: 'error', kind: 'preview', envId: lease.envId, detail: this.unreapedPreview(lease) });
       return false;
     }
     this.journal.clearLeasePreview(lease.id);
     return true;
+  }
+
+  /**
+   * What an operator can actually do about a tunnel that outlived its kill.
+   *
+   * Pointing at `pool gc` was only ever true on Linux — it is a tag scan, and
+   * `procScanSupported()` is Linux-only — which is precisely the platform where
+   * the record is NOT recoverable. Name the pid and the public URL instead, so
+   * the remedy survives the lease row that is usually about to be deleted.
+   */
+  private unreapedPreview(lease: LeaseRow): string {
+    const where = procScanSupported()
+      ? `'backlot pool gc' can still reclaim it by tag`
+      : `there is no tag scan on this platform — kill pid ${lease.previewPid} by hand`;
+    return (
+      `the preview tunnel (pid ${lease.previewPid}) could not be confirmed dead —` +
+      ` ${lease.previewUrl ?? 'its public URL'} may still be serving, unauthenticated; ${where}`
+    );
   }
 
   /** Release a lease and reap its preview tunnel first. */
@@ -1967,7 +1987,12 @@ export class Engine {
     }
     const pub = resolvePreviewPublisher(this.previewPublisherName(stack));
     return this.envLocked(env.id, async () => {
-      await this.stopPreviewForLease(lease);
+      // Publishing over an unconfirmed pid would overwrite the only record of a
+      // tunnel that may still be serving — the exact loss stopPreviewForLease
+      // keeps the row to prevent.
+      if (!(await this.stopPreviewForLease(lease))) {
+        throw new BrokerError('infra-error', this.unreapedPreview(lease), 'preview');
+      }
       const dirs = this.envDirs(env.id);
       const { url, pid } = await pub.start({
         envId: env.id,
@@ -1977,7 +2002,14 @@ export class Engine {
       });
       const freshLease = this.journal.leaseForHolder(h, stack.id);
       if (!freshLease) {
-        await pub.stop(pid);
+        if (!(await pub.stop(pid))) {
+          logEvent({
+            level: 'error',
+            kind: 'preview',
+            envId: env.id,
+            detail: `the lease lapsed mid-publish and the new tunnel (pid ${pid.pid}) outlived its kill — ${url} may still be serving, unauthenticated`,
+          });
+        }
         throw new BrokerError('env-error', 'lease lapsed while starting preview — retry after binding again', 'lease');
       }
       freshLease.previewService = service;
@@ -2005,11 +2037,7 @@ export class Engine {
     if (!lease.previewPid) return { stopped: false };
     const service = lease.previewService;
     if (!(await this.stopPreviewForLease(lease))) {
-      throw new BrokerError(
-        'infra-error',
-        `the preview tunnel (pid ${lease.previewPid}) could not be confirmed dead — the public URL may still be live; 'backlot pool gc' reclaims it by tag`,
-        'preview',
-      );
+      throw new BrokerError('infra-error', this.unreapedPreview(lease), 'preview');
     }
     logEvent({ level: 'info', kind: 'preview', envId: lease.envId, detail: `stopped preview for '${service ?? 'unknown'}'` });
     return { stopped: true, service };
@@ -2196,22 +2224,29 @@ export class Engine {
         issue: `this build cannot read its own version (package.json missing or unreadable beside dist/) — skew with a CLI cannot be detected`,
       });
     }
-    const previewConfigured =
-      process.env.BACKLOT_PREVIEW_PUBLISHER?.trim() ||
-      this.journal.allEnvs().some((e) => {
-        try {
-          const m = loadStack(e.stackRoot).manifest.preview;
-          return m && !m.forbidden;
-        } catch {
-          return false;
-        }
-      });
-    if (previewConfigured) {
+    // Per configured publisher, never the default: `preview.publisher` is the
+    // seam future adapters plug into, and checking cloudflared on behalf of a
+    // stack that names another provider tells it to install a tool it does not
+    // use. An unknown name throws a work-error from resolve, which is itself
+    // worth reporting — but doctor must never fail on a typo'd manifest.
+    const override = process.env.BACKLOT_PREVIEW_PUBLISHER?.trim();
+    const previewPublishers = new Set<string>();
+    for (const e of this.journal.allEnvs()) {
       try {
-        resolvePreviewPublisher(DEFAULT_PREVIEW_PUBLISHER).checkPrerequisite();
+        const stack = loadStack(e.stackRoot);
+        const spec = stack.manifest.preview;
+        if (spec?.forbidden) continue;
+        if (spec || override) previewPublishers.add(this.previewPublisherName(stack));
+      } catch {
+        /* unreadable manifest — reported elsewhere */
+      }
+    }
+    if (override && previewPublishers.size === 0) previewPublishers.add(override);
+    for (const name of previewPublishers) {
+      try {
+        resolvePreviewPublisher(name).checkPrerequisite();
       } catch (err) {
-        const msg = (err as BrokerError).message ?? String(err);
-        issues.push({ level: 'error', issue: msg });
+        issues.push({ level: 'error', issue: (err as BrokerError).message ?? String(err) });
       }
     }
     for (const env of this.journal.allEnvs()) {
@@ -2298,7 +2333,17 @@ export class Engine {
     // (bind, quiesce, teardownClaimed, shutdown), and clearing here is also what
     // keeps ctx from advertising a tunnel the tag scan just shot.
     const lease = this.journal.leaseForEnv(env.id);
-    if (lease?.previewPid) await this.stopPreviewForLease(lease);
+    if (lease?.previewPid) {
+      const service = lease.previewService;
+      if (await this.stopPreviewForLease(lease)) {
+        logEvent({
+          level: 'info',
+          kind: 'preview',
+          envId: env.id,
+          detail: `the preview tunnel for '${service ?? 'unknown'}' went with the services it published — run 'backlot preview ${service ?? '<service>'}' again to republish`,
+        });
+      }
+    }
     const recorded = pids ?? env.servicePids;
     let survivors: Record<string, ServicePid> = {};
     if (Object.keys(recorded).length > 0) {
@@ -2590,6 +2635,24 @@ export class Engine {
           detail: `lease ${lease.id} points at environment ${lease.envId}, which no longer exists — pruned (torn journal write)`,
         });
         continue;
+      }
+      // A quick tunnel is best-effort: cloudflared drops it on network churn and
+      // exits on its own, and nothing else looks while the daemon is up — so ctx
+      // kept advertising a URL that had stopped answering an hour earlier, and
+      // `preview stop` reported success for a corpse. Same predicate recovery
+      // uses, on the live cadence.
+      if (lease.previewPid && !sameProcess(lease.previewPid, lease.previewStart)) {
+        this.journal.clearLeasePreview(lease.id);
+        lease.previewPid = undefined;
+        lease.previewStart = undefined;
+        lease.previewUrl = undefined;
+        lease.previewService = undefined;
+        logEvent({
+          level: 'warn',
+          kind: 'preview',
+          envId: lease.envId,
+          detail: `the preview tunnel for '${lease.previewService ?? 'unknown'}' exited on its own — its URL is no longer published`,
+        });
       }
       // Never expire a lease whose env has an operation in flight (a long bind
       // under a tiny TTL must not lose its env mid-bind).

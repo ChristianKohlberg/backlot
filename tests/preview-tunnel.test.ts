@@ -198,6 +198,51 @@ describe('preview tunnels', () => {
     expect(c.json?.previewUrls).toEqual({});
   });
 
+  // A quick tunnel is best-effort and exits on its own; nothing looked while
+  // the daemon was up, so ctx kept advertising a URL that had stopped answering.
+  it('drops the URL from ctx once the tunnel exits on its own', async () => {
+    const { cli, stateDir } = ctx();
+    await cli(['up', '--json']);
+    await cli(['preview', 'web', '--json']);
+    const pid = tunnelPid(stateDir);
+    const before = await cli(['ctx', '--json']);
+    expect(before.json?.previewUrls).toEqual({ web: FAKE_URL });
+    process.kill(pid, 'SIGKILL');
+    expect(await goneWithin(pid, 5000)).toBe(true);
+    let previewUrls: unknown = { web: FAKE_URL };
+    const deadline = Date.now() + 10_000;
+    while (Date.now() < deadline) {
+      previewUrls = (await cli(['ctx', '--json'])).json?.previewUrls;
+      if (JSON.stringify(previewUrls) === '{}') break;
+    }
+    expect(previewUrls).toEqual({});
+  });
+
+  // The publisher name is a seam: checking cloudflared on behalf of a stack
+  // that names another provider tells it to install a tool it does not use.
+  it('doctor reports the publisher the manifest actually names', async () => {
+    const { cli } = ctx({}, 'preview:\n  publisher: some-future-adapter\n');
+    await cli(['up', '--json']);
+    const doc = await cli(['doctor', '--json']);
+    const issues = (doc.json?.issues ?? []) as Array<{ level: string; issue: string }>;
+    expect(issues.some((i) => /unknown preview publisher 'some-future-adapter'/.test(i.issue))).toBe(true);
+    expect(issues.some((i) => /cloudflared/.test(i.issue))).toBe(false);
+  });
+
+  // Crash recovery must reap the tunnel like any other managed process — and
+  // 'like any other' means cross-platform, not via the Linux-only tag scan.
+  it('a daemon that was killed outright reaps the tunnel when it comes back', async () => {
+    const { cli, stateDir } = ctx();
+    await cli(['up', '--json']);
+    await cli(['preview', 'web', '--json']);
+    const pid = tunnelPid(stateDir);
+    expect(alive(pid)).toBe(true);
+    process.kill(Number(readFileSync(join(stateDir, 'daemon.pid'), 'utf8')), 'SIGKILL');
+    const status = await cli(['status', '--json']);
+    expect(status.code).toBe(0);
+    expect(await goneWithin(pid, 10_000)).toBe(true);
+  });
+
   // The tunnel's pid lives on the LEASE row, and teardown deletes that row
   // outright — so before the reap moved to reapEnvProcesses, a force-recycle
   // left the public URL serving with nothing left that could ever name it.
