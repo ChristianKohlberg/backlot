@@ -19,6 +19,7 @@ import { BrokerError, template, templateEnv, now, shortId, matchesAny, safeJoin 
 import { cmdTimeoutS, runBounded, runBoundedIO, LONG_CMD_TIMEOUT_S } from '../core/exec.js';
 import { makeDatastore, type DsHandle } from '../drivers/datastores.js';
 import { ensureAppliance, stopAppliance, probeTcp } from '../drivers/appliances.js';
+import { DEFAULT_PREVIEW_PUBLISHER, resolvePreviewPublisher } from '../drivers/preview.js';
 import { EnvSupervisor, killGroupVerified, reapPids } from './supervisor.js';
 import { isAlive, processGroup, procScanSupported, sameProcess, scanByCwd, scanTagged, serviceTag, startTime } from '../core/procscan.js';
 import { policy } from '../core/policy.js';
@@ -240,6 +241,11 @@ export class Engine {
       this.journal.saveEnv(env);
       envs++;
     }
+    for (const lease of this.journal.allLeases()) {
+      if (lease.previewPid && !sameProcess(lease.previewPid, lease.previewStart)) {
+        this.journal.clearLeasePreview(lease.id);
+      }
+    }
     const jobs = this.journal.failStaleJobs();
     logEvent({
       level: stranded ? 'warn' : 'info',
@@ -384,7 +390,7 @@ export class Engine {
         // path preserves env.activeServices for this same holder.
         return { env, fresh: false };
       }
-      this.journal.deleteLease(mine.id);
+      this.endLease(mine);
     }
     // The queue-bypass path may ONLY refresh an existing lease — claiming free
     // capacity here would jump the FIFO the waiters are queued on.
@@ -1364,7 +1370,7 @@ export class Engine {
       // A failed bind must not strand the lease for a run; sessions keep theirs to iterate.
       if (kind === 'run') {
         const lease = this.journal.leaseForHolder(holder, stack.id);
-        if (lease) this.journal.deleteLease(lease.id);
+        if (lease) await this.endLease(lease);
       }
       throw err;
     }
@@ -1413,12 +1419,15 @@ export class Engine {
       if (activeSet && !activeSet.has(name)) continue;
       urls[name] = s.url;
     }
+    const previewUrls: Record<string, string> = {};
+    if (lease?.previewService && lease.previewUrl) previewUrls[lease.previewService] = lease.previewUrl;
     return {
       stack: stack.manifest.name,
       envId: env.id,
       state: env.state,
       lease: lease ? { id: lease.id, kind: lease.kind, hygiene: lease.hygiene, expiresAt: lease.expiresAt } : null,
       urls,
+      previewUrls,
       /**
        * True when this lease is over the DATASTORES ONLY, so `urls` is empty by
        * design rather than because a service failed to come up — a distinction a
@@ -1533,7 +1542,7 @@ export class Engine {
     } finally {
       // Only our own ephemeral run lease — guaranteed kind 'run' — is deleted.
       const lease = this.journal.leaseForHolder(holder, stack.id);
-      if (lease && lease.kind === 'run') this.journal.deleteLease(lease.id); // env stays hot in the pool
+      if (lease && lease.kind === 'run') await this.endLease(lease); // env stays hot in the pool
     }
   }
 
@@ -1836,9 +1845,130 @@ export class Engine {
         otherHolders: others,
       };
     }
+    await this.endLease(lease);
+    return { released: true, envId: lease.envId };
+  }
+
+  private previewPublisherName(stack: Stack): string {
+    const fromManifest = stack.manifest.preview?.publisher?.trim();
+    if (fromManifest) return fromManifest;
+    const fromEnv = process.env.BACKLOT_PREVIEW_PUBLISHER?.trim();
+    if (fromEnv) return fromEnv;
+    return DEFAULT_PREVIEW_PUBLISHER;
+  }
+
+  private assertPreviewAllowed(stack: Stack): void {
+    if (stack.manifest.preview?.forbidden) {
+      throw new BrokerError(
+        'work-error',
+        `this stack forbids public preview in backlot.yml (preview.forbidden) — the manifest must not be published to the internet`,
+        'manifest',
+      );
+    }
+  }
+
+  /** Stop and clear any lease-scoped preview tunnel recorded on this lease. */
+  private async stopPreviewForLease(lease: LeaseRow): Promise<void> {
+    if (!lease.previewPid) return;
+    let pubName = DEFAULT_PREVIEW_PUBLISHER;
+    const env = this.journal.getEnv(lease.envId);
+    if (env) {
+      try {
+        pubName = this.previewPublisherName(loadStack(env.stackRoot));
+      } catch {
+        /* stack root unreadable — still reap the tunnel */
+      }
+    }
+    const pub = resolvePreviewPublisher(pubName);
+    try {
+      await pub.stop({ pid: lease.previewPid, startTime: lease.previewStart });
+    } catch {
+      /* best-effort — the process may already be gone */
+    }
+    this.journal.clearLeasePreview(lease.id);
+  }
+
+  /** Release a lease and reap its preview tunnel first. */
+  private async endLease(lease: LeaseRow): Promise<void> {
+    await this.stopPreviewForLease(lease);
     this.journal.deleteLease(lease.id);
     this.stopWatch(lease.envId);
-    return { released: true, envId: lease.envId };
+  }
+
+  async previewStart(cwd: string, service: string, holder?: string, ttlMs?: number): Promise<{ service: string; url: string }> {
+    const stack = loadStack(cwd);
+    this.assertPreviewAllowed(stack);
+    const h = holder ?? resolve(cwd);
+    const lease = this.journal.leaseForHolder(h, stack.id);
+    if (!lease) {
+      throw new BrokerError('env-error', `no active lease for this worktree — run 'backlot up' first`, 'lease');
+    }
+    if (ttlMs !== undefined && ttlMs > 0) {
+      lease.expiresAt = now() + ttlMs;
+      this.journal.saveLease(lease);
+    }
+    const env = this.envForLease(lease);
+    if (env.dataOnly) {
+      throw new BrokerError('work-error', `preview has nothing to publish on a data-only lease — no services are running`, 'preview');
+    }
+    if (!stack.manifest.services[service]) {
+      throw new BrokerError('work-error', `no service '${service}' in backlot.yml`, 'manifest');
+    }
+    const activeSet = env.activeServices ? new Set(env.activeServices) : null;
+    if (activeSet && !activeSet.has(service)) {
+      throw new BrokerError(
+        'work-error',
+        `service '${service}' is not part of this lease's slice — only ${[...activeSet].map((s) => `'${s}'`).join(', ')} are up`,
+        'preview',
+      );
+    }
+    const spec = stack.manifest.services[service];
+    if (!spec.port) {
+      throw new BrokerError('work-error', `service '${service}' has no port — preview publishes a network port`, 'preview');
+    }
+    this.assertUsable(env.id);
+    const localPort = env.ports[spec.port];
+    if (!localPort) {
+      throw new BrokerError('env-error', `service '${service}' has no allocated port on this environment`, 'preview');
+    }
+    const pub = resolvePreviewPublisher(this.previewPublisherName(stack));
+    return this.envLocked(env.id, async () => {
+      await this.stopPreviewForLease(lease);
+      const dirs = this.envDirs(env.id);
+      const { url, pid } = await pub.start({
+        envId: env.id,
+        service,
+        localUrl: `http://127.0.0.1:${localPort}`,
+        logDir: dirs.logs,
+      });
+      const freshLease = this.journal.leaseForHolder(h, stack.id);
+      if (!freshLease) {
+        await pub.stop(pid);
+        throw new BrokerError('env-error', 'lease lapsed while starting preview — retry after binding again', 'lease');
+      }
+      freshLease.previewService = service;
+      freshLease.previewUrl = url;
+      freshLease.previewPid = pid.pid;
+      freshLease.previewStart = pid.startTime;
+      this.journal.saveLease(freshLease);
+      this.touch(env.id);
+      logEvent({ level: 'info', kind: 'preview', envId: env.id, detail: `published '${service}' at ${url}` });
+      return { service, url };
+    });
+  }
+
+  async previewStop(cwd: string, holder?: string): Promise<{ stopped: boolean; service?: string }> {
+    const stack = loadStack(cwd);
+    const h = holder ?? resolve(cwd);
+    const lease = this.journal.leaseForHolder(h, stack.id);
+    if (!lease) {
+      throw new BrokerError('env-error', `no active lease for this worktree — nothing to stop`, 'lease');
+    }
+    if (!lease.previewPid) return { stopped: false };
+    const service = lease.previewService;
+    await this.stopPreviewForLease(lease);
+    logEvent({ level: 'info', kind: 'preview', envId: lease.envId, detail: `stopped preview for '${service ?? 'unknown'}'` });
+    return { stopped: true, service };
   }
 
   /** Live-probed appliance overview for the stack at cwd. */
@@ -2021,6 +2151,24 @@ export class Engine {
         level: 'warn',
         issue: `this build cannot read its own version (package.json missing or unreadable beside dist/) — skew with a CLI cannot be detected`,
       });
+    }
+    const previewConfigured =
+      process.env.BACKLOT_PREVIEW_PUBLISHER?.trim() ||
+      this.journal.allEnvs().some((e) => {
+        try {
+          const m = loadStack(e.stackRoot).manifest.preview;
+          return m && !m.forbidden;
+        } catch {
+          return false;
+        }
+      });
+    if (previewConfigured) {
+      try {
+        resolvePreviewPublisher(DEFAULT_PREVIEW_PUBLISHER).checkPrerequisite();
+      } catch (err) {
+        const msg = (err as BrokerError).message ?? String(err);
+        issues.push({ level: 'error', issue: msg });
+      }
     }
     for (const env of this.journal.allEnvs()) {
       if (env.state === 'recycling') issues.push({ level: 'warn', envId: env.id, issue: 'stuck in recycling (a daemon likely died mid-teardown; restart reconciles)' });
@@ -2380,8 +2528,7 @@ export class Engine {
       // holders yet squats in the journal until its TTL, and pardon() keeps
       // shifting that deadline. Disk is truth: prune the corpse, and say so.
       if (!this.journal.getEnv(lease.envId)) {
-        this.journal.deleteLease(lease.id);
-        this.stopWatch(lease.envId);
+        await this.endLease(lease);
         logEvent({
           level: 'warn',
           kind: 'lease',
@@ -2397,8 +2544,7 @@ export class Engine {
       // Waiting out the TTL meant a crashed agent's environment stayed leased —
       // and therefore un-poolable — for up to half an hour.
       if (lease.holderPid !== undefined && !sameProcess(lease.holderPid, lease.holderStart)) {
-        this.journal.deleteLease(lease.id);
-        this.stopWatch(lease.envId);
+        await this.endLease(lease);
         logEvent({
           level: 'info',
           kind: 'lease',
@@ -2408,8 +2554,7 @@ export class Engine {
         continue;
       }
       if (lease.expiresAt < now()) {
-        this.journal.deleteLease(lease.id);
-        this.stopWatch(lease.envId);
+        await this.endLease(lease);
       }
     }
     for (const env of this.journal.allEnvs()) {

@@ -86,6 +86,12 @@ export interface Context {
   envId: string;
   lease: Lease;
   urls: Record<string, string>;
+  /**
+   * Public preview URLs for services explicitly published via `backlot preview`.
+   * Each URL is world-readable and unauthenticated — anyone with the link reaches
+   * the service. Empty when no preview is active on this lease.
+   */
+  previewUrls?: Record<string, string>;
   /** True when the lease is over the datastores alone, so `urls` is empty by design. */
   dataOnly?: boolean;
   /**

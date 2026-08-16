@@ -35,6 +35,12 @@ Usage:
                           bare token, which is what an Authorization header wants
   backlot pull            copy declared outputs back into the worktree
   backlot release         release the current lease (environment stays warm)
+  backlot preview <service> [--ttl ...]
+                          publish a service from your lease on a public quick
+                          tunnel (Cloudflare by default). The URL is unauthenticated
+                          — anyone with the link reaches the service. Requires
+                          cloudflared on PATH (or BACKLOT_CLOUDFLARED).
+  backlot preview stop    stop the preview tunnel on your lease
   backlot status          daemon, pool, and lease overview
   backlot appliance ls|start|stop [name]
                           shared backing servers: probe, ensure up, explicit stop
@@ -199,7 +205,7 @@ async function main(): Promise<void> {
     return;
   }
 
-  const known = ['up', 'run', 'job', 'ctx', 'sync', 'bind', 'exec', 'logs', 'token', 'reset-data', 'pull', 'release', 'status', 'doctor', 'appliance', 'pool', 'daemon', 'update'];
+  const known = ['up', 'run', 'job', 'ctx', 'sync', 'bind', 'exec', 'logs', 'token', 'reset-data', 'pull', 'release', 'preview', 'status', 'doctor', 'appliance', 'pool', 'daemon', 'update'];
   if (!known.includes(verb)) {
     console.error(`backlot: unknown verb '${verb}'\n\n${USAGE}`);
     process.exit(64);
@@ -423,6 +429,31 @@ async function main(): Promise<void> {
     case 'release':
       res = await rpc('release', { cwd, holder });
       break;
+    case 'preview': {
+      const sub = positional[0];
+      if (sub === 'stop') {
+        res = await rpc('preview-stop', { cwd, holder });
+      } else if (!sub) {
+        console.error('backlot preview: which service? (usage: backlot preview <service> | backlot preview stop)');
+        process.exit(64);
+      } else {
+        const ttl = flagValue('--ttl');
+        let ttlMs: number | undefined;
+        if (ttl !== undefined) {
+          ttlMs = parseTtlMinutes(ttl);
+          if (ttlMs === undefined) {
+            console.error(`backlot: --ttl expects minutes (a positive number), got '${ttl}'`);
+            process.exit(64);
+          }
+        }
+        if (ttlMs !== undefined) {
+          res = await rpc('preview', { cwd, holder, service: sub, ttlMs });
+        } else {
+          res = await rpc('preview', { cwd, holder, service: sub });
+        }
+      }
+      break;
+    }
     case 'status':
       res = await rpc('status', {});
       break;

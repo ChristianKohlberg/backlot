@@ -108,6 +108,20 @@
         "$ref": "#/$defs/check"
       },
       "description": "Named runnable proofs (e2e, smoke). `backlot run <name>`."
+    },
+    "preview": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "forbidden": {
+          "type": "boolean",
+          "description": "When true, `backlot preview` is refused (work-error). Stacks with fixed dev credentials must set this."
+        },
+        "publisher": {
+          "type": "string",
+          "description": "Named preview publisher adapter (default: cloudflare-quick)."
+        }
+      }
     }
   },
   "$defs": {

@@ -102,6 +102,11 @@ export interface LeaseRow {
    */
   holderPid?: number;
   holderStart?: number;
+  /** Active lease-scoped public preview tunnel, when `backlot preview` is running. */
+  previewService?: string;
+  previewUrl?: string;
+  previewPid?: number;
+  previewStart?: number;
 }
 
 export class Journal {
@@ -157,6 +162,13 @@ export class Journal {
     `);
     // Migrations for journals created before holder identity existed.
     for (const col of ['holder_pid INTEGER', 'holder_start INTEGER']) {
+      try {
+        this.db.exec(`ALTER TABLE leases ADD COLUMN ${col}`);
+      } catch (err) {
+        if (!/duplicate column name/i.test(String((err as Error).message ?? err))) throw err;
+      }
+    }
+    for (const col of ['preview_service TEXT', 'preview_url TEXT', 'preview_pid INTEGER', 'preview_start INTEGER']) {
       try {
         this.db.exec(`ALTER TABLE leases ADD COLUMN ${col}`);
       } catch (err) {
@@ -320,12 +332,34 @@ export class Journal {
   saveLease(l: LeaseRow): void {
     this.db
       .prepare(
-        `INSERT INTO leases (id, env_id, kind, holder, hygiene, expires_at, holder_pid, holder_start)
-         VALUES (?,?,?,?,?,?,?,?)
+        `INSERT INTO leases (id, env_id, kind, holder, hygiene, expires_at, holder_pid, holder_start,
+           preview_service, preview_url, preview_pid, preview_start)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
          ON CONFLICT(id) DO UPDATE SET expires_at=excluded.expires_at, hygiene=excluded.hygiene,
-           holder_pid=excluded.holder_pid, holder_start=excluded.holder_start`,
+           holder_pid=excluded.holder_pid, holder_start=excluded.holder_start,
+           preview_service=excluded.preview_service, preview_url=excluded.preview_url,
+           preview_pid=excluded.preview_pid, preview_start=excluded.preview_start`,
       )
-      .run(l.id, l.envId, l.kind, l.holder, l.hygiene, l.expiresAt, l.holderPid ?? null, l.holderStart ?? null);
+      .run(
+        l.id,
+        l.envId,
+        l.kind,
+        l.holder,
+        l.hygiene,
+        l.expiresAt,
+        l.holderPid ?? null,
+        l.holderStart ?? null,
+        l.previewService ?? null,
+        l.previewUrl ?? null,
+        l.previewPid ?? null,
+        l.previewStart ?? null,
+      );
+  }
+
+  clearLeasePreview(id: string): void {
+    this.db
+      .prepare('UPDATE leases SET preview_service=NULL, preview_url=NULL, preview_pid=NULL, preview_start=NULL WHERE id=?')
+      .run(id);
   }
 
   private rowToLease(r: Record<string, unknown>): LeaseRow {
@@ -338,6 +372,10 @@ export class Journal {
       expiresAt: r.expires_at as number,
       holderPid: (r.holder_pid as number | null) ?? undefined,
       holderStart: (r.holder_start as number | null) ?? undefined,
+      previewService: (r.preview_service as string | null) ?? undefined,
+      previewUrl: (r.preview_url as string | null) ?? undefined,
+      previewPid: (r.preview_pid as number | null) ?? undefined,
+      previewStart: (r.preview_start as number | null) ?? undefined,
     };
   }
 

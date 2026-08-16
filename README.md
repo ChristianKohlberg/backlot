@@ -46,6 +46,8 @@ backlot run smoke --json   # bind -> run the check -> JSON verdict -> release
 backlot ctx --json         # re-read that same blob later, read-only — no re-bind (up already returned it)
 backlot sync               # edit locally, project it in — seconds; hot_reload services keep running
 backlot exec <cmd>         # run an arbitrary command in the env your lease holds (raw exit, not a verdict)
+backlot preview <service>  # publish one service on a public quick tunnel (requires cloudflared)
+backlot preview stop       # stop the preview tunnel on your lease
 backlot release            # environment returns to the pool, warm
 ```
 
@@ -277,6 +279,10 @@ Be clear-eyed about what running backlot means:
   is namespacing (ports, directories, database namespaces), not a security
   boundary — code in an environment runs as you, on your machine. For untrusted
   code, put the *substrate* in a sandbox (a VM, a cloud box), not your laptop.
+- **Public preview URLs are world-readable.** `backlot preview` publishes the
+  chosen service through a quick tunnel (Cloudflare by default). The URL is
+  **unauthenticated** — anyone with the link reaches the service. Stacks that
+  must never be published set `preview.forbidden: true` in `backlot.yml`.
 
 ## Claude Code
 
