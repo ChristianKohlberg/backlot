@@ -392,6 +392,22 @@ describe('preview tunnels', () => {
     expect(alive(pid)).toBe(true);
   });
 
+  // Tearing the live tunnel down and only then discovering the publisher cannot
+  // run leaves the caller with no preview and an error reading as a no-op.
+  it('does not kill the live tunnel when the new publish cannot even start', async () => {
+    const { cli, stateDir } = ctx();
+    await cli(['up', '--json']);
+    await cli(['preview', 'web', '--json']);
+    const pid = tunnelPid(stateDir);
+    rmSync(join(stateDir, 'fake-cloudflared'));
+    const second = await cli(['preview', 'api', '--json']);
+    expect(second.code).toBe(2);
+    expect(String(second.stderr + second.stdout)).toMatch(/preview requires cloudflared/);
+    expect(alive(pid)).toBe(true);
+    const c = await cli(['ctx', '--json']);
+    expect(c.json?.previewUrls).toEqual({ web: FAKE_URL });
+  });
+
   // The tunnel's pid lives on the LEASE row, and teardown deletes that row
   // outright — so before the reap moved to reapEnvProcesses, a force-recycle
   // left the public URL serving with nothing left that could ever name it.

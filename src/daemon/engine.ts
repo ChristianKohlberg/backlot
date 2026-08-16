@@ -1327,9 +1327,13 @@ export class Engine {
       // lease a concurrent `release` deleted while we were projecting, leaving
       // the environment leased for a full TTL after `released: true`.
       const held = this.journal.leaseForEnv(env.id);
-      if (held && held.id === lease.id) {
-        this.journal.saveLease({ ...held, expiresAt: now() + LEASE_TTL(held.kind) });
-      }
+      // Gone or re-claimed: there is no lease left to refresh, and reporting
+      // 'projected' would hand the caller a context with `lease: null` and exit
+      // 0 — their next exec/token then fails with "no active lease". Fall back
+      // like every other case projection cannot honestly serve; `up` re-earns a
+      // lease through the ordinary acquire path.
+      if (!held || held.id !== lease.id) return { outcome: 'fallback' };
+      this.journal.saveLease({ ...held, expiresAt: now() + LEASE_TTL(held.kind) });
       if (sync.copied > 0 || sync.deleted > 0) {
         logEvent({
           level: 'info', kind: 'watch', envId: env.id,
@@ -2016,19 +2020,20 @@ export class Engine {
     this.stopWatch(lease.envId);
   }
 
-  async previewStart(cwd: string, service: string, holder?: string, ttlMs?: number): Promise<{ service: string; url: string }> {
-    const stack = loadStack(cwd);
-    this.assertPreviewAllowed(stack);
-    const h = holder ?? resolve(cwd);
-    const lease = this.journal.leaseForHolder(h, stack.id);
-    if (!lease) {
-      throw new BrokerError('env-error', `no active lease for this worktree — run 'backlot up' first`, 'lease');
-    }
-    const env = this.envForLease(lease);
+  /**
+   * Everything about an environment that decides whether publishing `service`
+   * is legal, and the local port to publish. Returns that port.
+   *
+   * One function because it has to run TWICE — once before queueing for the env
+   * lock, and again inside it against a re-read row. Every field it reads is one
+   * a concurrent bind rewrites.
+   */
+  private previewTarget(env: EnvRow, stack: Stack, service: string): number {
     if (env.dataOnly) {
       throw new BrokerError('work-error', `preview has nothing to publish on a data-only lease — no services are running`, 'preview');
     }
-    if (!stack.manifest.services[service]) {
+    const spec = stack.manifest.services[service];
+    if (!spec) {
       throw new BrokerError('work-error', `no service '${service}' in backlot.yml`, 'manifest');
     }
     const activeSet = env.activeServices ? new Set(env.activeServices) : null;
@@ -2039,15 +2044,28 @@ export class Engine {
         'preview',
       );
     }
-    const spec = stack.manifest.services[service];
     if (!spec.port) {
       throw new BrokerError('work-error', `service '${service}' has no port — preview publishes a network port`, 'preview');
     }
-    this.assertUsable(env.id);
-    const localPort = env.ports[spec.port];
-    if (!localPort) {
+    const port = env.ports[spec.port];
+    if (!port) {
       throw new BrokerError('env-error', `service '${service}' has no allocated port on this environment`, 'preview');
     }
+    return port;
+  }
+
+  async previewStart(cwd: string, service: string, holder?: string, ttlMs?: number): Promise<{ service: string; url: string }> {
+    const stack = loadStack(cwd);
+    this.assertPreviewAllowed(stack);
+    const h = holder ?? resolve(cwd);
+    const lease = this.journal.leaseForHolder(h, stack.id);
+    if (!lease) {
+      throw new BrokerError('env-error', `no active lease for this worktree — run 'backlot up' first`, 'lease');
+    }
+    // Fast fail before queueing behind a bind that may hold the lock for
+    // minutes; re-run authoritatively INSIDE the lock below.
+    this.previewTarget(this.envForLease(lease), stack, service);
+    const env = this.assertUsable(this.envForLease(lease).id);
     const pub = resolvePreviewPublisher(this.previewPublisherName(stack));
     return this.envLocked(env.id, async () => {
       // Re-read INSIDE the lock. `lease` was resolved before queueing, so a
@@ -2058,6 +2076,19 @@ export class Engine {
       if (!held || held.id !== lease.id) {
         throw new BrokerError('env-error', `the lease was replaced while this preview was queued — retry`, 'lease');
       }
+      // …and the ENVIRONMENT with it. Everything that decides whether publishing
+      // is legal — the lease's shape, its slice, its port ledger — is a field on
+      // a row an `up api` or `up --data-only` queued ahead of us has already
+      // rewritten. Judging that from the pre-lock snapshot published a PUBLIC,
+      // unauthenticated URL for a port nothing was listening on any more, and
+      // nothing re-examines a lease-scoped tunnel until the next bind.
+      const live = this.assertUsable(env.id);
+      const localPort = this.previewTarget(live, stack, service);
+      // Before the destructive step, not after it: `checkPrerequisite` used to
+      // run inside `pub.start`, so a cloudflared that went missing since the
+      // last publish killed the working tunnel and then failed, leaving the
+      // caller with no preview and an error that reads as if nothing happened.
+      pub.checkPrerequisite();
       // Publishing over an unconfirmed pid would overwrite the only record of a
       // tunnel that may still be serving — the exact loss stopPreviewForLease
       // keeps the row to prevent.
