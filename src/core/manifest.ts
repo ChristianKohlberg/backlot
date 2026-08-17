@@ -96,9 +96,20 @@ export function normalizeLogins(spec: LoginsSpec | undefined): Login[] {
   return Array.isArray(spec) ? spec : [spec];
 }
 
+export interface PreviewSpec {
+  /**
+   * When true, `backlot preview` is refused (work-error). Stacks with fixed dev
+   * credentials or a known signing key must set this.
+   */
+  forbidden?: boolean;
+  /** Named preview publisher adapter (default: cloudflare-quick). */
+  publisher?: string;
+}
+
 export interface Manifest {
   name: string;
   services: Record<string, ServiceSpec>;
+  preview?: PreviewSpec;
   appliances?: Record<string, ApplianceSpec>;
   datastores?: Record<string, DatastoreSpec>;
   caches?: string[];

@@ -86,6 +86,21 @@ export interface Context {
   envId: string;
   lease: Lease;
   urls: Record<string, string>;
+  /**
+   * Public preview URLs for services explicitly published via `backlot preview`.
+   * Each URL is world-readable and unauthenticated — anyone with the link reaches
+   * the service. Empty when no preview is active on this lease.
+   */
+  previewUrls?: Record<string, string>;
+  /**
+   * What a bind did to a live preview, returned on that bind's OWN response
+   * (`up`, `sync`, `reset-data`) — never on a plain `ctx` read, which cannot
+   * know which bind a notice belongs to. Set when the bind tore the tunnel down
+   * (the manifest now forbids preview, the previewed service left the running
+   * set, or its local port moved) or when `--reset-data`/`--pristine` left the
+   * same public URL serving new content.
+   */
+  previewNotice?: string;
   /** True when the lease is over the datastores alone, so `urls` is empty by design. */
   dataOnly?: boolean;
   /**

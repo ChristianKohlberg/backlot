@@ -8,7 +8,7 @@ bundles:
 - **The `backlot` skill** — a stack-agnostic guide to the lease model (warm pool,
   bind-by-sync, session vs run leases) and the verb table (`up` incl. the
   partial/per-service form, `run`, `ctx`, `release`, `sync`, `exec`, `logs`,
-  `reset-data`, `token`, `status`), so the agent leases a running, seeded,
+  `reset-data`, `token`, `preview`, `status`), so the agent leases a running, seeded,
   authenticated env correctly instead of hand-rolling dev servers.
 
 backlot is a **CLI-only** tool, so this plugin ships **only the skill — there is

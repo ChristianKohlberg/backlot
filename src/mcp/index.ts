@@ -110,6 +110,22 @@ const TOOLS: Tool[] = [
     verb: 'release',
   },
   {
+    name: 'backlot_preview',
+    description: 'Publish a leased service on a public quick tunnel (unauthenticated URL). Requires cloudflared unless BACKLOT_CLOUDFLARED is set.',
+    inputSchema: {
+      type: 'object',
+      properties: { ...cwdProp, service: { type: 'string', description: 'Service name from backlot.yml.' } },
+      required: ['cwd', 'service'],
+    },
+    verb: 'preview',
+  },
+  {
+    name: 'backlot_preview_stop',
+    description: 'Stop the preview tunnel on the current lease.',
+    inputSchema: { type: 'object', properties: { ...cwdProp }, required: ['cwd'] },
+    verb: 'preview-stop',
+  },
+  {
     name: 'backlot_status',
     description: 'Pool overview: environments, states, leases, recent daemon events.',
     inputSchema: { type: 'object', properties: {} },

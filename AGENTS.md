@@ -26,6 +26,44 @@ Consequence: a group kill (`killGroupVerified`) is not sufficient teardown — a
 
 Recorded `servicePids` hold only the **top-level service pids** — a service's own children were never on the books, so the tag scan is the only thing that finds them. For anything that also scrubbed the tag, `reapEnvTree` reaps by cwd (`scanByCwd`, which matches a `(deleted)` cwd too). That path is **teardown-only**: a quiesced env keeps its tree on disk and someone's shell may legitimately be sitting in it.
 
+## The preview tunnel is scoped to the lease, not to the services it publishes
+
+`backlot preview` journals its tunnel on the **lease row** (`preview_*`), not in
+`env.servicePids` — so none of the service-reap machinery above owns it, and the
+lifetime rule is deliberately different ([decision 0027](docs/decisions/0027-lease-scoped-public-preview.md)).
+A rebind, a `sync` or an idle quiesce restarts or stops services while the lease
+continues, and the tunnel **survives all of them**; ports are stable for an
+environment's lifetime, so it is aimed at the same place when the services return.
+It is reaped only when the lease ends (`release`, TTL lapse, dead holder, the
+sweeper's torn-row prune), at `teardownClaimed` (before `deleteEnv` drops the row
+that names it), at `shutdown()`, and in `recover()`.
+
+The sharp edge: because the tunnel outlives service restarts, the tag-based
+reclaim paths must **skip it** — `reapEnvProcesses`' scan filters out the pid the
+env's live lease records, and `poolGc` skips every leased preview pid. Do NOT
+"simplify" those filters away: without them Linux shoots the tunnel at a boundary
+where macOS keeps it, and that platform split is the whole bug class this feature
+had to close, and all three of them (`pool gc`, the scan, doctor's orphan report)
+must agree on `leasedPreviewPids()` or one will act on what another calls healthy.
+
+`reconcilePreviewForBind` owns what a bind **and a `sync`/`--watch` projection**
+do to a live tunnel: it tears it
+down when `preview.forbidden` appears, when the previewed service leaves the
+running set (a narrowed slice or `--data-only` — nothing brings it back this
+lease), or when its local port moves (a bind only — a projection allocates
+nothing, and it judges the slice by the env's durable shape, not by live pids);
+the slice and port causes are reconciled at the bind's **epilogue**, once the
+shape they judge against is committed, while `forbidden` is enforced up front so
+a failed bind cannot leave a stack published; `--reset-data`/`--pristine` keeps it and
+warns that the *same* public URL now serves *new* data. It **never throws** — the
+bind is legitimate — and the message rides back on the bind's own result as
+`previewNotice`, not through shared state a later `ctx` read could drain first.
+Both preview verbs re-read the lease *inside* `envLocked`, `clearLeasePreview` is
+a compare-and-swap on the pid, and `endLease` re-reads between the stop and the
+delete (it cannot take the env lock — `tryClaim` calls it under the pool lock),
+so no stale snapshot can forget a tunnel someone else just published. `tests/preview-tunnel.test.ts`
+covers all of it.
+
 ## Leases: `--ttl` is the agent form, `--holder-pid` is not
 
 `--holder-pid` / `BACKLOT_HOLDER_PID` frees the environment the moment the named process exits, which only helps a caller that outlives the command. `BACKLOT_HOLDER_PID=$$` from an agent harness names an already-exited shell, so the lease is reclaimable on arrival: the sweeper's dead-holder rule frees the env, the next binder takes it, and the first caller is left looking at a different, unseeded store through the same URL. It presents as a stale seed template — the wrong subsystem entirely. Binds naming a dead pid are now refused (exit 64). See the lease bullet in `docs/architecture.md`.
