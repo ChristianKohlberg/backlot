@@ -157,6 +157,19 @@ hand — `npm publish`, the annotated `vX.Y.Z` tag on the merge commit (`v0.9.1`
 what shipped since the last tag; follow semver off what actually changed
 (additive/back-compat = minor, fix-only = patch) rather than defaulting to patch.
 
+`dist/` is gitignored but **is** the published artifact (`files`, and both `bin`
+entries point into it), so the tarball only ever contains whatever the owner's
+working tree happened to hold. 0.11.0 shipped that way: published without a build,
+so the whole preview-tunnel feature it was cut for (`dist/drivers/preview.js`, plus
+the `engine`/`journal`/`cli`/`mcp` changes) was simply absent from npm, and 0.11.1
+exists only to republish it. Nothing catches this after the fact —
+`src/core/version.ts` reads `package.json`, so the stale install still *reports* the
+new version and the skew gate sees a matched pair while `backlot preview` does not
+exist. Hence `prepublishOnly` now builds; do not remove it, and do not read a green
+`npm test` as a good tarball (`pretest` builds into the same `dist/`, which is why
+local runs stayed green throughout). The tags are also behind — v0.10.0 and v0.11.0
+were never pushed.
+
 ## Claude Code plugin
 
 The repo doubles as its own Claude Code plugin marketplace (docs/config only — it

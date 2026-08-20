@@ -1,6 +1,6 @@
 {
   "name": "backlot",
-  "version": "0.11.0",
+  "version": "0.11.1",
   "description": "The repo-aware environment broker: puts a working, seeded, provable instance of your web application in front of coding agents and humans — warm pools, leases, bind-by-sync. Brokers environments; never provides them.",
   "keywords": [
     "environment",
@@ -35,7 +35,8 @@
     "test": "vitest run",
     "coverage": "npm run build && rm -rf coverage && NODE_V8_COVERAGE=\"$PWD/coverage/tmp\" vitest run; c8 report --temp-directory coverage/tmp --report-dir coverage --reporter text --reporter lcov --exclude-after-remap --include 'src/**'",
     "lint": "eslint src",
-    "pretest": "npm run build"
+    "pretest": "npm run build",
+    "prepublishOnly": "npm run build"
   },
   "devDependencies": {
     "@types/node": "^22.10.0",
