@@ -2106,6 +2106,7 @@ export class Engine {
         service,
         localUrl: `http://127.0.0.1:${localPort}`,
         logDir: dirs.logs,
+        settings: stack.manifest.preview,
       });
       // Identity, not mere existence: `pub.start` can take up to 45s holding only
       // this env's lock, and a concurrent release + `up` in that window hands the

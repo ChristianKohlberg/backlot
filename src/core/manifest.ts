@@ -104,6 +104,24 @@ export interface PreviewSpec {
   forbidden?: boolean;
   /** Named preview publisher adapter (default: cloudflare-quick). */
   publisher?: string;
+  /**
+   * Zone a naming publisher publishes under, e.g. `example.dev`. Required by
+   * `cloudflare-named`; meaningless to `cloudflare-quick`, which is handed its
+   * hostname by Cloudflare.
+   */
+  domain?: string;
+  /**
+   * What makes a hostname this environment's own.
+   *
+   * A naming publisher derives `<service>-<prefix>.<domain>`, so two
+   * environments sharing a prefix want the same name — and the second one takes
+   * it from the first. The manifest is the wrong place to make that unique: a
+   * pooled stack has several environments and one manifest. Left unset, the
+   * environment id supplies the prefix, which is unique by construction. Set it
+   * only to pin a name a human has to remember, and only where one environment
+   * of this stack runs at a time.
+   */
+  prefix?: string;
 }
 
 export interface Manifest {

@@ -120,6 +120,14 @@
         "publisher": {
           "type": "string",
           "description": "Named preview publisher adapter (default: cloudflare-quick)."
+        },
+        "domain": {
+          "type": "string",
+          "description": "Zone a naming publisher publishes under, e.g. example.dev. Required by cloudflare-named; ignored by cloudflare-quick."
+        },
+        "prefix": {
+          "type": "string",
+          "description": "What makes a hostname this environment's own (<service>-<prefix>.<domain>). Unset means the environment id, which is unique by construction; set it only to pin a memorable name, and only where one environment of this stack runs at a time."
         }
       }
     }
@@ -145,7 +153,7 @@
         },
         "description": {
           "type": "string",
-          "description": "What this login is FOR — the scope or permissions it exercises, so a consumer can pick the right one without reading the seed."
+          "description": "What this login is FOR \u2014 the scope or permissions it exercises, so a consumer can pick the right one without reading the seed."
         }
       }
     },
