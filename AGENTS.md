@@ -26,6 +26,30 @@ Consequence: a group kill (`killGroupVerified`) is not sufficient teardown — a
 
 Recorded `servicePids` hold only the **top-level service pids** — a service's own children were never on the books, so the tag scan is the only thing that finds them. For anything that also scrubbed the tag, `reapEnvTree` reaps by cwd (`scanByCwd`, which matches a `(deleted)` cwd too). That path is **teardown-only**: a quiesced env keeps its tree on disk and someone's shell may legitimately be sitting in it.
 
+## Publishers own their dialect — the engine must not learn one
+
+`preview.publisher` selects an adapter; `src/drivers/preview.ts` holds the
+registry. `start()` receives the manifest's `preview` block verbatim as
+`settings`, and the **publisher** turns that into an address. Do not move
+hostname derivation into the engine to save an argument: `cloudflare-quick`
+cannot accept a hostname at all, and the next adapter will want a port or a
+socket. That is what makes it a seam rather than one publisher with extra steps
+([decision 0028](docs/decisions/0028-named-preview-hostnames.md)).
+
+`cloudflare-named` creates a tunnel and a DNS record per `<prefix, service>` and
+**reuses** them across leases — `stop()` kills only the process. That is
+deliberate: the surviving name is the entire reason to use it, and a per-lease
+tunnel would churn objects in the operator's account and add a second lifecycle
+to reap. Its prerequisite is heavier than the quick publisher's (an origin
+certificate from `cloudflared tunnel login`, not just the binary), and
+`checkPrerequisite` names that command because "unauthorized" from a tunnel
+create is not something an operator can act on.
+
+A wildcard record was considered and **rejected**: it binds the whole zone to
+one tunnel, which forces one shared cloudflared process for every previewed
+service — and a shared process cannot honour 0027's `stop()` contract, because
+the pid another publication still references may not be killed.
+
 ## The preview tunnel is scoped to the lease, not to the services it publishes
 
 `backlot preview` journals its tunnel on the **lease row** (`preview_*`), not in

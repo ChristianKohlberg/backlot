@@ -46,7 +46,7 @@ backlot run smoke --json   # bind -> run the check -> JSON verdict -> release
 backlot ctx --json         # re-read that same blob later, read-only — no re-bind (up already returned it)
 backlot sync               # edit locally, project it in — seconds; hot_reload services keep running
 backlot exec <cmd>         # run an arbitrary command in the env your lease holds (raw exit, not a verdict)
-backlot preview <service>  # publish one service on a public quick tunnel (requires cloudflared)
+backlot preview <service>  # publish one service on a public tunnel (requires cloudflared)
 backlot preview stop       # stop the preview tunnel on your lease
 backlot release            # environment returns to the pool, warm
 ```
@@ -247,6 +247,41 @@ rejected — omitting the key remains how a stack says it has no logins
 Backlot does not create these logins, verify them, or know what a role means: the seed
 makes them, the manifest declares what exists, `ctx` reports it.
 
+### A preview URL that is still valid tomorrow
+
+`backlot preview` publishes through a **publisher**. The default,
+`cloudflare-quick`, takes whatever `*.trycloudflare.com` name Cloudflare hands
+it — right for "look at this for ten minutes", wrong for a bookmark, a ticket, a
+device you type an address into by hand, or an app pinned to a dev server. Every
+restart invalidates all of them.
+
+`cloudflare-named` publishes under a zone you own instead:
+
+```yaml
+preview:
+  publisher: cloudflare-named
+  domain: example.dev     # the zone; required by this publisher
+  prefix: myapp           # optional — see below
+```
+
+`web` then appears at `https://web-myapp.example.dev`, and it is the same
+address next week. Backlot creates the named tunnel and its DNS record on first
+use and reuses them; `preview stop` ends the process, not the name.
+
+**It needs a login, once:** `cloudflared tunnel login` for the zone, which leaves
+the origin certificate the publisher checks for. No API token, and backlot holds
+no new secret.
+
+**Leave `prefix` unset unless you mean it.** It defaults to the environment id,
+which is unique by construction. A pooled stack has several environments and one
+manifest, so a prefix written there is shared — and the second publish of `web`
+takes the hostname from the first. Set it only to pin a name a human has to
+remember, and only where one environment of the stack runs at a time.
+
+**A named URL is durable, and so is the exposure.** Put a Cloudflare Access
+policy over the zone; it matches on hostname, so one policy covers every preview
+you will ever publish there ([decision 0028](docs/decisions/0028-named-preview-hostnames.md)).
+
 ## What it is / is not
 
 | backlot is | backlot is not |
@@ -281,8 +316,11 @@ Be clear-eyed about what running backlot means:
   code, put the *substrate* in a sandbox (a VM, a cloud box), not your laptop.
 - **Public preview URLs are world-readable.** `backlot preview` publishes the
   chosen service through a quick tunnel (Cloudflare by default). The URL is
-  **unauthenticated** — anyone with the link reaches the service. Stacks that
-  must never be published set `preview.forbidden: true` in `backlot.yml`. The
+  **unauthenticated** — anyone with the link reaches the service, and under
+  `cloudflare-named` (below) that link still works tomorrow, so put an access
+  policy in front of the zone if what you publish is not meant for everyone.
+  Stacks that must never be published set `preview.forbidden: true` in
+  `backlot.yml`. The
   tunnel lives as long as your **lease**, not as long as a service process: a
   `sync`, a rebind or an idle quiesce leaves it up. A bind tears it down if the
   manifest starts forbidding preview, if the previewed service drops out of the

@@ -32,3 +32,4 @@ supersedes it and update this index — never edit a decision in place.
 | [0025](0025-data-only-environments-are-priced-separately.md) | A data-only environment answers to its own ceiling, and changing an environment's shape is a metered capacity event |
 | [0026](0026-a-stack-may-advertise-several-logins.md) | A stack may advertise several logins — `ctx.logins` stays the primary, `allLogins` carries the set |
 | [0027](0027-lease-scoped-public-preview.md) | Lease-scoped public preview is explicit, supervised, and separate from `expose` |
+| [0028](0028-named-preview-hostnames.md) | A preview may publish under a hostname we own, and the publisher is where that lives |
