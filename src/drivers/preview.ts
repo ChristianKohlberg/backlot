@@ -5,7 +5,7 @@
  * URLs for remote substrates. Preview is an explicit, opt-in verb that publishes
  * one service port to the internet for human inspection.
  */
-import { spawn, type ChildProcess } from 'node:child_process';
+import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
 import { appendFileSync, mkdirSync, existsSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
@@ -211,6 +211,49 @@ function originCert(): string {
   return override || join(homedir(), '.cloudflared', 'cert.pem');
 }
 
+/** Every dotted name in a line of cloudflared output, normalised for comparison. */
+function hostnamesIn(text: string): string[] {
+  return (text.match(/[a-z0-9][a-z0-9-]*(?:\.[a-z0-9][a-z0-9-]*)+\.?/gi) ?? []).map((h) =>
+    h.toLowerCase().replace(/\.$/, ''),
+  );
+}
+
+/**
+ * `route dns` reports success for a hostname that is NOT the one we asked for.
+ *
+ * An origin certificate authorises exactly one zone. Ask cloudflared to route a
+ * name outside it and it does not refuse — it treats the name as a label
+ * *inside* the certificate's zone, creates
+ * `backoffice-bcd.baustelle.dev.some-other.com`, prints `Added CNAME …` and
+ * exits 0. Backlot then hands back `https://backoffice-bcd.baustelle.dev`: an
+ * address that resolves nowhere, reported as a working preview.
+ *
+ * That happened on the first real setup, and it was caught by someone happening
+ * to run `dig` — which is not a control. The output names the record it really
+ * made, so compare it and refuse.
+ *
+ * Silence is not consent: cloudflared has printed several shapes of this line
+ * over the years ("Added CNAME x", "x is already configured to route to your
+ * tunnel"). If NO hostname can be found in the output at all, this passes rather
+ * than fails — refusing on an unrecognised-but-successful message would break
+ * publishing for a cloudflared whose wording we have not seen. The failure this
+ * guards is the one where a DIFFERENT name is stated plainly.
+ */
+function assertRouted(output: string, wanted: string): void {
+  const seen = hostnamesIn(output);
+  if (seen.length === 0 || seen.includes(wanted)) return;
+  const swallowed = seen.find((h) => h.startsWith(`${wanted}.`));
+  const zone = swallowed?.slice(wanted.length + 1);
+  throw new BrokerError(
+    'env-error',
+    zone
+      ? `cloudflared routed '${swallowed}' instead of '${wanted}' — the origin certificate authorises '${zone}', not the zone you asked for. Move ~/.cloudflared/cert.pem aside and run 'cloudflared tunnel login' for that zone.`
+      : `cloudflared reported routing '${seen.join(', ')}' when '${wanted}' was requested`,
+    'preview',
+    output.slice(-2000),
+  );
+}
+
 /**
  * One DNS label, from something a human wrote in a manifest.
  *
@@ -227,13 +270,25 @@ function label(raw: string): string {
   return cleaned.slice(0, 63).replace(/-+$/g, '');
 }
 
-function cf(bin: string, args: string[], what: string): string {
-  try {
-    return execFileSync(bin, args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
-  } catch (err) {
-    const detail = err && typeof err === 'object' && 'stderr' in err ? String((err as { stderr?: unknown }).stderr ?? '') : '';
-    throw new BrokerError('env-error', `${what} failed`, 'preview', detail.slice(-2000));
+/**
+ * Run cloudflared and keep BOTH streams.
+ *
+ * `execFileSync` hands back stdout alone, and cloudflared says the thing that
+ * matters — which record it actually created — on **stderr**. A caller that
+ * only sees stdout gets an empty string and concludes nothing is wrong, which
+ * is precisely the failure `assertRouted` exists to catch. Machine-readable
+ * output (`--output json`) stays on stdout, so the two are kept apart rather
+ * than concatenated.
+ */
+function cf(bin: string, args: string[], what: string): { out: string; err: string } {
+  const res = spawnSync(bin, args, { encoding: 'utf8' });
+  if (res.error) {
+    throw new BrokerError('env-error', `${what} failed: ${res.error.message}`, 'preview');
   }
+  if (res.status !== 0) {
+    throw new BrokerError('env-error', `${what} failed`, 'preview', String(res.stderr ?? '').slice(-2000));
+  }
+  return { out: String(res.stdout ?? ''), err: String(res.stderr ?? '') };
 }
 
 /**
@@ -247,7 +302,7 @@ function cf(bin: string, args: string[], what: string): string {
  */
 function ensureTunnel(bin: string, name: string): string {
   const find = (): string | undefined => {
-    const raw = cf(bin, ['tunnel', 'list', '--output', 'json'], 'listing Cloudflare tunnels');
+    const raw = cf(bin, ['tunnel', 'list', '--output', 'json'], 'listing Cloudflare tunnels').out;
     const rows: unknown = JSON.parse(raw || '[]');
     if (!Array.isArray(rows)) return undefined;
     const hit = rows.find((r) => r && typeof r === 'object' && (r as { name?: unknown }).name === name);
@@ -315,7 +370,11 @@ class CloudflareNamedPublisher implements PreviewPublisher {
     // `--overwrite-dns` because the record outlives the lease on purpose: the
     // second publish of the same hostname must land on the same tunnel rather
     // than fail on the record it left behind last time.
-    cf(bin, ['tunnel', 'route', 'dns', '--overwrite-dns', tunnelName, hostname], `routing ${hostname} to '${tunnelName}'`);
+    // cloudflared writes this line to stderr, so `cf` must hand both streams
+    // back or the check below would see an empty string and wave everything
+    // through — the exact failure it exists to catch.
+    const routed = cf(bin, ['tunnel', 'route', 'dns', '--overwrite-dns', tunnelName, hostname], `routing ${hostname} to '${tunnelName}'`);
+    assertRouted(`${routed.out}\n${routed.err}`, hostname);
 
     mkdirSync(opts.logDir, { recursive: true });
     const logPath = join(opts.logDir, `preview-${opts.service}.log`);

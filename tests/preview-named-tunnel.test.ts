@@ -54,6 +54,12 @@ if (args[0] === 'tunnel' && args[1] === 'create') {
   process.exit(0);
 }
 if (args[0] === 'tunnel' && args[1] === 'route') {
+  // cloudflared meldet die Zeile auf STDERR, nicht stdout — genau darin lag der Fehler.
+  const wanted = args[args.length - 1];
+  const zone = process.env.FAKE_SWALLOW_ZONE;
+  if (process.env.FAKE_QUIET_ROUTE) console.error('INF done');
+  else if (zone) console.error('INF ' + wanted + '.' + zone + ' is already configured to route to your tunnel');
+  else console.error('INF Added CNAME ' + wanted + ' which will route to this tunnel');
   process.exit(0);
 }
 // tunnel --config <cfg> run <name>
@@ -207,7 +213,36 @@ describe('the cloudflare-named preview publisher', () => {
     const c = await cli(['ctx', '--json']);
     expect(c.json?.previewUrls ?? {}).toEqual({});
   });
+  it('refuses when cloudflared routed a different hostname than the one asked for', async () => {
+    // Der echte Fall: das Zertifikat autorisiert eine andere Zone, cloudflared
+    // haengt sie an, legt `…baustelle.dev.fremde-zone.com` an — und meldet
+    // Erfolg. Ohne diese Pruefung gibt backlot eine Adresse zurueck, die
+    // nirgends aufloest.
+    const { cli } = ctx(NAMED, { FAKE_SWALLOW_ZONE: 'fremde-zone.com' });
+    await cli(['up', '--json']);
+
+    const prev = await cli(['preview', 'web', '--json']);
+    expect(prev.code).toBe(2);
+    const out = String(prev.stderr + prev.stdout);
+    expect(out).toMatch(/fremde-zone\.com/);
+    // Die Meldung muss den Weg hinaus nennen, nicht nur den Widerspruch.
+    expect(out).toMatch(/cloudflared tunnel login/);
+  });
+
+  it('publishes anyway when the routing message names no hostname at all', async () => {
+    // Wortwahl aendert sich zwischen cloudflared-Fassungen. Auf eine
+    // unbekannte, aber erfolgreiche Meldung hin abzubrechen wuerde
+    // Veroeffentlichen fuer Fassungen kaputtmachen, die wir nie gesehen haben —
+    // gefangen wird der Fall, in dem ein ANDERER Name ausdruecklich dasteht.
+    const { cli } = ctx(NAMED, { FAKE_QUIET_ROUTE: '1' });
+    await cli(['up', '--json']);
+
+    const prev = await cli(['preview', 'web', '--json']);
+    expect(prev.code).toBe(0);
+    expect(prev.json?.url).toBe('https://web-probe.example.dev');
+  });
 });
+
 
 function findFile(root: string, name: string): string | undefined {
   if (!existsSync(root)) return undefined;

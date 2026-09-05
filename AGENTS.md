@@ -50,6 +50,20 @@ one tunnel, which forces one shared cloudflared process for every previewed
 service — and a shared process cannot honour 0027's `stop()` contract, because
 the pid another publication still references may not be killed.
 
+**`cloudflared tunnel route dns` reports success for the WRONG hostname.** An
+origin certificate authorises exactly one zone; ask for a name outside it and
+cloudflared treats the whole thing as a label *inside* the cert's zone, creates
+`your.name.the-cert-zone.com`, prints `Added CNAME …` and exits 0. Backlot then
+hands back an address that resolves nowhere. This bit on the first real setup and
+was caught only because someone happened to run `dig`. `assertRouted` compares
+the name in the output against the one requested — and `cf()` therefore returns
+**stderr as well as stdout**, because that is the stream cloudflared says it on.
+Do not "simplify" `cf()` back to `execFileSync`: the check would read an empty
+string and wave every mismatch through. It passes when the output names no
+hostname at all, deliberately — the wording has changed between cloudflared
+versions, and refusing an unrecognised success would break publishing for
+versions we have not seen.
+
 ## The preview tunnel is scoped to the lease, not to the services it publishes
 
 `backlot preview` journals its tunnel on the **lease row** (`preview_*`), not in
