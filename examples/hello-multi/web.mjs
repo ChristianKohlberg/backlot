@@ -27,6 +27,6 @@ createServer(async (req, res) => {
     res.writeHead(502, { 'content-type': 'text/plain' });
     res.end(`api unreachable: ${err.message}`);
   }
-}).listen(PORT, () => {
+}).listen(PORT, '127.0.0.1', () => {
   console.log(`hello-multi web listening on :${PORT} (api: ${API_URL})`);
 });

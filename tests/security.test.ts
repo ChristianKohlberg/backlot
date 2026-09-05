@@ -41,7 +41,7 @@ function makeContext() {
 
 const SERVE = `import { createServer } from 'node:http';
 console.log('web up');
-createServer((q, s) => s.end('ok')).listen(Number(process.env.PORT));
+createServer((q, s) => s.end('ok')).listen(Number(process.env.PORT), '127.0.0.1');
 `;
 const stackWith = (extra = '') => `name: sec
 services:

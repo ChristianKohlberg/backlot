@@ -29,7 +29,7 @@ function makeSlowWorktree(name: string): string {
 import { writeFileSync } from 'node:fs';
 const start = Date.now();
 await new Promise((r) => setTimeout(r, 1500));
-createServer((q, s) => s.end('ok')).listen(Number(process.env.PORT), () => {
+createServer((q, s) => s.end('ok')).listen(Number(process.env.PORT), '127.0.0.1', () => {
   writeFileSync(${JSON.stringify(windowFile)}, JSON.stringify({ start, end: Date.now() }));
   console.log('slow-ready');
 });

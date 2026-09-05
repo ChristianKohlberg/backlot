@@ -39,7 +39,7 @@ function makeContext() {
 
 const SERVE = `import { createServer } from 'node:http';
 import { readFileSync } from 'node:fs';
-createServer((q, s) => s.end(readFileSync('./message.txt', 'utf8'))).listen(Number(process.env.PORT));
+createServer((q, s) => s.end(readFileSync('./message.txt', 'utf8'))).listen(Number(process.env.PORT), '127.0.0.1');
 `;
 
 const STACK = `name: opsy

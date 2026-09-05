@@ -87,7 +87,7 @@ function ctx(extraEnv: Record<string, string> = {}, stackExtra = '', hotReload =
   const wt = mkdtempSync(join(tmpdir(), 'backlot-preview-wt-'));
   writeFileSync(
     join(wt, 'srv.mjs'),
-    `import{createServer}from'node:http';console.log('ready');createServer((q,s)=>s.end('ok')).listen(Number(process.env.PORT));\n`,
+    `import{createServer}from'node:http';console.log('ready');createServer((q,s)=>s.end('ok')).listen(Number(process.env.PORT), '127.0.0.1');\n`,
   );
   writeFileSync(
     join(wt, 'stack.yaml'),
@@ -204,7 +204,7 @@ describe('preview tunnels', () => {
     const pid = tunnelPid(stateDir);
     writeFileSync(
       join(wt, 'srv.mjs'),
-      `import{createServer}from'node:http';console.log('ready');createServer((q,s)=>s.end('ok2')).listen(Number(process.env.PORT));\n`,
+      `import{createServer}from'node:http';console.log('ready');createServer((q,s)=>s.end('ok2')).listen(Number(process.env.PORT), '127.0.0.1');\n`,
     );
     const again = await cli(['up', '--json']);
     expect(again.code).toBe(0);

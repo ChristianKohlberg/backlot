@@ -75,7 +75,7 @@ function ctx(stackExtra: string, extraEnv: Record<string, string> = {}) {
   const wt = mkdtempSync(join(tmpdir(), 'backlot-named-wt-'));
   writeFileSync(
     join(wt, 'srv.mjs'),
-    `import{createServer}from'node:http';console.log('ready');createServer((q,s)=>s.end('ok')).listen(Number(process.env.PORT));\n`,
+    `import{createServer}from'node:http';console.log('ready');createServer((q,s)=>s.end('ok')).listen(Number(process.env.PORT), '127.0.0.1');\n`,
   );
   writeFileSync(
     join(wt, 'stack.yaml'),

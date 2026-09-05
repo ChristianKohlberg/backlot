@@ -60,12 +60,12 @@ function makeContext(extra: Record<string, string> = {}) {
 const STUBBORN = `import { createServer } from 'node:http';
 process.on('SIGTERM', () => { /* deliberately ignored */ });
 console.log('up');
-createServer((q, s) => s.end('ok')).listen(Number(process.env.PORT));
+createServer((q, s) => s.end('ok')).listen(Number(process.env.PORT), '127.0.0.1');
 `;
 
 const POLITE = `import { createServer } from 'node:http';
 console.log('up');
-createServer((q, s) => s.end('ok')).listen(Number(process.env.PORT));
+createServer((q, s) => s.end('ok')).listen(Number(process.env.PORT), '127.0.0.1');
 `;
 
 function makeWt(name: string, body: string): string {

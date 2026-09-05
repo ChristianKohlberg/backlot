@@ -33,7 +33,7 @@ function ctx(extraEnv: Record<string, string> = {}) {
   const stateDir = mkdtempSync(join(tmpdir(), 'backlot-lease-'));
   const wt = mkdtempSync(join(tmpdir(), 'backlot-lease-wt-'));
   dirs.push(stateDir, wt);
-  writeFileSync(join(wt, 'srv.mjs'), `import{createServer}from'node:http';console.log('ready');createServer((q,s)=>s.end('ok')).listen(Number(process.env.PORT));\n`);
+  writeFileSync(join(wt, 'srv.mjs'), `import{createServer}from'node:http';console.log('ready');createServer((q,s)=>s.end('ok')).listen(Number(process.env.PORT), '127.0.0.1');\n`);
   writeFileSync(
     join(wt, 'stack.yaml'),
     `name: lease\nservices:\n  web: { run: node srv.mjs, port: web, env: { PORT: "{{ports.web}}" }, ready: { log: ready, timeout: 20 } }\nchecks:\n  ok: { run: "true" }\n`,

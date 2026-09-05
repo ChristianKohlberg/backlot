@@ -45,7 +45,7 @@ function makeStack(dir: string, stackYaml: string, files: Record<string, string>
 
 const SERVE = `import { createServer } from 'node:http';
 import { readFileSync } from 'node:fs';
-createServer((q, s) => s.end(readFileSync('./message.txt', 'utf8'))).listen(Number(process.env.PORT));
+createServer((q, s) => s.end(readFileSync('./message.txt', 'utf8'))).listen(Number(process.env.PORT), '127.0.0.1');
 `;
 
 describe('--watch: save in the worktree, served without calling sync', () => {
@@ -90,7 +90,7 @@ services:
  * per-request read IS this fixture's "dev watcher": stage 2 needs no reload. */
 const SERVE_PID = `import { createServer } from 'node:http';
 import { readFileSync } from 'node:fs';
-createServer((q, s) => s.end(process.pid + ':' + readFileSync('./message.txt', 'utf8'))).listen(Number(process.env.PORT));
+createServer((q, s) => s.end(process.pid + ':' + readFileSync('./message.txt', 'utf8'))).listen(Number(process.env.PORT), '127.0.0.1');
 `;
 
 describe('--watch two-stage reload: an ordinary save must not bounce services', () => {

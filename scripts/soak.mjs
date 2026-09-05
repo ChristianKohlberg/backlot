@@ -333,7 +333,7 @@ createServer((req, res) => {
   }
   res.writeHead(200, { 'content-type': 'text/plain' });
   res.end('soak-a');
-}).listen(PORT, () => console.log('soak-a listening on :' + PORT));
+}).listen(PORT, '127.0.0.1', () => console.log('soak-a listening on :' + PORT));
 `);
   writeFileSync(join(dir, 'seed.mjs'), `import { DatabaseSync } from 'node:sqlite';
 const [dbPath, preset = 'dev'] = process.argv.slice(2);
@@ -392,7 +392,7 @@ checks:
 createServer((req, res) => {
   if (req.url === '/health') { res.writeHead(200); res.end('ok'); return; }
   res.end('${name}');
-}).listen(Number(process.env.PORT), () => console.log('${name} up'));
+}).listen(Number(process.env.PORT), '127.0.0.1', () => console.log('${name} up'));
 `);
 }
 
