@@ -455,10 +455,10 @@ describe('a slice builds per service, not gated by the whole-source stamp', () =
         '',
       ].join('\n'),
     );
-    writeFileSync(join(wt, 'keep.js'), 'require("http").createServer((q,s)=>s.end("keep")).listen(process.env.PORT)\n');
+    writeFileSync(join(wt, 'keep.js'), 'require("http").createServer((q,s)=>s.end("keep")).listen(process.env.PORT, "127.0.0.1")\n');
     writeFileSync(
       join(wt, 'build.js'),
-      'const fs=require("fs");fs.mkdirSync("out",{recursive:true});fs.writeFileSync("out/server.js",\'require("http").createServer((q,s)=>s.end("built")).listen(process.env.PORT)\')\n',
+      'const fs=require("fs");fs.mkdirSync("out",{recursive:true});fs.writeFileSync("out/server.js",\'require("http").createServer((q,s)=>s.end("built")).listen(process.env.PORT, "127.0.0.1")\')\n',
     );
     execFileSync('git', ['init', '-q'], { cwd: wt });
     execFileSync('git', ['add', '-A'], { cwd: wt });

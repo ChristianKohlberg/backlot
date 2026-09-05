@@ -32,7 +32,7 @@ function ctx() {
   const stateDir = mkdtempSync(join(tmpdir(), 'backlot-cap-'));
   const wt = mkdtempSync(join(tmpdir(), 'backlot-cap-wt-'));
   dirs.push(stateDir, wt);
-  writeFileSync(join(wt, 'srv.mjs'), `import{createServer}from'node:http';console.log('up');createServer((q,s)=>s.end('ok')).listen(Number(process.env.PORT));\n`);
+  writeFileSync(join(wt, 'srv.mjs'), `import{createServer}from'node:http';console.log('up');createServer((q,s)=>s.end('ok')).listen(Number(process.env.PORT), '127.0.0.1');\n`);
   writeFileSync(
     join(wt, 'stack.yaml'),
     `name: cap\nservices:\n  web: { run: node srv.mjs, port: web, env: { PORT: "{{ports.web}}" }, ready: { http: /, timeout: 20 } }\nchecks:\n  ok: { run: "true" }\n`,
@@ -103,7 +103,7 @@ describe('the capacity queue is per-stack, and holders bypass it', () => {
     const mkwt = (name: string) => {
       const wt = mkdtempSync(join(tmpdir(), `backlot-q-${name}-`));
       dirs.push(wt);
-      writeFileSync(join(wt, 'srv.mjs'), `import{createServer}from'node:http';console.log('up');createServer((q,s)=>s.end('ok')).listen(Number(process.env.PORT));\n`);
+      writeFileSync(join(wt, 'srv.mjs'), `import{createServer}from'node:http';console.log('up');createServer((q,s)=>s.end('ok')).listen(Number(process.env.PORT), '127.0.0.1');\n`);
       writeFileSync(
         join(wt, 'stack.yaml'),
         `name: ${name}\nservices:\n  web: { run: node srv.mjs, port: web, env: { PORT: "{{ports.web}}" }, ready: { http: /, timeout: 20 } }\n`,
@@ -168,7 +168,7 @@ describe('an expired-but-unswept lease cannot jump the queue', () => {
     dirs.push(stateDir);
     const wt = mkdtempSync(join(tmpdir(), 'backlot-exp-wt-'));
     dirs.push(wt);
-    writeFileSync(join(wt, 'srv.mjs'), `import{createServer}from'node:http';console.log('up');createServer((q,s)=>s.end('ok')).listen(Number(process.env.PORT));\n`);
+    writeFileSync(join(wt, 'srv.mjs'), `import{createServer}from'node:http';console.log('up');createServer((q,s)=>s.end('ok')).listen(Number(process.env.PORT), '127.0.0.1');\n`);
     writeFileSync(
       join(wt, 'stack.yaml'),
       `name: exp\nservices:\n  web: { run: node srv.mjs, port: web, env: { PORT: "{{ports.web}}" }, ready: { http: /, timeout: 20 } }\n`,

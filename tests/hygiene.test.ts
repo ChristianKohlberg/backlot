@@ -58,7 +58,7 @@ describe('auto-escalation: two failures -> pristine bind heals a poisoned cache'
       `import { createServer } from 'node:http';
 import { existsSync } from 'node:fs';
 if (existsSync('./poison.txt')) { console.error('Error: poisoned cache'); process.exit(1); }
-createServer((q, s) => s.end('clean')).listen(Number(process.env.PORT));
+createServer((q, s) => s.end('clean')).listen(Number(process.env.PORT), '127.0.0.1');
 `,
     );
     writeFileSync(
@@ -103,7 +103,7 @@ describe('degraded marking + auto-reap for a flapping service', () => {
     writeFileSync(
       join(wt, 'server.mjs'),
       `import { createServer } from 'node:http';
-createServer((q, s) => s.end('ok')).listen(Number(process.env.PORT));
+createServer((q, s) => s.end('ok')).listen(Number(process.env.PORT), '127.0.0.1');
 setTimeout(() => process.exit(1), 250); // dies AFTER readiness — the partial-zombie shape
 `,
     );
@@ -140,7 +140,7 @@ describe('idle quiesce (hot -> warm) and rebind', () => {
     writeFileSync(
       join(wt, 'server.mjs'),
       `import { createServer } from 'node:http';
-createServer((q, s) => s.end('ok')).listen(Number(process.env.PORT));
+createServer((q, s) => s.end('ok')).listen(Number(process.env.PORT), '127.0.0.1');
 `,
     );
     writeFileSync(
@@ -238,7 +238,7 @@ describe('environments stranded by a stack-identity change are reaped', () => {
     // loadStack() will ever produce again: invisible to its stack's pool but
     // still counted against POOL_MAX_TOTAL and still holding ports — forever,
     // because the only orphan test was "stackRoot missing".
-    writeFileSync(join(wt, 'server.mjs'), `import{createServer}from'node:http';console.log('up');createServer((q,s)=>s.end('ok')).listen(Number(process.env.PORT));\n`);
+    writeFileSync(join(wt, 'server.mjs'), `import{createServer}from'node:http';console.log('up');createServer((q,s)=>s.end('ok')).listen(Number(process.env.PORT), '127.0.0.1');\n`);
     writeFileSync(
       join(wt, 'stack.yaml'),
       `name: strand\nservices:\n  web: { run: node server.mjs, port: web, env: { PORT: "{{ports.web}}" }, ready: { http: /, timeout: 20 } }\n`,

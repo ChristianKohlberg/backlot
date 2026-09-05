@@ -20,7 +20,7 @@ writeFileSync(
   join(wt, 'server.mjs'),
   `import { createServer } from 'node:http';
 console.log('up');
-createServer((q, s) => s.end('ok')).listen(Number(process.env.PORT));
+createServer((q, s) => s.end('ok')).listen(Number(process.env.PORT), '127.0.0.1');
 `,
 );
 writeFileSync(

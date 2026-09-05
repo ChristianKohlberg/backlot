@@ -33,6 +33,6 @@ createServer((req, res) => {
   }
   res.writeHead(404, { 'content-type': 'application/json' });
   res.end(JSON.stringify({ error: 'not found' }));
-}).listen(PORT, () => {
+}).listen(PORT, '127.0.0.1', () => {
   console.log(`hello-multi api listening on :${PORT} (db: ${DB_PATH})`);
 });

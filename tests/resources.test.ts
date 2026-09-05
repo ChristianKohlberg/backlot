@@ -63,7 +63,7 @@ describe('ports are reserved pool-wide', () => {
     const wt = mkdtempSync(join(tmpdir(), 'backlot-ports-wt-'));
     dirs.push(stateDir, wt);
     mkdirSync(wt, { recursive: true });
-    writeFileSync(join(wt, 'srv.mjs'), `import{createServer}from'node:http';console.log('up');createServer((q,s)=>s.end('ok')).listen(Number(process.env.PORT));\n`);
+    writeFileSync(join(wt, 'srv.mjs'), `import{createServer}from'node:http';console.log('up');createServer((q,s)=>s.end('ok')).listen(Number(process.env.PORT), '127.0.0.1');\n`);
     writeFileSync(
       join(wt, 'stack.yaml'),
       `name: ports\nservices:\n  web: { run: node srv.mjs, port: web, env: { PORT: "{{ports.web}}" }, ready: { http: /, timeout: 20 } }\nchecks:\n  ok: { run: "true" }\n`,

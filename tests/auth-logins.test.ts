@@ -37,7 +37,7 @@ function ctx(authBlock: string) {
   dirs.push(stateDir, wt);
   writeFileSync(
     join(wt, 'srv.mjs'),
-    `import{createServer}from'node:http';console.log('up');createServer((q,s)=>s.end('ok')).listen(Number(process.env.PORT));\n`,
+    `import{createServer}from'node:http';console.log('up');createServer((q,s)=>s.end('ok')).listen(Number(process.env.PORT), '127.0.0.1');\n`,
   );
   writeFileSync(
     join(wt, 'backlot.yml'),
