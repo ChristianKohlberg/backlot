@@ -142,6 +142,25 @@ user_version`; a daemon refuses to open a journal stamped newer than it understa
 Bump it only when a change makes an older daemon **misread** this journal — the
 additive `ALTER TABLE` migrations are not bumps.
 
+## Caller environment inputs
+
+`services.*.env_from` allowlists caller variables (`required`/`optional`). Explicit
+`up` and `run` refresh them; `sync`, watch, reset and ref binds preserve the lease's
+memory-only inputs. Omitted optional values mask same-named daemon variables.
+Never journal or expose input values/hashes in context or diagnostics. A daemon
+restart needs a fresh `up` to resupply them. New holders must restart configured
+services even on identical source: warm reuse must not inherit another lease's
+inputs. Declaration changes also invalidate the process configuration. See
+`src/core/caller-env.ts` and `tests/caller-env.test.ts`.
+CLI/MCP autospawn must use the target stack's cwd and strip declared input names
+from the daemon environment; otherwise the first caller contaminates every later
+check/exec/unconfigured service despite correct per-lease service masking.
+
+Supervisor probe matching uses a raw, memory-only buffer; logs and error excerpts
+use the redacted buffer. Combining them breaks readiness when a declared value
+also matches `ready.log`/`fatal_logs`. Redaction retains split-value prefixes per
+output stream, so no raw prefix reaches disk before its remaining bytes arrive.
+
 ## Cutting a release
 
 A merged fix does not reach consumers until this happens — `main` can sit ahead of

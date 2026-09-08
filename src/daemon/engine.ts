@@ -16,6 +16,7 @@ import { runUpkeep, pendingUpkeep, templateBakeKeys } from '../core/upkeep.js';
 import { freePort, probeFree } from '../core/ports.js';
 import { envsRoot, artifactsRoot, stateRoot } from '../core/paths.js';
 import { BrokerError, template, templateEnv, now, shortId, matchesAny, safeJoin } from '../core/util.js';
+import { callerEnvSpec, requireCallerEnv, selectCallerEnv, serviceCallerEnv, validateCallerEnv } from '../core/caller-env.js';
 import { cmdTimeoutS, runBounded, runBoundedIO, LONG_CMD_TIMEOUT_S } from '../core/exec.js';
 import { makeDatastore, type DsHandle } from '../drivers/datastores.js';
 import { ensureAppliance, stopAppliance, probeTcp } from '../drivers/appliances.js';
@@ -26,6 +27,7 @@ import { policy } from '../core/policy.js';
 import { kernelSleepGap, readKernelSleepRecord } from '../core/sleep.js';
 import { retentionSweep } from '../core/retention.js';
 import { logEvent, recentEvents } from '../core/events.js';
+import { BindTrace, type BindDiagnostics } from '../core/diagnostics.js';
 import type { Hygiene, LeaseKind, ServicePid } from '../core/types.js';
 
 const POOL_MAX = () => policy().poolMax;
@@ -42,6 +44,8 @@ export type Progress = (phase: string) => void;
 
 export interface UpOptions {
   cwd: string;
+  /** Explicit refresh envelope; absent means retain this lease's in-memory inputs. */
+  callerEnv?: unknown;
   holder?: string;
   hygiene?: Hygiene;
   kind?: LeaseKind;
@@ -175,6 +179,12 @@ export class Engine {
   readonly busy = new Set<string>();
   /** --watch: per-env worktree watchers ("verbs sync, watch streams", decision 0005). */
   private watchers = new Map<string, { close: () => void }>();
+  /** Never persisted or returned. Lease IDs prevent reuse from inheriting another caller's inputs. */
+  private leaseInputs = new Map<string, { values: Record<string, string>; revision: string }>();
+  /** Opaque in-memory revisions only; no secret values or hashes in the journal. */
+  private appliedInputs = new Map<string, string>();
+  private appliedInputSpecs = new Map<string, string>();
+  private inputRevision = 0;
 
   private poolLocked<T>(fn: () => Promise<T> | T): Promise<T> {
     const next = this.poolChain.then(fn, fn);
@@ -849,8 +859,9 @@ export class Engine {
     return closure;
   }
 
-  private async bindAndStart(stack: Stack, envSnapshot: EnvRow, hygiene: Hygiene, kind: LeaseKind, watch: boolean, sourceRoot?: string, onProgress?: Progress, requestedServices?: string[], freshClaim = false, requestedDataOnly?: boolean): Promise<{ env: EnvRow; previewNotice?: string }> {
+  private async bindAndStart(stack: Stack, envSnapshot: EnvRow, hygiene: Hygiene, kind: LeaseKind, watch: boolean, sourceRoot?: string, onProgress?: Progress, requestedServices?: string[], freshClaim = false, requestedDataOnly?: boolean, callerEnv?: unknown): Promise<{ env: EnvRow; previewNotice?: string; bindDiagnostics: BindDiagnostics }> {
     const say = onProgress ?? (() => undefined);
+    const trace = new BindTrace();
     // Re-read under the env lock: the snapshot captured during acquire may be
     // stale (a concurrent degrade/pid update landed). Everything below mutates
     // and saves THIS fresh row, so no epilogue can clobber another verb's write.
@@ -894,6 +905,19 @@ export class Engine {
       );
     }
     const active = dataOnly ? new Set<string>() : this.resolveServiceClosure(stack, requestedNames);
+    const inputLease = this.journal.leaseForEnv(env.id);
+    if (!inputLease) throw new BrokerError('env-error', 'lease ended before bind; run backlot up again', 'lease');
+    const previousInputs = this.leaseInputs.get(inputLease.id);
+    const inputValues = callerEnv === undefined ? selectCallerEnv(stack.manifest, previousInputs?.values ?? {}) : validateCallerEnv(stack.manifest, callerEnv);
+    requireCallerEnv(stack.manifest, active, inputValues);
+    const sameInputs = previousInputs !== undefined &&
+      Object.keys(previousInputs.values).length === Object.keys(inputValues).length &&
+      Object.entries(inputValues).every(([key, value]) => previousInputs.values[key] === value);
+    const inputs = sameInputs ? previousInputs : { values: inputValues, revision: String(++this.inputRevision) };
+    this.leaseInputs.set(inputLease.id, inputs);
+    const inputSpec = callerEnvSpec(stack.manifest);
+    const inputsChanged = (inputSpec !== '[]' && this.appliedInputs.get(env.id) !== inputs.revision) ||
+      inputSpec !== (this.appliedInputSpecs.get(env.id) ?? '[]');
     const dirs = this.envDirs(env.id);
     // Ports are allocated once at createEnv (decision 0004: stable for the
     // environment's lifetime). A service ADDED to the manifest afterwards had
@@ -942,11 +966,13 @@ export class Engine {
     // Appliances first: shared backing servers must answer before anything
     // else is worth doing. Milliseconds when they're up; a one-time start
     // when they're not (decision 0018). Failures here are infra-errors.
+    trace.phase('appliances');
     for (const [name, spec] of Object.entries(stack.manifest.appliances ?? {})) {
       const state = await ensureAppliance(name, spec, stack.root, say);
       if (state !== 'up') logEvent({ level: 'info', kind: 'appliance', detail: `'${name}' ${state} (${spec.probe})` });
     }
 
+    trace.phase('sync');
     say('syncing worktree');
     // reset-data and pristine mean "clean slate", so they also sweep env-side
     // droppings; a plain reuse bind keeps them (and keeps its build artifacts).
@@ -954,6 +980,7 @@ export class Engine {
     // the daemon's event loop, stalling every concurrent verb behind it.
     const sync = await syncIntoEnvThreaded(sourceRoot ?? stack.root, dirs.tree, stack.manifest, hygiene !== 'reuse');
     say(`synced ${sync.files.length} files (${sync.copied} changed, ${sync.deleted} removed)`);
+    trace.result.sync = { files: sync.files.length, copied: sync.copied, deleted: sync.deleted };
     if (sync.sweptDroppings > 0) {
       // The sweep removed files no sync produced — possibly the very output
       // (an undeclared node_modules, generated code) the ledger is vouching
@@ -962,13 +989,14 @@ export class Engine {
       // keeps both the files and the fast path.
       env.fingerprints = {};
     }
-    const upkeep = await runUpkeep(dirs.tree, sync.files, stack.manifest, env.fingerprints);
+    trace.phase('upkeep');
+    const upkeep = await runUpkeep(dirs.tree, sync.files, stack.manifest, env.fingerprints, say);
+    trace.result.upkeep = { ran: upkeep.ran.length, skipped: (stack.manifest.upkeep?.length ?? 0) - upkeep.ran.length };
     // Content-derived template identity (vetbill-1i49): divergent
     // migrations/seeds in this tree yield a different bake key and thus a
     // disjoint template name — two envs of the same stack can no longer
     // silently share a template with the wrong schema.
     const bakeKeys = templateBakeKeys(stack.manifest, dirs.tree, sync.files);
-    for (const r of upkeep.ran) say(`upkeep: ${r.run}`);
     for (const dsName of upkeep.rebakeTemplates) {
       const spec = stack.manifest.datastores?.[dsName];
       if (spec) await makeDatastore(dsName, spec, stack.id, bakeKeys[dsName]).rebake(stack.root);
@@ -981,7 +1009,15 @@ export class Engine {
     // stop + start of exactly the requested slice.
     const runningServices = new Set(Object.keys(this.supervisor(env).pids()));
     const shapeMatches = runningServices.size === active.size && [...active].every((n) => runningServices.has(n));
+    if (env.fingerprints['@source'] !== sync.sourceHash) trace.result.reasons.push('source-changed');
+    if (upkeep.ran.length > 0) trace.result.reasons.push('upkeep-required');
+    if (env.state !== 'hot') trace.result.reasons.push('environment-not-running');
+    if (!this.supervisor(env).allHealthyPids()) trace.result.reasons.push('service-process-unhealthy');
+    if (!shapeMatches) trace.result.reasons.push('service-shape-changed');
+    if (inputsChanged) trace.result.reasons.push('environment-inputs-changed');
+    if (hygiene !== 'reuse') trace.result.reasons.push(`hygiene-${hygiene}`);
     const unchanged =
+      !inputsChanged &&
       env.fingerprints['@source'] === sync.sourceHash &&
       upkeep.ran.length === 0 &&
       env.state === 'hot' &&
@@ -990,6 +1026,13 @@ export class Engine {
       hygiene === 'reuse';
     env.fingerprints = { ...upkeep.fingerprints };
     if (unchanged) {
+      trace.result.reuse = 'reused';
+      trace.result.builds = Object.entries(stack.manifest.services)
+        .filter(([name, spec]) => active.has(name) && spec.build)
+        .map(([service]) => env.fingerprints[`@built:${service}`] === sync.sourceHash
+          ? { service, cache: 'hit', reason: 'source-unchanged' }
+          : { service, cache: 'skipped', reason: 'running-service-reused' });
+      trace.phase('finalize');
       env.fingerprints['@source'] = sync.sourceHash;
       env.lastUsedAt = now();
       // Refresh from the LIVE supervisor before saving. A service that restarted
@@ -1009,10 +1052,12 @@ export class Engine {
       return {
         env,
         previewNotice: forbiddenNotice ?? (await this.reconcilePreviewForBind(env, stack, active, say, { hygiene, portsReallocated: true })),
+        bindDiagnostics: trace.finish(),
       };
     }
 
     // Services must not hold open handles across a data restore or code change.
+    trace.phase('stop');
     await this.supervisor(env).stopAll();
     this.supervisors.delete(env.id);
     // Reap any process that survived or escaped the group kill above so the
@@ -1020,6 +1065,7 @@ export class Engine {
     await this.reapEnvProcesses(env);
 
     // Data state: create-or-restore per hygiene (probe first — infra-error, not code blame).
+    trace.phase('data');
     const dsHandle: DsHandle = { envId: env.id, envTree: dirs.tree, dataDir: dirs.data };
     for (const [name, spec] of Object.entries(stack.manifest.datastores ?? {})) {
       const ds = makeDatastore(name, spec, stack.id, bakeKeys[name]);
@@ -1041,11 +1087,16 @@ export class Engine {
     // whenever the source moved since it was last built; '@built:*' stamps ride
     // in env.fingerprints (runUpkeep preserves them) and pristine wipes them.
     const ctx = this.templateCtx(stack, env);
+    trace.phase('build');
     for (const [name, spec] of Object.entries(stack.manifest.services)) {
       if (!active.has(name)) continue; // don't build a slice we won't start
       const build = spec.build;
       if (!build) continue;
-      if (env.fingerprints[`@built:${name}`] === sync.sourceHash) continue; // already built at this source
+      if (env.fingerprints[`@built:${name}`] === sync.sourceHash) {
+        trace.result.builds.push({ service: name, cache: 'hit', reason: 'source-unchanged' });
+        continue;
+      }
+      trace.result.builds.push({ service: name, cache: 'miss', reason: env.fingerprints[`@built:${name}`] ? 'source-changed' : 'no-build-record' });
       say(`building '${name}'`);
       const buildStart = now();
       const beat = setInterval(() => say(`building '${name}' … ${Math.round((now() - buildStart) / 1000)}s`), 5000);
@@ -1065,6 +1116,7 @@ export class Engine {
     env.fingerprints['@source'] = sync.sourceHash;
 
     // Start in dependency order, readiness-gated, fatal-log fast-fail.
+    trace.phase('ready');
     const sup = this.supervisor(env);
     const started = new Set<string>();
     // Only the requested slice (already a depends_on closure, so every dep of a
@@ -1128,14 +1180,15 @@ export class Engine {
           run: template(spec.run, ctx),
           ...(spec.watch_run ? { watch_run: template(spec.watch_run, ctx) } : {}),
         };
-        sup.start(name, resolved, templateEnv(spec.env, ctx), watch);
+        const serviceEnv = { ...templateEnv(spec.env, ctx), ...serviceCallerEnv(spec, inputs.values) };
+        sup.start(name, resolved, serviceEnv, watch);
         const url = spec.port ? `http://localhost:${env.ports[spec.port]}` : undefined;
         say(`starting '${name}', waiting until ready`);
         const readyStart = now();
         const beat = setInterval(() => say(`waiting for '${name}' … ${Math.round((now() - readyStart) / 1000)}s`), 3000);
         beat.unref();
         try {
-          await sup.waitReady(name, spec, url, templateEnv(spec.env, ctx));
+          await sup.waitReady(name, spec, url, serviceEnv);
           clearInterval(beat);
           say(`'${name}' ready`);
         } catch (err) {
@@ -1157,6 +1210,7 @@ export class Engine {
       }
     }
 
+    trace.phase('finalize');
     // `env` is a SNAPSHOT taken before services started. Writing it back whole
     // discards anything that changed meanwhile — in particular the onDegraded
     // callback, which fires when an EARLIER service flaps while a later one is
@@ -1188,11 +1242,14 @@ export class Engine {
     env.dataOnly = dataOnly;
     env.bindCount += 1;
     env.lastUsedAt = now();
+    this.appliedInputs.set(env.id, inputs.revision);
+    this.appliedInputSpecs.set(env.id, inputSpec);
     env.failStreak = 0; // a successful bind clears the escalation counter
     this.journal.saveEnv(env);
     return {
       env,
       previewNotice: forbiddenNotice ?? (await this.reconcilePreviewForBind(env, stack, active, say, { hygiene, portsReallocated: true })),
+      bindDiagnostics: trace.finish(),
     };
   }
 
@@ -1280,35 +1337,47 @@ export class Engine {
     envId: string,
     cwd: string,
     holder: string,
-  ): Promise<{ outcome: 'projected' | 'fallback' | 'skip'; previewNotice?: string }> {
+  ): Promise<{ outcome: 'projected' | 'fallback' | 'skip'; previewNotice?: string; bindDiagnostics?: BindDiagnostics }> {
+    const trace = new BindTrace();
+    const fallback = () => ({ outcome: 'fallback' as const, bindDiagnostics: trace.finish() });
     const stack = loadStack(cwd);
+    trace.phase('queue');
     return this.envLocked(envId, async () => {
+      trace.phase('prepare');
       const env = this.journal.getEnv(envId);
       // Teardown owns a recycling env and closes its watcher; do nothing.
       if (!env || env.state === 'recycling') return { outcome: 'skip' };
       // Only a LIVE lease still pointing at this env may mutate it from a
       // watch event; anything else re-earns an environment via acquire.
       const lease = this.journal.leaseForHolder(holder, stack.id);
-      if (!lease || lease.envId !== envId || lease.expiresAt <= now()) return { outcome: 'fallback' };
+      if (!lease || lease.envId !== envId || lease.expiresAt <= now()) return fallback();
       // Same trust conditions as bindAndStart's fast path: hot, all healthy.
       // A quiesced or half-dead env needs services started, not just files.
-      if (env.state !== 'hot' || !this.supervisor(env).allHealthyPids()) return { outcome: 'fallback' };
+      if (env.state !== 'hot' || !this.supervisor(env).allHealthyPids()) return fallback();
+      // Changing declarations must reconfigure the process even for a hot-reload
+      // service: its own watcher reloads source, not its startup environment.
+      if (callerEnvSpec(stack.manifest) !== (this.appliedInputSpecs.get(env.id) ?? '[]')) return fallback();
 
       const dirs = this.envDirs(env.id);
       // The one sync implementation (constraint: no second copy path).
       // cleanUntracked stays FALSE: a watch save must never sweep the env's
       // undeclared build artifacts.
+      trace.phase('sync');
       const sync = await syncIntoEnvThreaded(stack.root, dirs.tree, stack.manifest, false);
+      trace.result.sync = { files: sync.files.length, copied: sync.copied, deleted: sync.deleted };
       // The fallback decision: would this tree fire any upkeep rule or
       // template rebake? (Same trigger hashes runUpkeep would compare.)
+      trace.phase('upkeep');
       if (pendingUpkeep(dirs.tree, sync.files, stack.manifest, env.fingerprints).length > 0) {
-        return { outcome: 'fallback' };
+        return fallback();
       }
+      trace.result.upkeep.skipped = stack.manifest.upkeep?.length ?? 0;
+      trace.phase('finalize');
 
       // Epilogue on a FRESH row (the onDegraded/onPidsChanged callbacks write
       // concurrently): record the new source identity and the activity.
       const fresh = this.journal.getEnv(env.id);
-      if (!fresh || fresh.state !== 'hot') return { outcome: 'fallback' }; // degraded mid-projection
+      if (!fresh || fresh.state !== 'hot') return fallback(); // degraded mid-projection
       fresh.fingerprints['@source'] = sync.sourceHash;
       fresh.lastUsedAt = now();
       this.journal.saveEnv(fresh);
@@ -1337,7 +1406,7 @@ export class Engine {
       // 0 — their next exec/token then fails with "no active lease". Fall back
       // like every other case projection cannot honestly serve; `up` re-earns a
       // lease through the ordinary acquire path.
-      if (!held || held.id !== lease.id) return { outcome: 'fallback' };
+      if (!held || held.id !== lease.id) return fallback();
       this.journal.saveLease({ ...held, expiresAt: now() + LEASE_TTL(held.kind) });
       if (sync.copied > 0 || sync.deleted > 0) {
         logEvent({
@@ -1345,13 +1414,16 @@ export class Engine {
           detail: `projected ${sync.copied} changed, ${sync.deleted} removed — services kept (two-stage reload)`,
         });
       }
-      return { outcome: 'projected', previewNotice };
+      trace.result.reuse = 'projected';
+      trace.result.reasons = ['hot-reload-projection'];
+      return { outcome: 'projected', previewNotice, bindDiagnostics: trace.finish() };
     });
   }
 
   // ---------------------------------------------------------------- verbs
 
   async up(opts: UpOptions) {
+    const requestStarted = performance.now();
     const stack = loadStack(opts.cwd);
     // Resolve a requested slice BEFORE acquiring an env: an unknown name is a
     // user typo, not a bind failure, so it must not reach bindAndStart's catch
@@ -1397,23 +1469,39 @@ export class Engine {
       );
     }
     const holder = opts.holder ?? resolve(opts.cwd);
+    // Validate before claiming: missing input is caller configuration, not an
+    // environment failure deserving hygiene escalation or a stranded lease.
+    const suppliedInputs = opts.callerEnv === undefined ? undefined : validateCallerEnv(stack.manifest, opts.callerEnv);
+    const existingLease = this.journal.leaseForHolder(holder, stack.id);
+    const existingEnv = existingLease ? this.journal.getEnv(existingLease.envId) : undefined;
+    const selectedInputs = (opts.dataOnly ?? existingEnv?.dataOnly) === true
+      ? new Set<string>()
+      : this.resolveServiceClosure(stack, opts.services ?? existingEnv?.activeServices ?? []);
+    requireCallerEnv(stack.manifest, selectedInputs, suppliedInputs ?? (existingLease ? this.leaseInputs.get(existingLease.id)?.values : undefined) ?? {});
     const kind = opts.kind ?? 'session';
     let hygiene = opts.hygiene ?? 'reuse';
     opts.onProgress?.(`acquiring an environment (pool ${this.journal.envsForStack(stack.id).length}/${POOL_MAX()})`);
+    const queueStarted = performance.now();
+    let queueMs = 0;
     const { env, fresh } = await this.acquireEnv(stack, holder, kind, hygiene, opts.ttlMs ?? LEASE_TTL(kind), opts.dataOnly === true, opts.holderPid);
     // Auto-escalation (decision 0007): two consecutive bind failures on this
     // warm environment -> the next bind is pristine, whatever was asked.
     if (hygiene !== 'pristine' && env.failStreak >= 2) hygiene = 'pristine';
     try {
-      const { env: bound, previewNotice } = await this.envLocked(
+      const { env: bound, previewNotice, bindDiagnostics } = await this.envLocked(
         env.id,
-        () => this.bindAndStart(stack, env, hygiene, kind, opts.watch ?? false, opts.sourceRoot, opts.onProgress, opts.services, fresh, opts.dataOnly),
+        () => {
+          queueMs = performance.now() - queueStarted;
+          return this.bindAndStart(stack, env, hygiene, kind, opts.watch ?? false, opts.sourceRoot, opts.onProgress, opts.services, fresh, opts.dataOnly, suppliedInputs);
+        },
         (s) => opts.onProgress?.(`waiting for another operation on this environment … ${s}s`),
       );
       if (opts.watch && kind === 'session' && !this.watchers.has(bound.id)) {
         this.startWatch(bound.id, stack.root, opts.cwd, holder);
       }
-      return { ...this.ctx(opts.cwd, holder, bound.id), previewNotice };
+      bindDiagnostics.phasesMs.queue = queueMs;
+      bindDiagnostics.durationMs = performance.now() - requestStarted;
+      return { ...this.ctx(opts.cwd, holder, bound.id), previewNotice, bindDiagnostics };
     } catch (err) {
       const fresh = this.journal.getEnv(env.id);
       if (fresh) {
@@ -1591,6 +1679,7 @@ export class Engine {
         pulled: opts.pull ? pullOutputs(stack.root, dirs.tree, stack.manifest) : undefined,
         envId: env.id,
         durationMs: now() - startedAt,
+        bindDiagnostics: context.bindDiagnostics,
       };
     } finally {
       // Only our own ephemeral run lease — guaranteed kind 'run' — is deleted.
@@ -1652,6 +1741,8 @@ export class Engine {
   }
 
   async syncLease(cwd: string, holder?: string, onProgress?: Progress) {
+    const requestStarted = performance.now();
+    let projectionDiagnostics: BindDiagnostics | undefined;
     const h = holder ?? resolve(cwd);
     // The dogfooded 57s-for-a-one-line-edit: sync used to full-rebind (stop,
     // rebuild, restart, ready-wait) on ANY source change, defeating the dev
@@ -1669,12 +1760,26 @@ export class Engine {
       onProgress?.('projecting worktree (services kept)');
       const projected = await this.watchProject(lease.envId, cwd, h);
       if (projected.outcome === 'projected') {
-        return { ...this.ctx(cwd, h, lease.envId), previewNotice: projected.previewNotice };
+        if (projected.bindDiagnostics) projected.bindDiagnostics.durationMs = performance.now() - requestStarted;
+        return { ...this.ctx(cwd, h, lease.envId), previewNotice: projected.previewNotice, bindDiagnostics: projected.bindDiagnostics };
       }
+      projectionDiagnostics = projected.bindDiagnostics;
     }
     // Anything projection can't honestly serve — pending upkeep/rebake, a
     // quiesced or degraded env, a lapsed lease — takes the full bind.
-    return this.up({ cwd, holder: h, kind: 'session', hygiene: 'reuse', onProgress });
+    const result = await this.up({ cwd, holder: h, kind: 'session', hygiene: 'reuse', onProgress });
+    if (projectionDiagnostics) {
+      // A projection may already have copied the tree before discovering upkeep
+      // is needed. Include that attempt instead of hiding its time and copies.
+      for (const key of Object.keys(projectionDiagnostics.phasesMs) as Array<keyof BindDiagnostics['phasesMs']>) {
+        result.bindDiagnostics.phasesMs[key] += projectionDiagnostics.phasesMs[key];
+      }
+      result.bindDiagnostics.sync.copied += projectionDiagnostics.sync.copied;
+      result.bindDiagnostics.sync.deleted += projectionDiagnostics.sync.deleted;
+      result.bindDiagnostics.reasons.unshift('projection-fallback');
+    }
+    result.bindDiagnostics.durationMs = performance.now() - requestStarted;
+    return result;
   }
 
   /** bind --ref: project a COMMITTED ref (not the worktree state) into the env. */
@@ -1725,12 +1830,19 @@ export class Engine {
     if (!lease) throw new BrokerError('env-error', `no active lease — run 'backlot up' first`, 'lease');
     this.journal.saveLease({ ...lease, hygiene: 'reset-data', expiresAt: now() + LEASE_TTL(lease.kind) });
     const env = this.envForLease(lease);
-    const { previewNotice } = await this.envLocked(
+    const resetStarted = performance.now();
+    let queueMs = 0;
+    const { previewNotice, bindDiagnostics } = await this.envLocked(
       env.id,
-      () => this.bindAndStart(stack, env, 'reset-data', lease.kind, false, undefined, onProgress),
+      () => {
+        queueMs = performance.now() - resetStarted;
+        return this.bindAndStart(stack, env, 'reset-data', lease.kind, false, undefined, onProgress);
+      },
       (s) => onProgress?.(`waiting for another operation on this environment … ${s}s`),
     );
-    return { ...this.ctx(cwd, h), previewNotice };
+    bindDiagnostics.phasesMs.queue = queueMs;
+    bindDiagnostics.durationMs = performance.now() - resetStarted;
+    return { ...this.ctx(cwd, h), previewNotice, bindDiagnostics };
   }
 
   /**
@@ -2022,6 +2134,7 @@ export class Engine {
       logEvent({ level: 'error', kind: 'preview', envId: lease.envId, detail: this.unreapedPreview(last) });
     }
     this.journal.deleteLease(lease.id);
+    this.leaseInputs.delete(lease.id);
     this.stopWatch(lease.envId);
   }
 
@@ -2666,6 +2779,9 @@ export class Engine {
     }
     rmSync(env.root, { recursive: true, force: true });
     this.journal.deleteEnv(env.id);
+    if (lease) this.leaseInputs.delete(lease.id);
+    this.appliedInputs.delete(env.id);
+    this.appliedInputSpecs.delete(env.id);
     this.envChains.delete(env.id); // don't leak a settled chain for a dead id
   }
 

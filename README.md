@@ -214,11 +214,57 @@ checks:
   e2e: { run: pnpm e2e, artifacts: [test-results/**] }
 ```
 
+An upkeep rule may set `timeout` in seconds, for example
+`{ when: Cargo.lock, run: cargo build --release, timeout: 1200 }`.
+Rules without it keep the 300-second default; `BACKLOT_CMD_TIMEOUT_S` overrides
+both. The deadline kills the command's process group. With `--progress`, each
+command reports its rule number before starting, elapsed time every five seconds,
+and completion on stderr; command text and output are not streamed, and `--json`
+stdout stays machine-readable. Successful unchanged rules remain skipped.
+
 Services are commands, not containers. Backing infrastructure (your DB server) stays
 externally run — backlot probes it and classifies its absence honestly
 (`infra-error`, never blaming your code). If the repo has one blessed way to start
 that infrastructure, declare it as an **appliance** and backlot ensures it without
 ever owning it ([decision 0018](docs/decisions/0018-appliances-ensured-not-owned.md)).
+
+### Caller environment inputs
+
+Services may explicitly request variables from the process invoking `up` or `run`:
+
+```yaml
+services:
+  api:
+    run: node server.mjs
+    env_from:
+      API_KEY: optional
+      API_ENDPOINT: required
+```
+
+Export those names in your shell, then run `backlot up`. The CLI sends only
+declared names over the local socket; the shared daemon does not need a restart.
+When autospawning, it removes those names from the new daemon's environment so
+the first caller's inputs cannot become ambient configuration for other leases.
+`required` refuses a missing value before claiming an environment. `optional`
+leaves it unset. An empty string is a supplied value. Inputs override same-named
+`env` entries and mask a same-named daemon variable when omitted. They are service
+and readiness-probe inputs, not build, upkeep, check-command, or `exec` inputs.
+`BACKLOT_*` names are reserved for broker controls and cannot be declared here.
+
+Each explicit `up` refreshes the lease's inputs, including clearing omitted optional
+values, and changed inputs restart services even when source files are unchanged.
+`sync`, `--watch`, `reset-data`, and `bind --ref` keep that lease's inputs. A new
+holder never inherits them: reusing its warm environment restarts input-configured
+services with the new holder's values. Each `run` takes fresh caller inputs for
+its own isolated service processes. The MCP adapter uses its own process environment.
+
+Values remain in daemon/process memory, never in the journal or context/status
+responses. Broker service logs redact exact input values, including values split
+across output chunks. Repo commands can still write their own files or transform
+values; applications own that output. Release forgets the input record; existing
+warm services retain their startup environment until stopped or rebound. After a
+daemon restart, run `up` again with the values: required inputs refuse a rebind
+without them, and optional inputs stay off until supplied again.
 
 ### Several logins, each with a purpose
 
@@ -281,6 +327,30 @@ remember, and only where one environment of the stack runs at a time.
 **A named URL is durable, and so is the exposure.** Put a Cloudflare Access
 policy over the zone; it matches on hostname, so one policy covers every preview
 you will ever publish there ([decision 0028](docs/decisions/0028-named-preview-hostnames.md)).
+
+### Understanding a slow bind
+
+`up --json`, `sync --json`, and `reset-data --json` return `bindDiagnostics` for
+that operation; a `run` verdict includes its setup diagnostics too. `ctx` does
+not replay timings from earlier calls. The report includes:
+
+- `durationMs`: elapsed daemon-side operation time, excluding CLI startup.
+- `phasesMs`: time spent acquiring/waiting (`queue`), preparing, ensuring
+  appliances, syncing, upkeep, stopping services, data preparation, builds,
+  readiness, and finalization. Skipped phases are zero.
+- `reuse`: `reused` for an unchanged running environment, `rebound` for the
+  ordinary preparation/start path, or `projected` when hot-reload services kept
+  running. `reasons` explains why reuse was unavailable or projection was used.
+- `sync`: file counts; `upkeep`: numbers of rules run and skipped; `builds`:
+  each selected build's cache hit/miss and reason (`source-unchanged`,
+  `source-changed`, or `no-build-record`). A build skipped because a running
+  hot-reload service already handles the projected source reports `skipped`
+  with `running-service-reused`. These describe Backlot's build-command
+  decisions; Cargo or another build tool may still reuse its own cache.
+
+Timings are request-local and appear on successful results. They contain no
+command output or caller environment values. For progress while a command is
+still running, use `--progress`, including alongside `--json`.
 
 ## What it is / is not
 

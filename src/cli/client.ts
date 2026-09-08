@@ -9,6 +9,7 @@ import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { socketPath, stateRoot } from '../core/paths.js';
 import { isAlive } from '../core/procscan.js';
+import { collectCallerEnv } from '../core/caller-env.js';
 
 /** A wedged daemon must not hang a caller forever. Overridable for tests. */
 const RPC_TIMEOUT_MS = (): number => Number(process.env.BACKLOT_RPC_TIMEOUT_MS ?? 15 * 60_000);
@@ -155,7 +156,7 @@ export async function awaitDaemonGone(oldPid?: number, timeoutMs = 15_000): Prom
   return false;
 }
 
-export async function ensureDaemon(): Promise<DaemonInfo> {
+export async function ensureDaemon(cwd = process.cwd()): Promise<DaemonInfo> {
   // Validate the socket path FIRST: ping() swallows every throw into "not up",
   // which would turn socketPath()'s loud sun_path refusal into a silent spawn
   // of a daemon bound to a truncated (colliding) socket.
@@ -167,6 +168,21 @@ export async function ensureDaemon(): Promise<DaemonInfo> {
   // build) and equally what makes skew possible (an upgrade cannot replace a
   // daemon that is already running).
   const daemonEntry = join(dirname(fileURLToPath(import.meta.url)), '..', 'daemon', 'index.js');
+  const daemonEnv = { ...process.env };
+  if (cwd !== undefined) {
+    try {
+      // Input values travel in the lease request, never in the shared daemon's
+      // ambient environment. Otherwise the FIRST caller leaks them into every
+      // future check, exec and unrelated service on this daemon.
+      for (const name of Object.keys(collectCallerEnv(cwd))) delete daemonEnv[name];
+    } catch {
+      // status/doctor/update also work outside a stack or with a broken manifest.
+      // Binding clients validate/collect their input envelope before spawning.
+    }
+  }
+  // HOME/XDG inputs may legitimately be service-specific. Pin routing before
+  // the stripped daemon recomputes its state root from its own environment.
+  daemonEnv.BACKLOT_STATE_DIR = stateRoot();
   const log = openSync(join(stateRoot(), 'daemon.log'), 'a');
   // node:sqlite (the journal) prints "SQLite is an experimental feature" on
   // every spawn, burying daemon.log's signal. Suppress ONLY that warning class,
@@ -174,7 +190,7 @@ export async function ensureDaemon(): Promise<DaemonInfo> {
   const child = spawn(process.execPath, ['--disable-warning=ExperimentalWarning', daemonEntry], {
     detached: true,
     stdio: ['ignore', log, log],
-    env: { ...process.env },
+    env: daemonEnv,
   });
   child.unref();
   const pingUntil = async (deadline: number): Promise<DaemonInfo | null> => {
