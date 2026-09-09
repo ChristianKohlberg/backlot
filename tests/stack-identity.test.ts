@@ -2,7 +2,7 @@ import ts from 'typescript';
 import { pathToFileURL } from 'node:url';
 import { expect, it } from 'vitest';
 import { execFile, execFileSync, spawn } from 'node:child_process';
-import { mkdtempSync, mkdirSync, writeFileSync, symlinkSync, rmSync, readFileSync, existsSync, readdirSync, renameSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, symlinkSync, rmSync, readFileSync, existsSync, readdirSync, renameSync, realpathSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createHash } from 'node:crypto';
@@ -22,7 +22,9 @@ const notesIn = (url: string) => {
   try { return db.prepare('SELECT note FROM notes').all(); } finally { db.close(); }
 };
 function fixture(sweepMs = 60000, name = 'identity') {
-  const root = mkdtempSync(join(tmpdir(), 'backlot-identity-'));
+  // macOS's tmpdir can itself be an alias (/var -> /private/var). Only
+  // `alias` below should carry a lexical identity; `wt` must be physical.
+  const root = realpathSync(mkdtempSync(join(tmpdir(), 'backlot-identity-')));
   const wt = join(root, 'real'); mkdirSync(wt);
   const alias = join(root, 'alias'); symlinkSync(wt, alias, 'dir');
   const state = join(root, 'state');
@@ -30,11 +32,20 @@ function fixture(sweepMs = 60000, name = 'identity') {
   writeFileSync(join(wt, 'seed.mjs'), "import{DatabaseSync}from'node:sqlite';const db=new DatabaseSync(process.argv[2]);db.exec('CREATE TABLE IF NOT EXISTS notes (note TEXT)');db.close();");
   writeFileSync(join(wt, 'server.mjs'), "import{createServer}from'node:http';createServer((q,r)=>r.end('ok')).listen(+process.env.PORT,'127.0.0.1');");
   const env: NodeJS.ProcessEnv = { ...process.env, BACKLOT_STATE_DIR: state, BACKLOT_HOLDER_PID: '', BACKLOT_SWEEP_MS: String(sweepMs) };
-  const cli = (args: string[]) => new Promise<Context>((resolve, reject) => {
-    execFile(process.execPath, [CLI, ...args, '--json'], { cwd: wt, env }, (err, out, stderr) => {
-      try { resolve(JSON.parse(out)); } catch { reject(new Error(String(err) + stderr + out)); }
+  const cli = async (args: string[]) => {
+    const result = await new Promise<Context>((resolve, reject) => {
+      execFile(process.execPath, [CLI, ...args, '--json'], { cwd: wt, env }, (err, out, stderr) => {
+        try { resolve(JSON.parse(out)); } catch { reject(new Error(String(err) + stderr + out)); }
+      });
     });
-  });
+    if (args[0] === 'daemon' && args[1] === 'stop' && !result.error) {
+      // The reply precedes shutdown. Wait for teardown and election-lock
+      // release before editing the journal or starting the replacement daemon.
+      await expect.poll(() => !existsSync(join(state, 'daemon.sock')) && !existsSync(join(state, 'daemon.lock')),
+        { timeout: 15000 }).toBe(true);
+    }
+    return result;
+  };
   const mcp = (verb: string, cwd: string, holder?: string) => new Promise<Context>((resolve, reject) => {
     const p = spawn(process.execPath, [MCP], { cwd: wt, env, stdio: ['pipe', 'pipe', 'ignore'] });
     const timer = setTimeout(() => { p.kill(); reject(new Error('MCP timeout')); }, 15000);
