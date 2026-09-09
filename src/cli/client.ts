@@ -51,6 +51,7 @@ export function rpc(
   verb: string,
   args: Record<string, unknown>,
   onProgress?: (phase: string) => void,
+  deadlineMs?: number,
 ): Promise<RpcResponse> {
   return new Promise((resolve, reject) => {
     const req = request(
@@ -94,6 +95,15 @@ export function rpc(
         }),
       );
     });
+    // Shutdown polling has its own wall-clock budget. A stalled or streaming
+    // ping must not extend it to the ordinary RPC inactivity timeout.
+    if (deadlineMs !== undefined) {
+      const deadline = setTimeout(() => req.destroy(Object.assign(new Error(`daemon did not respond to '${verb}' before the deadline`), {
+        backlotClass: 'infra-error' as const,
+      })), deadlineMs);
+      deadline.unref();
+      req.once('close', () => clearTimeout(deadline));
+    }
     req.end(JSON.stringify({ verb, args }));
   });
 }
@@ -111,20 +121,25 @@ export interface DaemonInfo {
   journalSchema?: number;
 }
 
-async function ping(): Promise<DaemonInfo | null> {
+async function ping(deadlineMs?: number, strict = false): Promise<DaemonInfo | null> {
   try {
-    const res = await rpc('ping', {});
-    if (!res.ok) return null;
+    const res = await rpc('ping', {}, undefined, deadlineMs);
+    if (!res.ok) {
+      if (strict) throw Object.assign(new Error(res.error.message), { backlotClass: 'infra-error' });
+      return null;
+    }
     const d = (res.data ?? {}) as DaemonInfo;
     return { pid: d.pid, version: d.version, journalSchema: d.journalSchema };
-  } catch {
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (strict && code !== 'ENOENT' && code !== 'ECONNREFUSED') throw error;
     return null;
   }
 }
 
-/** Ask the socket who is there, without spawning anything. Null = nobody answered. */
+/** Inspect without spawning; only an absent socket/listener means no daemon. */
 export async function daemonInfo(): Promise<DaemonInfo | null> {
-  return ping();
+  return ping(undefined, true);
 }
 
 /**
@@ -148,7 +163,7 @@ export async function daemonInfo(): Promise<DaemonInfo | null> {
 export async function awaitDaemonGone(oldPid?: number, timeoutMs = 15_000): Promise<boolean> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    const answering = (await ping()) !== null;
+    const answering = (await ping(Math.max(1, deadline - Date.now()))) !== null;
     const running = oldPid !== undefined && isAlive(oldPid);
     if (!answering && !running) return true;
     await new Promise((r) => setTimeout(r, 50));

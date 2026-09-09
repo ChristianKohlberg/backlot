@@ -4,7 +4,7 @@
  * human); exit codes are contractual — 0 ok, 1 work-error, 2 env-error,
  * 3 infra-error, 64 usage. See docs/architecture.md §11.
  */
-import { ensureDaemon, rpc, classifyClientError, awaitDaemonGone, type RpcError } from './client.js';
+import { ensureDaemon, daemonInfo, rpc, classifyClientError, awaitDaemonGone, type RpcError, type RpcResponse } from './client.js';
 import { isAlive } from '../core/procscan.js';
 import { VERSION, versionSkew } from '../core/version.js';
 import { installKind } from './install.js';
@@ -216,7 +216,12 @@ async function main(): Promise<void> {
   // Collect before autospawn: a malformed binding manifest must not start a
   // shared daemon with input values in its inherited environment.
   const callerEnv = ['up', 'run'].includes(verb) ? collectCallerEnv(process.cwd()) : undefined;
-  const daemon = await ensureDaemon(process.cwd());
+  const stopping = verb === 'daemon' && positional[0] === 'stop';
+  const daemon = stopping ? await daemonInfo() : await ensureDaemon(process.cwd());
+  if (!daemon) {
+    out({ stopping: true, stopped: true });
+    return;
+  }
 
   // Version skew is REFUSED, not warned about.
   //
@@ -271,7 +276,7 @@ async function main(): Promise<void> {
     }
   }
 
-  let res;
+  let res: RpcResponse | undefined;
   switch (verb) {
     case 'up': {
       const ttl = flagValue('--ttl');
@@ -505,6 +510,16 @@ async function main(): Promise<void> {
         process.exit(64);
       }
       res = await rpc('shutdown', {});
+      if (!res.ok) break;
+      if (!(await awaitDaemonGone(daemon.pid))) {
+        errExit({
+          class: 'infra-error',
+          message: 'the daemon accepted shutdown but did not exit before the deadline; check the daemon log and retry',
+          source: 'daemon',
+        });
+        return;
+      }
+      res = { ok: true, data: { stopping: true, stopped: true } };
       break;
     }
     case 'update': {

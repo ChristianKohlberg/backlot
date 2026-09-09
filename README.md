@@ -84,6 +84,11 @@ backlot update --check     # cli vs daemon, who would have to rebind, and the up
 backlot update             # restart; no-op when the daemon is already the installed build
 ```
 
+`backlot daemon stop` waits up to 15 seconds after the shutdown acknowledgement
+for the old daemon to exit. Success includes `stopped: true` (and retains
+`stopping: true` for compatibility); if no daemon is running, it succeeds without
+starting one. A shutdown that does not complete returns `infra-error` (exit 3).
+
 **What a restart costs.** Leases **survive** it. Services stop, environments drop
 to `warm`, and each holder's next verb rebinds — seconds, the same transition the
 idle sweeper already performs on a leased environment. `update` names every holder
