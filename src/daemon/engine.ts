@@ -1032,16 +1032,13 @@ export class Engine {
     const forbiddenNotice = await this.enforcePreviewForbidden(env, stack, say);
     if (hygiene === 'pristine') {
       say('preparing a pristine environment');
-      await this.supervisor(env).stopAll();
-      this.supervisors.delete(env.id);
-      const pristineSurvivors = await this.reapEnvProcesses(env);
+      await this.stopForBind(env);
       rmSync(dirs.tree, { recursive: true, force: true });
       rmSync(dirs.data, { recursive: true, force: true });
       mkdirSync(dirs.tree, { recursive: true });
       mkdirSync(dirs.data, { recursive: true });
       env.fingerprints = {};
       env.presets = {};
-      env.servicePids = pristineSurvivors;
       // Persist the cleared ledger NOW, not at the end of the bind. Appliances,
       // sync and upkeep all run before the epilogue, and a crash in any of them
       // used to leave the journal asserting fingerprints and presets for state
@@ -1145,11 +1142,7 @@ export class Engine {
 
     // Services must not hold open handles across a data restore or code change.
     trace.phase('stop');
-    await this.supervisor(env).stopAll();
-    this.supervisors.delete(env.id);
-    // Reap any process that survived or escaped the group kill above so the
-    // port-free check below does not see a stale holder. See reapEnvProcesses.
-    await this.reapEnvProcesses(env);
+    await this.stopForBind(env);
 
     // Data state: create-or-restore per hygiene (probe first — infra-error, not code blame).
     trace.phase('data');
@@ -2644,6 +2637,30 @@ export class Engine {
       this.journal.saveEnv(env);
       return env;
     });
+  }
+
+  /**
+   * Stop and reap this environment's services mid-bind, and journal the result
+   * at once. The row is what capacity accounting reads: an application charge
+   * retained for a conversion stands on `hot` or recorded pids, so leaving
+   * either in the journal after the processes are gone kept a slot reserved for
+   * nothing if the rest of the bind failed. Survivors stay recorded — and keep
+   * the charge — because a pid nobody can confirm dead may still hold a port.
+   * Re-reads the live row so a concurrent degrade is preserved and a recycled
+   * row is never written back.
+   */
+  private async stopForBind(env: EnvRow): Promise<void> {
+    const survivors = await this.supervisor(env).stopAll();
+    this.supervisors.delete(env.id);
+    const unreaped = await this.reapEnvProcesses(env, { ...env.servicePids, ...survivors });
+    const live = this.journal.getEnv(env.id);
+    if (live) {
+      if (live.state === 'hot') live.state = 'warm';
+      live.servicePids = unreaped;
+      this.journal.saveEnv(live);
+      env.state = live.state;
+    }
+    env.servicePids = unreaped;
   }
 
   /**

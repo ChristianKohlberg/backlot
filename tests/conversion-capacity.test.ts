@@ -156,6 +156,33 @@ describe('application capacity survives an unfinished data-only conversion', () 
     await f.alive(next.data);
   });
 
+  it('releases the application slot when a conversion fails after its services were stopped', async () => {
+    const f = fixture(2, 1);
+    const tree = f.stack('app');
+    const original = readFileSync(join(tree, 'backlot.yml'), 'utf8');
+    const first = await f.cli(tree, 'up', '--holder', 'a');
+    expect(first.code, first.stdout + first.stderr).toBe(0);
+    await f.alive(first.data);
+    writeFileSync(join(tree, 'backlot.yml'), original.replace('create: node seed.mjs {{ns}}', 'create: "false"'));
+    const failed = await f.cli(tree, 'up', '--holder', 'a', '--data-only', '--reset-data');
+    expect(failed.code, failed.stdout + failed.stderr).toBe(1);
+    await expect(fetch(first.data.urls.web.replace('localhost', '127.0.0.1'), { signal: AbortSignal.timeout(2000) })).rejects.toThrow();
+    const row = f.journal().getEnv(first.data.envId);
+    expect(row?.state).toBe('warm');
+    expect(row?.servicePids).toEqual({});
+    writeFileSync(join(tree, 'backlot.yml'), original);
+    // Nothing runs on that row any more, so the stack's single application slot
+    // is free for another holder — and the failed converter no longer owns it.
+    const competing = await f.cli(tree, 'up', '--holder', 'b');
+    expect(competing.code, competing.stdout + competing.stderr).toBe(0);
+    expect(competing.data.envId).not.toBe(first.data.envId);
+    await f.alive(competing.data);
+    const returning = await f.cli(tree, 'up', '--holder', 'a');
+    expect(returning.code, returning.stdout + returning.stderr).toBe(2);
+    expect(String(returning.data?.error?.message ?? '')).toMatch(/change shape to an application environment/);
+    await f.alive(competing.data);
+  });
+
   it('does not change the shape while an initial application bind can still start services', async () => {
     const f = fixture(1, 2);
     const tree = f.stack('app');
