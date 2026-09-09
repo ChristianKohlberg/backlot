@@ -420,7 +420,11 @@ export class Journal {
       `SELECT l.* FROM leases l JOIN envs e ON e.id = l.env_id WHERE l.holder = ? AND e.stack = ?`,
     ).all(holder, stack) as Record<string, unknown>[];
     if (rows.length > 1) {
-      throw new BrokerError('env-error', `ambiguous leases for holder '${holder}': ${rows.map((r) => r.env_id).join(', ')}; inspect status and resolve the duplicate environments explicitly`, 'lease');
+      throw new BrokerError(
+        'env-error',
+        `ambiguous leases for holder '${holder}': ${rows.map((r) => r.env_id).join(', ')}; inspect 'backlot status', then retire one with 'backlot pool recycle <envId> --force' — that destroys the selected environment and its data and ends its lease`,
+        'lease',
+      );
     }
     return rows[0] ? this.rowToLease(rows[0]) : undefined;
   }

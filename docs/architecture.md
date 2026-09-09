@@ -81,7 +81,10 @@ same stack, while separate Git worktree directories remain distinct. CLI and MCP
 resolve paths before requesting a lease. Explicit holder strings stay opaque;
 new implicit holders use the physical caller directory. On upgrade, verified
 legacy alias identities migrate without changing environment IDs, ports, data,
-or lease IDs. Old path-shaped holders are not guessed or rewritten: a canonical
+or lease IDs; the migration is retried at every bind and sweep, so a manifest that
+is unreadable when the daemon starts only delays it. Templates baked under the
+retired identity are dropped once nothing refers to it, retrying a failed drop
+rather than leaking it. Old path-shaped holders are not guessed or rewritten: a canonical
 default request reports the exact `--holder` needed to inspect or release that
 legacy lease. If legacy aliases converge on several leases for the same holder,
 Backlot refuses ambiguity and names the environments instead of selecting one.

@@ -186,8 +186,15 @@ export function canonicalDirectory(from: string): string {
   catch { throw new BrokerError('work-error', `cannot resolve project directory '${from}'`, 'manifest'); }
 }
 
+const IDENTITY_HASH_LENGTH = 8;
+
 export function stackIdentity(name: string, root: string): string {
-  return `${name}-${createHash('sha256').update(root).digest('base64url').slice(0, 8)}`;
+  return `${name}-${createHash('sha256').update(root).digest('base64url').slice(0, IDENTITY_HASH_LENGTH)}`;
+}
+
+/** The identity a migrated row carried while its root was still spelled `legacyRoot`. */
+export function retiredStackIdentity(stack: string, legacyRoot: string): string {
+  return stackIdentity(stack.slice(0, -(IDENTITY_HASH_LENGTH + 1)), legacyRoot);
 }
 
 export function findStackRoot(from: string): string {

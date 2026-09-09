@@ -9,16 +9,16 @@ import { mkdirSync, rmSync, copyFileSync, readdirSync, statSync, existsSync, rea
 import { join, sep } from 'node:path';
 import { Journal, JOURNAL_SCHEMA_VERSION, type EnvRow, type LeaseRow } from '../core/journal.js';
 import { VERSION, compareVersions, versionSkew } from '../core/version.js';
-import { canonicalDirectory, stackIdentity, loadStack, defaultPreset, normalizeLogins, type Stack } from '../core/manifest.js';
+import { canonicalDirectory, stackIdentity, retiredStackIdentity, loadStack, defaultPreset, normalizeLogins, type Stack } from '../core/manifest.js';
 import { changedOutputs, pullOutputs } from '../core/sync.js';
 import { syncIntoEnvThreaded } from '../core/sync-thread.js';
 import { runUpkeep, pendingUpkeep, templateBakeKeys } from '../core/upkeep.js';
 import { freePort, probeFree } from '../core/ports.js';
-import { envsRoot, artifactsRoot, stateRoot } from '../core/paths.js';
+import { envsRoot, artifactsRoot, stateRoot, templatesRoot } from '../core/paths.js';
 import { BrokerError, template, templateEnv, now, shortId, matchesAny, safeJoin } from '../core/util.js';
 import { callerEnvSpec, requireCallerEnv, selectCallerEnv, serviceCallerEnv, validateCallerEnv } from '../core/caller-env.js';
 import { cmdTimeoutS, runBounded, runBoundedIO, LONG_CMD_TIMEOUT_S } from '../core/exec.js';
-import { makeDatastore, type DsHandle } from '../drivers/datastores.js';
+import { makeDatastore, retireBakedTemplates, withBakeLock, type DsHandle } from '../drivers/datastores.js';
 import { ensureAppliance, stopAppliance, probeTcp } from '../drivers/appliances.js';
 import { DEFAULT_PREVIEW_PUBLISHER, resolvePreviewPublisher } from '../drivers/preview.js';
 import { EnvSupervisor, killGroupVerified, reapPids } from './supervisor.js';
@@ -218,18 +218,15 @@ export class Engine {
 
   /** Recovery (decision 0009): reap recorded PIDs from a previous daemon life; hot -> warm. */
   async recover(): Promise<void> {
-    const identities: Array<{ id: string; stack: string; root: string }> = [];
     for (const env of this.journal.allEnvs()) {
       try {
-        const stack = loadStack(env.stackRoot);
         // Only migrate a proven lexical alias. Renamed manifests remain subject
-        // to ordinary orphan retention; an unreadable source proves nothing.
-        if (stackIdentity(stack.manifest.name, env.stackRoot) === env.stack && stack.id !== env.stack) {
-          identities.push({ id: env.id, stack: stack.id, root: stack.root });
-        }
+        // to ordinary orphan retention; an unreadable source proves nothing and
+        // is retried at every later bind and sweep boundary.
+        this.adoptLegacyAliases(loadStack(env.stackRoot));
       } catch { /* leave unavailable or renamed projects unchanged */ }
     }
-    this.journal.canonicalizeStacks(identities);
+    for (const env of this.journal.allEnvs()) await this.retireLegacyTemplates(env);
     let envs = 0;
     let stranded = 0;
     for (const env of this.journal.allEnvs()) {
@@ -1435,7 +1432,62 @@ export class Engine {
 
   // ---------------------------------------------------------------- verbs
 
+  /**
+   * A proven lexical alias: the row's identity is exactly what the current
+   * manifest name yields for the spelling it recorded, and that spelling still
+   * resolves to `stack`'s physical root. A renamed manifest, or a source that
+   * is unreadable or gone, proves nothing and is left alone.
+   */
+  private legacyAlias(env: EnvRow, stack: Stack): { id: string; stack: string; root: string } | null {
+    if (env.stack === stack.id || stackIdentity(stack.manifest.name, env.stackRoot) !== env.stack) return null;
+    try {
+      if (canonicalDirectory(env.stackRoot) !== stack.root) return null;
+    } catch {
+      return null;
+    }
+    return { id: env.id, stack: stack.id, root: stack.root };
+  }
+
+  /**
+   * Migrate every proven alias of `stack` to its physical identity. Idempotent,
+   * and applied at every boundary that judges a row by identity — recovery, the
+   * holder verbs, the sweeper's orphan check — so a manifest that was merely
+   * unreadable when the daemon started can only defer the migration, never turn
+   * it into a reclaim or a duplicate environment once repaired.
+   */
+  private adoptLegacyAliases(stack: Stack): void {
+    const changes = this.journal.allEnvs().map((env) => this.legacyAlias(env, stack)).filter((c) => c !== null);
+    if (changes.length === 0) return;
+    this.journal.canonicalizeStacks(changes);
+    for (const change of changes) {
+      logEvent({ level: 'info', kind: 'retention', envId: change.id, detail: `stack identity migrated to '${change.stack}' (physical root ${change.root})` });
+    }
+  }
+
+  /**
+   * Templates are keyed by stack id, so a migrated row leaves the templates its
+   * old identity baked with no reader. They are retired only once no row still
+   * carries that identity; a server-side template whose drop fails keeps its
+   * marker, and the sweeper tries again.
+   */
+  private async retireLegacyTemplates(env: EnvRow): Promise<void> {
+    if (!env.legacyStackRoot) return;
+    const retired = retiredStackIdentity(env.stack, env.legacyStackRoot);
+    const dir = join(templatesRoot(), retired);
+    if (retired === env.stack || !existsSync(dir) || this.journal.envsForStack(retired).length > 0) return;
+    await withBakeLock(retired, async () => {
+      const { dropped, deferred } = await retireBakedTemplates(dir, existsSync(env.stackRoot) ? env.stackRoot : templatesRoot());
+      if (deferred > 0) {
+        logEvent({ level: 'warn', kind: 'retention', envId: env.id, detail: `${deferred} template(s) keyed by retired stack identity '${retired}' could not be dropped yet — will retry` });
+        return;
+      }
+      rmSync(dir, { recursive: true, force: true });
+      logEvent({ level: 'info', kind: 'retention', envId: env.id, detail: `retired templates keyed by legacy stack identity '${retired}' (${dropped} server-side template(s) dropped)` });
+    });
+  }
+
   private callerHolder(cwd: string, holder: string | undefined, stack: Stack): string {
+    this.adoptLegacyAliases(stack);
     if (holder !== undefined) return holder;
     const canonical = canonicalDirectory(cwd);
     for (const env of this.journal.envsForStack(stack.id)) {
@@ -1443,7 +1495,7 @@ export class Engine {
       const lease = this.journal.leaseForEnv(env.id);
       const legacyPathHolder = lease && (lease.holder === env.legacyStackRoot || lease.holder.startsWith(env.legacyStackRoot + sep));
       if (legacyPathHolder && lease.expiresAt > now() && canonical === join(env.stackRoot, lease.holder.slice(env.legacyStackRoot.length))) {
-        throw new BrokerError('env-error', `a legacy path holder still owns ${env.id}; use --holder ${JSON.stringify(lease.holder)} to inspect or release that lease before using the canonical default holder`, 'lease');
+        throw new BrokerError('env-error', `a legacy path holder still owns ${env.id}; pass holder ${JSON.stringify(lease.holder)} (--holder on the CLI) to inspect or release that lease before using the canonical default holder`, 'lease');
       }
     }
     return canonical;
@@ -3046,6 +3098,7 @@ export class Engine {
     }
     for (const env of this.journal.allEnvs()) {
       if (this.busy.has(env.id)) continue;
+      await this.retireLegacyTemplates(env);
       // An environment whose STACK can never be bound again — the repo was
       // deleted or moved, or (after an identity-scheme change or a manifest
       // rename) its root no longer resolves to the recorded stack id — is
@@ -3059,8 +3112,9 @@ export class Engine {
           orphanReason = `stack root ${env.stackRoot} is gone`;
         } else {
           try {
-            const currentId = loadStack(env.stackRoot).id;
-            if (currentId !== env.stack) orphanReason = `stack root ${env.stackRoot} now resolves to '${currentId}', not '${env.stack}'`;
+            const current = loadStack(env.stackRoot);
+            if (this.legacyAlias(env, current)) this.adoptLegacyAliases(current);
+            else if (current.id !== env.stack) orphanReason = `stack root ${env.stackRoot} now resolves to '${current.id}', not '${env.stack}'`;
           } catch {
             /* unreadable manifest — ambiguous, leave the env alone */
           }

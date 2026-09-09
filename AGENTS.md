@@ -91,13 +91,20 @@ covers all of it.
 ## Physical stack identity
 
 `findStackRoot` canonicalizes directories before hashing identity; MCP also resolves
-cwd in its own process before RPC. Recovery migrates only proven lexical aliases,
-leaving env IDs, ports, namespaces and explicit holders intact. `legacy_stack_root`
+cwd in its own process before RPC. `adoptLegacyAliases` migrates only proven lexical
+aliases, leaving env IDs, ports, namespaces and explicit holders intact. It is
+idempotent and runs at recovery, in every holder verb and at the sweeper's orphan
+check — an unreadable manifest at daemon start may only *defer* a migration; treating
+the un-migrated row as an orphan (or missing it on the next bind) reclaims or
+duplicates a live environment. Templates are keyed by stack id, so the retired id's
+directory is dropped through its own `.baked` markers once no row carries that id;
+a failed drop keeps the marker and the sweeper retries. `legacy_stack_root`
 retains the old path spelling so canonical implicit requests can name the holder
 needed for recovery instead of silently creating another lease. Never rewrite a
 path-looking holder as though it were certainly implicit; old journals lack that
-provenance. Converged same-holder leases must refuse ambiguity. See
-`tests/stack-identity.test.ts` for CLI/MCP, migration and distinct-worktree coverage.
+provenance. Converged same-holder leases must refuse ambiguity and name the
+`pool recycle <envId> --force` way out. See `tests/stack-identity.test.ts` for
+CLI/MCP, deferred migration, template retirement and distinct-worktree coverage.
 
 ## Leases: `--ttl` is the agent form, `--holder-pid` is not
 

@@ -139,6 +139,43 @@ export async function dropBakedTemplates(dir: string, cwd: string): Promise<numb
   return dropped;
 }
 
+/**
+ * Retire the markers in `dir`: a server-side template is dropped and its
+ * marker removed only when the drop command actually succeeded, so a marker
+ * whose appliance is unreachable stays behind for a later attempt instead of
+ * leaking its database. Legacy bare-string markers have nothing to drop.
+ */
+export async function retireBakedTemplates(dir: string, cwd: string): Promise<{ dropped: number; deferred: number }> {
+  let dropped = 0;
+  let deferred = 0;
+  let entries: string[] = [];
+  try {
+    entries = readdirSync(dir);
+  } catch {
+    return { dropped, deferred };
+  }
+  for (const f of entries) {
+    if (!f.endsWith('.baked')) continue;
+    const full = join(dir, f);
+    let drop: string | null = null;
+    try {
+      drop = parseBakedMarker(readFileSync(full, 'utf8')).drop;
+    } catch {
+      /* unreadable marker — nothing to drop */
+    }
+    if (drop) {
+      const r = await runBounded(drop, cwd);
+      if (r.code !== 0 || r.timedOut) {
+        deferred++;
+        continue;
+      }
+      dropped++;
+    }
+    rmSync(full, { force: true });
+  }
+  return { dropped, deferred };
+}
+
 // ---------------------------------------------------------------- sqlite
 
 class SqliteDs implements DsDriver {
