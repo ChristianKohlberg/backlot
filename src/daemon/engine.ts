@@ -395,6 +395,9 @@ export class Engine {
         // an unmetered conversion is exactly how the cheap data-only ceiling
         // could be spent as application capacity: take N catalog-priced
         // environments, then turn them into full stacks for free (decision 0025).
+        // A queued bind may still start the previous shape. Do not rewrite its
+        // reservation while that operation owns the environment lock.
+        if ((env.dataOnly === true) !== dataOnly && this.busy.has(env.id)) return null;
         if ((env.dataOnly === true) !== dataOnly && !this.convertShape(env, dataOnly)) {
           throw new BrokerError(
             'env-error',
@@ -420,7 +423,8 @@ export class Engine {
     if (onlyMine) return null;
     const envs = this.journal.envsForStack(stack.id);
     const free = envs
-      .filter((e) => !this.journal.leaseForEnv(e.id) && e.state !== 'degraded' && e.state !== 'recycling')
+      .filter((e) => !this.journal.leaseForEnv(e.id) && e.state !== 'degraded' && e.state !== 'recycling' &&
+        ((e.dataOnly === true) === dataOnly || !this.busy.has(e.id)))
       // Matching SHAPE first, then heat. A data-only row handed to an ordinary
       // `up` is not wrong — it is a conversion, and conversions have to be paid
       // for (below) — but reaching for one while a matching environment sits free
@@ -480,19 +484,16 @@ export class Engine {
    * Move an environment between the application and data-only buckets, if the
    * destination has room. Returns false — changing nothing — when it does not.
    *
-   * The write happens at CLAIM time, not after the bind, because that is what
-   * makes the accounting exact: a concurrent claim must already see this
-   * environment in its new bucket. It records intent rather than reality, which
-   * is safe — `dataOnly` says what shape the environment IS, and a bind that
-   * later fails leaves it warm with nothing running, exactly like any other
-   * failed bind. MUST run under the pool lock (tryClaim holds it).
+   * Reserve the destination at claim time so concurrent claims see it. An
+   * app-to-data conversion retains its application charge until services are
+   * stopped: upkeep can fail before teardown. No rollback may release a slot
+   * while another operation is still using it. MUST run under the pool lock.
    */
   private convertShape(env: EnvRow, dataOnly: boolean): boolean {
-    if ((env.dataOnly === true) === dataOnly) return true; // nothing to convert
-    // Count the destination bucket WITHOUT this environment, since it is leaving
-    // the other one: this stack's app count already excludes it when it is
-    // data-only, and vice versa, so the ordinary check is the right one.
-    if (this.capacityBinding(env.stack, dataOnly) !== null) return false;
+    if ((env.dataOnly === true) === dataOnly) return true;
+    // An unfinished conversion already holds its application slot. Returning
+    // to the application shape must not demand a second slot for the same row.
+    if ((dataOnly || !this.usesApplicationCapacity(env)) && this.capacityBinding(env.stack, dataOnly) !== null) return false;
     env.dataOnly = dataOnly;
     const row = this.journal.getEnv(env.id);
     if (row) this.journal.saveEnv({ ...row, dataOnly });
@@ -500,15 +501,20 @@ export class Engine {
       level: 'info',
       kind: 'pool-shape',
       envId: env.id,
-      detail: `converted to ${dataOnly ? 'data-only' : 'an application environment'} — it now counts against the ${dataOnly ? 'BACKLOT_POOL_MAX_DATA_ONLY' : 'BACKLOT_POOL_MAX/BACKLOT_POOL_MAX_TOTAL'} ceiling`,
+      detail: `reserved ${dataOnly ? 'data-only' : 'an application environment'} — counts against ${dataOnly ? 'BACKLOT_POOL_MAX_DATA_ONLY; application capacity remains reserved until services stop' : 'BACKLOT_POOL_MAX/BACKLOT_POOL_MAX_TOTAL'}`,
     });
     return true;
   }
 
-  /** Application (non-data-only) environments, machine-wide or for one stack. */
+  /** Durable shape reserves capacity; running reality can retain it too. */
+  private usesApplicationCapacity(env: EnvRow): boolean {
+    return env.dataOnly !== true || env.state === 'hot' || Object.keys(env.servicePids).length > 0;
+  }
+
+  /** Application reservations, including unfinished conversions to data-only. */
   private appEnvs(stackId?: string): EnvRow[] {
     const rows = stackId === undefined ? this.journal.allEnvs() : this.journal.envsForStack(stackId);
-    return rows.filter((e) => e.dataOnly !== true);
+    return rows.filter((e) => this.usesApplicationCapacity(e));
   }
 
   /** Data-only environments, machine-wide (they have no per-stack ceiling). */
@@ -548,9 +554,9 @@ export class Engine {
       .allEnvs()
       .filter(
         (e) =>
-          // Same shape only: the two shapes answer to different ceilings, so
-          // evicting a data-only environment cannot free an application slot.
-          (e.dataOnly === true) === dataOnly &&
+          // An unfinished conversion can hold both reservations. Evicting it
+          // releases whichever ceiling is currently binding.
+          (dataOnly ? e.dataOnly === true : this.usesApplicationCapacity(e)) &&
           // 'provisioning' is mid-creation, 'recycling' is already going, and
           // 'degraded' is the sweeper's own to reap.
           (e.state === 'warm' || e.state === 'hot') &&
