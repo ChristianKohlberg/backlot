@@ -1082,7 +1082,10 @@ export class Engine {
     for (const [name, spec] of Object.entries(stack.manifest.datastores ?? {})) {
       const ds = makeDatastore(name, spec, stack.id, bakeKeys[name]);
       await ds.probe();
-      const preset = presets[name]!;
+      const preset = presets[name];
+      if (preset === undefined) {
+        throw new BrokerError('env-error', `missing resolved preset selection for datastore '${name}'`, name);
+      }
       const exists = Boolean(env.datastoreNs[name]);
       const force = env.presets[name] !== preset || hygiene !== 'reuse' || upkeep.rebakeTemplates.includes(name);
       if (force || !exists) say(`preparing datastore '${name}' (${preset})`);
