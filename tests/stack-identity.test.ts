@@ -560,7 +560,7 @@ it('baseline ordinary retention cannot reach migrated retirement records or reso
     const ordinary = join(f.state, 'templates', 'ordinary');
     mkdirSync(ordinary, { recursive: true });
     writeFileSync(join(ordinary, 'stale.db'), 'ordinary retention control');
-    const baseline = execFileSync('git', ['show', 'fc5df5b87f3acf2256ade08e7a3d297344c113c0:src/core/retention.ts'], { encoding: 'utf8' });
+    const baseline = readFileSync(join(import.meta.dirname, 'fixtures', 'baseline-retention.ts'), 'utf8');
     writeFileSync(executable, ts.transpileModule(baseline, { compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2023 } }).outputText);
     const output = execFileSync(process.execPath, ['--input-type=module', '-e', `const {pruneTemplates} = await import(${JSON.stringify(pathToFileURL(executable).href)}); console.log(await pruneTemplates({templatesKeep:0}));`], { cwd: f.wt, env: f.env, encoding: 'utf8' });
     expect(Number(output.trim())).toBe(1);
