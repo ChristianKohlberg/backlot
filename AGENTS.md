@@ -63,12 +63,17 @@ sweeper's torn-row prune), at `teardownClaimed` (before `deleteEnv` drops the ro
 that names it), at `shutdown()`, and in `recover()`.
 
 The sharp edge: because the tunnel outlives service restarts, the tag-based
-reclaim paths must **skip it** — `reapEnvProcesses`' scan filters out the pid the
-env's live lease records, and `poolGc` skips every leased preview pid. Do NOT
+reclaim paths must **skip it** — `reapEnvProcesses`' scan filters out the process
+group the env's live lease records, and `poolGc` skips every leased one. Do NOT
 "simplify" those filters away: without them Linux shoots the tunnel at a boundary
 where macOS keeps it, and that platform split is the whole bug class this feature
 had to close, and all three of them (`pool gc`, the scan, doctor's orphan report)
-must agree on `leasedPreviewPids(tagged)` or one will act on what another calls healthy. That classifier protects the verified leader's entire tagged process group, matching env and state root; a bare PID or `preview:` label is not ownership. Wrappers whose children stay in that group survive sync/quiesce/GC, and lease teardown kills the group. Detached `setsid` descendants are outside this guarantee; Linux tag scanning and cross-platform group teardown are covered in `tests/preview-process-group.test.ts`.
+must agree on `leasedPreviewPids(tagged)` or one will act on what another calls
+healthy. That classifier exempts the verified leader's whole tagged process group
+(a launcher's same-group tunnel child included), never a bare pid or a `preview:`
+label, and `setsid` descendants are outside it — the contract is in
+[decision 0027](docs/decisions/0027-lease-scoped-public-preview.md) and
+`tests/preview-process-group.test.ts` is the regression test.
 
 `reconcilePreviewForBind` owns what a bind **and a `sync`/`--watch` projection**
 do to a live tunnel: it tears it

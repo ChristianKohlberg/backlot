@@ -72,9 +72,18 @@ The message rides back on the **bind's own result** as `previewNotice` (`up`,
 could consume first.
 
 Because the tunnel outlives service restarts, the process-tag reclaim paths
-(`reapEnvProcesses`' scan and `pool gc`) must **skip** a preview pid a live lease
-still records — otherwise Linux would shoot it at a boundary where macOS keeps
-it, which is the one platform split this reap cannot have.
+(`reapEnvProcesses`' scan, `pool gc` and doctor's orphan report) must **skip**
+the tagged process group of a preview a live lease still records — otherwise
+Linux would shoot it at a boundary where macOS keeps it, which is the one
+platform split this reap cannot have. The group, not just the leader pid, is
+what is skipped: a publisher launcher may fork the real tunnel as a same-group
+child, and exempting only the leader let the scan pick the child and kill the
+whole group. Ownership is the lease's recorded leader pid **and** start time,
+alive and carrying this env's tag — a reused pid or a bare `preview:` label
+exempts nothing, and a descendant that `setsid`s out of the group is not
+protected. Lease teardown kills the same group. `Engine.leasedPreviewPids` is
+the one classifier every consumer shares; `tests/preview-process-group.test.ts`
+is the regression test.
 
 Stacks may forbid preview in the manifest (`preview.forbidden: true`); refusal is
 a **work-error**. `cloudflared` is an external prerequisite; its absence is an
