@@ -24,7 +24,7 @@ import type { EnvState, Hygiene, LeaseKind, ServicePid } from './types.js';
  * test lane's database. Disk is truth (decision 0009), so the truth has to say
  * what wrote it.
  */
-export const JOURNAL_SCHEMA_VERSION = 1;
+export const JOURNAL_SCHEMA_VERSION = 2;
 
 /**
  * service_pids was once `{"web": 1234}` and is now
@@ -86,6 +86,7 @@ export interface EnvRow {
 }
 
 export interface LeaseRow {
+  presets?: Record<string, string>;
   id: string;
   envId: string;
   kind: LeaseKind;
@@ -176,6 +177,12 @@ export class Journal {
       } catch (err) {
         if (!/duplicate column name/i.test(String((err as Error).message ?? err))) throw err;
       }
+    }
+    try {
+      this.db.exec('ALTER TABLE leases ADD COLUMN presets TEXT');
+      this.db.exec("UPDATE leases SET presets = COALESCE((SELECT presets FROM envs WHERE envs.id = leases.env_id), '{}')");
+    } catch (err) {
+      if (!/duplicate column name/i.test(String((err as Error).message ?? err))) throw err;
     }
     // Migration for journals created before fail_streak existed. Swallowing
     // EVERY error here hid real failures (a corrupt journal, a locked file) as
@@ -335,13 +342,13 @@ export class Journal {
     this.db
       .prepare(
         `INSERT INTO leases (id, env_id, kind, holder, hygiene, expires_at, holder_pid, holder_start,
-           preview_service, preview_url, preview_pid, preview_start, preview_port)
-         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+           preview_service, preview_url, preview_pid, preview_start, preview_port, presets)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
          ON CONFLICT(id) DO UPDATE SET expires_at=excluded.expires_at, hygiene=excluded.hygiene,
            holder_pid=excluded.holder_pid, holder_start=excluded.holder_start,
            preview_service=excluded.preview_service, preview_url=excluded.preview_url,
            preview_pid=excluded.preview_pid, preview_start=excluded.preview_start,
-           preview_port=excluded.preview_port`,
+           preview_port=excluded.preview_port, presets=excluded.presets`,
       )
       .run(
         l.id,
@@ -357,6 +364,7 @@ export class Journal {
         l.previewPid ?? null,
         l.previewStart ?? null,
         l.previewPort ?? null,
+        l.presets === undefined ? null : JSON.stringify(l.presets),
       );
   }
 
@@ -383,6 +391,7 @@ export class Journal {
     return {
       id: r.id as string,
       envId: r.env_id as string,
+      presets: r.presets == null ? undefined : JSON.parse(r.presets as string),
       kind: r.kind as LeaseKind,
       holder: r.holder as string,
       hygiene: r.hygiene as Hygiene,

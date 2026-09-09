@@ -198,6 +198,10 @@ function hygiene(): string | undefined {
 }
 
 async function main(): Promise<void> {
+  if (presetArgs.length > 0 && !['up', 'run', 'reset-data'].includes(verb ?? '')) {
+    console.error('backlot: --preset is supported by up, run and reset-data');
+    process.exit(64);
+  }
   if (!verb || verb === 'help' || verb === '--help' || verb === '-h') {
     console.log(USAGE);
     return;
@@ -225,10 +229,6 @@ async function main(): Promise<void> {
   const callerEnv = ['up', 'run'].includes(verb) ? collectCallerEnv(process.cwd()) : undefined;
   let presets: Record<string, string> | undefined;
   if (presetArgs.length > 0) {
-    if (!['up', 'run', 'reset-data'].includes(verb)) {
-      console.error('backlot: --preset is supported by up, run and reset-data');
-      process.exit(64);
-    }
     const manifest = loadStack(process.cwd()).manifest;
     presets = parsePresetArgs(manifest, presetArgs);
     selectPresets(manifest, verb === 'run' ? 'run' : 'session', presets);

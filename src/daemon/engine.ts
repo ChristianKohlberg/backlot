@@ -441,6 +441,7 @@ export class Engine {
     if (env) {
       this.journal.saveLease({
         id: `l-${shortId()}`, envId: env.id, kind, holder, hygiene, expiresAt: now() + ttlMs,
+        presets: selectPresets(stack.manifest, kind),
         ...holderIdentity(holderPid),
       });
       // fresh: true — a NEW owner. It must not inherit a previous holder's
@@ -882,7 +883,10 @@ export class Engine {
     // matching whatever is still running. resolveServiceClosure owns the
     // empty->whole-app rule, so a preserved shape whose services were all removed
     // from the manifest falls back to full rather than starting none.
-    const presets = selectPresets(stack.manifest, kind, requestedPresets, freshClaim ? undefined : env.presets);
+    const presetLease = this.journal.leaseForEnv(env.id);
+    if (!presetLease) throw new BrokerError('env-error', 'lease ended before bind; run backlot up again', 'lease');
+    const presets = selectPresets(stack.manifest, kind, requestedPresets, presetLease.presets ?? (freshClaim ? undefined : env.presets));
+    this.journal.saveLease({ ...presetLease, presets });
     const presetsChanged = Object.entries(presets).some(([name, preset]) => env.presets[name] !== preset);
     const presetSelectionChanged = Object.entries(presets).some(([name, preset]) => Object.hasOwn(env.presets, name) && env.presets[name] !== preset);
     const declaredServices = Object.keys(stack.manifest.services);
@@ -1368,6 +1372,9 @@ export class Engine {
       // watch event; anything else re-earns an environment via acquire.
       const lease = this.journal.leaseForHolder(holder, stack.id);
       if (!lease || lease.envId !== envId || lease.expiresAt <= now()) return fallback();
+      const forbiddenNotice = await this.enforcePreviewForbidden(env, stack, () => undefined);
+      const presets = selectPresets(stack.manifest, lease.kind, undefined, lease.presets ?? env.presets);
+      if (Object.entries(presets).some(([name, preset]) => env.presets[name] !== preset)) return fallback();
       // Same trust conditions as bindAndStart's fast path: hot, all healthy.
       // A quiesced or half-dead env needs services started, not just files.
       if (env.state !== 'hot' || !this.supervisor(env).allHealthyPids()) return fallback();
@@ -1424,7 +1431,7 @@ export class Engine {
       // like every other case projection cannot honestly serve; `up` re-earns a
       // lease through the ordinary acquire path.
       if (!held || held.id !== lease.id) return fallback();
-      this.journal.saveLease({ ...held, expiresAt: now() + LEASE_TTL(held.kind) });
+      this.journal.saveLease({ ...held, presets, expiresAt: now() + LEASE_TTL(held.kind) });
       if (sync.copied > 0 || sync.deleted > 0) {
         logEvent({
           level: 'info', kind: 'watch', envId: env.id,
@@ -1433,7 +1440,7 @@ export class Engine {
       }
       trace.result.reuse = 'projected';
       trace.result.reasons = ['hot-reload-projection'];
-      return { outcome: 'projected', previewNotice, bindDiagnostics: trace.finish() };
+      return { outcome: 'projected', previewNotice: previewNotice ?? forbiddenNotice, bindDiagnostics: trace.finish() };
     });
   }
 
