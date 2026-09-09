@@ -284,8 +284,12 @@ describe('application capacity survives an unfinished data-only conversion', () 
         await sleep(20);
       }
       if (order.length > 0) {
+        // Whatever is still parked at the barrier must be let go first, or
+        // awaiting the pair would hang on it and the timeout would hide the
+        // outcome that actually settled early.
+        writeFileSync(join(gate, 'release'), '');
         const [outcome] = await settled;
-        expect.fail(`the application bind settled before reaching its upkeep barrier: ${JSON.stringify(outcome)}`);
+        expect.fail(`the application bind settled before reaching its upkeep barrier (journal dataOnly=${journal().getEnv(first.envId)?.dataOnly}): ${JSON.stringify(outcome)}`);
       }
       expect(existsSync(join(gate, 'entered'))).toBe(true);
       // Persisted shape while the claimed bind is parked: still an application.

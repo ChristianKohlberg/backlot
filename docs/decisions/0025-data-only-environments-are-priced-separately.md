@@ -1,6 +1,6 @@
 # 0025. A data-only environment answers to its own ceiling — and changing an environment's shape is a capacity event
 
-- Status: Accepted
+- Status: Accepted — amended 2026-09: a conversion to data-only keeps its application charge until the old services are stopped, and a shape change waits for an in-flight operation (see Rationale)
 - Date: 2026-07
 - Context: `up --data-only` ([0023](0023-data-only-leases.md)) removed the *weight*
   of an application environment but kept the *slot competition*: it was charged
@@ -26,7 +26,12 @@
    event.** A claim may still convert an environment between shapes — including a
    holder switching its own lease, which 0023 supports in both directions — but
    only when the destination ceiling has room. The conversion is written at claim
-   time and logged as `pool-shape`.
+   time and logged as `pool-shape`. A conversion **to** data-only keeps its
+   application charge while the row is still `hot` or records service pids, so
+   the slot is released only once the old services are actually stopped and the
+   journal says so; returning such a row to the application shape needs no second
+   slot. A shape change is deferred (bounded by `BACKLOT_WAIT_MS`), not refused,
+   while an operation is in flight on that environment.
 
 3. A free environment of the **matching** shape is always preferred over
    converting one, so capacity is never spent when it need not be.
@@ -59,18 +64,27 @@ tests in `tests/data-only-lease.test.ts`, which is the right way round.
 
 **Why write the shape at claim time rather than after the bind.** The accounting
 has to be exact against a concurrent claim, which must already see the environment
-in its new bucket. It records intent rather than reality, and that is safe: the
-field says what shape the environment *is*, and a bind that then fails leaves it
-warm with nothing running — indistinguishable from any other failed bind.
+in its new bucket. The field records intent, and intent alone was **not** safe in
+the data-only direction: the destination bucket was reserved while the old
+application's services were still running, so upkeep failing or stalling before
+the stop phase admitted another application past the cap. The application charge
+is therefore derived from durable running state — `hot`, or recorded service
+pids — rather than from the shape field, and the bind's stop phase journals the
+stopped result at once so a later failure releases the slot instead of holding it
+until the next sweep. A claim also carries a bind reservation until its bind holds
+the environment lock, since a concurrent shape change could otherwise rewrite the
+row in the gap before `busy` is set. `tests/conversion-capacity.test.ts` proves
+each of these; the agent-facing summary lives in `AGENTS.md`.
 
 ## Consequences
 
 - `poolMax`/`poolMaxTotal` now mean "application environments", and the refusal
   text says so. A host can hold `poolMaxTotal` applications *plus*
   `poolMaxDataOnly` lanes.
-- Eviction (#46) is bucketed: a data-only request can only evict a cold data-only
-  environment, since giving up an application one would not free the ceiling that
-  refused it.
+- Eviction (#46) is bucketed by charge, not by shape field: a data-only request can
+  only evict a cold data-only environment, since giving up an application one would
+  not free the ceiling that refused it, while an application request may evict a
+  data-only row whose unfinished conversion still holds an application charge.
 - A conversion refused for capacity reports the destination ceiling, naming the
   lease that would have to change shape.
 - `dataOnly` is no longer derived per bind. `bindAndStart` reads the row and
