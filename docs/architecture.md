@@ -74,24 +74,48 @@ different work into that tree. Source worktrees visit environments; environments
 visit worktrees. Consequences: caches survive rebinds, ports (and therefore URLs) are
 stable for an environment's lifetime, and the consumer's worktree is never touched.
 
-### The safety invariant
+### Physical stack identity
 
 Stack identity uses the physical project directory: symlink spellings refer to the
 same stack, while separate Git worktree directories remain distinct. CLI and MCP
-resolve paths before requesting a lease. Explicit holder strings stay opaque;
-new implicit holders use the physical caller directory. On upgrade, verified
-legacy alias identities migrate without changing environment IDs, ports, data,
-or lease IDs; the migration is retried at every bind and sweep, so a manifest that
-is unreadable when the daemon starts only delays it. Templates baked under the
-retired identity are dropped once nothing refers to it. Recovery never waits for
-retirement: sweeps attempt at most one external drop, capped at two seconds.
-Failed drops keep their markers and `.retirement.json` records, retry with
-backoff, and stop automatic attempts after three failures. After repairing the
-appliance, `backlot pool gc` retries retained records, including after the last
-environment for that stack has been recycled. Old path-shaped holders are not guessed or rewritten: a canonical
-default request without its own live canonical lease reports the exact `--holder` needed to inspect or release that
-legacy lease. If legacy aliases converge on several leases for the same holder,
-Backlot refuses ambiguity and names the environments instead of selecting one.
+resolve paths in the caller process before RPC. Explicit holder strings stay
+opaque; new implicit holders use the physical caller directory.
+
+On upgrade, verified legacy alias identities migrate without changing environment
+IDs, ports, datastore namespaces, data, lease IDs, or holder strings. Reconciliation
+runs at recovery, holder verbs, and before ordinary retention and orphan checks.
+An unreadable manifest delays migration and protects its template ownership from
+ordinary pruning; renamed or unavailable sources do not prove an alias.
+
+Old path-shaped holders are never guessed to be implicit or rewritten. A caller's
+own live canonical lease takes precedence. Otherwise, a legacy directory holder
+that resolves to the caller (including a symlinked subdirectory on an already
+canonical stack), or whose mapping cannot be resolved, blocks the default request
+with the exact `--holder` needed to inspect or release it. If aliases converge on
+several leases for the same holder, Backlot refuses ambiguity and names the
+environments. Recovery requires inspecting `backlot status` and explicitly choosing
+`backlot pool recycle <envId> --force`: this destroys the selected environment and
+its data and ends its lease.
+
+Proven obsolete template directories move atomically under the bake lock into
+`retired-templates/` in the state root, outside older daemons' ordinary retention.
+A `.retired-stack.json` descriptor keeps cleanup discoverable after the last
+environment is recycled. Retirement waits until no environment carries the old
+identity and no canonical environment is busy. Namespace ownership checks across
+both template roots preserve shared or ambiguous server templates, including
+truncated-name collisions; ordinary retention respects those owners too.
+
+Recovery performs no external retirement drops. Each sweep or explicit
+`backlot pool gc` retirement batch attempts at most one external drop, capped at
+two seconds or the shorter configured command timeout. Unconfirmed drops retain
+their markers and `.retirement.json` records with durable backoff; automatic
+attempts stop after three failures. After repairing the appliance, run
+`backlot pool gc` to retry retained records despite backoff or the attempt limit;
+repeat for additional pending markers. This still preserves shared or ambiguous
+ownership. Ordinary retention never prunes retirement descriptors or failure
+records.
+
+### The safety invariant
 
 **An environment never holds the only copy of anything.** The consumer's worktree
 remains the sole source of truth; the environment's tree is a disposable projection;
