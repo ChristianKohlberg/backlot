@@ -192,6 +192,12 @@
           },
           "description": "Injected environment; values may template {{ports.*}}, {{datastores.*.url}}, {{services.*.url}}."
         },
+        "env_from": {
+          "type": "object",
+          "propertyNames": { "pattern": "^(?!BACKLOT_)[A-Za-z_][A-Za-z0-9_]*$" },
+          "additionalProperties": { "enum": ["required", "optional"] },
+          "description": "Allowlisted caller environment inputs. up/run refresh values from their caller; sync/reset retain lease inputs. A supplied value overrides a same-named env entry; a missing optional input keeps an explicit env default, otherwise masks the daemon value. Memory only: re-run up after a daemon restart."
+        },
         "ready": {
           "$ref": "#/$defs/readiness"
         },
@@ -327,6 +333,11 @@
         "run": {
           "type": "string",
           "description": "Repo command, or an engine built-in prefixed with @ (e.g. @rebake-template <datastore>)."
+        },
+        "timeout": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "description": "Command deadline in seconds (default 300). BACKLOT_CMD_TIMEOUT_S overrides this value."
         }
       }
     },

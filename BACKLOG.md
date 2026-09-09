@@ -45,12 +45,16 @@ What it exposed:
   unit-tested red-first (tests/sleep-pardon.test.ts encodes the confirmed
   scenario), and the parser is verified against this machine's real
   post-sleep sysctl output.
-- [ ] **P2 · Cold bind measured 191s vs the ~50s 0.2 baseline — and nothing
-  says where the time went.** --progress shows phase names without durations;
+- [x] **P2 · Cold bind measured 191s vs the ~50s 0.2 baseline — and nothing
+  says where the time went.** FIXED 2026-09-09: `up`/`sync`/`reset-data --json`
+  and the run verdict carry `bindDiagnostics` (per-phase ms, reuse decision and
+  reasons, sync/upkeep counts, per-build cache hit/miss) — README "Understanding
+  a slow bind". The verdict's own `durationMs` still spans bind + check; the
+  bind share is `bindDiagnostics.durationMs`. The 191s regression itself is
+  not diagnosed. Original entry: --progress shows phase names without durations;
   run verdicts conflate bind time into durationMs (91.9s reported for a
-  sub-second check). Add per-phase durations to progress and the verdict
-  (bindMs vs checkMs) BEFORE diagnosing the regression; suspects include the
-  29k-file project, emulated MSSQL seeding, and dotnet build.
+  sub-second check); suspects include the 29k-file project, emulated MSSQL
+  seeding, and dotnet build.
 - [ ] **P2 · Watch lifecycle is invisible and uncontrollable.** up --watch
   returns immediately with nothing saying a daemon-resident watcher engaged;
   status/pool ls carry no watching flag; no stop verb; a later plain up does

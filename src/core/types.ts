@@ -4,6 +4,7 @@
  */
 
 import type { Login } from './manifest.js';
+import type { BindDiagnostics } from './diagnostics.js';
 
 export type EnvState = 'provisioning' | 'hot' | 'warm' | 'degraded' | 'recycling';
 
@@ -82,6 +83,8 @@ export interface Verdict {
 
 /** What `backlot ctx --json` returns — the consumer's entire interface. */
 export interface Context {
+  /** Present on bind responses only; ctx never replays another request's timings. */
+  bindDiagnostics?: BindDiagnostics;
   stack: string;
   envId: string;
   lease: Lease;

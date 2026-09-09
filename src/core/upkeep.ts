@@ -74,9 +74,10 @@ export async function runUpkeep(
   syncedFiles: string[],
   manifest: Manifest,
   previous: Record<string, string>,
+  onProgress?: (phase: string) => void,
 ): Promise<UpkeepOutcome> {
   const outcome: UpkeepOutcome = { ran: [], fingerprints: { ...previous }, rebakeTemplates: [] };
-  for (const rule of manifest.upkeep ?? []) {
+  for (const [index, rule] of (manifest.upkeep ?? []).entries()) {
     const key = `${rule.when} -> ${rule.run}`;
     const hash = triggerHash(envTree, syncedFiles, rule.when);
     if (previous[key] === hash) continue;
@@ -92,15 +93,32 @@ export async function runUpkeep(
       // Bounded like every other repo-declared command: an install blocking on
       // a half-up registry used to hold the env's busy bit until the daemon
       // was killed.
-      const timeoutS = cmdTimeoutS();
-      const r = await runBounded(rule.run, envTree, timeoutS);
+      const timeoutS = cmdTimeoutS(rule.timeout);
+      // Commands and their output may contain credentials. Progress names only
+      // the manifest rule's position, never its command or captured output.
+      const label = `upkeep rule ${index + 1}`;
+      const started = Date.now();
+      onProgress?.(`${label}: starting (timeout ${timeoutS}s)`);
+      const heartbeat = onProgress && setInterval(() => {
+        onProgress(`${label}: running (${Math.floor((Date.now() - started) / 1000)}s elapsed)`);
+      }, 5000);
+      heartbeat?.unref();
+      let r;
+      try {
+        r = await runBounded(rule.run, envTree, timeoutS);
+      } finally {
+        if (heartbeat) clearInterval(heartbeat);
+      }
       if (r.timedOut) {
+        onProgress?.(`${label}: timed out after ${timeoutS}s`);
         throw new BrokerError('work-error', `upkeep rule timed out after ${timeoutS}s (process group killed): ${rule.run}`, rule.when, r.output.slice(-800));
       }
       if (r.code !== 0) {
+        onProgress?.(`${label}: failed (${Math.floor((Date.now() - started) / 1000)}s elapsed)`);
         // Triggered by the binding's own change -> work-error by default (decision 0008).
         throw new BrokerError('work-error', `upkeep rule failed: ${rule.run}`, rule.when, r.output.slice(-800));
       }
+      onProgress?.(`${label}: finished (${Math.floor((Date.now() - started) / 1000)}s elapsed)`);
     }
     outcome.ran.push({ when: rule.when, run: rule.run });
     outcome.fingerprints[key] = hash;

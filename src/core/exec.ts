@@ -23,9 +23,9 @@ export const LONG_CMD_TIMEOUT_S = 600;
 
 /**
  * The deadline for a repo-declared command. Callers pass the default that fits
- * their site's class (setup steps 300s; build/exec-grade work 600s);
- * BACKLOT_CMD_TIMEOUT_S overrides ALL of them — the escape hatch for a repo
- * whose legitimate commands outrun the class default.
+ * their site's class (setup steps 300s, or an upkeep rule's own `timeout`;
+ * build/exec-grade work 600s); BACKLOT_CMD_TIMEOUT_S overrides ALL of them —
+ * the escape hatch for a repo whose legitimate commands outrun the class default.
  */
 export function cmdTimeoutS(fallback: number = DEFAULT_CMD_TIMEOUT_S): number {
   const e = process.env.BACKLOT_CMD_TIMEOUT_S;

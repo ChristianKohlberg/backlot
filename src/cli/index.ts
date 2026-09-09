@@ -8,6 +8,8 @@ import { ensureDaemon, rpc, classifyClientError, awaitDaemonGone, type RpcError 
 import { isAlive } from '../core/procscan.js';
 import { VERSION, versionSkew } from '../core/version.js';
 import { installKind } from './install.js';
+import { collectCallerEnv } from '../core/caller-env.js';
+import { BrokerError } from '../core/util.js';
 
 const USAGE = `backlot — puts a working instance of a web application in front of you.
 
@@ -211,7 +213,10 @@ async function main(): Promise<void> {
     process.exit(64);
   }
 
-  const daemon = await ensureDaemon();
+  // Collect before autospawn: a malformed binding manifest must not start a
+  // shared daemon with input values in its inherited environment.
+  const callerEnv = ['up', 'run'].includes(verb) ? collectCallerEnv(process.cwd()) : undefined;
+  const daemon = await ensureDaemon(process.cwd());
 
   // Version skew is REFUSED, not warned about.
   //
@@ -286,7 +291,7 @@ async function main(): Promise<void> {
       }
       res = await rpc(
         'up',
-        { cwd, holder, holderPid, hygiene: hygiene(), watch: flags.has('--watch'), ttlMs, services: positional, dataOnly },
+        { cwd, holder, holderPid, hygiene: hygiene(), watch: flags.has('--watch'), ttlMs, services: positional, dataOnly, callerEnv },
         progress,
       );
       endProgress();
@@ -299,13 +304,13 @@ async function main(): Promise<void> {
         process.exit(64);
       }
       if (flags.has('--detach')) {
-        res = await rpc('run-detach', { cwd, holder, check, hygiene: hygiene() });
+        res = await rpc('run-detach', { cwd, holder, check, hygiene: hygiene(), callerEnv });
         if (res.ok) {
           out(res.data);
           return;
         }
       } else {
-        res = await rpc('run', { cwd, holder, check, hygiene: hygiene(), pull: flags.has('--pull') }, progress);
+        res = await rpc('run', { cwd, holder, check, hygiene: hygiene(), pull: flags.has('--pull'), callerEnv }, progress);
         endProgress();
 
       }
@@ -614,7 +619,7 @@ async function main(): Promise<void> {
       }
       // Spawned from THIS CLI's dist, which is what makes the new daemon the
       // installed build.
-      const now = await ensureDaemon();
+      const now = await ensureDaemon(cwd);
       const remaining = versionSkew(VERSION, now.version);
       if (remaining) {
         errExit({
@@ -646,6 +651,10 @@ async function main(): Promise<void> {
 }
 
 main().catch((err) => {
+  if (err instanceof BrokerError) {
+    errExit(err.toJSON());
+    return;
+  }
   const msg = String((err as Error).message ?? err);
   // Agents branch on the error class MECHANICALLY (decision 0010), so a
   // client-side failure must not masquerade as env-error: that tells the agent

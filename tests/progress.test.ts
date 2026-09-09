@@ -28,6 +28,8 @@ writeFileSync(
   `name: prog
 services:
   web: { run: node server.mjs, port: web, env: { PORT: "{{ports.web}}" }, ready: { http: /, timeout: 20 } }
+upkeep:
+  - { when: server.mjs, run: "echo progress-secret-token", timeout: 20 }
 `,
 );
 execFileSync('git', ['init', '-q'], { cwd: wt });
@@ -67,6 +69,9 @@ describe('streaming progress', () => {
     const phases = r.stderr.replace(/\r/g, '\n');
     expect(phases).toMatch(/syncing worktree/);
     expect(phases).toMatch(/starting 'web'/);
+    expect(phases).toMatch(/upkeep rule 1: starting/);
+    expect(phases).toMatch(/upkeep rule 1: finished/);
+    expect(phases).not.toContain('progress-secret-token');
     await run(['release']);
     await run(['pool', 'recycle']);
   }, 30_000);

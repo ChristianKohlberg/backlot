@@ -22,6 +22,8 @@ export interface ServiceSpec {
   cwd?: string;
   port?: string;
   env?: Record<string, string>;
+  /** Allowlisted inputs supplied by the caller, retained only in lease memory. */
+  env_from?: Record<string, 'required' | 'optional'>;
   ready?: ReadySpec;
   fatal_logs?: string;
   depends_on?: string[];
@@ -66,6 +68,8 @@ export interface CheckSpec {
 export interface UpkeepRule {
   when: string;
   run: string;
+  /** Hard process-group deadline in seconds; default 300, global override wins. */
+  timeout?: number;
 }
 
 /**

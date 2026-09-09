@@ -5,10 +5,12 @@
  * crash pass silently.
  */
 import { spawn, type ChildProcess } from 'node:child_process';
+import { StringDecoder } from 'node:string_decoder';
 import { appendFileSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { BrokerError, now, safeJoin } from '../core/util.js';
 import { runBounded } from '../core/exec.js';
+import { redactStream } from '../core/caller-env.js';
 import { stateRoot } from '../core/paths.js';
 import { groupAlive, processGroup, sameProcess, serviceTag, startTime } from '../core/procscan.js';
 import type { ReadySpec, ServiceSpec } from '../core/manifest.js';
@@ -23,6 +25,8 @@ export interface ServiceEvent {
 interface Running {
   proc: ChildProcess;
   buf: string;
+  /** Probe matching only; never returned or persisted. */
+  probeBuf: string;
   restarts: number;
   expectedExit: boolean;
   /** Pending restart timer — must be cancellable by stopAll so it can't orphan. */
@@ -81,13 +85,13 @@ export class EnvSupervisor {
     return [...this.services.values()].every((r) => r.proc.exitCode === null);
   }
 
-  start(name: string, spec: ServiceSpec, env: Record<string, string>, watchMode: boolean): void {
+  start(name: string, spec: ServiceSpec, env: NodeJS.ProcessEnv, watchMode: boolean, secrets: string[] = []): void {
     const cmd = watchMode && spec.watch_run ? spec.watch_run : spec.run;
     // A repo can already run arbitrary shell here, so this is not a privilege
     // boundary — it makes an ACCIDENT loud. `cwd: ../sibling` silently ran the
     // service outside its environment tree, against files backlot never synced.
     const cwd = spec.cwd ? safeJoin(this.envTree, spec.cwd, `service '${name}' cwd`) : this.envTree;
-    const running: Running = { proc: null as unknown as ChildProcess, buf: '', restarts: 0, expectedExit: false, restartTimer: null, startedAt: now() };
+    const running: Running = { proc: null as unknown as ChildProcess, buf: '', probeBuf: '', restarts: 0, expectedExit: false, restartTimer: null, startedAt: now() };
     const launch = () => {
       running.restartTimer = null;
       // A teardown that landed while this restart was pending: do not respawn.
@@ -115,8 +119,7 @@ export class EnvSupervisor {
       // and an un-pinned pid is one the reaper must refuse to signal.
       running.startTime = proc.pid ? startTime(proc.pid) : undefined;
       this.onPidsChanged?.();
-      const sink = (d: Buffer) => {
-        const s = d.toString();
+      const sink = (s: string) => {
         running.buf = (running.buf + s).slice(-64_000);
         try {
           appendFileSync(this.logPath(name), s);
@@ -124,8 +127,16 @@ export class EnvSupervisor {
           /* log dir gone mid-teardown */
         }
       };
-      proc.stdout!.on('data', sink);
-      proc.stderr!.on('data', sink);
+      for (const stream of [proc.stdout!, proc.stderr!]) {
+        const decoder = new StringDecoder('utf8');
+        const redact = redactStream(secrets);
+        stream.on('data', (d: Buffer) => {
+          const text = decoder.write(d);
+          running.probeBuf = (running.probeBuf + text).slice(-64_000);
+          sink(redact(text));
+        });
+        stream.on('end', () => sink(redact(decoder.end(), true)));
+      }
       // A spawn failure (EAGAIN/EMFILE under fleet load) emits 'error'; with no
       // listener it becomes an uncaught exception that kills the whole daemon.
       proc.on('error', (err) => {
@@ -185,7 +196,7 @@ export class EnvSupervisor {
     this.note(name, 'started');
   }
 
-  async waitReady(name: string, spec: ServiceSpec, url: string | undefined, env: Record<string, string>): Promise<void> {
+  async waitReady(name: string, spec: ServiceSpec, url: string | undefined, env: NodeJS.ProcessEnv): Promise<void> {
     const ready: ReadySpec = spec.ready ?? (spec.port ? { http: '/' } : { log: '.' });
     const timeoutMs = (ready.timeout ?? 120) * 1000;
     const fatal = spec.fatal_logs ? new RegExp(spec.fatal_logs) : undefined;
@@ -195,7 +206,7 @@ export class EnvSupervisor {
 
     for (;;) {
       const buf = running.buf;
-      if (fatal && fatal.test(buf)) {
+      if (fatal && fatal.test(running.probeBuf)) {
         throw new BrokerError('work-error', `service '${name}' hit a fatal log marker during boot`, name, tail(buf));
       }
       // The daemonization detector (exit 0 in <2s) already gave up on this
@@ -223,7 +234,7 @@ export class EnvSupervisor {
           }
         }
       } else if (ready.log) {
-        if (new RegExp(ready.log).test(buf)) return;
+        if (new RegExp(ready.log).test(running.probeBuf)) return;
       } else if (ready.cmd) {
         // Bounded by what remains of the readiness budget: a probe command
         // that itself hangs used to block this loop long past ready.timeout.
