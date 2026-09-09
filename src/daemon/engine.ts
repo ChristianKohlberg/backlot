@@ -9,9 +9,10 @@ import { mkdirSync, rmSync, copyFileSync, readdirSync, statSync, existsSync, rea
 import { join, resolve } from 'node:path';
 import { Journal, JOURNAL_SCHEMA_VERSION, type EnvRow, type LeaseRow } from '../core/journal.js';
 import { VERSION, compareVersions, versionSkew } from '../core/version.js';
-import { loadStack, defaultPreset, normalizeLogins, type Stack } from '../core/manifest.js';
+import { loadStack, normalizeLogins, type Stack } from '../core/manifest.js';
 import { changedOutputs, pullOutputs } from '../core/sync.js';
 import { syncIntoEnvThreaded } from '../core/sync-thread.js';
+import { selectPresets } from '../core/presets.js';
 import { runUpkeep, pendingUpkeep, templateBakeKeys } from '../core/upkeep.js';
 import { freePort, probeFree } from '../core/ports.js';
 import { envsRoot, artifactsRoot, stateRoot } from '../core/paths.js';
@@ -43,6 +44,8 @@ const CHECK_TIMEOUT_S = 600;
 export type Progress = (phase: string) => void;
 
 export interface UpOptions {
+  /** Explicit datastore-to-preset overrides; continuing leases retain unmentioned choices. */
+  presets?: unknown;
   cwd: string;
   /** Explicit refresh envelope; absent means retain this lease's in-memory inputs. */
   callerEnv?: unknown;
@@ -859,7 +862,7 @@ export class Engine {
     return closure;
   }
 
-  private async bindAndStart(stack: Stack, envSnapshot: EnvRow, hygiene: Hygiene, kind: LeaseKind, watch: boolean, sourceRoot?: string, onProgress?: Progress, requestedServices?: string[], freshClaim = false, requestedDataOnly?: boolean, callerEnv?: unknown): Promise<{ env: EnvRow; previewNotice?: string; bindDiagnostics: BindDiagnostics }> {
+  private async bindAndStart(stack: Stack, envSnapshot: EnvRow, hygiene: Hygiene, kind: LeaseKind, watch: boolean, sourceRoot?: string, onProgress?: Progress, requestedServices?: string[], freshClaim = false, requestedDataOnly?: boolean, callerEnv?: unknown, requestedPresets?: unknown): Promise<{ env: EnvRow; previewNotice?: string; bindDiagnostics: BindDiagnostics }> {
     const say = onProgress ?? (() => undefined);
     const trace = new BindTrace();
     // Re-read under the env lock: the snapshot captured during acquire may be
@@ -879,6 +882,8 @@ export class Engine {
     // matching whatever is still running. resolveServiceClosure owns the
     // empty->whole-app rule, so a preserved shape whose services were all removed
     // from the manifest falls back to full rather than starting none.
+    const presets = selectPresets(stack.manifest, kind, requestedPresets, freshClaim ? undefined : env.presets);
+    const presetsChanged = Object.entries(presets).some(([name, preset]) => env.presets[name] !== preset);
     const declaredServices = Object.keys(stack.manifest.services);
     const requestedNames =
       requestedServices !== undefined
@@ -1015,9 +1020,11 @@ export class Engine {
     if (!this.supervisor(env).allHealthyPids()) trace.result.reasons.push('service-process-unhealthy');
     if (!shapeMatches) trace.result.reasons.push('service-shape-changed');
     if (inputsChanged) trace.result.reasons.push('environment-inputs-changed');
+    if (presetsChanged) trace.result.reasons.push('datastore-preset-changed');
     if (hygiene !== 'reuse') trace.result.reasons.push(`hygiene-${hygiene}`);
     const unchanged =
       !inputsChanged &&
+      !presetsChanged &&
       env.fingerprints['@source'] === sync.sourceHash &&
       upkeep.ran.length === 0 &&
       env.state === 'hot' &&
@@ -1070,13 +1077,21 @@ export class Engine {
     for (const [name, spec] of Object.entries(stack.manifest.datastores ?? {})) {
       const ds = makeDatastore(name, spec, stack.id, bakeKeys[name]);
       await ds.probe();
-      const preset = defaultPreset(spec, kind);
+      const preset = presets[name]!;
       const exists = Boolean(env.datastoreNs[name]);
       const force = env.presets[name] !== preset || hygiene !== 'reuse' || upkeep.rebakeTemplates.includes(name);
       if (force || !exists) say(`preparing datastore '${name}' (${preset})`);
       await ds.ensure(dsHandle, preset, force, exists);
       env.datastoreNs[name] = ds.ns(dsHandle);
       env.presets[name] = preset;
+      // Report each completed restore truthfully even if a later store fails.
+      // Merge into the live row so a supervisor update is not overwritten.
+      const current = this.journal.getEnv(env.id);
+      if (current) {
+        current.datastoreNs = { ...env.datastoreNs };
+        current.presets = { ...env.presets };
+        this.journal.saveEnv(current);
+      }
     }
 
     // Builds: per service, gated on that service's OWN build fingerprint. A
@@ -1426,6 +1441,7 @@ export class Engine {
   async up(opts: UpOptions) {
     const requestStarted = performance.now();
     const stack = loadStack(opts.cwd);
+    selectPresets(stack.manifest, opts.kind ?? 'session', opts.presets);
     // Resolve a requested slice BEFORE acquiring an env: an unknown name is a
     // user typo, not a bind failure, so it must not reach bindAndStart's catch
     // (which bumps failStreak — two typos would escalate the next real bind to a
@@ -1493,7 +1509,7 @@ export class Engine {
         env.id,
         () => {
           queueMs = performance.now() - queueStarted;
-          return this.bindAndStart(stack, env, hygiene, kind, opts.watch ?? false, opts.sourceRoot, opts.onProgress, opts.services, fresh, opts.dataOnly, suppliedInputs);
+          return this.bindAndStart(stack, env, hygiene, kind, opts.watch ?? false, opts.sourceRoot, opts.onProgress, opts.services, fresh, opts.dataOnly, suppliedInputs, opts.presets);
         },
         (s) => opts.onProgress?.(`waiting for another operation on this environment … ${s}s`),
       );
@@ -1593,7 +1609,7 @@ export class Engine {
        */
       tokenCommand: stack.manifest.auth?.token ?? null,
       tokenVia: stack.manifest.auth?.token ? 'backlot token --role <role> --raw' : null,
-      datastores: Object.fromEntries(Object.entries(ctx.datastores).map(([n, d]) => [n, { url: d.url, ns: d.ns }])),
+      datastores: Object.fromEntries(Object.entries(ctx.datastores).map(([n, d]) => [n, { url: d.url, ns: d.ns, preset: env.presets[n] }])),
       artifactsDir: join(artifactsRoot(), env.id),
       events: this.supervisors.get(env.id)?.events.slice(-20) ?? [],
     };
@@ -1824,8 +1840,9 @@ export class Engine {
     return { jobs: this.journal.listJobs(20) };
   }
 
-  async resetData(cwd: string, holder?: string, onProgress?: Progress) {
+  async resetData(cwd: string, holder?: string, onProgress?: Progress, presets?: unknown) {
     const stack = loadStack(cwd);
+    selectPresets(stack.manifest, 'session', presets);
     const h = holder ?? resolve(cwd);
     const lease = this.journal.leaseForHolder(h, stack.id);
     if (!lease) throw new BrokerError('env-error', `no active lease — run 'backlot up' first`, 'lease');
@@ -1837,7 +1854,7 @@ export class Engine {
       env.id,
       () => {
         queueMs = performance.now() - resetStarted;
-        return this.bindAndStart(stack, env, 'reset-data', lease.kind, false, undefined, onProgress);
+        return this.bindAndStart(stack, env, 'reset-data', lease.kind, false, undefined, onProgress, undefined, false, undefined, undefined, presets);
       },
       (s) => onProgress?.(`waiting for another operation on this environment … ${s}s`),
     );

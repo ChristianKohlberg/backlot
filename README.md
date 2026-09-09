@@ -151,6 +151,32 @@ shapes still works in both directions, but now needs room in the shape you are
 switching *into* — otherwise the cheap ceiling would just be application capacity
 by another name ([decision 0025](docs/decisions/0025-data-only-environments-are-priced-separately.md)).
 
+### Choosing datastore presets
+
+`up`, `run` (including `--detach`) and `reset-data` accept `--preset NAME` when
+the stack has one datastore. For multiple stores, name each target explicitly:
+
+```bash
+backlot up --preset main=dev --preset audit=empty
+backlot reset-data --preset main=empty
+backlot run smoke --preset main=dev
+```
+
+Names must appear in that datastore's `presets` catalog. Without a catalog, the
+implicit `default` and any manifest-declared `default_preset` names remain valid.
+Unknown stores, unknown presets, duplicate targets and ambiguous bare names are
+refused before acquiring an environment or changing data. Changing a preset
+restores that store even with ordinary reuse hygiene; unmentioned stores keep
+their current data. `reset-data` still restores every store.
+
+A continuing lease keeps its selections across `up`, `sync`, `reset-data` and
+daemon restart unless explicitly overridden. If a manifest removes the selected
+preset, the next bind selects its declared default. A new lease uses the manifest
+defaults and never inherits the previous holder's choices. `ctx --json` reports
+`.datastores.<name>.preset`; a changed selection appears as
+`datastore-preset-changed` in bind diagnostics. MCP accepts the same choices as a
+`presets` object mapping datastore names to preset names.
+
 ### How long you hold it: `--ttl` for agents, `--holder-pid` for shells
 
 A lease has a TTL, and there are two ways to say when you are done with an
