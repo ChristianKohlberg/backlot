@@ -6,6 +6,7 @@ import { join } from 'node:path';
 import { createHash } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
 import { Journal } from '../src/core/journal.js';
+import { retireBakedTemplates } from '../src/drivers/datastores.js';
 
 const CLI = join(import.meta.dirname, '..', 'dist/cli/index.js');
 const MCP = join(import.meta.dirname, '..', 'dist/mcp/index.js');
@@ -236,13 +237,13 @@ it('templates keyed by the retired identity are dropped through their own marker
     const applianceUp = join(f.root, 'appliance-up');
     const droppedAt = join(f.root, 'dropped');
     writeFileSync(join(retiredDir, 'main-default@stale.baked'), JSON.stringify({ v: 1, ns: 'backlot_tpl_stale', drop: `test -e '${applianceUp}' && touch '${droppedAt}'` }));
-    await f.cli(['status']); // autospawn: recovery migrates the row and attempts the retirement
+    await f.cli(['status']); // recovery migrates; retirement is deferred to maintenance
     await sleep(1000);
     expect(journal.getEnv(first.envId)!.legacyStackRoot).toBe(f.alias);
     expect(existsSync(droppedAt)).toBe(false);
     expect(existsSync(join(retiredDir, 'main-default@stale.baked'))).toBe(true); // deferred: the drop failed
     writeFileSync(applianceUp, '');
-    await sleep(1200);
+    await f.cli(['pool', 'gc']);
     expect(existsSync(droppedAt)).toBe(true);
     expect(existsSync(retiredDir)).toBe(false);
     const again = await f.cli(['up', '--holder', 'owner']);
@@ -251,3 +252,79 @@ it('templates keyed by the retired identity are dropped through their own marker
     expect(journal.allEnvs()).toHaveLength(1);
   } finally { await f.cleanup(); }
 }, 40000);
+
+
+it('an existing canonical default lease remains reachable beside a migrated alias default lease', async () => {
+  const f = fixture();
+  try {
+    const canonical = await f.cli(['up']);
+    const alias = await f.cli(['up', '--holder', f.alias]);
+    await f.cli(['daemon', 'stop']);
+    const journal = journalAsLegacyAlias(f, alias.envId, true);
+    const result = await f.cli(['up']);
+    expect(result.error).toBeUndefined();
+    expect(result.envId).toBe(canonical.envId);
+    expect(result.urls).toEqual(canonical.urls);
+    expect(result.lease.id).toBe(canonical.lease.id);
+    expect(journal.allEnvs()).toHaveLength(2);
+    expect(journal.leaseForEnv(alias.envId)?.holder).toBe(f.alias);
+  } finally { await f.cleanup(); }
+}, 30000);
+
+it('recovery never runs a retired drop; failed drops retain actionable bounded retry records', async () => {
+  const f = fixture();
+  try {
+    const first = await f.cli(['up', '--holder', 'owner']);
+    await f.cli(['daemon', 'stop']);
+    journalAsLegacyAlias(f, first.envId, true);
+    const dir = join(f.state, 'templates', legacyIdentity(f.alias));
+    mkdirSync(dir, { recursive: true });
+    const count = join(f.root, 'drop-attempts');
+    const marker = join(dir, 'main-default@missing.baked');
+    writeFileSync(marker, JSON.stringify({ v: 1, ns: 'already-missing', drop: `echo attempt >> '${count}'; false` }));
+    const context = await f.cli(['ctx', '--holder', 'owner']);
+    expect(context.envId).toBe(first.envId);
+    expect(existsSync(count), 'recovery must not run external template drops').toBe(false);
+    for (let i = 0; i < 3; i++) await f.cli(['pool', 'gc']);
+    expect(readFileSync(count, 'utf8').trim().split('\n')).toHaveLength(3);
+    const failure = JSON.parse(readFileSync(`${marker}.retirement.json`, 'utf8'));
+    expect(failure.attempts).toBe(3);
+    expect(failure.state).toBe('needs-attention');
+    expect(failure.message).toContain('pool gc');
+    expect(existsSync(marker), 'unconfirmed drop must keep ownership metadata').toBe(true);
+    const automatic = await retireBakedTemplates(dir, f.wt);
+    expect(automatic.attempted).toBe(0);
+    expect(readFileSync(count, 'utf8').trim().split('\n')).toHaveLength(3);
+    await f.cli(['daemon', 'stop']);
+    await f.cli(['ctx', '--holder', 'owner']);
+    expect(readFileSync(count, 'utf8').trim().split('\n')).toHaveLength(3);
+    await f.cli(['pool', 'recycle', '--force']);
+    expect(existsSync(marker), 'retirement ownership outlives its last env').toBe(true);
+    // The operator fixes the command to be idempotent for an already absent DB.
+    writeFileSync(marker, JSON.stringify({ v: 1, ns: 'already-missing', drop: 'true' }));
+    await f.cli(['pool', 'gc']);
+    expect(existsSync(dir)).toBe(false);
+  } finally { await f.cleanup(); }
+}, 30000);
+
+
+it('retirement bounds a hanging drop and processes only one marker per maintenance batch', async () => {
+  const f = fixture();
+  try {
+    const first = await f.cli(['up', '--holder', 'owner']);
+    await f.cli(['daemon', 'stop']);
+    journalAsLegacyAlias(f, first.envId, true);
+    const dir = join(f.state, 'templates', legacyIdentity(f.alias));
+    mkdirSync(dir, { recursive: true });
+    const hanging = join(dir, 'a-hang.baked');
+    const second = join(dir, 'b-next.baked');
+    writeFileSync(hanging, JSON.stringify({ v: 1, ns: 'hanging', drop: 'node -e "setInterval(()=>{},1000)"' }));
+    writeFileSync(second, JSON.stringify({ v: 1, ns: 'next', drop: 'true' }));
+    await f.cli(['ctx', '--holder', 'owner']);
+    expect(existsSync(`${hanging}.retirement.json`)).toBe(false);
+    // Completion itself proves the hanging command has a bounded maintenance timeout.
+    await f.cli(['pool', 'gc']);
+    expect(JSON.parse(readFileSync(`${hanging}.retirement.json`, 'utf8')).attempts).toBe(1);
+    expect(existsSync(second), 'only one external command may run in a batch').toBe(true);
+  } finally { await f.cleanup(); }
+}, 15000);

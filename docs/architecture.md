@@ -83,9 +83,13 @@ new implicit holders use the physical caller directory. On upgrade, verified
 legacy alias identities migrate without changing environment IDs, ports, data,
 or lease IDs; the migration is retried at every bind and sweep, so a manifest that
 is unreadable when the daemon starts only delays it. Templates baked under the
-retired identity are dropped once nothing refers to it, retrying a failed drop
-rather than leaking it. Old path-shaped holders are not guessed or rewritten: a canonical
-default request reports the exact `--holder` needed to inspect or release that
+retired identity are dropped once nothing refers to it. Recovery never waits for
+retirement: sweeps attempt at most one external drop, capped at two seconds.
+Failed drops keep their markers and `.retirement.json` records, retry with
+backoff, and stop automatic attempts after three failures. After repairing the
+appliance, `backlot pool gc` retries retained records, including after the last
+environment for that stack has been recycled. Old path-shaped holders are not guessed or rewritten: a canonical
+default request without its own live canonical lease reports the exact `--holder` needed to inspect or release that
 legacy lease. If legacy aliases converge on several leases for the same holder,
 Backlot refuses ambiguity and names the environments instead of selecting one.
 

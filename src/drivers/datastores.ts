@@ -27,7 +27,7 @@ import { join } from 'node:path';
 import { connect } from 'node:net';
 import { templatesRoot } from '../core/paths.js';
 import { sha256, template, BrokerError } from '../core/util.js';
-import { runBounded, DEFAULT_CMD_TIMEOUT_S } from '../core/exec.js';
+import { runBounded, cmdTimeoutS, DEFAULT_CMD_TIMEOUT_S } from '../core/exec.js';
 import type { DatastoreSpec } from '../core/manifest.js';
 
 export interface DsHandle {
@@ -145,35 +145,50 @@ export async function dropBakedTemplates(dir: string, cwd: string): Promise<numb
  * whose appliance is unreachable stays behind for a later attempt instead of
  * leaking its database. Legacy bare-string markers have nothing to drop.
  */
-export async function retireBakedTemplates(dir: string, cwd: string): Promise<{ dropped: number; deferred: number }> {
+export async function retireBakedTemplates(dir: string, cwd: string, force = false): Promise<{ dropped: number; deferred: number; attempted: number }> {
   let dropped = 0;
   let deferred = 0;
+  let attempted = 0;
   let entries: string[] = [];
-  try {
-    entries = readdirSync(dir);
-  } catch {
-    return { dropped, deferred };
-  }
+  try { entries = readdirSync(dir); } catch { return { dropped, deferred, attempted }; }
   for (const f of entries) {
     if (!f.endsWith('.baked')) continue;
     const full = join(dir, f);
-    let drop: string | null = null;
+    const failurePath = `${full}.retirement.json`;
+    let attempts = 0;
+    let nextAttemptAt = 0;
     try {
-      drop = parseBakedMarker(readFileSync(full, 'utf8')).drop;
-    } catch {
-      /* unreadable marker — nothing to drop */
-    }
+      const saved = JSON.parse(readFileSync(failurePath, 'utf8'));
+      attempts = Number(saved.attempts) || 0;
+      nextAttemptAt = Number(saved.nextAttemptAt) || 0;
+    } catch { /* first attempt */ }
+    if (!force && (attempts >= 3 || nextAttemptAt > Date.now())) { deferred++; continue; }
+    // One external command per batch bounds maintenance latency independently
+    // of how many retired markers a stack accumulated.
+    if (attempted > 0) { deferred++; continue; }
+    let drop: string | null = null;
+    try { drop = parseBakedMarker(readFileSync(full, 'utf8')).drop; }
+    catch { deferred++; continue; }
+    attempted++;
     if (drop) {
-      const r = await runBounded(drop, cwd);
+      const r = await runBounded(drop, cwd, Math.min(2, cmdTimeoutS()));
       if (r.code !== 0 || r.timedOut) {
+        attempts++;
+        writeFileSync(failurePath, JSON.stringify({
+          attempts,
+          nextAttemptAt: Date.now() + Math.min(3600000, 60000 * 2 ** Math.min(attempts - 1, 6)),
+          state: attempts >= 3 ? 'needs-attention' : 'retry-pending',
+          message: 'Drop unconfirmed; marker retained. Check the appliance and retry with backlot pool gc.',
+        }));
         deferred++;
         continue;
       }
       dropped++;
     }
     rmSync(full, { force: true });
+    rmSync(failurePath, { force: true });
   }
-  return { dropped, deferred };
+  return { dropped, deferred, attempted };
 }
 
 // ---------------------------------------------------------------- sqlite

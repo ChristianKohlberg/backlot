@@ -5,7 +5,7 @@
 import { execFileSync, spawn } from 'node:child_process';
 import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { mkdirSync, rmSync, copyFileSync, readdirSync, statSync, existsSync, readFileSync, watch as fsWatch, constants as fsConstants } from 'node:fs';
+import { mkdirSync, rmSync, copyFileSync, readdirSync, statSync, existsSync, readFileSync, writeFileSync, renameSync, watch as fsWatch, constants as fsConstants } from 'node:fs';
 import { join, sep } from 'node:path';
 import { Journal, JOURNAL_SCHEMA_VERSION, type EnvRow, type LeaseRow } from '../core/journal.js';
 import { VERSION, compareVersions, versionSkew } from '../core/version.js';
@@ -226,7 +226,7 @@ export class Engine {
         this.adoptLegacyAliases(loadStack(env.stackRoot));
       } catch { /* leave unavailable or renamed projects unchanged */ }
     }
-    for (const env of this.journal.allEnvs()) await this.retireLegacyTemplates(env);
+    for (const env of this.journal.allEnvs()) this.registerRetiredTemplates(env);
     let envs = 0;
     let stranded = 0;
     for (const env of this.journal.allEnvs()) {
@@ -277,7 +277,7 @@ export class Engine {
     });
     // Anything the journal never knew about — the owner died before the pids
     // were ever written, or the env row is long gone — is only findable by tag.
-    const gc = await this.poolGc();
+    const gc = await this.poolGc(false);
     if (gc.reclaimed.length) {
       logEvent({ level: 'warn', kind: 'gc', detail: `reclaimed ${gc.reclaimed.length} orphaned process(es) at startup` });
     }
@@ -292,7 +292,8 @@ export class Engine {
    * to an env with an operation in flight, is left strictly alone — a bind
    * racing the sweep must not have its dev-server shot out from under it.
    */
-  async poolGc(): Promise<{ supported: boolean; reclaimed: Array<{ pid: number; envId: string; service: string }>; skipped: number }> {
+  async poolGc(retryRetiredTemplates = true): Promise<{ supported: boolean; reclaimed: Array<{ pid: number; envId: string; service: string }>; skipped: number }> {
+    if (retryRetiredTemplates) await this.retireLegacyTemplateBatch(true);
     if (!procScanSupported()) return { supported: false, reclaimed: [], skipped: 0 };
     const tagged = scanTagged(stateRoot());
     if (tagged.length === 0) return { supported: true, reclaimed: [], skipped: 0 };
@@ -1460,36 +1461,64 @@ export class Engine {
     if (changes.length === 0) return;
     this.journal.canonicalizeStacks(changes);
     for (const change of changes) {
+      const migrated = this.journal.getEnv(change.id);
+      if (migrated) this.registerRetiredTemplates(migrated);
       logEvent({ level: 'info', kind: 'retention', envId: change.id, detail: `stack identity migrated to '${change.stack}' (physical root ${change.root})` });
     }
   }
 
-  /**
-   * Templates are keyed by stack id, so a migrated row leaves the templates its
-   * old identity baked with no reader. They are retired only once no row still
-   * carries that identity; a server-side template whose drop fails keeps its
-   * marker, and the sweeper tries again.
-   */
-  private async retireLegacyTemplates(env: EnvRow): Promise<void> {
+  /** A durable descriptor keeps failed retirement discoverable after the last env is recycled. */
+  private registerRetiredTemplates(env: EnvRow): void {
     if (!env.legacyStackRoot) return;
     const retired = retiredStackIdentity(env.stack, env.legacyStackRoot);
     const dir = join(templatesRoot(), retired);
-    if (retired === env.stack || !existsSync(dir) || this.journal.envsForStack(retired).length > 0) return;
-    await withBakeLock(retired, async () => {
-      const { dropped, deferred } = await retireBakedTemplates(dir, existsSync(env.stackRoot) ? env.stackRoot : templatesRoot());
-      if (deferred > 0) {
-        logEvent({ level: 'warn', kind: 'retention', envId: env.id, detail: `${deferred} template(s) keyed by retired stack identity '${retired}' could not be dropped yet — will retry` });
-        return;
-      }
-      rmSync(dir, { recursive: true, force: true });
-      logEvent({ level: 'info', kind: 'retention', envId: env.id, detail: `retired templates keyed by legacy stack identity '${retired}' (${dropped} server-side template(s) dropped)` });
-    });
+    if (retired === env.stack || !existsSync(dir)) return;
+    const record = join(dir, '.retired-stack.json');
+    if (existsSync(record)) return;
+    writeFileSync(`${record}.tmp`, JSON.stringify({
+      stack: env.stack, legacyRoot: env.legacyStackRoot, root: env.stackRoot,
+    }));
+    renameSync(`${record}.tmp`, record);
+  }
+
+  /** One bounded external drop, after ownership/reaping work; never part of recovery. */
+  private async retireLegacyTemplateBatch(force = false): Promise<void> {
+    for (const env of this.journal.allEnvs()) this.registerRetiredTemplates(env);
+    let entries: string[];
+    try { entries = readdirSync(templatesRoot()); } catch { return; }
+    for (const retired of entries) {
+      const dir = join(templatesRoot(), retired);
+      let descriptor: { stack: string; legacyRoot: string; root: string };
+      try {
+        descriptor = JSON.parse(readFileSync(join(dir, '.retired-stack.json'), 'utf8'));
+        if (typeof descriptor.stack !== 'string' || typeof descriptor.legacyRoot !== 'string' || typeof descriptor.root !== 'string') continue;
+        if (retiredStackIdentity(descriptor.stack, descriptor.legacyRoot) !== retired || descriptor.stack === retired) continue;
+      } catch { continue; }
+      // A skipped migration or an in-flight old bake still owns these templates.
+      if (this.journal.envsForStack(retired).length > 0) continue;
+      if (this.journal.envsForStack(descriptor.stack).some((row) => this.busy.has(row.id))) continue;
+      const attempted = await withBakeLock(retired, async () => {
+        const { dropped, deferred, attempted } = await retireBakedTemplates(
+          dir, existsSync(descriptor.root) ? descriptor.root : templatesRoot(), force,
+        );
+        if (deferred > 0) {
+          if (attempted > 0) logEvent({ level: 'warn', kind: 'retention', detail: `retired templates for '${retired}' remain; failed drops retain .retirement.json records with bounded retries. Check the appliance, then run backlot pool gc to retry.` });
+          return attempted > 0;
+        }
+        rmSync(dir, { recursive: true, force: true });
+        logEvent({ level: 'info', kind: 'retention', detail: `retired templates keyed by legacy stack identity '${retired}' (${dropped} server-side template(s) dropped)` });
+        return true;
+      });
+      if (attempted) break;
+    }
   }
 
   private callerHolder(cwd: string, holder: string | undefined, stack: Stack): string {
     this.adoptLegacyAliases(stack);
     if (holder !== undefined) return holder;
     const canonical = canonicalDirectory(cwd);
+    const own = this.journal.leaseForHolder(canonical, stack.id);
+    if (own && own.expiresAt > now()) return canonical;
     for (const env of this.journal.envsForStack(stack.id)) {
       if (!env.legacyStackRoot) continue;
       const lease = this.journal.leaseForEnv(env.id);
@@ -3098,7 +3127,6 @@ export class Engine {
     }
     for (const env of this.journal.allEnvs()) {
       if (this.busy.has(env.id)) continue;
-      await this.retireLegacyTemplates(env);
       // An environment whose STACK can never be bound again — the repo was
       // deleted or moved, or (after an identity-scheme change or a manifest
       // rename) its root no longer resolves to the recorded stack id — is
@@ -3185,6 +3213,9 @@ export class Engine {
         });
       }
     }
+    // Maintenance runs after ownership/expiry/reaping and does at most one
+    // bounded external drop per sweep. Recovery never waits for it.
+    await this.retireLegacyTemplateBatch();
   }
 
   async shutdown(): Promise<void> {

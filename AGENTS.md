@@ -98,7 +98,12 @@ check — an unreadable manifest at daemon start may only *defer* a migration; t
 the un-migrated row as an orphan (or missing it on the next bind) reclaims or
 duplicates a live environment. Templates are keyed by stack id, so the retired id's
 directory is dropped through its own `.baked` markers once no row carries that id;
-a failed drop keeps the marker and the sweeper retries. `legacy_stack_root`
+recovery never waits for retirement, and each sweep attempts at most one drop
+with a two-second cap. Failed drops retain `.retirement.json` records with
+backoff; automatic retries stop after three failures, and explicit `pool gc`
+retries them after the appliance is repaired. A `.retired-stack.json` descriptor
+keeps this cleanup discoverable even after the last migrated env is recycled.
+`legacy_stack_root`
 retains the old path spelling so canonical implicit requests can name the holder
 needed for recovery instead of silently creating another lease. Never rewrite a
 path-looking holder as though it were certainly implicit; old journals lack that
