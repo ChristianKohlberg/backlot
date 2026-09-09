@@ -1,6 +1,6 @@
 import { afterAll, describe, expect, it } from 'vitest';
 import { execFile, execFileSync, spawn } from 'node:child_process';
-import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { redactStream, validateCallerEnv } from '../src/core/caller-env.js';
@@ -10,7 +10,11 @@ const cleanups: Array<() => Promise<void>> = [];
 afterAll(async () => { for (const cleanup of cleanups) await cleanup(); });
 
 function fixture(mode: 'required' | 'optional' = 'optional', logReady = false) {
-  const root = mkdtempSync(join(tmpdir(), 'bl-inputs-'));
+  // realpath: macOS's tmpdir is a symlink (/var -> /private/var), and a stack's
+  // identity hashes its root path. A CLI child's process.cwd() reports the
+  // resolved path, so an MCP tool cwd given as the symlink would name a
+  // different stack than the CLI verbs that follow it.
+  const root = realpathSync(mkdtempSync(join(tmpdir(), 'bl-inputs-')));
   const state = join(root, 'state');
   const tree = join(root, 'tree');
   execFileSync('mkdir', ['-p', tree]);
@@ -51,7 +55,19 @@ checks:
     const url = context.urls.web.replace('localhost', '127.0.0.1');
     return await (await fetch(url)).json() as { value: string | null; pid: number; extra: string | null };
   };
-  return { root, state, tree, cli, response };
+  // `daemon stop` answers BEFORE the deferred shutdown runs, so a verb sent
+  // straight after it can still reach the old daemon (memory intact) or a
+  // half-closed socket. Wait until the pid is gone before the next autospawn.
+  const restartDaemon = async () => {
+    const pid = Number(readFileSync(join(state, 'daemon.pid'), 'utf8'));
+    expect((await cli(['daemon', 'stop'])).code).toBe(0);
+    for (let i = 0; i < 200; i++) {
+      try { process.kill(pid, 0); } catch { return; }
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    throw new Error(`daemon ${pid} did not exit after stop`);
+  };
+  return { root, state, tree, cli, response, restartDaemon };
 }
 
 describe('caller environment inputs', () => {
@@ -114,7 +130,7 @@ describe('caller environment inputs', () => {
     expect((await f.cli(['status'])).json.envs).toHaveLength(0);
     const first = await f.cli(['up'], { TEST_CALLER_KEY: 'restart-sensitive-key' });
     expect(first.code).toBe(0);
-    expect((await f.cli(['daemon', 'stop'])).code).toBe(0);
+    await f.restartDaemon();
     const sync = await f.cli(['sync']);
     expect(sync.code).toBe(1);
     expect(sync.json.error.message).toContain('daemon restarts');
@@ -152,7 +168,7 @@ describe('caller environment inputs', () => {
     const restored = await f.cli(['sync']);
     expect((await f.response(restored.json)).value).toBeNull();
     expect((await f.cli(['up'], { TEST_CALLER_KEY: 'optional-secret' })).code).toBe(0);
-    expect((await f.cli(['daemon', 'stop'])).code).toBe(0);
+    await f.restartDaemon();
     const restarted = await f.cli(['sync']);
     expect((await f.response(restarted.json)).value).toBeNull();
   });
