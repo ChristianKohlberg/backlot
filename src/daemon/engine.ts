@@ -42,6 +42,13 @@ const CHECK_TIMEOUT_S = 600;
 /** Streamed bind phases → human progress on stderr (never on the --json stdout). */
 export type Progress = (phase: string) => void;
 
+/**
+ * What one claim attempt found: an environment to bind, a deferral because the
+ * holder's own environment has an operation in flight that its shape change
+ * must wait for, or nothing (capacity, or not this caller's turn).
+ */
+type ClaimOutcome = { env: EnvRow; fresh: boolean } | { deferred: EnvRow; op: string } | null;
+
 export interface UpOptions {
   cwd: string;
   /** Explicit refresh envelope; absent means retain this lease's in-memory inputs. */
@@ -177,6 +184,17 @@ export class Engine {
   private envChains = new Map<string, Promise<unknown>>();
   /** Envs with an operation in flight — the sweeper must not expire/quiesce these. */
   readonly busy = new Set<string>();
+  /** What is in flight on a busy env, so a deferral can name it. */
+  private busyOp = new Map<string, string>();
+  /**
+   * Claims handed out but whose bind has not yet taken the environment lock.
+   * The lock marks `busy` only once its callback runs, several microtasks after
+   * the claim resolved — a shape conversion chained right behind that claim
+   * would otherwise rewrite the reservation of an environment about to start
+   * services. Counted under the pool lock, released by `up` once its bind
+   * holds the lock (or could not reach it).
+   */
+  private pendingBinds = new Map<string, number>();
   /** --watch: per-env worktree watchers ("verbs sync, watch streams", decision 0005). */
   private watchers = new Map<string, { close: () => void }>();
   /** Never persisted or returned. Lease IDs prevent reuse from inheriting another caller's inputs. */
@@ -192,7 +210,7 @@ export class Engine {
     return next;
   }
 
-  private envLocked<T>(envId: string, fn: () => Promise<T>, onWait?: (elapsedS: number) => void): Promise<T> {
+  private envLocked<T>(envId: string, fn: () => Promise<T>, onWait?: (elapsedS: number) => void, op = 'an operation'): Promise<T> {
     const chain = this.envChains.get(envId) ?? Promise.resolve();
     // Heartbeat while queued behind another operation on this environment: a
     // blocked verb used to print its last phase and go SILENT until the lock
@@ -205,10 +223,12 @@ export class Engine {
     const run = async () => {
       if (beat) clearInterval(beat);
       this.busy.add(envId);
+      this.busyOp.set(envId, op);
       try {
         return await fn();
       } finally {
         this.busy.delete(envId);
+        this.busyOp.delete(envId);
       }
     };
     const next = chain.then(run, run);
@@ -375,8 +395,31 @@ export class Engine {
     return env;
   }
 
-  /** One atomic claim attempt — MUST run under the pool lock. */
-  private async tryClaim(stack: Stack, holder: string, kind: LeaseKind, hygiene: Hygiene, ttlMs: number, dataOnly: boolean, holderPid?: number, onlyMine = false): Promise<{ env: EnvRow; fresh: boolean } | null> {
+  /** The operation in flight on an environment, or null when nothing owns it. */
+  private inFlightOn(envId: string): string | null {
+    if (this.busy.has(envId)) return this.busyOp.get(envId) ?? 'an operation';
+    if ((this.pendingBinds.get(envId) ?? 0) > 0) return 'a bind that has been claimed and is about to start';
+    return null;
+  }
+
+  private reserveBind(envId: string): void {
+    this.pendingBinds.set(envId, (this.pendingBinds.get(envId) ?? 0) + 1);
+  }
+
+  private releaseBind(envId: string): void {
+    const n = (this.pendingBinds.get(envId) ?? 0) - 1;
+    if (n > 0) this.pendingBinds.set(envId, n);
+    else this.pendingBinds.delete(envId);
+  }
+
+  /**
+   * One atomic claim attempt — MUST run under the pool lock. `deferred` is not
+   * a capacity shortfall: the holder's own environment is mid-operation and its
+   * shape may not be rewritten until that finishes. Callers wait for it without
+   * evicting or judging capacity, and every returned claim carries a bind
+   * reservation that `up` must release.
+   */
+  private async tryClaim(stack: Stack, holder: string, kind: LeaseKind, hygiene: Hygiene, ttlMs: number, dataOnly: boolean, holderPid?: number, onlyMine = false): Promise<ClaimOutcome> {
     // A holder keeps its env: rebinding your own lease is the normal loop —
     // unless that env is being torn down or has flapped, in which case drop the
     // stale lease and fall through to a fresh claim.
@@ -397,7 +440,10 @@ export class Engine {
         // environments, then turn them into full stacks for free (decision 0025).
         // A queued bind may still start the previous shape. Do not rewrite its
         // reservation while that operation owns the environment lock.
-        if ((env.dataOnly === true) !== dataOnly && this.busy.has(env.id)) return null;
+        if ((env.dataOnly === true) !== dataOnly) {
+          const op = this.inFlightOn(env.id);
+          if (op !== null) return { deferred: env, op };
+        }
         if ((env.dataOnly === true) !== dataOnly && !this.convertShape(env, dataOnly)) {
           throw new BrokerError(
             'env-error',
@@ -409,6 +455,7 @@ export class Engine {
         this.journal.saveLease({ ...mine, hygiene, expiresAt: now() + ttlMs, ...holderIdentity(holderPid) });
         // A continuing lease keeps its shape: bindAndStart's undefined-request
         // path preserves env.activeServices for this same holder.
+        this.reserveBind(env.id);
         return { env, fresh: false };
       }
       // Awaited: endLease became async when it grew a tunnel reap, and the
@@ -424,7 +471,7 @@ export class Engine {
     const envs = this.journal.envsForStack(stack.id);
     const free = envs
       .filter((e) => !this.journal.leaseForEnv(e.id) && e.state !== 'degraded' && e.state !== 'recycling' &&
-        ((e.dataOnly === true) === dataOnly || !this.busy.has(e.id)))
+        ((e.dataOnly === true) === dataOnly || this.inFlightOn(e.id) === null))
       // Matching SHAPE first, then heat. A data-only row handed to an ordinary
       // `up` is not wrong — it is a conversion, and conversions have to be paid
       // for (below) — but reaching for one while a matching environment sits free
@@ -450,6 +497,7 @@ export class Engine {
       // here: it may only change AFTER the bind reconciles reality (fast path /
       // epilogue), so an early bind failure can't strand the journal asserting
       // a shape that isn't running.
+      this.reserveBind(env.id);
       return { env, fresh: true };
     }
     return null;
@@ -728,6 +776,22 @@ export class Engine {
     );
   }
 
+  /**
+   * A bounded wait on the holder's OWN environment ran out. This is not a
+   * capacity refusal — no ceiling bound, and no eviction could have helped —
+   * so it names the operation and the environment instead of a cap.
+   */
+  private busyRefusal(env: EnvRow, op: string, dataOnly: boolean): BrokerError {
+    return new BrokerError(
+      'env-error',
+      `environment ${env.id} is busy after waiting ${Math.round(WAIT_MS() / 1000)}s: ${op} is in flight on it, ` +
+        `and your lease would have to change shape to ${dataOnly ? 'data-only' : 'an application environment'}, ` +
+        `which cannot happen while that operation may still be using it as ${env.dataOnly === true ? 'data-only' : 'an application environment'}. ` +
+        `Retry once it completes, or raise BACKLOT_WAIT_MS to wait longer.`,
+      'pool',
+    );
+  }
+
   /** Queue at capacity WITHOUT holding the pool lock while sleeping. */
   private async acquireEnv(stack: Stack, holder: string, kind: LeaseKind, hygiene: Hygiene, ttlMs: number, dataOnly: boolean, holderPid?: number): Promise<{ env: EnvRow; fresh: boolean }> {
     const start = now();
@@ -741,8 +805,18 @@ export class Engine {
     // nothing and joins the queue like everyone else.
     const live = this.journal.leaseForHolder(holder, stack.id);
     if (live && live.expiresAt > now()) {
-      const claimed = await this.poolLocked(() => this.tryClaim(stack, holder, kind, hygiene, ttlMs, dataOnly, holderPid, true));
-      if (claimed) return claimed;
+      // A deferral waits HERE, outside the queue: the holder consumes no
+      // capacity and is only waiting on its own environment, so parking it at
+      // the FIFO head would block every other claimant on this stack for
+      // nothing. If the lease lapses meanwhile, onlyMine returns null and the
+      // holder joins the queue like everyone else.
+      for (;;) {
+        const claimed = await this.poolLocked(() => this.tryClaim(stack, holder, kind, hygiene, ttlMs, dataOnly, holderPid, true));
+        if (claimed === null) break;
+        if ('env' in claimed) return claimed;
+        if (now() - start > WAIT_MS()) throw this.busyRefusal(claimed.deferred, claimed.op, dataOnly);
+        await new Promise((r) => setTimeout(r, 250));
+      }
     }
     // FIFO ticket. Without ordering, every waiter polled independently and a
     // freed environment went to whoever happened to poll first — so an early
@@ -776,7 +850,14 @@ export class Engine {
       const queue = this.waiting.get(stack.id);
       const myTurn = !queue || queue.length === 0 || queue[0] === ticket;
       const claimed = myTurn ? await this.poolLocked(() => this.tryClaim(stack, holder, kind, hygiene, ttlMs, dataOnly, holderPid)) : null;
-      if (claimed) return claimed;
+      if (claimed && 'env' in claimed) return claimed;
+      if (claimed) {
+        // Deferred on the holder's own environment: no ceiling bound, so neither
+        // eviction nor the structural check has anything true to say.
+        if (now() - start > WAIT_MS()) throw this.busyRefusal(claimed.deferred, claimed.op, dataOnly);
+        await new Promise((r) => setTimeout(r, 250));
+        continue;
+      }
       // A machine-wide block never clears by waiting — the count is of env rows,
       // and a release leaves the row behind — so a host holding as many cold
       // worktrees as the heuristic allows locked out every new stack
@@ -1424,7 +1505,7 @@ export class Engine {
       trace.result.reuse = 'projected';
       trace.result.reasons = ['hot-reload-projection'];
       return { outcome: 'projected', previewNotice, bindDiagnostics: trace.finish() };
-    });
+    }, undefined, 'a watch projection');
   }
 
   // ---------------------------------------------------------------- verbs
@@ -1494,14 +1575,22 @@ export class Engine {
     // Auto-escalation (decision 0007): two consecutive bind failures on this
     // warm environment -> the next bind is pristine, whatever was asked.
     if (hygiene !== 'pristine' && env.failStreak >= 2) hygiene = 'pristine';
+    let reserved = true;
+    const bindStarted = () => {
+      if (!reserved) return;
+      reserved = false;
+      this.releaseBind(env.id);
+    };
     try {
       const { env: bound, previewNotice, bindDiagnostics } = await this.envLocked(
         env.id,
         () => {
+          bindStarted();
           queueMs = performance.now() - queueStarted;
           return this.bindAndStart(stack, env, hygiene, kind, opts.watch ?? false, opts.sourceRoot, opts.onProgress, opts.services, fresh, opts.dataOnly, suppliedInputs);
         },
         (s) => opts.onProgress?.(`waiting for another operation on this environment … ${s}s`),
+        'a bind',
       );
       if (opts.watch && kind === 'session' && !this.watchers.has(bound.id)) {
         this.startWatch(bound.id, stack.root, opts.cwd, holder);
@@ -1521,6 +1610,8 @@ export class Engine {
         if (lease) await this.endLease(lease);
       }
       throw err;
+    } finally {
+      bindStarted();
     }
   }
 
@@ -1651,6 +1742,7 @@ export class Engine {
         );
         },
         (s) => opts.onProgress?.(`waiting for another operation on this environment … ${s}s`),
+        `check '${opts.check}'`,
       ).finally(() => clearInterval(beat));
       const artifactsDir = this.collectArtifacts(env.id, dirs.tree, check.artifacts ?? []);
       // A check that failed because the ENVIRONMENT fell over is not the repo's
@@ -1846,6 +1938,7 @@ export class Engine {
         return this.bindAndStart(stack, env, 'reset-data', lease.kind, false, undefined, onProgress);
       },
       (s) => onProgress?.(`waiting for another operation on this environment … ${s}s`),
+      'a data reset',
     );
     bindDiagnostics.phasesMs.queue = queueMs;
     bindDiagnostics.durationMs = performance.now() - resetStarted;
@@ -1936,7 +2029,7 @@ export class Engine {
         throw new BrokerError('work-error', `exec timed out after ${timeoutS}s (process group killed; set BACKLOT_CMD_TIMEOUT_S if legitimate)`, 'exec', r.stderr.slice(-800));
       }
       return { exitCode: r.code, stdout: r.stdout.slice(-8000), stderr: r.stderr.slice(-8000) };
-    });
+    }, undefined, 'an exec');
   }
 
   /** Resolve auth.token with {{role}} and run it in the env tree. */
@@ -1959,7 +2052,7 @@ export class Engine {
       }
       if (r.code !== 0) throw new BrokerError('work-error', `auth.token command failed`, 'auth', r.stderr.slice(-400));
       return { token: r.stdout.trim(), role };
-    });
+    }, undefined, 'a token command');
   }
 
   logs(cwd: string, service: string, lines: number, holder?: string) {
@@ -2262,7 +2355,7 @@ export class Engine {
       this.touch(env.id);
       logEvent({ level: 'info', kind: 'preview', envId: env.id, detail: `published '${service}' at ${url}` });
       return { service, url };
-    });
+    }, undefined, 'a preview publish');
   }
 
   async previewStop(cwd: string, holder?: string): Promise<{ stopped: boolean; service?: string }> {
@@ -2285,7 +2378,7 @@ export class Engine {
       }
       logEvent({ level: 'info', kind: 'preview', envId: held.envId, detail: `stopped preview for '${service ?? 'unknown'}'` });
       return { stopped: true, service };
-    });
+    }, undefined, 'a preview stop');
   }
 
   /** Live-probed appliance overview for the stack at cwd. */
@@ -3108,7 +3201,7 @@ export class Engine {
               });
             }
           }
-        });
+        }, undefined, 'an idle quiesce');
       }
     }
   }
