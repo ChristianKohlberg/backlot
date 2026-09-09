@@ -51,6 +51,8 @@ export interface UpOptions {
   kind?: LeaseKind;
   watch?: boolean;
   ttlMs?: number;
+  /** Content operations keep the current live lease deadline; fresh claims use the default. */
+  preserveLeaseDeadline?: boolean;
   /**
    * Bring up only these services (plus their transitive depends_on closure)
    * instead of the whole app — `backlot up sherlock audit`. An empty array is
@@ -376,7 +378,7 @@ export class Engine {
   }
 
   /** One atomic claim attempt — MUST run under the pool lock. */
-  private async tryClaim(stack: Stack, holder: string, kind: LeaseKind, hygiene: Hygiene, ttlMs: number, dataOnly: boolean, holderPid?: number, onlyMine = false): Promise<{ env: EnvRow; fresh: boolean } | null> {
+  private async tryClaim(stack: Stack, holder: string, kind: LeaseKind, hygiene: Hygiene, ttlMs: number, dataOnly: boolean, holderPid?: number, onlyMine = false, preserveLeaseDeadline = false): Promise<{ env: EnvRow; fresh: boolean } | null> {
     // A holder keeps its env: rebinding your own lease is the normal loop —
     // unless that env is being torn down or has flapped, in which case drop the
     // stale lease and fall through to a fresh claim.
@@ -403,7 +405,7 @@ export class Engine {
             'pool',
           );
         }
-        this.journal.saveLease({ ...mine, hygiene, expiresAt: now() + ttlMs, ...holderIdentity(holderPid) });
+        this.journal.saveLease({ ...mine, hygiene, expiresAt: preserveLeaseDeadline && mine.expiresAt > now() ? mine.expiresAt : now() + ttlMs, ...holderIdentity(holderPid) });
         // A continuing lease keeps its shape: bindAndStart's undefined-request
         // path preserves env.activeServices for this same holder.
         return { env, fresh: false };
@@ -723,7 +725,7 @@ export class Engine {
   }
 
   /** Queue at capacity WITHOUT holding the pool lock while sleeping. */
-  private async acquireEnv(stack: Stack, holder: string, kind: LeaseKind, hygiene: Hygiene, ttlMs: number, dataOnly: boolean, holderPid?: number): Promise<{ env: EnvRow; fresh: boolean }> {
+  private async acquireEnv(stack: Stack, holder: string, kind: LeaseKind, hygiene: Hygiene, ttlMs: number, dataOnly: boolean, holderPid?: number, preserveLeaseDeadline = false): Promise<{ env: EnvRow; fresh: boolean }> {
     const start = now();
     // A holder that already holds this stack's LIVE lease consumes no
     // capacity — rebinding only refreshes it. Sending it through the queue
@@ -735,7 +737,7 @@ export class Engine {
     // nothing and joins the queue like everyone else.
     const live = this.journal.leaseForHolder(holder, stack.id);
     if (live && live.expiresAt > now()) {
-      const claimed = await this.poolLocked(() => this.tryClaim(stack, holder, kind, hygiene, ttlMs, dataOnly, holderPid, true));
+      const claimed = await this.poolLocked(() => this.tryClaim(stack, holder, kind, hygiene, ttlMs, dataOnly, holderPid, true, preserveLeaseDeadline));
       if (claimed) return claimed;
     }
     // FIFO ticket. Without ordering, every waiter polled independently and a
@@ -746,7 +748,7 @@ export class Engine {
     queue.push(ticket);
     this.waiting.set(stack.id, queue);
     try {
-      return await this.acquireQueued(stack, holder, kind, hygiene, ttlMs, dataOnly, start, ticket, holderPid);
+      return await this.acquireQueued(stack, holder, kind, hygiene, ttlMs, dataOnly, start, ticket, holderPid, preserveLeaseDeadline);
     } finally {
       const rest = (this.waiting.get(stack.id) ?? []).filter((t) => t !== ticket);
       if (rest.length > 0) this.waiting.set(stack.id, rest);
@@ -764,12 +766,13 @@ export class Engine {
     start: number,
     ticket: number,
     holderPid?: number,
+    preserveLeaseDeadline = false,
   ): Promise<{ env: EnvRow; fresh: boolean }> {
     for (;;) {
       // Only the head of THIS STACK's queue may claim; everyone else waits.
       const queue = this.waiting.get(stack.id);
       const myTurn = !queue || queue.length === 0 || queue[0] === ticket;
-      const claimed = myTurn ? await this.poolLocked(() => this.tryClaim(stack, holder, kind, hygiene, ttlMs, dataOnly, holderPid)) : null;
+      const claimed = myTurn ? await this.poolLocked(() => this.tryClaim(stack, holder, kind, hygiene, ttlMs, dataOnly, holderPid, false, preserveLeaseDeadline)) : null;
       if (claimed) return claimed;
       // A machine-wide block never clears by waiting — the count is of env rows,
       // and a release leaves the row behind — so a host holding as many cold
@@ -1325,7 +1328,7 @@ export class Engine {
       // The full bind also covers every state projection can't fix on its own:
       // a quiesced/degraded/recycled-away env, or a lapsed lease that must be
       // re-earned through the ordinary acquire path.
-      await this.up({ cwd, holder, kind: 'session', hygiene: 'reuse', watch: true });
+      await this.up({ cwd, holder, kind: 'session', hygiene: 'reuse', watch: true, preserveLeaseDeadline: true });
     }
   }
 
@@ -1382,10 +1385,8 @@ export class Engine {
       fresh.fingerprints['@source'] = sync.sourceHash;
       fresh.lastUsedAt = now();
       this.journal.saveEnv(fresh);
-      // A projection re-reads the manifest and refreshes the lease clock, so a
-      // watcher can keep a lease alive for days — and `preview.forbidden` added
-      // in that window used to take effect only on the next FULL bind, leaving
-      // the stack published the whole time. The shape is this environment's
+      // A projection re-reads the manifest, so preview policy changes take
+      // effect without waiting for a full bind. The shape is this environment's
       // DURABLE one, not the supervisor's live pids: nothing here restarted a
       // service, so a pid missing during a restart backoff is not a slice change.
       const shape = fresh.dataOnly
@@ -1395,20 +1396,15 @@ export class Engine {
         hygiene: 'reuse',
         portsReallocated: false,
       });
-      // Watch activity refreshes the lease (§6) — exactly what the old
-      // full-bind watch path did via tryClaim's re-save. Re-read: the reconcile
-      // above may have cleared preview columns this snapshot still carries, and
-      // saveLease is an upsert — falling back to the snapshot would RESURRECT a
-      // lease a concurrent `release` deleted while we were projecting, leaving
-      // the environment leased for a full TTL after `released: true`.
+      // Content changes preserve the deadline. Re-read ownership after the
+      // asynchronous reconcile: release may have ended this lease meanwhile.
       const held = this.journal.leaseForEnv(env.id);
       // Gone or re-claimed: there is no lease left to refresh, and reporting
       // 'projected' would hand the caller a context with `lease: null` and exit
       // 0 — their next exec/token then fails with "no active lease". Fall back
       // like every other case projection cannot honestly serve; `up` re-earns a
       // lease through the ordinary acquire path.
-      if (!held || held.id !== lease.id) return fallback();
-      this.journal.saveLease({ ...held, expiresAt: now() + LEASE_TTL(held.kind) });
+      if (!held || held.id !== lease.id || held.expiresAt <= now()) return fallback();
       if (sync.copied > 0 || sync.deleted > 0) {
         logEvent({
           level: 'info', kind: 'watch', envId: env.id,
@@ -1484,7 +1480,7 @@ export class Engine {
     opts.onProgress?.(`acquiring an environment (pool ${this.journal.envsForStack(stack.id).length}/${POOL_MAX()})`);
     const queueStarted = performance.now();
     let queueMs = 0;
-    const { env, fresh } = await this.acquireEnv(stack, holder, kind, hygiene, opts.ttlMs ?? LEASE_TTL(kind), opts.dataOnly === true, opts.holderPid);
+    const { env, fresh } = await this.acquireEnv(stack, holder, kind, hygiene, opts.ttlMs ?? LEASE_TTL(kind), opts.dataOnly === true, opts.holderPid, opts.preserveLeaseDeadline);
     // Auto-escalation (decision 0007): two consecutive bind failures on this
     // warm environment -> the next bind is pristine, whatever was asked.
     if (hygiene !== 'pristine' && env.failStreak >= 2) hygiene = 'pristine';
@@ -1768,7 +1764,7 @@ export class Engine {
     }
     // Anything projection can't honestly serve — pending upkeep/rebake, a
     // quiesced or degraded env, a lapsed lease — takes the full bind.
-    const result = await this.up({ cwd, holder: h, kind: 'session', hygiene: 'reuse', onProgress });
+    const result = await this.up({ cwd, holder: h, kind: 'session', hygiene: 'reuse', onProgress, preserveLeaseDeadline: true });
     if (projectionDiagnostics) {
       // A projection may already have copied the tree before discovering upkeep
       // is needed. Include that attempt instead of hiding its time and copies.
@@ -1793,19 +1789,8 @@ export class Engine {
     } catch {
       throw new BrokerError('work-error', `'${ref}' is not a commit in this repository`, 'bind');
     }
-    // Preserve the lease clock: `bind --ref` re-points the env at a commit — a
-    // content operation. It must not silently shorten a long lease to the
-    // default (a 480-min lease dropping to ~30 min would arm a fuse that stops
-    // the env's dev servers mid-workflow). Keep the current lease's remaining
-    // time unless --ttl was given explicitly; with no live lease yet, up()
-    // applies the default.
-    const lease = this.journal.leaseForHolder(h, stack.id);
-    // Snapshot the clock once: two now() reads could straddle the expiry instant
-    // and yield a 0/negative remaining, which — not being nullish — would write
-    // an already-lapsed lease instead of falling back to the default.
-    const t = now();
-    const remainingMs = lease ? lease.expiresAt - t : 0;
-    const keepTtlMs = ttlMs ?? (remainingMs > 0 ? remainingMs : undefined);
+    // Ref binds preserve the same absolute deadline as sync/watch/reset.
+    // Resolve it under the claim lock, after archive work, unless explicitly renewed.
     const tmp = mkdtempSync(join(tmpdir(), 'backlot-ref-'));
     try {
       // Bounded AND off the sync path for the same reason as the worker: a
@@ -1814,7 +1799,7 @@ export class Engine {
       if (r.timedOut || r.code !== 0) {
         throw new BrokerError('work-error', `git archive of ${sha} failed${r.timedOut ? ' (timed out)' : ''}`, 'bind', r.output.slice(-400));
       }
-      return await this.up({ cwd, holder: h, kind: 'session', hygiene: 'reuse', sourceRoot: tmp, ttlMs: keepTtlMs });
+      return await this.up({ cwd, holder: h, kind: 'session', hygiene: 'reuse', sourceRoot: tmp, ttlMs, preserveLeaseDeadline: ttlMs === undefined });
     } finally {
       rmSync(tmp, { recursive: true, force: true });
     }
@@ -1829,7 +1814,7 @@ export class Engine {
     const h = holder ?? resolve(cwd);
     const lease = this.journal.leaseForHolder(h, stack.id);
     if (!lease) throw new BrokerError('env-error', `no active lease — run 'backlot up' first`, 'lease');
-    this.journal.saveLease({ ...lease, hygiene: 'reset-data', expiresAt: now() + LEASE_TTL(lease.kind) });
+    this.journal.saveLease({ ...lease, hygiene: 'reset-data' });
     const env = this.envForLease(lease);
     const resetStarted = performance.now();
     let queueMs = 0;
