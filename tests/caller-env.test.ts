@@ -157,6 +157,57 @@ describe('caller environment inputs', () => {
     expect((await f.response(restarted.json)).value).toBeNull();
   });
 
+  it('keeps a templated manifest default for an omitted optional input and masks the daemon without one', async () => {
+    const f = fixture();
+    writeFileSync(join(f.tree, 'backlot.yml'), readFileSync(join(f.tree, 'backlot.yml'), 'utf8')
+      .replace("env: { PORT: '{{ports.web}}' }", "env: { PORT: '{{ports.web}}', TEST_CALLER_KEY: 'default-{{ports.web}}' }"));
+    // Boot the daemon with a same-named value: the manifest default must win over it.
+    expect((await f.cli(['status'], { TEST_CALLER_KEY: 'stale-daemon-value' }, f.root)).code).toBe(0);
+    const defaulted = await f.cli(['up']);
+    expect(defaulted.code, defaulted.stderr + defaulted.stdout).toBe(0);
+    const port = new URL(defaulted.json.urls.web).port;
+    expect((await f.response(defaulted.json)).value).toBe(`default-${port}`);
+    const logs = await f.cli(['logs', 'web']);
+    expect(logs.stdout).toContain(`default-${port}`.slice(0, 3));
+    expect(logs.stdout).not.toContain('[redacted]');
+    const supplied = await f.cli(['up'], { TEST_CALLER_KEY: 'caller-wins' });
+    expect((await f.response(supplied.json)).value).toBe('caller-wins');
+    expect(supplied.json.bindDiagnostics.reasons).toContain('environment-inputs-changed');
+    const returned = await f.cli(['up']);
+    expect((await f.response(returned.json)).value).toBe(`default-${port}`);
+    // Drop the default again: omission now masks the daemon's own value.
+    writeFileSync(join(f.tree, 'backlot.yml'), readFileSync(join(f.tree, 'backlot.yml'), 'utf8')
+      .replace(", TEST_CALLER_KEY: 'default-{{ports.web}}'", ''));
+    const masked = await f.cli(['up']);
+    expect(masked.code, masked.stderr + masked.stdout).toBe(0);
+    expect((await f.response(masked.json)).value).toBeNull();
+  }, 30_000);
+
+  it('binds a preserved slice whose service left the manifest instead of refusing before the claim', async () => {
+    const f = fixture();
+    // No hot_reload: sync must take the full bind, which is where the pre-claim check runs.
+    const manifest = readFileSync(join(f.tree, 'backlot.yml'), 'utf8').replace('    hot_reload: true\n', '').replace('checks:\n', [
+      '  worker:',
+      '    run: node server.mjs',
+      '    port: worker',
+      "    env: { PORT: '{{ports.worker}}' }",
+      '    ready: { http: /, timeout: 10 }',
+      'checks:',
+      '',
+    ].join('\n'));
+    writeFileSync(join(f.tree, 'backlot.yml'), manifest);
+    const slice = await f.cli(['up', 'worker']);
+    expect(slice.code, slice.stderr + slice.stdout).toBe(0);
+    expect(Object.keys(slice.json.urls)).toEqual(['worker']);
+    writeFileSync(join(f.tree, 'backlot.yml'), manifest.replace(/  worker:\n(    .*\n)+/, ''));
+    const synced = await f.cli(['sync']);
+    expect(synced.code, synced.stderr + synced.stdout).toBe(0);
+    expect(Object.keys(synced.json.urls)).toEqual(['web']);
+    const explicit = await f.cli(['up', 'worker']);
+    expect(explicit.code).toBe(1);
+    expect(explicit.json.error.message).toContain("no service 'worker'");
+  }, 30_000);
+
   it('validates required inputs before converting a data-only lease to an application', async () => {
     const f = fixture('required');
     writeFileSync(join(f.tree, 'seed.mjs'), `import {DatabaseSync} from 'node:sqlite'; const db=new DatabaseSync(process.argv[2]); db.exec('CREATE TABLE IF NOT EXISTS t(x)');db.close();`);

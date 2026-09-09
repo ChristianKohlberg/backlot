@@ -39,9 +39,15 @@ export function requireCallerEnv(manifest: Manifest, active: Iterable<string>, v
   }
 }
 
-/** Undefined deliberately masks a same-named inherited daemon value. */
+/**
+ * A supplied value wins; an omitted one keeps the service's explicit `env`
+ * default, and undefined deliberately masks a same-named inherited daemon
+ * value when there is no such default.
+ */
 export function serviceCallerEnv(spec: ServiceSpec, values: Record<string, string>): NodeJS.ProcessEnv {
-  return Object.fromEntries(Object.keys(spec.env_from ?? {}).map((name) => [name, values[name]]));
+  return Object.fromEntries(Object.keys(spec.env_from ?? {}).flatMap((name): Array<[string, string | undefined]> =>
+    values[name] !== undefined ? [[name, values[name]]] : name in (spec.env ?? {}) ? [] : [[name, undefined]],
+  ));
 }
 
 /** Declaration identity only: safe to compare without hashing secret values. */

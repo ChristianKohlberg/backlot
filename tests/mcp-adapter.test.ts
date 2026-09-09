@@ -73,6 +73,24 @@ describe('MCP adapter', () => {
     expect(err?.message).toMatch(/requires: cwd/);
   }, 30_000);
 
+  it('answers a missing manifest for a binding tool as a classed work-error result, not a protocol error', async () => {
+    const empty = mkdtempSync(join(tmpdir(), 'backlot-mcp-nostack-'));
+    try {
+      const [res] = await talk([
+        { jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'backlot_up', arguments: { cwd: empty } } },
+      ]);
+      expect(res.error).toBeUndefined();
+      const body = res.result as { content: Array<{ text: string }>; isError: boolean };
+      expect(body.isError).toBe(true);
+      const payload = JSON.parse(body.content[0].text) as { error: { class: string; source?: string; message: string } };
+      expect(payload.error.class).toBe('work-error');
+      expect(payload.error.source).toBe('manifest');
+      expect(payload.error.message).toMatch(/backlot\.yml/);
+    } finally {
+      rmSync(empty, { recursive: true, force: true });
+    }
+  });
+
   it('offers a holder so concurrent agents can avoid sharing one lease', async () => {
     const out = await talk([
       { jsonrpc: '2.0', id: 1, method: 'initialize', params: {} },

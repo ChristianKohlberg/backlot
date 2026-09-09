@@ -146,7 +146,9 @@ additive `ALTER TABLE` migrations are not bumps.
 
 `services.*.env_from` allowlists caller variables (`required`/`optional`). Explicit
 `up` and `run` refresh them; `sync`, watch, reset and ref binds preserve the lease's
-memory-only inputs. Omitted optional values mask same-named daemon variables.
+memory-only inputs. A supplied value overrides a same-named `env` entry; an omitted
+optional value keeps the service's explicit `env` default, and without one it masks
+the same-named daemon variable. Only caller-supplied values are redacted from logs.
 Never journal or expose input values/hashes in context or diagnostics. A daemon
 restart needs a fresh `up` to resupply them. New holders must restart configured
 services even on identical source: warm reuse must not inherit another lease's

@@ -1180,8 +1180,9 @@ export class Engine {
           run: template(spec.run, ctx),
           ...(spec.watch_run ? { watch_run: template(spec.watch_run, ctx) } : {}),
         };
-        const serviceEnv = { ...templateEnv(spec.env, ctx), ...serviceCallerEnv(spec, inputs.values) };
-        sup.start(name, resolved, serviceEnv, watch);
+        const callerValues = serviceCallerEnv(spec, inputs.values);
+        const serviceEnv = { ...templateEnv(spec.env, ctx), ...callerValues };
+        sup.start(name, resolved, serviceEnv, watch, Object.values(callerValues).filter((value): value is string => value !== undefined));
         const url = spec.port ? `http://localhost:${env.ports[spec.port]}` : undefined;
         say(`starting '${name}', waiting until ready`);
         const readyStart = now();
@@ -1476,7 +1477,7 @@ export class Engine {
     const existingEnv = existingLease ? this.journal.getEnv(existingLease.envId) : undefined;
     const selectedInputs = (opts.dataOnly ?? existingEnv?.dataOnly) === true
       ? new Set<string>()
-      : this.resolveServiceClosure(stack, opts.services ?? existingEnv?.activeServices ?? []);
+      : this.resolveServiceClosure(stack, opts.services ?? existingEnv?.activeServices?.filter((n) => n in stack.manifest.services) ?? []);
     requireCallerEnv(stack.manifest, selectedInputs, suppliedInputs ?? (existingLease ? this.leaseInputs.get(existingLease.id)?.values : undefined) ?? {});
     const kind = opts.kind ?? 'session';
     let hygiene = opts.hygiene ?? 'reuse';

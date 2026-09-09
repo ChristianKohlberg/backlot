@@ -11,6 +11,7 @@ import { createInterface } from 'node:readline';
 import { ensureDaemon, rpc } from '../cli/client.js';
 import { VERSION, versionSkew } from '../core/version.js';
 import { collectCallerEnv } from '../core/caller-env.js';
+import { BrokerError } from '../core/util.js';
 
 const PROTOCOL = '2025-06-18';
 
@@ -187,7 +188,13 @@ rl.on('line', (line) => {
             return respondError(id, -32602, `tool '${toolName}' requires: ${missing.join(', ')}`);
           }
           const refreshInputs = ['up', 'run', 'run-detach'].includes(tool.verb);
-          const callerEnv = refreshInputs ? collectCallerEnv(String(args.cwd)) : undefined;
+          let callerEnv: Record<string, string> | undefined;
+          try {
+            callerEnv = refreshInputs ? collectCallerEnv(String(args.cwd)) : undefined;
+          } catch (err) {
+            if (!(err instanceof BrokerError)) throw err;
+            return respond(id, { content: [{ type: 'text', text: JSON.stringify({ error: err.toJSON() }) }], isError: true });
+          }
           const daemon = await ensureDaemon(typeof args.cwd === 'string' ? args.cwd : undefined);
           // Version skew is refused here too, and this is the surface where it
           // matters MOST: the caller is an agent, it cannot see a warning on

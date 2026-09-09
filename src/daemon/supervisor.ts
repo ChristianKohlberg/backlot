@@ -85,7 +85,7 @@ export class EnvSupervisor {
     return [...this.services.values()].every((r) => r.proc.exitCode === null);
   }
 
-  start(name: string, spec: ServiceSpec, env: NodeJS.ProcessEnv, watchMode: boolean): void {
+  start(name: string, spec: ServiceSpec, env: NodeJS.ProcessEnv, watchMode: boolean, secrets: string[] = []): void {
     const cmd = watchMode && spec.watch_run ? spec.watch_run : spec.run;
     // A repo can already run arbitrary shell here, so this is not a privilege
     // boundary — it makes an ACCIDENT loud. `cwd: ../sibling` silently ran the
@@ -129,7 +129,7 @@ export class EnvSupervisor {
       };
       for (const stream of [proc.stdout!, proc.stderr!]) {
         const decoder = new StringDecoder('utf8');
-        const redact = redactStream(Object.keys(spec.env_from ?? {}).flatMap((key) => env[key] === undefined ? [] : [env[key]!]));
+        const redact = redactStream(secrets);
         stream.on('data', (d: Buffer) => {
           const text = decoder.write(d);
           running.probeBuf = (running.probeBuf + text).slice(-64_000);

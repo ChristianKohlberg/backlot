@@ -245,10 +245,11 @@ Export those names in your shell, then run `backlot up`. The CLI sends only
 declared names over the local socket; the shared daemon does not need a restart.
 When autospawning, it removes those names from the new daemon's environment so
 the first caller's inputs cannot become ambient configuration for other leases.
-`required` refuses a missing value before claiming an environment. `optional`
-leaves it unset. An empty string is a supplied value. Inputs override same-named
-`env` entries and mask a same-named daemon variable when omitted. They are service
-and readiness-probe inputs, not build, upkeep, check-command, or `exec` inputs.
+`required` refuses a missing value before claiming an environment. An empty string
+is a supplied value. A supplied input overrides a same-named `env` entry. An omitted
+`optional` input keeps the service's explicit `env` default (templated as usual);
+without such a default it is unset and masks a same-named daemon variable. They are
+service and readiness-probe inputs, not build, upkeep, check-command, or `exec` inputs.
 `BACKLOT_*` names are reserved for broker controls and cannot be declared here.
 
 Each explicit `up` refreshes the lease's inputs, including clearing omitted optional

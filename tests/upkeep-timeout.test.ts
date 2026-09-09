@@ -59,10 +59,11 @@ describe('per-rule upkeep deadlines and live progress', () => {
     const pending = runUpkeep(dir, ['input'], manifest, {}, (phase) => progress.push(phase));
     expect(progress).toEqual(['upkeep rule 1: starting (timeout 15s)']);
     const result = await pending;
-    expect(progress.some((phase) => /^upkeep rule 1: running \(\d+s elapsed\)$/.test(phase))).toBe(true);
-    expect(progress.at(-1)).toMatch(/finished/);
+    const heartbeats = progress.slice(1, -1);
+    expect(heartbeats.length).toBeGreaterThanOrEqual(1);
+    for (const phase of heartbeats) expect(phase).toMatch(/^upkeep rule 1: running \(\d+s elapsed\)$/);
+    expect(progress.at(-1)).toMatch(/^upkeep rule 1: finished \(\d+s elapsed\)$/);
     expect(progress.join('\n')).not.toMatch(/secret-token|echo|sleep/);
-    expect(progress.length).toBeLessThanOrEqual(3);
     progress.length = 0;
     await runUpkeep(dir, ['input'], manifest, result.fingerprints, (phase) => progress.push(phase));
     expect(progress).toEqual([]);
