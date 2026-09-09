@@ -169,8 +169,9 @@ export const DAEMON_STOP_TIMEOUT_MS = 60_000;
 /**
  * Wait for the daemon to be really gone — not answering AND not running.
  *
- * `update` needs this between the restart request and the respawn, for two
- * distinct reasons:
+ * `update` needs this between the restart request and the respawn, and
+ * `daemon stop` (with `DAEMON_STOP_TIMEOUT_MS`) before it reports `stopped`,
+ * for two distinct reasons:
  *
  * - `shutdown` returns its result frame ~50ms BEFORE the process exits, so
  *   pinging straight away is answered by the daemon that is about to die,
