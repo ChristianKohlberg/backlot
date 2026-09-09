@@ -10,7 +10,7 @@ import { VERSION, versionSkew } from '../core/version.js';
 import { installKind } from './install.js';
 import { collectCallerEnv } from '../core/caller-env.js';
 import { loadStack } from '../core/manifest.js';
-import { parsePresetArgs, selectPresets } from '../core/presets.js';
+import { parsePresetArgs } from '../core/presets.js';
 import { BrokerError } from '../core/util.js';
 
 const USAGE = `backlot — puts a working instance of a web application in front of you.
@@ -231,7 +231,6 @@ async function main(): Promise<void> {
   if (presetArgs.length > 0) {
     const manifest = loadStack(process.cwd()).manifest;
     presets = parsePresetArgs(manifest, presetArgs);
-    selectPresets(manifest, verb === 'run' ? 'run' : 'session', presets);
   }
   const daemon = await ensureDaemon(process.cwd());
 

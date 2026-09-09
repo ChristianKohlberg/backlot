@@ -883,6 +883,12 @@ export class Engine {
     // matching whatever is still running. resolveServiceClosure owns the
     // empty->whole-app rule, so a preserved shape whose services were all removed
     // from the manifest falls back to full rather than starting none.
+    // The kill switch depends on the MANIFEST alone, which has already been
+    // re-read — so it acts here, before anything else can fail. A stack that
+    // forbids preview must not stay published because a bind's ready probe
+    // timed out. Every other reason to invalidate a tunnel depends on what this
+    // bind commits, and is reconciled at the epilogue instead.
+    const forbiddenNotice = await this.enforcePreviewForbidden(env, stack, say);
     const presetLease = this.journal.leaseForEnv(env.id);
     if (!presetLease) throw new BrokerError('env-error', 'lease ended before bind; run backlot up again', 'lease');
     const presets = selectPresets(stack.manifest, kind, requestedPresets, presetLease.presets ?? (freshClaim ? undefined : env.presets));
@@ -947,12 +953,6 @@ export class Engine {
       }
     }
     if (addedPort) this.journal.saveEnv(env);
-    // The kill switch depends on the MANIFEST alone, which has already been
-    // re-read — so it acts here, before anything else can fail. A stack that
-    // forbids preview must not stay published because a bind's ready probe
-    // timed out. Every other reason to invalidate a tunnel depends on what this
-    // bind commits, and is reconciled at the epilogue instead.
-    const forbiddenNotice = await this.enforcePreviewForbidden(env, stack, say);
     if (hygiene === 'pristine') {
       say('preparing a pristine environment');
       await this.supervisor(env).stopAll();
@@ -1360,7 +1360,8 @@ export class Engine {
     holder: string,
   ): Promise<{ outcome: 'projected' | 'fallback' | 'skip'; previewNotice?: string; bindDiagnostics?: BindDiagnostics }> {
     const trace = new BindTrace();
-    const fallback = () => ({ outcome: 'fallback' as const, bindDiagnostics: trace.finish() });
+    let forbiddenNotice: string | undefined;
+    const fallback = () => ({ outcome: 'fallback' as const, previewNotice: forbiddenNotice, bindDiagnostics: trace.finish() });
     const stack = loadStack(cwd);
     trace.phase('queue');
     return this.envLocked(envId, async () => {
@@ -1372,7 +1373,7 @@ export class Engine {
       // watch event; anything else re-earns an environment via acquire.
       const lease = this.journal.leaseForHolder(holder, stack.id);
       if (!lease || lease.envId !== envId || lease.expiresAt <= now()) return fallback();
-      const forbiddenNotice = await this.enforcePreviewForbidden(env, stack, () => undefined);
+      forbiddenNotice = await this.enforcePreviewForbidden(env, stack, () => undefined);
       const presets = selectPresets(stack.manifest, lease.kind, undefined, lease.presets ?? env.presets);
       if (Object.entries(presets).some(([name, preset]) => env.presets[name] !== preset)) return fallback();
       // Same trust conditions as bindAndStart's fast path: hot, all healthy.
@@ -1449,6 +1450,7 @@ export class Engine {
   async up(opts: UpOptions) {
     const requestStarted = performance.now();
     const stack = loadStack(opts.cwd);
+    const forbiddenNotice = await this.enforceHolderPreviewForbidden(stack, opts.holder ?? resolve(opts.cwd), opts.onProgress);
     selectPresets(stack.manifest, opts.kind ?? 'session', opts.presets);
     // Resolve a requested slice BEFORE acquiring an env: an unknown name is a
     // user typo, not a bind failure, so it must not reach bindAndStart's catch
@@ -1526,7 +1528,7 @@ export class Engine {
       }
       bindDiagnostics.phasesMs.queue = queueMs;
       bindDiagnostics.durationMs = performance.now() - requestStarted;
-      return { ...this.ctx(opts.cwd, holder, bound.id), previewNotice, bindDiagnostics };
+      return { ...this.ctx(opts.cwd, holder, bound.id), previewNotice: previewNotice ?? forbiddenNotice, bindDiagnostics };
     } catch (err) {
       const fresh = this.journal.getEnv(env.id);
       if (fresh) {
@@ -1768,6 +1770,7 @@ export class Engine {
   async syncLease(cwd: string, holder?: string, onProgress?: Progress) {
     const requestStarted = performance.now();
     let projectionDiagnostics: BindDiagnostics | undefined;
+    let projectionNotice: string | undefined;
     const h = holder ?? resolve(cwd);
     // The dogfooded 57s-for-a-one-line-edit: sync used to full-rebind (stop,
     // rebuild, restart, ready-wait) on ANY source change, defeating the dev
@@ -1789,10 +1792,12 @@ export class Engine {
         return { ...this.ctx(cwd, h, lease.envId), previewNotice: projected.previewNotice, bindDiagnostics: projected.bindDiagnostics };
       }
       projectionDiagnostics = projected.bindDiagnostics;
+      projectionNotice = projected.previewNotice;
     }
     // Anything projection can't honestly serve — pending upkeep/rebake, a
     // quiesced or degraded env, a lapsed lease — takes the full bind.
     const result = await this.up({ cwd, holder: h, kind: 'session', hygiene: 'reuse', onProgress });
+    result.previewNotice ??= projectionNotice;
     if (projectionDiagnostics) {
       // A projection may already have copied the tree before discovering upkeep
       // is needed. Include that attempt instead of hiding its time and copies.
@@ -1850,8 +1855,9 @@ export class Engine {
 
   async resetData(cwd: string, holder?: string, onProgress?: Progress, presets?: unknown) {
     const stack = loadStack(cwd);
-    selectPresets(stack.manifest, 'session', presets);
     const h = holder ?? resolve(cwd);
+    const forbiddenNotice = await this.enforceHolderPreviewForbidden(stack, h, onProgress);
+    selectPresets(stack.manifest, 'session', presets);
     const lease = this.journal.leaseForHolder(h, stack.id);
     if (!lease) throw new BrokerError('env-error', `no active lease — run 'backlot up' first`, 'lease');
     this.journal.saveLease({ ...lease, hygiene: 'reset-data', expiresAt: now() + LEASE_TTL(lease.kind) });
@@ -1868,7 +1874,7 @@ export class Engine {
     );
     bindDiagnostics.phasesMs.queue = queueMs;
     bindDiagnostics.durationMs = performance.now() - resetStarted;
-    return { ...this.ctx(cwd, h), previewNotice, bindDiagnostics };
+    return { ...this.ctx(cwd, h), previewNotice: previewNotice ?? forbiddenNotice, bindDiagnostics };
   }
 
   /**
@@ -2646,6 +2652,19 @@ export class Engine {
    * key, so before one runs the service is still listening where the tunnel
    * points and a mismatch means nothing yet.
    */
+  private async enforceHolderPreviewForbidden(stack: Stack, holder: string, onProgress?: Progress): Promise<string | undefined> {
+    if (!stack.manifest.preview?.forbidden) return undefined;
+    const lease = this.journal.leaseForHolder(holder, stack.id);
+    if (!lease) return undefined;
+    return this.envLocked(lease.envId, async () => {
+      const held = this.journal.leaseForHolder(holder, stack.id);
+      if (!held || held.id !== lease.id) return undefined;
+      const env = this.journal.getEnv(held.envId);
+      if (!env) return undefined;
+      return this.enforcePreviewForbidden(env, stack, onProgress ?? (() => undefined));
+    });
+  }
+
   /**
    * Tear down a live preview the moment the manifest forbids one.
    *
