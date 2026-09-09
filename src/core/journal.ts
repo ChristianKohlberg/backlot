@@ -11,9 +11,14 @@ import type { EnvState, Hygiene, LeaseKind, ServicePid } from './types.js';
  * The journal schema this build understands, stamped into `PRAGMA user_version`.
  *
  * Bump it when a change makes an OLDER daemon misread this journal — not for
- * every additive column. The additive migrations below are deliberately not
- * bumps: an old daemon selecting a known subset of columns reads a newer
- * journal correctly.
+ * every additive column: a bump is unnecessary when an old daemon selecting
+ * a known subset of columns still reads the journal correctly.
+ *
+ * Schema 2 separates lease-intended presets (`leases.presets`) from completed
+ * restores (`envs.presets`). Older daemons would inherit actual data as intent
+ * after a failed bind or pristine wipe. Existing leases migrate from their
+ * environment's recorded choices; tests/preset-selection.test.ts covers the
+ * retry and restart invariant.
  *
  * What this exists to stop is the DOWNGRADE, which has already cost once. The
  * sha256 env-id migration stranded pre-upgrade rows that then counted against

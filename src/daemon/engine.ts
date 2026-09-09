@@ -873,16 +873,6 @@ export class Engine {
     if (env.state === 'recycling') {
       throw new BrokerError('env-error', `environment ${env.id} is being recycled — retry`, 'pool');
     }
-    // Which services this bind brings up. An explicit list wins: `up` sends []
-    // (whole app) or a slice, `run` sends []. An undefined request means "no
-    // caller preference": on a FRESH claim that is the whole app (a new owner
-    // never inherits the previous holder's slice), and on a continuing lease
-    // (reset-data/watch/bind on the same holder's env) it preserves the current
-    // shape. Because the shape is only ever read from the journal — never
-    // rewritten at claim time — an early bind failure leaves activeServices
-    // matching whatever is still running. resolveServiceClosure owns the
-    // empty->whole-app rule, so a preserved shape whose services were all removed
-    // from the manifest falls back to full rather than starting none.
     // The kill switch depends on the MANIFEST alone, which has already been
     // re-read — so it acts here, before anything else can fail. A stack that
     // forbids preview must not stay published because a bind's ready probe
@@ -895,6 +885,16 @@ export class Engine {
     this.journal.saveLease({ ...presetLease, presets });
     const presetsChanged = Object.entries(presets).some(([name, preset]) => env.presets[name] !== preset);
     const presetSelectionChanged = Object.entries(presets).some(([name, preset]) => Object.hasOwn(env.presets, name) && env.presets[name] !== preset);
+    // Which services this bind brings up. An explicit list wins: `up` sends []
+    // (whole app) or a slice, `run` sends []. An undefined request means "no
+    // caller preference": on a FRESH claim that is the whole app (a new owner
+    // never inherits the previous holder's slice), and on a continuing lease
+    // (reset-data/watch/bind on the same holder's env) it preserves the current
+    // shape. Because the shape is only ever read from the journal — never
+    // rewritten at claim time — an early bind failure leaves activeServices
+    // matching whatever is still running. resolveServiceClosure owns the
+    // empty->whole-app rule, so a preserved shape whose services were all removed
+    // from the manifest falls back to full rather than starting none.
     const declaredServices = Object.keys(stack.manifest.services);
     const requestedNames =
       requestedServices !== undefined
@@ -2620,38 +2620,7 @@ export class Engine {
     return survivors;
   }
 
-  /**
-   * Reconcile a live preview against the environment this bind just produced.
-   *
-   * The tunnel outlives service restarts, so everything here is about what is
-   * now BEHIND the unchanged public URL. Three outcomes invalidate it outright
-   * and tear it down — the manifest started forbidding preview, the previewed
-   * service is no longer in the running slice, or it moved to a different local
-   * port (a renamed port key; existing keys are never reassigned, decision
-   * 0004). A data reset does not: the tunnel keeps serving, which is precisely
-   * why it has to be said out loud.
-   *
-   * Runs at the bind's EPILOGUE, once the shape it judges against is committed.
-   * From the top of the bind it was reading a REQUESTED slice that the epilogue
-   * had not written yet, so a bind that then failed its ready probe left the
-   * tunnel torn down against a slice change that never happened — and dropped
-   * the report with the thrown error. `preview.forbidden` is the exception and
-   * is enforced early by `enforcePreviewForbidden`: it depends on the manifest,
-   * not on the bind.
-   *
-   * Never throws. The bind that narrowed the slice or wiped the data is a
-   * legitimate operation and failing it would strand the caller in a loop (and
-   * bump failStreak into a pristine escalation); the classified message is the
-   * report, and it rides back on the bind's own result.
-   *
-   * `active` must be the DURABLE shape this environment is bound to, never the
-   * supervisor's live pid map: a service in restart backoff is missing from
-   * that map for a second and would be read as "left the slice", killing a
-   * tunnel the restart makes correct again. `portsReallocated` is false on the
-   * projection path — only a real bind fills `env.ports` for a renamed port
-   * key, so before one runs the service is still listening where the tunnel
-   * points and a mismatch means nothing yet.
-   */
+  /** Enforce the kill switch under the env lock before preset validation can fail. */
   private async enforceHolderPreviewForbidden(stack: Stack, holder: string, onProgress?: Progress): Promise<string | undefined> {
     if (!stack.manifest.preview?.forbidden) return undefined;
     const lease = this.journal.leaseForHolder(holder, stack.id);
@@ -2687,6 +2656,38 @@ export class Engine {
     return detail;
   }
 
+  /**
+   * Reconcile a live preview against the environment this bind just produced.
+   *
+   * The tunnel outlives service restarts, so everything here is about what is
+   * now BEHIND the unchanged public URL. Three outcomes invalidate it outright
+   * and tear it down — the manifest started forbidding preview, the previewed
+   * service is no longer in the running slice, or it moved to a different local
+   * port (a renamed port key; existing keys are never reassigned, decision
+   * 0004). A data reset does not: the tunnel keeps serving, which is precisely
+   * why it has to be said out loud.
+   *
+   * Runs at the bind's EPILOGUE, once the shape it judges against is committed.
+   * From the top of the bind it was reading a REQUESTED slice that the epilogue
+   * had not written yet, so a bind that then failed its ready probe left the
+   * tunnel torn down against a slice change that never happened — and dropped
+   * the report with the thrown error. `preview.forbidden` is the exception and
+   * is enforced early by `enforcePreviewForbidden`: it depends on the manifest,
+   * not on the bind.
+   *
+   * Never throws. The bind that narrowed the slice or wiped the data is a
+   * legitimate operation and failing it would strand the caller in a loop (and
+   * bump failStreak into a pristine escalation); the classified message is the
+   * report, and it rides back on the bind's own result.
+   *
+   * `active` must be the DURABLE shape this environment is bound to, never the
+   * supervisor's live pid map: a service in restart backoff is missing from
+   * that map for a second and would be read as "left the slice", killing a
+   * tunnel the restart makes correct again. `portsReallocated` is false on the
+   * projection path — only a real bind fills `env.ports` for a renamed port
+   * key, so before one runs the service is still listening where the tunnel
+   * points and a mismatch means nothing yet.
+   */
   private async reconcilePreviewForBind(
     env: EnvRow,
     stack: Stack,

@@ -142,7 +142,8 @@ user_version`; a daemon refuses to open a journal stamped newer than it understa
 Bump it only when a change makes an older daemon **misread** this journal — the
 additive `ALTER TABLE` migrations are not bumps.
 
-Lease preset intent is stored in `leases.presets`; `envs.presets` records only completed restores. Schema 2 blocks older daemons from inheriting actual data as intent after a failed bind or pristine wipe. Existing leases migrate from their environment's recorded choices.
+For preset intent versus completed restores and its compatibility barrier, see
+the `JOURNAL_SCHEMA_VERSION` comment in `src/core/journal.ts`.
 
 ## Caller environment inputs
 
