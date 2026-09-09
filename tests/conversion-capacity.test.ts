@@ -86,6 +86,7 @@ function inProcessStack(root: string, name: string) {
   execFileSync('git', ['init', '-q'], { cwd: tree });
   writeFileSync(join(tree, 'server.mjs'), "import{createServer}from'node:http';createServer((q,s)=>s.end('alive')).listen(Number(process.env.PORT),'127.0.0.1');\n");
   writeFileSync(join(tree, 'seed.mjs'), "import{DatabaseSync}from'node:sqlite';const d=new DatabaseSync(process.argv[2]);d.exec('CREATE TABLE IF NOT EXISTS t(x)');d.close();\n");
+  writeFileSync(join(tree, 'barrier.mjs'), "import{writeFileSync,existsSync}from'node:fs';import{join}from'node:path';const d=process.env.BACKLOT_TEST_GATE_DIR;writeFileSync(join(d,'entered'),'');const t=setInterval(()=>{if(existsSync(join(d,'release'))){clearInterval(t);process.exit(0)}},20);\n");
   writeFileSync(join(tree, 'backlot.yml'), `name: ${name}
 services:
   web:
@@ -250,12 +251,17 @@ describe('application capacity survives an unfinished data-only conversion', () 
 
   it('keeps the application reservation of a claimed bind that has not yet taken the environment lock', async () => {
     const root = realpathSync(mkdtempSync(join(tmpdir(), 'bl-convert-engine-')));
+    const gate = join(root, 'gate');
+    mkdirSync(gate);
     const saved = { ...process.env };
     Object.assign(process.env, {
       BACKLOT_STATE_DIR: join(root, 'state'), BACKLOT_POOL_MAX: '2', BACKLOT_POOL_MAX_TOTAL: '1',
-      BACKLOT_POOL_MAX_DATA_ONLY: '4', BACKLOT_SWEEP_MS: '60000', BACKLOT_WAIT_MS: '30000',
+      BACKLOT_POOL_MAX_DATA_ONLY: '4', BACKLOT_SWEEP_MS: '60000', BACKLOT_WAIT_MS: '30000', BACKLOT_TEST_GATE_DIR: gate,
     });
     const engine = new Engine();
+    const journal = () => new Journal(join(root, 'state', 'journal.db'));
+    const order: string[] = [];
+    let competing: Promise<Awaited<ReturnType<Engine['up']>>> | undefined;
     try {
       const tree = inProcessStack(root, 'app');
       const other = inProcessStack(root, 'other');
@@ -267,28 +273,55 @@ describe('application capacity survives an unfinished data-only conversion', () 
       // The row is warm with nothing recorded. An application rebind claims it and
       // a conversion back is chained straight behind that claim, before the bind
       // has taken the environment lock — the only moment the reservation is not
-      // also visible as `busy`.
-      const order: string[] = [];
-      const app = engine.up({ cwd: tree, holder: 'a', dataOnly: false, services: [] });
-      const back = engine.up({ cwd: tree, holder: 'a', dataOnly: true });
-      const settled = Promise.allSettled([app.finally(() => order.push('app')), back.finally(() => order.push('data'))]);
+      // also visible as `busy`. The bind then parks at an upkeep barrier so the
+      // window between claim and running services can be observed.
+      writeFileSync(join(tree, 'backlot.yml'), readFileSync(join(tree, 'backlot.yml'), 'utf8') + 'upkeep:\n  - { when: backlot.yml, run: node barrier.mjs }\n');
+      const app = engine.up({ cwd: tree, holder: 'a', dataOnly: false, services: [] }).finally(() => order.push('app'));
+      const back = engine.up({ cwd: tree, holder: 'a', dataOnly: true }).finally(() => order.push('data'));
+      const settled = Promise.allSettled([app, back]);
+      for (let i = 0; i < 250 && !existsSync(join(gate, 'entered')); i++) {
+        if (order.length > 0) break;
+        await sleep(20);
+      }
+      if (order.length > 0) {
+        const [outcome] = await settled;
+        expect.fail(`the application bind settled before reaching its upkeep barrier: ${JSON.stringify(outcome)}`);
+      }
+      expect(existsSync(join(gate, 'entered'))).toBe(true);
+      // Persisted shape while the claimed bind is parked: still an application.
+      expect(journal().getEnv(first.envId)?.dataOnly).toBe(false);
+      // And the machine-wide application cap of one still counts it: another
+      // stack must not be admitted while that reservation stands.
+      competing = engine.up({ cwd: other, holder: 'b', dataOnly: false, services: [] }).finally(() => order.push('other'));
+      competing.catch(() => undefined);
+      const early = await Promise.race([
+        competing.then(() => 'admitted', () => 'refused'),
+        sleep(1500).then(() => 'waiting'),
+      ]);
+      expect(early).toBe('waiting');
+      expect(journal().getEnv(first.envId)?.dataOnly).toBe(false);
+      writeFileSync(join(gate, 'release'), '');
       const [appOutcome, backOutcome] = await settled;
       expect(appOutcome.status, JSON.stringify(appOutcome)).toBe('fulfilled');
       const bound = (appOutcome as PromiseFulfilledResult<Awaited<typeof app>>).value;
       expect(bound.dataOnly).toBe(false);
       expect(bound.envId).toBe(first.envId);
-      expect(order).toEqual(['app', 'data']);
+      expect(order.indexOf('app')).toBe(0);
+      expect(order.indexOf('data')).toBeGreaterThan(0);
       expect(backOutcome.status, JSON.stringify(backOutcome)).toBe('fulfilled');
       const converted = (backOutcome as PromiseFulfilledResult<Awaited<typeof back>>).value;
       expect(converted.dataOnly).toBe(true);
       expect(converted.urls).toEqual({});
-      // The conversion ran only after the bind stopped what it started, so the
-      // application slot is genuinely free for the next stack.
-      const next = await engine.up({ cwd: other, holder: 'b', dataOnly: false, services: [] });
-      expect(next.dataOnly).toBe(false);
-      const r = await fetch(next.urls.web.replace('localhost', '127.0.0.1'), { signal: AbortSignal.timeout(2000) });
+      // The other stack is admitted only once the conversion has stopped what
+      // the bind started and released the slot.
+      const admitted = await competing;
+      expect(admitted.dataOnly).toBe(false);
+      expect(order.indexOf('other')).toBeGreaterThan(order.indexOf('app'));
+      const r = await fetch(admitted.urls.web.replace('localhost', '127.0.0.1'), { signal: AbortSignal.timeout(2000) });
       expect(await r.text()).toBe('alive');
     } finally {
+      writeFileSync(join(gate, 'release'), '');
+      if (competing) await competing.catch(() => undefined);
       await engine.shutdown();
       for (const key of Object.keys(process.env)) if (!(key in saved)) delete process.env[key];
       Object.assign(process.env, saved);
