@@ -6,7 +6,7 @@ import { execFileSync, spawn } from 'node:child_process';
 import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { mkdirSync, rmSync, copyFileSync, readdirSync, statSync, existsSync, readFileSync, writeFileSync, renameSync, watch as fsWatch, constants as fsConstants } from 'node:fs';
-import { join, sep } from 'node:path';
+import { isAbsolute, join, sep } from 'node:path';
 import { Journal, JOURNAL_SCHEMA_VERSION, type EnvRow, type LeaseRow } from '../core/journal.js';
 import { VERSION, compareVersions, versionSkew } from '../core/version.js';
 import { canonicalDirectory, stackIdentity, retiredStackIdentity, loadStack, defaultPreset, normalizeLogins, type Stack } from '../core/manifest.js';
@@ -14,11 +14,11 @@ import { changedOutputs, pullOutputs } from '../core/sync.js';
 import { syncIntoEnvThreaded } from '../core/sync-thread.js';
 import { runUpkeep, pendingUpkeep, templateBakeKeys } from '../core/upkeep.js';
 import { freePort, probeFree } from '../core/ports.js';
-import { envsRoot, artifactsRoot, stateRoot, templatesRoot } from '../core/paths.js';
+import { envsRoot, artifactsRoot, stateRoot, templatesRoot, retiredTemplatesRoot } from '../core/paths.js';
 import { BrokerError, template, templateEnv, now, shortId, matchesAny, safeJoin } from '../core/util.js';
 import { callerEnvSpec, requireCallerEnv, selectCallerEnv, serviceCallerEnv, validateCallerEnv } from '../core/caller-env.js';
 import { cmdTimeoutS, runBounded, runBoundedIO, LONG_CMD_TIMEOUT_S } from '../core/exec.js';
-import { makeDatastore, retireBakedTemplates, withBakeLock, type DsHandle } from '../drivers/datastores.js';
+import { makeDatastore, retireBakedTemplates, withBakeLock, tryWithBakeLock, type DsHandle } from '../drivers/datastores.js';
 import { ensureAppliance, stopAppliance, probeTcp } from '../drivers/appliances.js';
 import { DEFAULT_PREVIEW_PUBLISHER, resolvePreviewPublisher } from '../drivers/preview.js';
 import { EnvSupervisor, killGroupVerified, reapPids } from './supervisor.js';
@@ -227,6 +227,7 @@ export class Engine {
       } catch { /* leave unavailable or renamed projects unchanged */ }
     }
     for (const env of this.journal.allEnvs()) this.registerRetiredTemplates(env);
+    if (existsSync(templatesRoot())) for (const retired of readdirSync(templatesRoot())) this.relocateRetiredTemplates(retired);
     let envs = 0;
     let stranded = 0;
     for (const env of this.journal.allEnvs()) {
@@ -1474,25 +1475,45 @@ export class Engine {
     const dir = join(templatesRoot(), retired);
     if (retired === env.stack || !existsSync(dir)) return;
     const record = join(dir, '.retired-stack.json');
-    if (existsSync(record)) return;
-    writeFileSync(`${record}.tmp`, JSON.stringify({
-      stack: env.stack, legacyRoot: env.legacyStackRoot, root: env.stackRoot,
-    }));
-    renameSync(`${record}.tmp`, record);
+    if (!existsSync(record)) {
+      writeFileSync(`${record}.tmp`, JSON.stringify({
+        stack: env.stack, legacyRoot: env.legacyStackRoot, root: env.stackRoot,
+      }));
+      renameSync(`${record}.tmp`, record);
+    }
+    this.relocateRetiredTemplates(retired);
+  }
+
+  private relocateRetiredTemplates(retired: string): void {
+    tryWithBakeLock(retired, () => {
+      if (this.journal.envsForStack(retired).length > 0) return;
+      const dir = join(templatesRoot(), retired);
+      try {
+        const descriptor = JSON.parse(readFileSync(join(dir, '.retired-stack.json'), 'utf8'));
+        if (typeof descriptor.stack !== 'string' || typeof descriptor.legacyRoot !== 'string' || typeof descriptor.root !== 'string') return;
+        if (retiredStackIdentity(descriptor.stack, descriptor.legacyRoot) !== retired || descriptor.stack === retired) return;
+      } catch { return; }
+      mkdirSync(retiredTemplatesRoot(), { recursive: true });
+      const destination = join(retiredTemplatesRoot(), retired);
+      renameSync(dir, existsSync(destination) ? `${destination}.${shortId()}` : destination);
+    });
   }
 
   /** One bounded external drop, after ownership/reaping work; never part of recovery. */
   private async retireLegacyTemplateBatch(force = false): Promise<void> {
     for (const env of this.journal.allEnvs()) this.registerRetiredTemplates(env);
+    if (existsSync(templatesRoot())) for (const retired of readdirSync(templatesRoot())) this.relocateRetiredTemplates(retired);
     let entries: string[];
-    try { entries = readdirSync(templatesRoot()); } catch { return; }
-    for (const retired of entries) {
-      const dir = join(templatesRoot(), retired);
+    try { entries = readdirSync(retiredTemplatesRoot()); } catch { return; }
+    for (const entry of entries) {
+      const dir = join(retiredTemplatesRoot(), entry);
+      let retired: string;
       let descriptor: { stack: string; legacyRoot: string; root: string };
       try {
         descriptor = JSON.parse(readFileSync(join(dir, '.retired-stack.json'), 'utf8'));
         if (typeof descriptor.stack !== 'string' || typeof descriptor.legacyRoot !== 'string' || typeof descriptor.root !== 'string') continue;
-        if (retiredStackIdentity(descriptor.stack, descriptor.legacyRoot) !== retired || descriptor.stack === retired) continue;
+        retired = retiredStackIdentity(descriptor.stack, descriptor.legacyRoot);
+        if ((entry !== retired && !entry.startsWith(retired + '.')) || descriptor.stack === retired) continue;
       } catch { continue; }
       // A skipped migration or an in-flight old bake still owns these templates.
       if (this.journal.envsForStack(retired).length > 0) continue;
@@ -1520,12 +1541,12 @@ export class Engine {
     const own = this.journal.leaseForHolder(canonical, stack.id);
     if (own && own.expiresAt > now()) return canonical;
     for (const env of this.journal.envsForStack(stack.id)) {
-      if (!env.legacyStackRoot) continue;
       const lease = this.journal.leaseForEnv(env.id);
-      const legacyPathHolder = lease && (lease.holder === env.legacyStackRoot || lease.holder.startsWith(env.legacyStackRoot + sep));
-      if (!legacyPathHolder || lease.expiresAt <= now()) continue;
+      if (!lease || lease.expiresAt <= now() || !isAbsolute(lease.holder)) continue;
+      const legacyRoot = env.legacyStackRoot;
+      const legacyPathHolder = legacyRoot && (lease.holder === legacyRoot || lease.holder.startsWith(legacyRoot + sep));
       let candidate: string | undefined;
-      try { candidate = canonicalDirectory(join(env.stackRoot, lease.holder.slice(env.legacyStackRoot.length))); }
+      try { candidate = canonicalDirectory(legacyPathHolder ? join(env.stackRoot, lease.holder.slice(legacyRoot.length)) : lease.holder); }
       catch { candidate = undefined; }
       if (candidate === undefined || canonical === candidate) {
         throw new BrokerError('env-error', `a legacy path holder still owns ${env.id}; pass holder ${JSON.stringify(lease.holder)} (--holder on the CLI) to inspect or release that lease before using the canonical default holder`, 'lease');

@@ -1,3 +1,5 @@
+import ts from 'typescript';
+import { pathToFileURL } from 'node:url';
 import { expect, it } from 'vitest';
 import { execFile, execFileSync, spawn } from 'node:child_process';
 import { mkdtempSync, mkdirSync, writeFileSync, symlinkSync, rmSync, readFileSync, existsSync, readdirSync, renameSync } from 'node:fs';
@@ -233,13 +235,14 @@ it('templates keyed by the retired identity are dropped through their own marker
     await f.cli(['release', '--holder', 'owner']);
     await f.cli(['daemon', 'stop']);
     const journal = journalAsLegacyAlias(f, first.envId, false);
-    const retiredDir = join(f.state, 'templates', legacyIdentity(f.alias));
+    let retiredDir = join(f.state, 'templates', legacyIdentity(f.alias));
     mkdirSync(retiredDir, { recursive: true });
     writeFileSync(join(retiredDir, 'main-default@stale.db'), 'stale sqlite template');
     const applianceUp = join(f.root, 'appliance-up');
     const droppedAt = join(f.root, 'dropped');
     writeFileSync(join(retiredDir, 'main-default@stale.baked'), JSON.stringify({ v: 1, ns: 'backlot_tpl_stale', drop: `test -e '${applianceUp}' && touch '${droppedAt}'` }));
     await f.cli(['status']); // recovery migrates; retirement is deferred to maintenance
+    retiredDir = join(f.state, 'retired-templates', legacyIdentity(f.alias));
     await sleep(1000);
     expect(journal.getEnv(first.envId)!.legacyStackRoot).toBe(f.alias);
     expect(existsSync(droppedAt)).toBe(false);
@@ -279,12 +282,14 @@ it('recovery never runs a retired drop; failed drops retain actionable bounded r
     const first = await f.cli(['up', '--holder', 'owner']);
     await f.cli(['daemon', 'stop']);
     journalAsLegacyAlias(f, first.envId, true);
-    const dir = join(f.state, 'templates', legacyIdentity(f.alias));
+    let dir = join(f.state, 'templates', legacyIdentity(f.alias));
     mkdirSync(dir, { recursive: true });
     const count = join(f.root, 'drop-attempts');
-    const marker = join(dir, 'main-default@missing.baked');
+    let marker = join(dir, 'main-default@missing.baked');
     writeFileSync(marker, JSON.stringify({ v: 1, ns: 'already-missing', drop: `echo attempt >> '${count}'; false` }));
     const context = await f.cli(['ctx', '--holder', 'owner']);
+    dir = join(f.state, 'retired-templates', legacyIdentity(f.alias));
+    marker = join(dir, 'main-default@missing.baked');
     expect(context.envId).toBe(first.envId);
     expect(existsSync(count), 'recovery must not run external template drops').toBe(false);
     for (let i = 0; i < 3; i++) await f.cli(['pool', 'gc']);
@@ -316,13 +321,16 @@ it('retirement bounds a hanging drop and processes only one marker per maintenan
     const first = await f.cli(['up', '--holder', 'owner']);
     await f.cli(['daemon', 'stop']);
     journalAsLegacyAlias(f, first.envId, true);
-    const dir = join(f.state, 'templates', legacyIdentity(f.alias));
+    let dir = join(f.state, 'templates', legacyIdentity(f.alias));
     mkdirSync(dir, { recursive: true });
-    const hanging = join(dir, 'a-hang.baked');
-    const second = join(dir, 'b-next.baked');
+    let hanging = join(dir, 'a-hang.baked');
+    let second = join(dir, 'b-next.baked');
     writeFileSync(hanging, JSON.stringify({ v: 1, ns: 'hanging', drop: 'node -e "setInterval(()=>{},1000)"' }));
     writeFileSync(second, JSON.stringify({ v: 1, ns: 'next', drop: 'true' }));
     await f.cli(['ctx', '--holder', 'owner']);
+    dir = join(f.state, 'retired-templates', legacyIdentity(f.alias));
+    hanging = join(dir, 'a-hang.baked');
+    second = join(dir, 'b-next.baked');
     expect(existsSync(`${hanging}.retirement.json`)).toBe(false);
     // Completion itself proves the hanging command has a bounded maintenance timeout.
     await f.cli(['pool', 'gc']);
@@ -338,12 +346,14 @@ it('periodic automatic GC respects three failed attempts and backoff', async () 
     const first = await f.cli(['up', '--holder', 'owner']);
     await f.cli(['daemon', 'stop']);
     journalAsLegacyAlias(f, first.envId, true);
-    const dir = join(f.state, 'templates', legacyIdentity(f.alias));
+    let dir = join(f.state, 'templates', legacyIdentity(f.alias));
     mkdirSync(dir, { recursive: true });
     const count = join(f.root, 'attempts');
-    const marker = join(dir, 'failed.baked');
+    let marker = join(dir, 'failed.baked');
     writeFileSync(marker, JSON.stringify({ v: 1, ns: 'failed', drop: `echo attempt >> '${count}'; false` }));
     await f.cli(['status']);
+    dir = join(f.state, 'retired-templates', legacyIdentity(f.alias));
+    marker = join(dir, 'failed.baked');
     for (let i = 0; i < 3; i++) await f.cli(['pool', 'gc']);
     const failure = readFileSync(`${marker}.retirement.json`, 'utf8');
     expect(JSON.parse(failure).attempts).toBe(3);
@@ -399,9 +409,10 @@ it('retirement preserves a live template shared by long canonical and legacy sta
     const journal = journalAsLegacyAlias(f, first.envId, true);
     const root = join(f.state, 'templates');
     const canonicalDir = join(root, legacyIdentity(f.wt, f.name));
-    const retiredDir = join(root, legacyIdentity(f.alias, f.name));
+    let retiredDir = join(root, legacyIdentity(f.alias, f.name));
     renameSync(canonicalDir, retiredDir);
     expect((await f.cli(['ctx', '--holder', 'owner'])).envId).toBe(first.envId);
+    retiredDir = join(f.state, 'retired-templates', legacyIdentity(f.alias, f.name));
     expect(journal.getEnv(first.envId)!.stack).toBe(legacyIdentity(f.wt, f.name));
     const second = await f.cli(['up', '--holder', 'other']);
     expect(second.error).toBeUndefined();
@@ -417,6 +428,7 @@ it('retirement preserves a live template shared by long canonical and legacy sta
     expect(readFileSync(join(appliance, ns), 'utf8')).toBe('seeded\n');
     expect(readFileSync(join(retiredDir, file), 'utf8')).toBe(retired);
     expect(JSON.parse(readFileSync(failure, 'utf8')).attempts).toBe(3);
+    expect(await pruneTemplates({ templatesKeep: 0 } as Policy, root)).toBe(0);
     expect(readFileSync(join(canonicalDir, file), 'utf8')).toBe(canonical);
     expect(readFileSync(first.datastores.main.url, 'utf8')).toBe('seeded\n');
     expect(readFileSync(second.datastores.main.url, 'utf8')).toBe('seeded\n');
@@ -462,7 +474,7 @@ for (const repaired of [false, true]) {
       const first = await f.cli(['up', '--holder', 'owner']);
       await f.cli(['daemon', 'stop']);
       const journal = journalAsLegacyAlias(f, first.envId, true);
-      const dir = join(f.state, 'templates', legacyIdentity(f.alias));
+      let dir = join(f.state, 'templates', legacyIdentity(f.alias));
       mkdirSync(dir, { recursive: true });
       const attempts = join(f.root, 'unexpected-drops');
       const records: Record<string, string> = {};
@@ -479,6 +491,7 @@ for (const repaired of [false, true]) {
       expect(journal.getEnv(first.envId)!.stack).toBe(legacyIdentity(f.alias));
       if (repaired) writeFileSync(manifest, good);
       await sleep(2200);
+      if (repaired) dir = join(f.state, 'retired-templates', legacyIdentity(f.alias));
       expect(existsSync(attempts)).toBe(false);
       for (const [file, content] of Object.entries(records)) expect(readFileSync(join(dir, file), 'utf8')).toBe(content);
       expect(existsSync(join(dir, '.retired-stack.json'))).toBe(repaired);
@@ -491,3 +504,72 @@ for (const repaired of [false, true]) {
     }
   }, 30000);
 }
+
+
+it('canonical stack rows recognize a legacy holder whose subdirectory alone was symlinked', async () => {
+  const f = fixture();
+  try {
+    const sub = join(f.wt, 'sub');
+    mkdirSync(sub);
+    const holder = join(f.wt, 'link');
+    symlinkSync(sub, holder, 'dir');
+    const first = await f.mcp('up', holder, holder);
+    expect(first.error).toBeUndefined();
+    const db = new DatabaseSync(first.datastores.main.url);
+    db.prepare('INSERT INTO notes VALUES (?)').run('canonical legacy owner');
+    db.close();
+    await f.cli(['daemon', 'stop']);
+    const journal = new Journal(join(f.state, 'journal.db'));
+    expect(journal.getEnv(first.envId)!.legacyStackRoot).toBeFalsy();
+    const implicit = await f.mcp('up', sub);
+    expect(implicit.error?.message).toContain(`pass holder ${JSON.stringify(holder)} (--holder on the CLI)`);
+    expect(journal.allEnvs()).toHaveLength(1);
+    expect(journal.leaseForEnv(first.envId)!.holder).toBe(holder);
+    const retained = await f.mcp('ctx', sub, holder);
+    expect(retained.envId).toBe(first.envId);
+    expect(retained.lease.id).toBe(first.lease.id);
+    expect(notesIn(retained.datastores.main.url)).toEqual([{ note: 'canonical legacy owner' }]);
+    const canonical = await f.mcp('up', sub, sub);
+    expect(canonical.error).toBeUndefined();
+    expect((await f.mcp('up', sub)).envId).toBe(canonical.envId);
+    expect(journal.leaseForEnv(first.envId)!.holder).toBe(holder);
+  } finally { await f.cleanup(); }
+}, 30000);
+
+it('baseline ordinary retention cannot reach migrated retirement records or resources', async () => {
+  const f = fixture();
+  const executable = join(import.meta.dirname, '..', 'dist', 'core', `.old-retention-${process.pid}.js`);
+  try {
+    const first = await f.cli(['up', '--holder', 'owner']);
+    await f.cli(['daemon', 'stop']);
+    journalAsLegacyAlias(f, first.envId, true);
+    const legacy = join(f.state, 'templates', legacyIdentity(f.alias));
+    mkdirSync(legacy, { recursive: true });
+    const resource = join(f.root, 'external-template');
+    writeFileSync(resource, 'live resource');
+    for (let i = 0; i < 8; i++) {
+      writeFileSync(join(legacy, `${i}.baked`), JSON.stringify({ v: 1, ns: `obsolete_${i}`, drop: `rm -f '${resource}'; false` }));
+      writeFileSync(join(legacy, `${i}.baked.retirement.json`), JSON.stringify({ attempts: 3, state: 'needs-attention' }));
+    }
+    await f.cli(['status']);
+    await f.cli(['daemon', 'stop']);
+    const retired = join(f.state, 'retired-templates', legacyIdentity(f.alias));
+    expect(existsSync(legacy)).toBe(false);
+    const records = Object.fromEntries(readdirSync(retired).map((name) => [name, readFileSync(join(retired, name), 'utf8')]));
+    expect(records['.retired-stack.json']).toBeDefined();
+    const ordinary = join(f.state, 'templates', 'ordinary');
+    mkdirSync(ordinary, { recursive: true });
+    writeFileSync(join(ordinary, 'stale.db'), 'ordinary retention control');
+    const baseline = execFileSync('git', ['show', 'fc5df5b87f3acf2256ade08e7a3d297344c113c0:src/core/retention.ts'], { encoding: 'utf8' });
+    writeFileSync(executable, ts.transpileModule(baseline, { compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2023 } }).outputText);
+    const output = execFileSync(process.execPath, ['--input-type=module', '-e', `const {pruneTemplates} = await import(${JSON.stringify(pathToFileURL(executable).href)}); console.log(await pruneTemplates({templatesKeep:0}));`], { cwd: f.wt, env: f.env, encoding: 'utf8' });
+    expect(Number(output.trim())).toBe(1);
+    expect(existsSync(join(ordinary, 'stale.db'))).toBe(false);
+    expect(readFileSync(resource, 'utf8')).toBe('live resource');
+    expect(readdirSync(retired).sort()).toEqual(Object.keys(records).sort());
+    for (const [name, content] of Object.entries(records)) expect(readFileSync(join(retired, name), 'utf8')).toBe(content);
+  } finally {
+    rmSync(executable, { force: true });
+    await f.cleanup();
+  }
+}, 30000);

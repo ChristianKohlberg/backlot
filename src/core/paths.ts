@@ -58,4 +58,5 @@ export const lockPath = (): string => join(stateRoot(), 'daemon.lock');
 export const journalPath = (): string => join(stateRoot(), 'journal.db');
 export const envsRoot = (): string => join(stateRoot(), 'envs');
 export const templatesRoot = (): string => join(stateRoot(), 'templates');
+export const retiredTemplatesRoot = (): string => join(stateRoot(), 'retired-templates');
 export const artifactsRoot = (): string => join(stateRoot(), 'artifacts');

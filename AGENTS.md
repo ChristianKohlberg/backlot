@@ -103,6 +103,9 @@ with a two-second cap. Failed drops retain `.retirement.json` records with
 backoff; automatic retries stop after three failures, and explicit `pool gc`
 retries them after the appliance is repaired. A `.retired-stack.json` descriptor
 keeps this cleanup discoverable even after the last migrated env is recycled.
+Proven obsolete directories move atomically under the bake lock to
+`retired-templates/`, outside older daemons' ordinary retention; namespace
+ownership checks cover both template roots.
 `legacy_stack_root`
 retains the old path spelling so canonical implicit requests can name the holder
 needed for recovery instead of silently creating another lease. Never rewrite a

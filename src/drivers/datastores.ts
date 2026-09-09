@@ -23,7 +23,7 @@ import {
   writeFileSync,
   constants as fsConstants,
 } from 'node:fs';
-import { dirname, join } from 'node:path';
+import { basename, dirname, join } from 'node:path';
 import { connect } from 'node:net';
 import { templatesRoot } from '../core/paths.js';
 import { sha256, template, BrokerError } from '../core/util.js';
@@ -91,6 +91,18 @@ export async function withBakeLock<T>(key: string, fn: () => Promise<T>): Promis
   }
 }
 
+export function tryWithBakeLock(key: string, fn: () => void): boolean {
+  if (bakeLocks.has(key)) return false;
+  const lock = Promise.resolve();
+  bakeLocks.set(key, lock);
+  try {
+    fn();
+    return true;
+  } finally {
+    if (bakeLocks.get(key) === lock) bakeLocks.delete(key);
+  }
+}
+
 /**
  * Baked-template markers are self-describing (vetbill-1i49): they carry the
  * server-side template ns AND the already-templated drop command, so
@@ -117,16 +129,27 @@ export function parseBakedMarker(content: string): BakedMarker {
 
 export function hasOtherTemplateOwner(full: string, ns: string): boolean {
   if (!ns) return true;
-  const root = dirname(dirname(full));
+  const parent = dirname(dirname(full));
+  const roots = ['templates', 'retired-templates'].includes(basename(parent))
+    ? [join(dirname(parent), 'templates'), join(dirname(parent), 'retired-templates')]
+    : [parent];
   try {
-    for (const entry of readdirSync(root, { withFileTypes: true })) {
-      if (!entry.isDirectory()) continue;
-      const dir = join(root, entry.name);
-      for (const file of readdirSync(dir)) {
-        const candidate = join(dir, file);
-        if (!file.endsWith('.baked') || candidate === full) continue;
-        const owner = parseBakedMarker(readFileSync(candidate, 'utf8'));
-        if (!owner.ns || owner.ns === ns) return true;
+    for (const root of roots) {
+      let entries;
+      try { entries = readdirSync(root, { withFileTypes: true }); }
+      catch (err) {
+        if ((err as NodeJS.ErrnoException).code === 'ENOENT') continue;
+        throw err;
+      }
+      for (const entry of entries) {
+        if (!entry.isDirectory()) continue;
+        const dir = join(root, entry.name);
+        for (const file of readdirSync(dir)) {
+          const candidate = join(dir, file);
+          if (!file.endsWith('.baked') || candidate === full) continue;
+          const owner = parseBakedMarker(readFileSync(candidate, 'utf8'));
+          if (!owner.ns || owner.ns === ns) return true;
+        }
       }
     }
   } catch { return true; }
