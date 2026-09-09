@@ -109,19 +109,44 @@ it('uses the selected preset for synchronous and detached checks',async()=>{
   }finally{await f.cleanup();}
 },30000);
 
-it('accepts and validates preset maps through MCP',async()=>{
-  const f=fixture();
+function mcp(f:ReturnType<typeof fixture>){
   const p=spawn(process.execPath,[join(import.meta.dirname,'../dist/mcp/index.js')],{cwd:f.tree,env:f.env,stdio:['pipe','pipe','ignore']});
   let buf='';let id=0;const pending=new Map<number,(v:any)=>void>();
   p.stdout.on('data',d=>{buf+=String(d);let n;while((n=buf.indexOf('\n'))>=0){const line=buf.slice(0,n);buf=buf.slice(n+1);if(line.trim()){const v=JSON.parse(line);pending.get(v.id)?.(v);}}});
   const call=(name:string,args:unknown)=>new Promise<any>((resolve,reject)=>{const n=++id;const timer=setTimeout(()=>reject(new Error('MCP request timed out')),15000);pending.set(n,v=>{clearTimeout(timer);pending.delete(n);resolve(v);});p.stdin.write(JSON.stringify({jsonrpc:'2.0',id:n,method:'tools/call',params:{name,arguments:args}})+'\n');});
+  const close=async()=>{p.kill();await new Promise<void>(resolve=>p.once('exit',()=>resolve()));};
+  return {call,close};
+}
+
+it('accepts and validates preset maps through MCP',async()=>{
+  const f=fixture();const m=mcp(f);
   try{
-    const response=await call('backlot_up',{cwd:f.tree,holder:'mcp',presets:{main:'alternate'}});
+    const response=await m.call('backlot_up',{cwd:f.tree,holder:'mcp',presets:{main:'alternate'}});
     expect(response.result?.isError,JSON.stringify(response)).not.toBe(true);
     const context=JSON.parse(response.result.content[0].text);expect(f.value(context)).toBe('alternate');expect(context.datastores.main.preset).toBe('alternate');
-    const invalid=await call('backlot_up',{cwd:f.tree,holder:'mcp',presets:{main:'missing'}});expect(invalid.result.isError).toBe(true);expect(f.value(context)).toBe('alternate');
-  }finally{p.kill();await new Promise<void>(resolve=>p.once('exit',()=>resolve()));await f.cleanup();}
+    const invalid=await m.call('backlot_up',{cwd:f.tree,holder:'mcp',presets:{main:'missing'}});expect(invalid.result.isError).toBe(true);expect(f.value(context)).toBe('alternate');
+  }finally{await m.close();await f.cleanup();}
 },30000);
+
+it('journals a detached run failure as a job verdict unless explicit presets are refused up front',async()=>{const f=fixture();const m=mcp(f);try{
+  const path=join(f.tree,'stack.yaml');const manifest=JSON.parse(readFileSync(path,'utf8'));manifest.datastores.main.default_preset.run='missing';writeFileSync(path,JSON.stringify(manifest));
+  const detached=await f.cli(['run','alternate','--detach']);expect(detached.code,detached.stdout).toBe(0);expect(typeof detached.json.jobId).toBe('string');
+  let job;
+  for(let i=0;i<100;i++){job=await f.cli(['job',detached.json.jobId]);if(job.json.state==='done')break;await new Promise(r=>setTimeout(r,100));}
+  expect(job!.json.state).toBe('done');expect(job!.json.verdict.ok).toBe(false);expect(job!.json.verdict.failure.class).toBe('work-error');expect(job!.json.verdict.failure.message).toContain('missing');
+  const refused=await m.call('backlot_run_detach',{cwd:f.tree,check:'alternate',presets:{main:'missing'}});expect(refused.result.isError,JSON.stringify(refused)).toBe(true);
+  expect((await f.cli(['job','ls'])).json.jobs.filter((j:any)=>j.id!==detached.json.jobId)).toHaveLength(0);
+  expect((await f.cli(['status'])).json.envs).toHaveLength(0);
+}finally{await m.close();await f.cleanup();}},30000);
+
+it('treats an empty presets catalog like an omitted one',async()=>{const f=fixture();try{
+  const path=join(f.tree,'stack.yaml');const manifest=JSON.parse(readFileSync(path,'utf8'));manifest.datastores.main.presets=[];writeFileSync(path,JSON.stringify(manifest));
+  const declared=await f.cli(['up']);expect(declared.code,declared.stdout).toBe(0);expect(f.value(declared.json)).toBe('dev');expect(declared.json.datastores.main.preset).toBe('dev');
+  const bad=await f.cli(['up','--preset','alternate']);expect(bad.code,bad.stdout).toBe(1);expect(f.value(declared.json)).toBe('dev');
+  await f.cli(['release']);
+  delete manifest.datastores.main.default_preset;writeFileSync(path,JSON.stringify(manifest));
+  const implicit=await f.cli(['up']);expect(implicit.code,implicit.stdout).toBe(0);expect(f.value(implicit.json)).toBe('default');expect(implicit.json.datastores.main.preset).toBe('default');
+}finally{await f.cleanup();}},30000);
 
 
 it('rejects invalid declared defaults before allocating an environment',async()=>{const f=fixture();try{

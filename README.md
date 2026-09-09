@@ -164,8 +164,8 @@ backlot run smoke --preset main=dev
 
 Names must appear in that datastore's `presets` catalog, and so must the names a
 `default_preset` declares: a declared default outside the catalog fails every
-bind, with or without `--preset`. Without a catalog, the implicit `default` and
-any manifest-declared `default_preset` names remain valid.
+bind, with or without `--preset`. Without a catalog (omitted or empty), the
+implicit `default` and any manifest-declared `default_preset` names remain valid.
 Unknown stores, unknown presets, duplicate targets and ambiguous bare names are
 refused before acquiring an environment or changing data. Changing a preset
 restores that store even with ordinary reuse hygiene; unmentioned stores keep

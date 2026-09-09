@@ -15,7 +15,7 @@ export function selectPresets(manifest: Manifest, kind: LeaseKind, requested?: u
   }
   return Object.fromEntries(Object.entries(stores).map(([name, spec]) => {
     // A manifest without a catalog retains its historical default choices.
-    const catalog = spec.presets ?? [...new Set(['default', ...Object.values(spec.default_preset ?? {})])];
+    const catalog = spec.presets?.length ? spec.presets : [...new Set(['default', ...Object.values(spec.default_preset ?? {})])];
     for (const value of Object.values(spec.default_preset ?? {})) {
       if (!catalog.includes(value)) throw new BrokerError('work-error', `default preset '${value}' for '${name}' is not declared in presets`, 'manifest');
     }

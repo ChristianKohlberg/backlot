@@ -48,7 +48,7 @@ async function dispatch(verb: string, args: Record<string, unknown>, emit: (phas
     case 'run':
       return engine.run({ cwd, holder, callerEnv: args.callerEnv, presets: args.presets, check: String(args.check), hygiene: (args.hygiene as never) ?? undefined, pull: Boolean(args.pull), onProgress: emit });
     case 'run-detach': {
-      selectPresets(loadStack(cwd).manifest, 'run', args.presets);
+      if (args.presets !== undefined) selectPresets(loadStack(cwd).manifest, 'run', args.presets);
       const jobId = engine.createJob(cwd, String(args.check));
       // Fire-and-forget — env/pool locks make it safe; the journaled verdict
       // outlives the client (decision 0015).
