@@ -68,7 +68,7 @@ env's live lease records, and `poolGc` skips every leased preview pid. Do NOT
 "simplify" those filters away: without them Linux shoots the tunnel at a boundary
 where macOS keeps it, and that platform split is the whole bug class this feature
 had to close, and all three of them (`pool gc`, the scan, doctor's orphan report)
-must agree on `leasedPreviewPids()` or one will act on what another calls healthy.
+must agree on `leasedPreviewPids(tagged)` or one will act on what another calls healthy. That classifier protects the verified leader's entire tagged process group, matching env and state root; a bare PID or `preview:` label is not ownership. Wrappers whose children stay in that group survive sync/quiesce/GC, and lease teardown kills the group. Detached `setsid` descendants are outside this guarantee; Linux tag scanning and cross-platform group teardown are covered in `tests/preview-process-group.test.ts`.
 
 `reconcilePreviewForBind` owns what a bind **and a `sync`/`--watch` projection**
 do to a live tunnel: it tears it

@@ -302,6 +302,12 @@ it — right for "look at this for ten minutes", wrong for a bookmark, a ticket,
 device you type an address into by hand, or an app pinned to a dev server. Every
 restart invalidates all of them.
 
+Preview launchers may fork children within their process group: Backlot preserves
+that leased group through sync and idle cleanup, and stops it when the lease ends.
+The launcher must remain alive and keep its tunnel children in that group;
+detached children that call `setsid` are outside this ownership guarantee. Orphan
+tag scanning is Linux-only; macOS uses recorded identity and group teardown.
+
 `cloudflare-named` publishes under a zone you own instead:
 
 ```yaml
