@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { canonicalDirectory } from '../core/manifest.js';
 /**
  * Minimal MCP (Model Context Protocol) server over stdio — a THIN adapter on
  * the same daemon RPC the CLI uses (decision 0014: never a second
@@ -190,6 +191,7 @@ rl.on('line', (line) => {
           const refreshInputs = ['up', 'run', 'run-detach'].includes(tool.verb);
           let callerEnv: Record<string, string> | undefined;
           try {
+            if (typeof args.cwd === 'string') args.cwd = canonicalDirectory(args.cwd);
             callerEnv = refreshInputs ? collectCallerEnv(String(args.cwd)) : undefined;
           } catch (err) {
             if (!(err instanceof BrokerError)) throw err;

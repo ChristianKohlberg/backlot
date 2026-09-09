@@ -76,6 +76,16 @@ stable for an environment's lifetime, and the consumer's worktree is never touch
 
 ### The safety invariant
 
+Stack identity uses the physical project directory: symlink spellings refer to the
+same stack, while separate Git worktree directories remain distinct. CLI and MCP
+resolve paths before requesting a lease. Explicit holder strings stay opaque;
+new implicit holders use the physical caller directory. On upgrade, verified
+legacy alias identities migrate without changing environment IDs, ports, data,
+or lease IDs. Old path-shaped holders are not guessed or rewritten: a canonical
+default request reports the exact `--holder` needed to inspect or release that
+legacy lease. If legacy aliases converge on several leases for the same holder,
+Backlot refuses ambiguity and names the environments instead of selecting one.
+
 **An environment never holds the only copy of anything.** The consumer's worktree
 remains the sole source of truth; the environment's tree is a disposable projection;
 templates are rebuildable by definition. Every reclaim decision — lease expiry, recycle,

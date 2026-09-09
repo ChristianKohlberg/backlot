@@ -88,6 +88,17 @@ delete (it cannot take the env lock — `tryClaim` calls it under the pool lock)
 so no stale snapshot can forget a tunnel someone else just published. `tests/preview-tunnel.test.ts`
 covers all of it.
 
+## Physical stack identity
+
+`findStackRoot` canonicalizes directories before hashing identity; MCP also resolves
+cwd in its own process before RPC. Recovery migrates only proven lexical aliases,
+leaving env IDs, ports, namespaces and explicit holders intact. `legacy_stack_root`
+retains the old path spelling so canonical implicit requests can name the holder
+needed for recovery instead of silently creating another lease. Never rewrite a
+path-looking holder as though it were certainly implicit; old journals lack that
+provenance. Converged same-holder leases must refuse ambiguity. See
+`tests/stack-identity.test.ts` for CLI/MCP, migration and distinct-worktree coverage.
+
 ## Leases: `--ttl` is the agent form, `--holder-pid` is not
 
 `--holder-pid` / `BACKLOT_HOLDER_PID` frees the environment the moment the named process exits, which only helps a caller that outlives the command. `BACKLOT_HOLDER_PID=$$` from an agent harness names an already-exited shell, so the lease is reclaimable on arrival: the sweeper's dead-holder rule frees the env, the next binder takes it, and the first caller is left looking at a different, unseeded store through the same URL. It presents as a stale seed template — the wrong subsystem entirely. Binds naming a dead pid are now refused (exit 64). See the lease bullet in `docs/architecture.md`.

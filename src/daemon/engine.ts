@@ -6,10 +6,10 @@ import { execFileSync, spawn } from 'node:child_process';
 import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { mkdirSync, rmSync, copyFileSync, readdirSync, statSync, existsSync, readFileSync, watch as fsWatch, constants as fsConstants } from 'node:fs';
-import { join, resolve } from 'node:path';
+import { join, sep } from 'node:path';
 import { Journal, JOURNAL_SCHEMA_VERSION, type EnvRow, type LeaseRow } from '../core/journal.js';
 import { VERSION, compareVersions, versionSkew } from '../core/version.js';
-import { loadStack, defaultPreset, normalizeLogins, type Stack } from '../core/manifest.js';
+import { canonicalDirectory, stackIdentity, loadStack, defaultPreset, normalizeLogins, type Stack } from '../core/manifest.js';
 import { changedOutputs, pullOutputs } from '../core/sync.js';
 import { syncIntoEnvThreaded } from '../core/sync-thread.js';
 import { runUpkeep, pendingUpkeep, templateBakeKeys } from '../core/upkeep.js';
@@ -218,6 +218,18 @@ export class Engine {
 
   /** Recovery (decision 0009): reap recorded PIDs from a previous daemon life; hot -> warm. */
   async recover(): Promise<void> {
+    const identities: Array<{ id: string; stack: string; root: string }> = [];
+    for (const env of this.journal.allEnvs()) {
+      try {
+        const stack = loadStack(env.stackRoot);
+        // Only migrate a proven lexical alias. Renamed manifests remain subject
+        // to ordinary orphan retention; an unreadable source proves nothing.
+        if (stackIdentity(stack.manifest.name, env.stackRoot) === env.stack && stack.id !== env.stack) {
+          identities.push({ id: env.id, stack: stack.id, root: stack.root });
+        }
+      } catch { /* leave unavailable or renamed projects unchanged */ }
+    }
+    this.journal.canonicalizeStacks(identities);
     let envs = 0;
     let stranded = 0;
     for (const env of this.journal.allEnvs()) {
@@ -1423,6 +1435,20 @@ export class Engine {
 
   // ---------------------------------------------------------------- verbs
 
+  private callerHolder(cwd: string, holder: string | undefined, stack: Stack): string {
+    if (holder !== undefined) return holder;
+    const canonical = canonicalDirectory(cwd);
+    for (const env of this.journal.envsForStack(stack.id)) {
+      if (!env.legacyStackRoot) continue;
+      const lease = this.journal.leaseForEnv(env.id);
+      const legacyPathHolder = lease && (lease.holder === env.legacyStackRoot || lease.holder.startsWith(env.legacyStackRoot + sep));
+      if (legacyPathHolder && lease.expiresAt > now() && canonical === join(env.stackRoot, lease.holder.slice(env.legacyStackRoot.length))) {
+        throw new BrokerError('env-error', `a legacy path holder still owns ${env.id}; use --holder ${JSON.stringify(lease.holder)} to inspect or release that lease before using the canonical default holder`, 'lease');
+      }
+    }
+    return canonical;
+  }
+
   async up(opts: UpOptions) {
     const requestStarted = performance.now();
     const stack = loadStack(opts.cwd);
@@ -1469,7 +1495,7 @@ export class Engine {
         'lease',
       );
     }
-    const holder = opts.holder ?? resolve(opts.cwd);
+    const holder = this.callerHolder(opts.cwd, opts.holder, stack);
     // Validate before claiming: missing input is caller configuration, not an
     // environment failure deserving hygiene escalation or a stranded lease.
     const suppliedInputs = opts.callerEnv === undefined ? undefined : validateCallerEnv(stack.manifest, opts.callerEnv);
@@ -1541,7 +1567,7 @@ export class Engine {
 
   ctx(cwd: string, holder?: string, envId?: string) {
     const stack = loadStack(cwd);
-    const h = holder ?? resolve(cwd);
+    const h = this.callerHolder(cwd, holder, stack);
     const lease = this.journal.leaseForHolder(h, stack.id);
     const targetId = envId ?? lease?.envId;
     if (!targetId) {
@@ -1744,13 +1770,13 @@ export class Engine {
   async syncLease(cwd: string, holder?: string, onProgress?: Progress) {
     const requestStarted = performance.now();
     let projectionDiagnostics: BindDiagnostics | undefined;
-    const h = holder ?? resolve(cwd);
     // The dogfooded 57s-for-a-one-line-edit: sync used to full-rebind (stop,
     // rebuild, restart, ready-wait) on ANY source change, defeating the dev
     // servers' own watchers. When the lease is live and the save fires no
     // upkeep rule, the watch projection serves the same contract in seconds —
     // services kept, stage 2 belongs to the dev server (architecture §6).
     const stack = loadStack(cwd);
+    const h = this.callerHolder(cwd, holder, stack);
     // Projection is only honest when EVERY service picks the change up itself
     // (hot_reload, owner decision 2026-07-20): under a non-watching process a
     // projected file is silently stale code — the exact failure class the
@@ -1786,7 +1812,7 @@ export class Engine {
   /** bind --ref: project a COMMITTED ref (not the worktree state) into the env. */
   async bindRef(cwd: string, ref: string, holder?: string, ttlMs?: number) {
     const stack = loadStack(cwd);
-    const h = holder ?? resolve(cwd);
+    const h = this.callerHolder(cwd, holder, stack);
     let sha: string;
     try {
       sha = execFileSync('git', ['-C', stack.root, 'rev-parse', '--verify', `${ref}^{commit}`], { encoding: 'utf8' }).trim();
@@ -1826,7 +1852,7 @@ export class Engine {
 
   async resetData(cwd: string, holder?: string, onProgress?: Progress) {
     const stack = loadStack(cwd);
-    const h = holder ?? resolve(cwd);
+    const h = this.callerHolder(cwd, holder, stack);
     const lease = this.journal.leaseForHolder(h, stack.id);
     if (!lease) throw new BrokerError('env-error', `no active lease — run 'backlot up' first`, 'lease');
     this.journal.saveLease({ ...lease, hygiene: 'reset-data', expiresAt: now() + LEASE_TTL(lease.kind) });
@@ -1897,7 +1923,7 @@ export class Engine {
 
   async exec(cwd: string, cmd: string, holder?: string) {
     const stack = loadStack(cwd);
-    const h = holder ?? resolve(cwd);
+    const h = this.callerHolder(cwd, holder, stack);
     const lease = this.journal.leaseForHolder(h, stack.id);
     if (!lease) throw new BrokerError('env-error', `no active lease — run 'backlot up' first`, 'lease');
     const env = this.envForLease(lease);
@@ -1938,7 +1964,7 @@ export class Engine {
     const stack = loadStack(cwd);
     const spec = stack.manifest.auth?.token;
     if (!spec) throw new BrokerError('work-error', `backlot.yml declares no auth.token command`, 'manifest');
-    const lease = this.journal.leaseForHolder(holder ?? resolve(cwd), stack.id);
+    const lease = this.journal.leaseForHolder(this.callerHolder(cwd, holder, stack), stack.id);
     if (!lease) throw new BrokerError('env-error', `no active lease — run 'backlot up' first`, 'lease');
     const env = this.envForLease(lease);
     const dirs = this.envDirs(env.id);
@@ -1963,7 +1989,7 @@ export class Engine {
     if (!stack.manifest.services[service]) {
       throw new BrokerError('work-error', `no service '${service}' in backlot.yml (have: ${Object.keys(stack.manifest.services).join(', ')})`, service);
     }
-    const lease = this.journal.leaseForHolder(holder ?? resolve(cwd), stack.id);
+    const lease = this.journal.leaseForHolder(this.callerHolder(cwd, holder, stack), stack.id);
     if (!lease) throw new BrokerError('env-error', `no active lease — run 'backlot up' first`, 'lease');
     const env = this.envForLease(lease);
     this.touch(env.id);
@@ -1976,7 +2002,7 @@ export class Engine {
 
   pull(cwd: string, holder?: string) {
     const stack = loadStack(cwd);
-    const lease = this.journal.leaseForHolder(holder ?? resolve(cwd), stack.id);
+    const lease = this.journal.leaseForHolder(this.callerHolder(cwd, holder, stack), stack.id);
     if (!lease) throw new BrokerError('env-error', `no active lease — run 'backlot up' first`, 'lease');
     const env = this.envForLease(lease);
     this.touch(env.id);
@@ -1995,7 +2021,7 @@ export class Engine {
    */
   async release(cwd: string, holder?: string) {
     const stack = loadStack(cwd);
-    const asked = holder ?? resolve(cwd);
+    const asked = this.callerHolder(cwd, holder, stack);
     const lease = this.journal.leaseForHolder(asked, stack.id);
     if (!lease) {
       const others = this.journal
@@ -2176,7 +2202,7 @@ export class Engine {
   async previewStart(cwd: string, service: string, holder?: string, ttlMs?: number): Promise<{ service: string; url: string }> {
     const stack = loadStack(cwd);
     this.assertPreviewAllowed(stack);
-    const h = holder ?? resolve(cwd);
+    const h = this.callerHolder(cwd, holder, stack);
     const lease = this.journal.leaseForHolder(h, stack.id);
     if (!lease) {
       throw new BrokerError('env-error', `no active lease for this worktree — run 'backlot up' first`, 'lease');
@@ -2261,7 +2287,7 @@ export class Engine {
 
   async previewStop(cwd: string, holder?: string): Promise<{ stopped: boolean; service?: string }> {
     const stack = loadStack(cwd);
-    const h = holder ?? resolve(cwd);
+    const h = this.callerHolder(cwd, holder, stack);
     const lease = this.journal.leaseForHolder(h, stack.id);
     if (!lease) {
       throw new BrokerError('env-error', `no active lease for this worktree — nothing to stop`, 'lease');
