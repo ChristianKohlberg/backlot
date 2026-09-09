@@ -331,9 +331,10 @@ you will ever publish there ([decision 0028](docs/decisions/0028-named-preview-h
 
 ### Understanding a slow bind
 
-`up --json`, `sync --json`, and `reset-data --json` return `bindDiagnostics` for
-that operation; a `run` verdict includes its setup diagnostics too. `ctx` does
-not replay timings from earlier calls. The report includes:
+`up --json`, `sync --json`, `reset-data --json`, and `bind --ref --json` return
+`bindDiagnostics` for that operation; a `run` verdict includes its setup
+diagnostics too. `ctx` does not replay timings from earlier calls. The report
+includes:
 
 - `durationMs`: elapsed daemon-side operation time, excluding CLI startup.
 - `phasesMs`: time spent acquiring/waiting (`queue`), preparing, ensuring

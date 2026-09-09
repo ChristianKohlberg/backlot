@@ -196,7 +196,7 @@
           "type": "object",
           "propertyNames": { "pattern": "^(?!BACKLOT_)[A-Za-z_][A-Za-z0-9_]*$" },
           "additionalProperties": { "enum": ["required", "optional"] },
-          "description": "Allowlisted caller environment inputs. up/run refresh values from their caller; sync/reset retain lease inputs. Missing optional inputs mask daemon values. Memory only: re-run up after a daemon restart. Overrides same-named env entries."
+          "description": "Allowlisted caller environment inputs. up/run refresh values from their caller; sync/reset retain lease inputs. A supplied value overrides a same-named env entry; a missing optional input keeps an explicit env default, otherwise masks the daemon value. Memory only: re-run up after a daemon restart."
         },
         "ready": {
           "$ref": "#/$defs/readiness"
