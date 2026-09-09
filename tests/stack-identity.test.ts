@@ -422,3 +422,72 @@ it('retirement preserves a live template shared by long canonical and legacy sta
     expect(readFileSync(second.datastores.main.url, 'utf8')).toBe('seeded\n');
   } finally { await f.cleanup(); }
 }, 30000);
+
+for (const missingLink of [false, true]) {
+  it(`legacy nested symlink holders refuse implicit duplication (${missingLink ? 'unresolvable mapping' : 'physical match'})`, async () => {
+    const f = fixture();
+    try {
+      const sub = join(f.wt, 'sub');
+      mkdirSync(sub);
+      const link = join(f.wt, 'link');
+      symlinkSync(sub, link, 'dir');
+      const holder = join(f.alias, 'link');
+      const first = await f.cli(['up', '--holder', holder]);
+      const db = new DatabaseSync(first.datastores.main.url);
+      db.prepare('INSERT INTO notes VALUES (?)').run('nested holder data');
+      db.close();
+      await f.cli(['daemon', 'stop']);
+      const journal = journalAsLegacyAlias(f, first.envId, true);
+      if (missingLink) rmSync(link);
+      const result = await f.mcp('up', sub);
+      expect(result.error?.message).toContain(`pass holder ${JSON.stringify(holder)} (--holder on the CLI)`);
+      expect(journal.allEnvs()).toHaveLength(1);
+      expect(journal.allLeases()).toHaveLength(1);
+      const retained = await f.mcp('ctx', sub, holder);
+      expect(retained.envId).toBe(first.envId);
+      expect(retained.lease.id).toBe(first.lease.id);
+      expect(retained.urls).toEqual(first.urls);
+      expect(journal.leaseForEnv(first.envId)!.holder).toBe(holder);
+      expect(notesIn(retained.datastores.main.url)).toEqual([{ note: 'nested holder data' }]);
+    } finally { await f.cleanup(); }
+  }, 30000);
+}
+
+for (const repaired of [false, true]) {
+  it(`retention protects deferred legacy cleanup ownership (${repaired ? 'repaired before retention' : 'still invalid'})`, async () => {
+    const f = fixture();
+    const manifest = join(f.wt, 'backlot.yml');
+    const good = readFileSync(manifest, 'utf8');
+    try {
+      const first = await f.cli(['up', '--holder', 'owner']);
+      await f.cli(['daemon', 'stop']);
+      const journal = journalAsLegacyAlias(f, first.envId, true);
+      const dir = join(f.state, 'templates', legacyIdentity(f.alias));
+      mkdirSync(dir, { recursive: true });
+      const attempts = join(f.root, 'unexpected-drops');
+      const records: Record<string, string> = {};
+      for (let i = 0; i < 8; i++) {
+        records[`${i}.baked`] = JSON.stringify({ v: 1, ns: `deferred_${i}`, drop: `echo attempt >> '${attempts}'; false` });
+        records[`${i}.baked.retirement.json`] = JSON.stringify({ attempts: 3, nextAttemptAt: 0, state: 'needs-attention' });
+      }
+      for (const [file, content] of Object.entries(records)) writeFileSync(join(dir, file), content);
+      writeFileSync(manifest, 'name: [broken\n');
+      f.env.BACKLOT_SWEEP_MS = '1500';
+      f.env.BACKLOT_RETENTION_MS = '1';
+      f.env.BACKLOT_TEMPLATES_KEEP = '1';
+      await f.cli(['status']);
+      expect(journal.getEnv(first.envId)!.stack).toBe(legacyIdentity(f.alias));
+      if (repaired) writeFileSync(manifest, good);
+      await sleep(2200);
+      expect(existsSync(attempts)).toBe(false);
+      for (const [file, content] of Object.entries(records)) expect(readFileSync(join(dir, file), 'utf8')).toBe(content);
+      expect(existsSync(join(dir, '.retired-stack.json'))).toBe(repaired);
+      expect(journal.getEnv(first.envId)!.stack).toBe(legacyIdentity(repaired ? f.wt : f.alias));
+      expect(journal.allEnvs()).toHaveLength(1);
+      expect(journal.leaseForEnv(first.envId)!.id).toBe(first.lease.id);
+    } finally {
+      writeFileSync(manifest, good);
+      await f.cleanup();
+    }
+  }, 30000);
+}

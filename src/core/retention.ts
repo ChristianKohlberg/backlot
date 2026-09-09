@@ -91,7 +91,7 @@ export function pruneJobs(journal: Journal, p: Policy): number {
  * marker also DROPs the database instead of leaking it on the appliance
  * forever (vetbill-1i49). Legacy bare-string markers prune file-only.
  */
-export async function pruneTemplates(p: Policy, root = templatesRoot()): Promise<number> {
+export async function pruneTemplates(p: Policy, root = templatesRoot(), protectedStacks: ReadonlySet<string> = new Set()): Promise<number> {
   let pruned = 0;
   for (const stackDir of entriesOf(root)) {
     const dir = join(root, stackDir);
@@ -100,7 +100,7 @@ export async function pruneTemplates(p: Policy, root = templatesRoot()): Promise
     // the one remaining writer mutating this dir outside it, reopening the
     // deleted-mid-restore race the lock exists to close.
     pruned += await withBakeLock(stackDir, async () => {
-      if (existsSync(join(dir, '.retired-stack.json'))) return 0;
+      if (protectedStacks.has(stackDir) || existsSync(join(dir, '.retired-stack.json'))) return 0;
       let count = 0;
       const files = entriesOf(dir)
         .filter((f) => !f.startsWith('.') && !f.endsWith('.retirement.json'))
@@ -142,11 +142,12 @@ export async function pruneTemplates(p: Policy, root = templatesRoot()): Promise
 export async function retentionSweep(
   journal: Journal,
   p: Policy,
+  protectedStacks: ReadonlySet<string> = new Set(),
 ): Promise<{ artifacts: number; logs: number; jobs: number; templates: number }> {
   return {
     artifacts: pruneArtifacts(p),
     logs: truncateLogs(p),
     jobs: pruneJobs(journal, p),
-    templates: await pruneTemplates(p),
+    templates: await pruneTemplates(p, templatesRoot(), protectedStacks),
   };
 }

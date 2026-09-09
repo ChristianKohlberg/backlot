@@ -1523,7 +1523,11 @@ export class Engine {
       if (!env.legacyStackRoot) continue;
       const lease = this.journal.leaseForEnv(env.id);
       const legacyPathHolder = lease && (lease.holder === env.legacyStackRoot || lease.holder.startsWith(env.legacyStackRoot + sep));
-      if (legacyPathHolder && lease.expiresAt > now() && canonical === join(env.stackRoot, lease.holder.slice(env.legacyStackRoot.length))) {
+      if (!legacyPathHolder || lease.expiresAt <= now()) continue;
+      let candidate: string | undefined;
+      try { candidate = canonicalDirectory(join(env.stackRoot, lease.holder.slice(env.legacyStackRoot.length))); }
+      catch { candidate = undefined; }
+      if (candidate === undefined || canonical === candidate) {
         throw new BrokerError('env-error', `a legacy path holder still owns ${env.id}; pass holder ${JSON.stringify(lease.holder)} (--holder on the CLI) to inspect or release that lease before using the canonical default holder`, 'lease');
       }
     }
@@ -3054,7 +3058,15 @@ export class Engine {
     if (t - this.lastRetention > Number(process.env.BACKLOT_RETENTION_MS ?? 10 * 60_000)) {
       this.lastRetention = t;
       try {
-        await retentionSweep(this.journal, policy());
+        const protectedStacks = new Set<string>();
+        for (const env of this.journal.allEnvs()) {
+          try {
+            const stack = loadStack(env.stackRoot);
+            this.adoptLegacyAliases(stack);
+            if (this.journal.getEnv(env.id)?.stack !== stack.id) protectedStacks.add(env.stack);
+          } catch { protectedStacks.add(env.stack); }
+        }
+        await retentionSweep(this.journal, policy(), protectedStacks);
       } catch {
         /* best-effort */
       }
