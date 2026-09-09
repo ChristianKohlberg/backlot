@@ -4,8 +4,10 @@
  * human); exit codes are contractual — 0 ok, 1 work-error, 2 env-error,
  * 3 infra-error, 64 usage. See docs/architecture.md §11.
  */
-import { ensureDaemon, daemonInfo, rpc, classifyClientError, awaitDaemonGone, type RpcError, type RpcResponse } from './client.js';
+import { ensureDaemon, daemonInfo, rpc, classifyClientError, awaitDaemonGone, DAEMON_STOP_TIMEOUT_MS, type RpcError, type RpcResponse } from './client.js';
 import { isAlive } from '../core/procscan.js';
+import { join } from 'node:path';
+import { stateRoot } from '../core/paths.js';
 import { VERSION, versionSkew } from '../core/version.js';
 import { installKind } from './install.js';
 import { collectCallerEnv } from '../core/caller-env.js';
@@ -511,10 +513,13 @@ async function main(): Promise<void> {
       }
       res = await rpc('shutdown', {});
       if (!res.ok) break;
-      if (!(await awaitDaemonGone(daemon.pid))) {
+      if (!(await awaitDaemonGone(daemon.pid, DAEMON_STOP_TIMEOUT_MS))) {
         errExit({
           class: 'infra-error',
-          message: 'the daemon accepted shutdown but did not exit before the deadline; check the daemon log and retry',
+          message:
+            `the daemon accepted shutdown and is still shutting down after ${Math.round(DAEMON_STOP_TIMEOUT_MS / 1000)}s — ` +
+            `service teardown may still be in progress. Do not issue another stop; wait for ${daemon.pid !== undefined ? `pid ${daemon.pid}` : 'the daemon'} to exit, ` +
+            `and check ${join(stateRoot(), 'daemon.log')} if it never does.`,
           source: 'daemon',
         });
         return;

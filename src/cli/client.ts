@@ -121,26 +121,50 @@ export interface DaemonInfo {
   journalSchema?: number;
 }
 
-async function ping(deadlineMs?: number, strict = false): Promise<DaemonInfo | null> {
+/**
+ * Three answers, not two: `absent` is a missing socket or nobody listening on
+ * it; `unresponsive` is a listener that never produced a usable result before
+ * the ping's budget (wedged, half-open, or mid-exit). Only the first means the
+ * daemon is gone — collapsing the second into it is how a wedged daemon gets
+ * reported as stopped.
+ */
+type Probe = { state: 'up'; info: DaemonInfo } | { state: 'absent' } | { state: 'unresponsive'; error: Error };
+
+async function probe(deadlineMs?: number): Promise<Probe> {
   try {
     const res = await rpc('ping', {}, undefined, deadlineMs);
     if (!res.ok) {
-      if (strict) throw Object.assign(new Error(res.error.message), { backlotClass: 'infra-error' });
-      return null;
+      return { state: 'unresponsive', error: Object.assign(new Error(res.error.message), { backlotClass: 'infra-error' as const }) };
     }
     const d = (res.data ?? {}) as DaemonInfo;
-    return { pid: d.pid, version: d.version, journalSchema: d.journalSchema };
+    return { state: 'up', info: { pid: d.pid, version: d.version, journalSchema: d.journalSchema } };
   } catch (error) {
     const code = (error as NodeJS.ErrnoException).code;
-    if (strict && code !== 'ENOENT' && code !== 'ECONNREFUSED') throw error;
-    return null;
+    if (code === 'ENOENT' || code === 'ECONNREFUSED') return { state: 'absent' };
+    return { state: 'unresponsive', error: error as Error };
   }
+}
+
+async function ping(): Promise<DaemonInfo | null> {
+  const p = await probe();
+  return p.state === 'up' ? p.info : null;
 }
 
 /** Inspect without spawning; only an absent socket/listener means no daemon. */
 export async function daemonInfo(): Promise<DaemonInfo | null> {
-  return ping(undefined, true);
+  const p = await probe();
+  if (p.state === 'unresponsive') throw p.error;
+  return p.state === 'up' ? p.info : null;
 }
+
+/**
+ * How long `daemon stop` waits for the acknowledged shutdown to finish. The
+ * engine serialises a verified group kill per service (SIGTERM grace plus a
+ * post-SIGKILL wait) across every supervisor before it reaps, so a shared box
+ * with many signal-trapping services legitimately needs more than `update`'s
+ * default window.
+ */
+export const DAEMON_STOP_TIMEOUT_MS = 60_000;
 
 /**
  * Wait for the daemon to be really gone — not answering AND not running.
@@ -159,13 +183,18 @@ export async function daemonInfo(): Promise<DaemonInfo | null> {
  *   concedes with exit 0. The client then reads "our child exited cleanly, a
  *   winner must exist" and waits out a full window for a winner that was never
  *   started. Waiting on the PID closes it.
+ *
+ * Each ping is cut at the remaining budget, and a ping that had to be cut is
+ * evidence of a daemon, not of its absence: a listener that never answered is
+ * still a listener. Only a probe that found no socket or no listener, with the
+ * recorded pid (when known) also dead, counts as gone.
  */
 export async function awaitDaemonGone(oldPid?: number, timeoutMs = 15_000): Promise<boolean> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    const answering = (await ping(Math.max(1, deadline - Date.now()))) !== null;
+    const p = await probe(Math.max(1, deadline - Date.now()));
     const running = oldPid !== undefined && isAlive(oldPid);
-    if (!answering && !running) return true;
+    if (p.state === 'absent' && !running) return true;
     await new Promise((r) => setTimeout(r, 50));
   }
   return false;

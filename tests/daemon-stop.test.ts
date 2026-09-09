@@ -4,7 +4,7 @@ import { createServer } from 'node:http';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { awaitDaemonGone } from '../src/cli/client.js';
+import { awaitDaemonGone, DAEMON_STOP_TIMEOUT_MS } from '../src/cli/client.js';
 import { VERSION } from '../src/core/version.js';
 
 const CLI = join(import.meta.dirname, '../dist/cli/index.js');
@@ -15,7 +15,7 @@ function fixture() {
   mkdirSync(state);
   const cli = (args: string[], vars: NodeJS.ProcessEnv = {}) => new Promise<{ code: number; stdout: string; stderr: string }>((resolve) => {
     execFile(process.execPath, [CLI, ...args, '--json'], {
-      cwd: root, env: { ...process.env, BACKLOT_STATE_DIR: state, ...vars }, timeout: 25_000,
+      cwd: root, env: { ...process.env, BACKLOT_STATE_DIR: state, ...vars }, timeout: DAEMON_STOP_TIMEOUT_MS + 20_000,
     }, (error, stdout, stderr) => resolve({ code: error ? Number(error.code ?? 1) : 0, stdout, stderr }));
   });
   const cleanup = async () => {
@@ -81,15 +81,19 @@ it('reports infra-error when an acknowledged shutdown never completes', async ()
   });
   await new Promise<void>((resolve) => server.listen(join(f.state, 'daemon.sock'), resolve));
   try {
+    const started = performance.now();
     const stop = await f.cli(['daemon', 'stop']);
     expect(stop.code, JSON.stringify(stop)).toBe(3);
-    expect(JSON.parse(stop.stdout).error).toMatchObject({ class: 'infra-error', source: 'daemon' });
-    expect(JSON.parse(stop.stdout).error.message).toContain('shutdown');
+    expect(performance.now() - started).toBeGreaterThanOrEqual(DAEMON_STOP_TIMEOUT_MS);
+    const error = JSON.parse(stop.stdout).error;
+    expect(error).toMatchObject({ class: 'infra-error', source: 'daemon' });
+    expect(error.message).toContain('still shutting down');
+    expect(error.message).not.toMatch(/retry/i);
   } finally {
     await new Promise<void>((resolve) => server.close(() => resolve()));
     await f.cleanup();
   }
-}, 25_000);
+}, DAEMON_STOP_TIMEOUT_MS + 30_000);
 
 
 it('keeps shutdown polling bounded even when ping stops responding', async () => {
@@ -111,6 +115,25 @@ it('keeps shutdown polling bounded even when ping stops responding', async () =>
   }
 }, 5000);
 
+
+it('never reads a ping cut by its own deadline as an absent daemon, even without a pid to check', async () => {
+  const f = fixture();
+  const previous = process.env.BACKLOT_STATE_DIR;
+  const server = createServer(() => {});
+  await new Promise<void>((resolve) => server.listen(join(f.state, 'daemon.sock'), resolve));
+  try {
+    process.env.BACKLOT_STATE_DIR = f.state;
+    const started = performance.now();
+    expect(await awaitDaemonGone(undefined, 150)).toBe(false);
+    expect(performance.now() - started).toBeLessThan(2000);
+  } finally {
+    if (previous === undefined) delete process.env.BACKLOT_STATE_DIR;
+    else process.env.BACKLOT_STATE_DIR = previous;
+    server.closeAllConnections();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    await f.cleanup();
+  }
+}, 5000);
 
 it('does not claim an unresponsive daemon is already stopped', async () => {
   const f = fixture();
