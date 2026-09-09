@@ -34,11 +34,11 @@ ports are stable for an environment's lifetime ([0004](0004-watchers-never-move-
 it is aimed at the same place when the services come back. Four things do break
 that, and none of them may be silent. The bind is the boundary that notices,
 because it is where the manifest is re-read and the running set decided — and so
-is the `--watch`/`sync` **projection**, which re-reads the manifest and refreshes
-the lease clock without rebinding, so a kill switch flipped under a watcher must
-not wait days for the next full bind. It **reports** rather than throws, since
-the bind itself is legitimate and failing it would strand the caller. Three tear
-the tunnel down:
+is the `--watch`/`sync` **projection**, which re-reads the manifest without
+rebinding and keeps the lease's deadline, so a kill switch flipped under a
+long-lived watcher must not wait for the next full bind. It **reports** rather
+than throws, since the bind itself is legitimate and failing it would strand the
+caller. Three tear the tunnel down:
 
 - **`preview.forbidden` is now set** (work-error class). The kill switch has to
   act on what is already published, not only refuse the next `preview` — and it

@@ -728,8 +728,9 @@ export class Engine {
   private async acquireEnv(stack: Stack, holder: string, kind: LeaseKind, hygiene: Hygiene, ttlMs: number, dataOnly: boolean, holderPid?: number, preserveLeaseDeadline = false): Promise<{ env: EnvRow; fresh: boolean }> {
     const start = now();
     // A holder that already holds this stack's LIVE lease consumes no
-    // capacity — rebinding only refreshes it. Sending it through the queue
-    // stalled the normal edit-sync-retest loop behind strangers waiting for
+    // capacity — rebinding only re-saves it (renewing the deadline for an
+    // explicit `up`, preserving it for content operations). Sending it through
+    // the queue stalled the normal edit-sync-retest loop behind strangers waiting for
     // expiry. Expiry is checked HERE, not just in the sweeper: a lapsed lease
     // survives in the journal until the next sweep, and refreshing that
     // corpse would jump a waiter queued on precisely its expiry. onlyMine
