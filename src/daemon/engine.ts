@@ -1812,9 +1812,9 @@ export class Engine {
   async resetData(cwd: string, holder?: string, onProgress?: Progress) {
     const stack = loadStack(cwd);
     const h = holder ?? resolve(cwd);
+    const noLease = () => new BrokerError('env-error', `no active lease — run 'backlot up' first`, 'lease');
     const lease = this.journal.leaseForHolder(h, stack.id);
-    if (!lease) throw new BrokerError('env-error', `no active lease — run 'backlot up' first`, 'lease');
-    this.journal.saveLease({ ...lease, hygiene: 'reset-data' });
+    if (!lease || lease.expiresAt <= now()) throw noLease();
     const env = this.envForLease(lease);
     const resetStarted = performance.now();
     let queueMs = 0;
@@ -1822,7 +1822,10 @@ export class Engine {
       env.id,
       () => {
         queueMs = performance.now() - resetStarted;
-        return this.bindAndStart(stack, env, 'reset-data', lease.kind, false, undefined, onProgress);
+        const held = this.journal.leaseForHolder(h, stack.id);
+        if (!held || held.id !== lease.id || held.expiresAt <= now()) throw noLease();
+        this.journal.saveLease({ ...held, hygiene: 'reset-data' });
+        return this.bindAndStart(stack, env, 'reset-data', held.kind, false, undefined, onProgress);
       },
       (s) => onProgress?.(`waiting for another operation on this environment … ${s}s`),
     );
