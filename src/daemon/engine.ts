@@ -1497,7 +1497,7 @@ export class Engine {
       // A skipped migration or an in-flight old bake still owns these templates.
       if (this.journal.envsForStack(retired).length > 0) continue;
       if (this.journal.envsForStack(descriptor.stack).some((row) => this.busy.has(row.id))) continue;
-      const attempted = await withBakeLock(retired, async () => {
+      const attempted = await withBakeLock(descriptor.stack, () => withBakeLock(retired, async () => {
         const { dropped, deferred, attempted } = await retireBakedTemplates(
           dir, existsSync(descriptor.root) ? descriptor.root : templatesRoot(), force,
         );
@@ -1508,7 +1508,7 @@ export class Engine {
         rmSync(dir, { recursive: true, force: true });
         logEvent({ level: 'info', kind: 'retention', detail: `retired templates keyed by legacy stack identity '${retired}' (${dropped} server-side template(s) dropped)` });
         return true;
-      });
+      }));
       if (attempted) break;
     }
   }
@@ -3044,7 +3044,7 @@ export class Engine {
     if (t - this.lastGc > Number(process.env.BACKLOT_GC_MS ?? 60_000)) {
       this.lastGc = t;
       try {
-        await this.poolGc();
+        await this.poolGc(false);
       } catch {
         /* best-effort */
       }

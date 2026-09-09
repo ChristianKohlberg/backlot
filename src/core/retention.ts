@@ -8,7 +8,7 @@ import { join } from 'node:path';
 import { artifactsRoot, templatesRoot, envsRoot } from './paths.js';
 import { logEvent } from './events.js';
 import { runQuiet } from './util.js';
-import { parseBakedMarker, withBakeLock } from '../drivers/datastores.js';
+import { hasOtherTemplateOwner, parseBakedMarker, withBakeLock } from '../drivers/datastores.js';
 import type { Journal } from './journal.js';
 import type { Policy } from './policy.js';
 
@@ -100,8 +100,10 @@ export async function pruneTemplates(p: Policy, root = templatesRoot()): Promise
     // the one remaining writer mutating this dir outside it, reopening the
     // deleted-mid-restore race the lock exists to close.
     pruned += await withBakeLock(stackDir, async () => {
+      if (existsSync(join(dir, '.retired-stack.json'))) return 0;
       let count = 0;
       const files = entriesOf(dir)
+        .filter((f) => !f.startsWith('.') && !f.endsWith('.retirement.json'))
         .map((f) => {
           try {
             return { f, mtime: statSync(join(dir, f)).mtimeMs };
@@ -116,6 +118,7 @@ export async function pruneTemplates(p: Policy, root = templatesRoot()): Promise
         if (f.endsWith('.baked')) {
           try {
             const marker = parseBakedMarker(readFileSync(full, 'utf8'));
+            if (hasOtherTemplateOwner(full, marker.ns)) continue;
             if (marker.drop) {
               // This command came from a manifest that may no longer exist on
               // disk. Re-executing it silently is the part that deserves a

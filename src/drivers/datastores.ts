@@ -23,7 +23,7 @@ import {
   writeFileSync,
   constants as fsConstants,
 } from 'node:fs';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { connect } from 'node:net';
 import { templatesRoot } from '../core/paths.js';
 import { sha256, template, BrokerError } from '../core/util.js';
@@ -115,6 +115,24 @@ export function parseBakedMarker(content: string): BakedMarker {
   return { v: 1, ns: content.trim(), drop: null };
 }
 
+export function hasOtherTemplateOwner(full: string, ns: string): boolean {
+  if (!ns) return true;
+  const root = dirname(dirname(full));
+  try {
+    for (const entry of readdirSync(root, { withFileTypes: true })) {
+      if (!entry.isDirectory()) continue;
+      const dir = join(root, entry.name);
+      for (const file of readdirSync(dir)) {
+        const candidate = join(dir, file);
+        if (!file.endsWith('.baked') || candidate === full) continue;
+        const owner = parseBakedMarker(readFileSync(candidate, 'utf8'));
+        if (!owner.ns || owner.ns === ns) return true;
+      }
+    }
+  } catch { return true; }
+  return false;
+}
+
 /** Drop every marker's server-side template DB in `dir`, best-effort. */
 export async function dropBakedTemplates(dir: string, cwd: string): Promise<number> {
   let dropped = 0;
@@ -167,7 +185,11 @@ export async function retireBakedTemplates(dir: string, cwd: string, force = fal
     // of how many retired markers a stack accumulated.
     if (attempted > 0) { deferred++; continue; }
     let drop: string | null = null;
-    try { drop = parseBakedMarker(readFileSync(full, 'utf8')).drop; }
+    try {
+      const marker = parseBakedMarker(readFileSync(full, 'utf8'));
+      if (hasOtherTemplateOwner(full, marker.ns)) { deferred++; continue; }
+      drop = marker.drop;
+    }
     catch { deferred++; continue; }
     attempted++;
     if (drop) {

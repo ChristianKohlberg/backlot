@@ -1,31 +1,33 @@
 import { expect, it } from 'vitest';
 import { execFile, execFileSync, spawn } from 'node:child_process';
-import { mkdtempSync, mkdirSync, writeFileSync, symlinkSync, rmSync, readFileSync, existsSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, symlinkSync, rmSync, readFileSync, existsSync, readdirSync, renameSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createHash } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
 import { Journal } from '../src/core/journal.js';
 import { retireBakedTemplates } from '../src/drivers/datastores.js';
+import { pruneTemplates } from '../src/core/retention.js';
+import type { Policy } from '../src/core/policy.js';
 
 const CLI = join(import.meta.dirname, '..', 'dist/cli/index.js');
 const MCP = join(import.meta.dirname, '..', 'dist/mcp/index.js');
 type Context = { datastores: Record<string, { url: string }>; envId: string; urls: Record<string, string>; error?: { message: string }; lease: { id: string } };
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
-const legacyIdentity = (alias: string) => `identity-${createHash('sha256').update(alias).digest('base64url').slice(0, 8)}`;
+const legacyIdentity = (alias: string, name = 'identity') => `${name}-${createHash('sha256').update(alias).digest('base64url').slice(0, 8)}`;
 const notesIn = (url: string) => {
   const db = new DatabaseSync(url);
   try { return db.prepare('SELECT note FROM notes').all(); } finally { db.close(); }
 };
-function fixture(sweepMs = 60000) {
+function fixture(sweepMs = 60000, name = 'identity') {
   const root = mkdtempSync(join(tmpdir(), 'backlot-identity-'));
   const wt = join(root, 'real'); mkdirSync(wt);
   const alias = join(root, 'alias'); symlinkSync(wt, alias, 'dir');
   const state = join(root, 'state');
-  writeFileSync(join(wt, 'backlot.yml'), `name: identity\nservices:\n  web:\n    run: node server.mjs\n    port: http\n    env: {PORT: "{{ports.http}}"}\n    ready: {http: /, timeout: 10}\ndatastores:\n  main: {driver: sqlite, create: 'node seed.mjs {{ns}}', presets: [default]}\n`);
+  writeFileSync(join(wt, 'backlot.yml'), `name: ${name}\nservices:\n  web:\n    run: node server.mjs\n    port: http\n    env: {PORT: "{{ports.http}}"}\n    ready: {http: /, timeout: 10}\ndatastores:\n  main: {driver: sqlite, create: 'node seed.mjs {{ns}}', presets: [default]}\n`);
   writeFileSync(join(wt, 'seed.mjs'), "import{DatabaseSync}from'node:sqlite';const db=new DatabaseSync(process.argv[2]);db.exec('CREATE TABLE IF NOT EXISTS notes (note TEXT)');db.close();");
   writeFileSync(join(wt, 'server.mjs'), "import{createServer}from'node:http';createServer((q,r)=>r.end('ok')).listen(+process.env.PORT,'127.0.0.1');");
-  const env = { ...process.env, BACKLOT_STATE_DIR: state, BACKLOT_HOLDER_PID: '', BACKLOT_SWEEP_MS: String(sweepMs) };
+  const env: NodeJS.ProcessEnv = { ...process.env, BACKLOT_STATE_DIR: state, BACKLOT_HOLDER_PID: '', BACKLOT_SWEEP_MS: String(sweepMs) };
   const cli = (args: string[]) => new Promise<Context>((resolve, reject) => {
     execFile(process.execPath, [CLI, ...args, '--json'], { cwd: wt, env }, (err, out, stderr) => {
       try { resolve(JSON.parse(out)); } catch { reject(new Error(String(err) + stderr + out)); }
@@ -44,7 +46,7 @@ function fixture(sweepMs = 60000) {
     });
     p.stdin.write(JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: `backlot_${verb}`, arguments: { cwd, holder, holderPid: process.pid } } }) + '\n');
   });
-  return { root, wt, alias, state, cli, mcp, cleanup: async () => {
+  return { root, wt, alias, state, cli, mcp, env, name, cleanup: async () => {
     await cli(['pool', 'recycle', '--force']); await cli(['daemon', 'stop']); rmSync(root, { recursive: true, force: true });
   } };
 }
@@ -153,7 +155,7 @@ function journalAsLegacyAlias(f: ReturnType<typeof fixture>, envId: string, keep
   const saved = journal.getEnv(envId)!;
   const lease = journal.leaseForEnv(envId);
   journal.deleteEnv(saved.id);
-  journal.saveEnv({ ...saved, stack: legacyIdentity(f.alias), stackRoot: f.alias });
+  journal.saveEnv({ ...saved, stack: legacyIdentity(f.alias, f.name), stackRoot: f.alias });
   if (keepLease && lease) journal.saveLease(lease);
   return journal;
 }
@@ -328,3 +330,95 @@ it('retirement bounds a hanging drop and processes only one marker per maintenan
     expect(existsSync(second), 'only one external command may run in a batch').toBe(true);
   } finally { await f.cleanup(); }
 }, 15000);
+
+
+it('periodic automatic GC respects three failed attempts and backoff', async () => {
+  const f = fixture();
+  try {
+    const first = await f.cli(['up', '--holder', 'owner']);
+    await f.cli(['daemon', 'stop']);
+    journalAsLegacyAlias(f, first.envId, true);
+    const dir = join(f.state, 'templates', legacyIdentity(f.alias));
+    mkdirSync(dir, { recursive: true });
+    const count = join(f.root, 'attempts');
+    const marker = join(dir, 'failed.baked');
+    writeFileSync(marker, JSON.stringify({ v: 1, ns: 'failed', drop: `echo attempt >> '${count}'; false` }));
+    await f.cli(['status']);
+    for (let i = 0; i < 3; i++) await f.cli(['pool', 'gc']);
+    const failure = readFileSync(`${marker}.retirement.json`, 'utf8');
+    expect(JSON.parse(failure).attempts).toBe(3);
+    await f.cli(['daemon', 'stop']);
+    f.env.BACKLOT_SWEEP_MS = '100';
+    f.env.BACKLOT_GC_MS = '1';
+    await f.cli(['status']);
+    await sleep(1000);
+    expect(readFileSync(count, 'utf8').trim().split('\n')).toHaveLength(3);
+    expect(readFileSync(`${marker}.retirement.json`, 'utf8')).toBe(failure);
+    await f.cli(['pool', 'gc']);
+    expect(readFileSync(count, 'utf8').trim().split('\n')).toHaveLength(4);
+  } finally { await f.cleanup(); }
+}, 30000);
+
+it('ordinary retention preserves retired markers and all cleanup records beyond templatesKeep', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'backlot-retired-retention-'));
+  try {
+    const dir = join(root, 'legacy');
+    mkdirSync(dir);
+    const dropped = join(root, 'dropped');
+    const records: Record<string, string> = { '.retired-stack.json': JSON.stringify({ stack: 'canonical' }) };
+    for (let i = 0; i < 8; i++) {
+      records[`${i}.baked`] = JSON.stringify({ v: 1, ns: `template_${i}`, drop: `touch '${dropped}'; false` });
+      records[`${i}.baked.retirement.json`] = JSON.stringify({ attempts: 3, state: 'needs-attention' });
+    }
+    for (const [file, content] of Object.entries(records)) writeFileSync(join(dir, file), content);
+    expect(await pruneTemplates({ templatesKeep: 1 } as Policy, root)).toBe(0);
+    expect(existsSync(dropped)).toBe(false);
+    expect(readdirSync(dir).sort()).toEqual(Object.keys(records).sort());
+    for (const [file, content] of Object.entries(records)) expect(readFileSync(join(dir, file), 'utf8')).toBe(content);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+it('retirement preserves a live template shared by long canonical and legacy stack names', async () => {
+  const f = fixture(60000, 'a'.repeat(42));
+  try {
+    const appliance = join(f.root, 'appliance');
+    mkdirSync(appliance);
+    writeFileSync(join(f.wt, 'backlot.yml'), JSON.stringify({
+      name: f.name,
+      services: { web: { run: 'node server.mjs', port: 'http', env: { PORT: '{{ports.http}}' }, ready: { http: '/', timeout: 10 } } },
+      datastores: { main: {
+        driver: 'postgres', url: `${appliance}/{{ns}}`, presets: ['default'],
+        create: `echo seeded > '${appliance}/{{ns}}'`,
+        drop: `rm -f '${appliance}/{{ns}}'`,
+        template_restore: `cp '${appliance}/{{template}}' '${appliance}/{{ns}}'`,
+      } },
+    }));
+    const first = await f.cli(['up', '--holder', 'owner']);
+    expect(first.error).toBeUndefined();
+    await f.cli(['daemon', 'stop']);
+    const journal = journalAsLegacyAlias(f, first.envId, true);
+    const root = join(f.state, 'templates');
+    const canonicalDir = join(root, legacyIdentity(f.wt, f.name));
+    const retiredDir = join(root, legacyIdentity(f.alias, f.name));
+    renameSync(canonicalDir, retiredDir);
+    expect((await f.cli(['ctx', '--holder', 'owner'])).envId).toBe(first.envId);
+    expect(journal.getEnv(first.envId)!.stack).toBe(legacyIdentity(f.wt, f.name));
+    const second = await f.cli(['up', '--holder', 'other']);
+    expect(second.error).toBeUndefined();
+    const file = readdirSync(canonicalDir).find((f) => f.endsWith('.baked'))!;
+    const canonical = readFileSync(join(canonicalDir, file), 'utf8');
+    const retired = readFileSync(join(retiredDir, file), 'utf8');
+    const ns = JSON.parse(canonical).ns;
+    expect(JSON.parse(retired).ns).toBe(ns);
+    expect(ns).toHaveLength(63);
+    const failure = join(retiredDir, `${file}.retirement.json`);
+    writeFileSync(failure, JSON.stringify({ attempts: 3, state: 'needs-attention' }));
+    await f.cli(['pool', 'gc']);
+    expect(readFileSync(join(appliance, ns), 'utf8')).toBe('seeded\n');
+    expect(readFileSync(join(retiredDir, file), 'utf8')).toBe(retired);
+    expect(JSON.parse(readFileSync(failure, 'utf8')).attempts).toBe(3);
+    expect(readFileSync(join(canonicalDir, file), 'utf8')).toBe(canonical);
+    expect(readFileSync(first.datastores.main.url, 'utf8')).toBe('seeded\n');
+    expect(readFileSync(second.datastores.main.url, 'utf8')).toBe('seeded\n');
+  } finally { await f.cleanup(); }
+}, 30000);
