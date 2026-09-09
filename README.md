@@ -162,8 +162,10 @@ backlot reset-data --preset main=empty
 backlot run smoke --preset main=dev
 ```
 
-Names must appear in that datastore's `presets` catalog. Without a catalog, the
-implicit `default` and any manifest-declared `default_preset` names remain valid.
+Names must appear in that datastore's `presets` catalog, and so must the names a
+`default_preset` declares: a declared default outside the catalog fails every
+bind, with or without `--preset`. Without a catalog, the implicit `default` and
+any manifest-declared `default_preset` names remain valid.
 Unknown stores, unknown presets, duplicate targets and ambiguous bare names are
 refused before acquiring an environment or changing data. Changing a preset
 restores that store even with ordinary reuse hygiene; unmentioned stores keep
@@ -173,8 +175,9 @@ A continuing lease keeps its selections across `up`, `sync`, `reset-data` and
 daemon restart unless explicitly overridden. If a manifest removes the selected
 preset, the next bind selects its declared default. A new lease uses the manifest
 defaults and never inherits the previous holder's choices. `ctx --json` reports
-`.datastores.<name>.preset`; a changed selection appears as
-`datastore-preset-changed` in bind diagnostics. MCP accepts the same choices as a
+`.datastores.<name>.preset`; a selection that differs from the one the
+environment last recorded appears as `datastore-preset-changed` in bind
+diagnostics (a first bind or a newly added store has none to differ from). MCP accepts the same choices as a
 `presets` object mapping datastore names to preset names.
 
 ### How long you hold it: `--ttl` for agents, `--holder-pid` for shells

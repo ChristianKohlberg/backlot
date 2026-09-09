@@ -47,6 +47,27 @@ it('rejects an unknown preset on a fresh request',async()=>{const f=fixture();tr
   expect((await f.cli(['status'])).json.envs).toHaveLength(0);
 }finally{await f.cleanup();}},30000);
 
+it('refuses --preset on an unsupported verb as a usage error without touching the daemon',async()=>{const f=fixture();try{
+  for(const verb of ['ctx','sync']){
+    const bad=await f.cli([verb,'--preset','alternate']);
+    expect(bad.code,bad.stderr).toBe(64);expect(bad.stdout).toBe('');expect(bad.stderr).toContain('--preset is supported by up, run and reset-data');
+  }
+  expect(existsSync(join(f.state,'daemon.pid'))).toBe(false);
+  const invalid=await f.cli(['up','--preset','missing']);expect(invalid.code,invalid.stdout).toBe(1);expect(invalid.json.error.class).toBe('work-error');
+}finally{await f.cleanup();}},30000);
+
+it('labels a preset as changed only against a previously recorded selection',async()=>{const f=fixture();try{
+  const first=await f.cli(['up','--preset','alternate']);expect(first.code,first.stdout).toBe(0);
+  expect(first.json.bindDiagnostics.reasons).not.toContain('datastore-preset-changed');expect(first.json.datastores.main.preset).toBe('alternate');
+  const path=join(f.tree,'stack.yaml');const manifest=JSON.parse(readFileSync(path,'utf8'));manifest.datastores.audit=manifest.datastores.main;writeFileSync(path,JSON.stringify(manifest));
+  f.mutate(first.json);
+  const added=await f.cli(['up']);expect(added.code,added.stdout).toBe(0);
+  expect(added.json.bindDiagnostics.reasons).not.toContain('datastore-preset-changed');
+  expect(added.json.datastores.audit.preset).toBe('dev');expect(f.value(added.json,'audit')).toBe('dev');expect(f.value(added.json)).toBe('user-data');
+  const changed=await f.cli(['up','--preset','audit=alternate']);expect(changed.code,changed.stdout).toBe(0);
+  expect(changed.json.bindDiagnostics.reasons).toContain('datastore-preset-changed');expect(f.value(changed.json,'audit')).toBe('alternate');expect(f.value(changed.json)).toBe('user-data');
+}finally{await f.cleanup();}},30000);
+
 
 it('retains selection on warm up, sync, reset and daemon restart; a fresh holder gets the default',async()=>{
   const f=fixture();try{

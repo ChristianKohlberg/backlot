@@ -884,6 +884,7 @@ export class Engine {
     // from the manifest falls back to full rather than starting none.
     const presets = selectPresets(stack.manifest, kind, requestedPresets, freshClaim ? undefined : env.presets);
     const presetsChanged = Object.entries(presets).some(([name, preset]) => env.presets[name] !== preset);
+    const presetSelectionChanged = Object.entries(presets).some(([name, preset]) => Object.hasOwn(env.presets, name) && env.presets[name] !== preset);
     const declaredServices = Object.keys(stack.manifest.services);
     const requestedNames =
       requestedServices !== undefined
@@ -1020,7 +1021,7 @@ export class Engine {
     if (!this.supervisor(env).allHealthyPids()) trace.result.reasons.push('service-process-unhealthy');
     if (!shapeMatches) trace.result.reasons.push('service-shape-changed');
     if (inputsChanged) trace.result.reasons.push('environment-inputs-changed');
-    if (presetsChanged) trace.result.reasons.push('datastore-preset-changed');
+    if (presetSelectionChanged) trace.result.reasons.push('datastore-preset-changed');
     if (hygiene !== 'reuse') trace.result.reasons.push(`hygiene-${hygiene}`);
     const unchanged =
       !inputsChanged &&
