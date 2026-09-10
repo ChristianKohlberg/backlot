@@ -155,6 +155,9 @@ user_version`; a daemon refuses to open a journal stamped newer than it understa
 Bump it only when a change makes an older daemon **misread** this journal — the
 additive `ALTER TABLE` migrations are not bumps.
 
+For preset intent versus completed restores and its compatibility barrier, see
+the `JOURNAL_SCHEMA_VERSION` comment in `src/core/journal.ts`.
+
 ## Caller environment inputs
 
 `services.*.env_from` allowlists caller variables (`required`/`optional`). Explicit

@@ -33,23 +33,25 @@ const cwdProp = {
   },
 };
 
+const presetsProp = { presets: { type: 'object', additionalProperties: { type: 'string' }, description: 'Datastore-to-preset selections; omitted stores retain their current choice on a continuing lease.' } };
+
 const TOOLS: Tool[] = [
   {
     name: 'backlot_up',
     description: 'Lease a warm environment for this worktree: sync, upkeep, seed, start services. Returns the context blob (URLs, logins, connection strings).',
-    inputSchema: { type: 'object', properties: { ...cwdProp, hygiene: { type: 'string', enum: ['reuse', 'reset-data', 'pristine'] } }, required: ['cwd'] },
+    inputSchema: { type: 'object', properties: { ...cwdProp, ...presetsProp, hygiene: { type: 'string', enum: ['reuse', 'reset-data', 'pristine'] } }, required: ['cwd'] },
     verb: 'up',
   },
   {
     name: 'backlot_run',
     description: 'Run a named check from backlot.yml against a fresh binding: verdict with ok/exitCode/failure taxonomy (work-error = your code, env-error = environment, infra-error = external), artifacts dir, outputs_changed.',
-    inputSchema: { type: 'object', properties: { ...cwdProp, check: { type: 'string' }, hygiene: { type: 'string', enum: ['reuse', 'reset-data', 'pristine'] } }, required: ['cwd', 'check'] },
+    inputSchema: { type: 'object', properties: { ...cwdProp, ...presetsProp, check: { type: 'string' }, hygiene: { type: 'string', enum: ['reuse', 'reset-data', 'pristine'] } }, required: ['cwd', 'check'] },
     verb: 'run',
   },
   {
     name: 'backlot_run_detach',
     description: 'Submit a named check as a detached job (the CLI\'s `run --detach`): returns {jobId} immediately instead of blocking on a slow bind. Poll it with backlot_job; the verdict is journaled and outlives this call.',
-    inputSchema: { type: 'object', properties: { ...cwdProp, check: { type: 'string' }, hygiene: { type: 'string', enum: ['reuse', 'reset-data', 'pristine'] } }, required: ['cwd', 'check'] },
+    inputSchema: { type: 'object', properties: { ...cwdProp, ...presetsProp, check: { type: 'string' }, hygiene: { type: 'string', enum: ['reuse', 'reset-data', 'pristine'] } }, required: ['cwd', 'check'] },
     verb: 'run-detach',
   },
   {
@@ -91,7 +93,7 @@ const TOOLS: Tool[] = [
   {
     name: 'backlot_reset_data',
     description: 'Restore the data template on the current lease (replay a repro against pristine data). URLs stay stable.',
-    inputSchema: { type: 'object', properties: { ...cwdProp }, required: ['cwd'] },
+    inputSchema: { type: 'object', properties: { ...cwdProp, ...presetsProp }, required: ['cwd'] },
     verb: 'reset-data',
   },
   {

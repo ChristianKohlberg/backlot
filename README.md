@@ -164,6 +164,42 @@ application still counts against the application caps; retrying the conversion
 or returning to the application shape remains supported. A shape change waits
 for an operation already using the environment.
 
+### Choosing datastore presets
+
+`up`, `run` (including `--detach`) and `reset-data` accept `--preset NAME` when
+the stack has one datastore. For multiple stores, name each target explicitly:
+
+```bash
+backlot up --preset main=dev --preset audit=empty
+backlot reset-data --preset main=empty
+backlot run smoke --preset main=dev
+```
+
+Names must appear in that datastore's `presets` catalog, and so must the names a
+`default_preset` declares: a declared default outside the catalog fails every
+bind, with or without `--preset`. Without a catalog (omitted or empty), the
+implicit `default` and any manifest-declared `default_preset` names remain valid.
+Unknown stores, unknown presets, duplicate targets and ambiguous bare names are
+refused before acquiring an environment or changing data. Changing a preset
+restores that store even with ordinary reuse hygiene. Under reuse, unmentioned
+stores keep their data unless their inherited preset was removed or upkeep
+requires a template rebake. `reset-data` and `--pristine` restore every store.
+
+A continuing lease keeps its selections across `up`, `sync`, `reset-data`,
+`--pristine`, failed-bind retries and daemon restart unless explicitly overridden.
+If a manifest removes the selected preset, the next bind or sync selects the
+current default: `default_preset` for the lease kind (`session` or `run`), then
+the first catalog entry, then `default`. A new lease uses the manifest
+defaults and never inherits the previous holder's choices. In `ctx --json`,
+`.datastores.<name>.preset` reports the last completed restore, including earlier
+stores that succeeded when a later store failed; it is absent after a pristine
+wipe until that store is restored. A selection that differs from the one the
+environment last recorded appears as `datastore-preset-changed` in bind
+diagnostics (a first bind or a newly added store has none to differ from). MCP
+and RPC accept the same choices as a `presets` object mapping datastore names
+to preset names. Other CLI verbs reject `--preset` with exit 64 and a message
+on stderr.
+
 ### How long you hold it: `--ttl` for agents, `--holder-pid` for shells
 
 A lease has a TTL, and there are two ways to say when you are done with an

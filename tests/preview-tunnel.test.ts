@@ -6,6 +6,8 @@ import { execFile, execFileSync } from 'node:child_process';
 import { mkdtempSync, rmSync, writeFileSync, readFileSync, chmodSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
+import { parse, stringify } from 'yaml';
 import { scanTagged } from '../src/core/procscan.js';
 
 const repo = join(import.meta.dirname, '..');
@@ -478,3 +480,89 @@ describe('preview tunnels', () => {
     expect(c.json?.previewUrls ?? {}).toEqual({});
   });
 });
+
+
+function presetPreview(hotReload = false) {
+  const f = ctx({}, '', hotReload);
+  const manifestPath = join(f.wt, 'stack.yaml');
+  const manifest = parse(readFileSync(manifestPath, 'utf8'));
+  manifest.datastores = { main: {
+    driver: 'sqlite', presets: ['dev', 'alternate'], default_preset: { session: 'dev' },
+    create: 'node seed.mjs "{{ns}}" "{{preset}}"', template: true,
+  } };
+  writeFileSync(manifestPath, stringify(manifest));
+  writeFileSync(join(f.wt, 'seed.mjs'), `import {DatabaseSync} from 'node:sqlite';
+const db = new DatabaseSync(process.argv[2]);
+db.exec('CREATE TABLE marker(value TEXT)');
+db.prepare('INSERT INTO marker VALUES (?)').run(process.argv[3]);db.close();
+`);
+  const marker = (url: string) => {
+    const db = new DatabaseSync(url);
+    try { return db.prepare('SELECT value FROM marker').get()!.value; } finally { db.close(); }
+  };
+  return { ...f, manifest, manifestPath, marker };
+}
+
+it.each([
+  { args: ['up'], hotReload: false },
+  { args: ['reset-data'], hotReload: false },
+  { args: ['sync'], hotReload: false },
+  { args: ['up', '--preset', 'alternate'], hotReload: false },
+  { args: ['reset-data', '--preset', 'alternate'], hotReload: false },
+  { args: ['sync'], hotReload: true },
+])('enforces forbidden preview before invalid presets: $args reload=$hotReload', async ({ args, hotReload }) => {
+  const f = presetPreview(hotReload);
+  try {
+    const up = await f.cli(['up', '--json']);
+    expect(up.code, up.stdout + up.stderr).toBe(0);
+    const stores = up.json!.datastores as Record<string, {url: string}>;
+    const url = stores.main!.url;
+    expect(f.marker(url)).toBe('dev');
+    const published = await f.cli(['preview', 'web', '--json']);
+    expect(published.code, published.stdout + published.stderr).toBe(0);
+    const pid = tunnelPid(f.stateDir);
+    expect(alive(pid)).toBe(true);
+    const projectedManifest = join(f.stateDir, 'envs', String(up.json!.envId), 'tree', 'stack.yaml');
+    const before = readFileSync(projectedManifest, 'utf8');
+    f.manifest.preview = { forbidden: true };
+    f.manifest.datastores.main.default_preset.session = 'missing';
+    writeFileSync(f.manifestPath, stringify(f.manifest));
+    const failed = await f.cli([...args, '--json']);
+    expect(failed.code, failed.stdout + failed.stderr).toBe(1);
+    expect(failed.stdout).toContain("default preset 'missing'");
+    expect(await goneWithin(pid, 5000)).toBe(true);
+    expect((await f.cli(['ctx', '--json'])).json?.previewUrls).toEqual({});
+    expect(f.marker(url)).toBe('dev');
+    expect(readFileSync(projectedManifest, 'utf8')).toBe(before);
+  } finally {
+    await f.cli(['daemon', 'stop', '--json']);
+  }
+}, 30000);
+
+it('retains the forbidden preview notice through preset projection fallback', async () => {
+  const f = presetPreview(true);
+  try {
+    const up = await f.cli(['up', '--preset', 'alternate', '--json']);
+    expect(up.code, up.stdout + up.stderr).toBe(0);
+    const projected = await f.cli(['sync', '--json']);
+    expect((projected.json?.bindDiagnostics as {reuse: string}).reuse).toBe('projected');
+    const published = await f.cli(['preview', 'web', '--json']);
+    expect(published.code, published.stdout + published.stderr).toBe(0);
+    const pid = tunnelPid(f.stateDir);
+    f.manifest.preview = { forbidden: true };
+    f.manifest.datastores.main.presets = ['dev'];
+    writeFileSync(f.manifestPath, stringify(f.manifest));
+    const synced = await f.cli(['sync', '--json']);
+    expect(synced.code, synced.stdout + synced.stderr).toBe(0);
+    expect(synced.json?.previewUrls).toEqual({});
+    expect(String(synced.json?.previewNotice)).toMatch(/preview.forbidden.*torn down/);
+    expect((synced.json?.bindDiagnostics as {reasons: string[]}).reasons).toContain('datastore-preset-changed');
+    const stores = synced.json!.datastores as Record<string, {url: string; preset: string}>;
+    expect(stores.main!.preset).toBe('dev');
+    expect(f.marker(stores.main!.url)).toBe('dev');
+    expect(await goneWithin(pid, 5000)).toBe(true);
+    expect((await f.cli(['ctx', '--json'])).json?.previewNotice).toBeUndefined();
+  } finally {
+    await f.cli(['daemon', 'stop', '--json']);
+  }
+}, 30000);

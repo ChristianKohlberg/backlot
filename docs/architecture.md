@@ -305,7 +305,7 @@ first bind; no presets or templates).
 
 | Level | Meaning | Typical consumer |
 | --- | --- | --- |
-| `reuse` | keep everything | human inspect loop |
+| `reuse` | retain compatible state; see [preset selection](../README.md#choosing-datastore-presets) | human inspect loop |
 | `reset-data` | restore data template, keep all build caches | agent verify loops (default for runs) |
 | `pristine` | fresh environment | merge-grade verdicts; auto-escalation |
 

@@ -4,6 +4,8 @@
  * (decision 0009). One RPC endpoint; the CLI is a thin client. Serializes
  * requests through a simple queue — policy code stays race-free.
  */
+import { selectPresets } from '../core/presets.js';
+import { loadStack } from '../core/manifest.js';
 import { createServer, request } from 'node:http';
 import { existsSync, rmSync, writeFileSync, chmodSync } from 'node:fs';
 import { socketPath, pidPath, stateRoot } from '../core/paths.js';
@@ -32,7 +34,7 @@ async function dispatch(verb: string, args: Record<string, unknown>, emit: (phas
       return { pid: process.pid, version: VERSION, journalSchema: JOURNAL_SCHEMA_VERSION };
     case 'up':
       return engine.up({
-        cwd, holder, holderPid, callerEnv: args.callerEnv,
+        cwd, holder, holderPid, callerEnv: args.callerEnv, presets: args.presets,
         hygiene: (args.hygiene as never) ?? undefined,
         watch: Boolean(args.watch),
         ttlMs: args.ttlMs ? Number(args.ttlMs) : undefined,
@@ -44,8 +46,9 @@ async function dispatch(verb: string, args: Record<string, unknown>, emit: (phas
         onProgress: emit,
       });
     case 'run':
-      return engine.run({ cwd, holder, callerEnv: args.callerEnv, check: String(args.check), hygiene: (args.hygiene as never) ?? undefined, pull: Boolean(args.pull), onProgress: emit });
+      return engine.run({ cwd, holder, callerEnv: args.callerEnv, presets: args.presets, check: String(args.check), hygiene: (args.hygiene as never) ?? undefined, pull: Boolean(args.pull), onProgress: emit });
     case 'run-detach': {
+      if (args.presets !== undefined) selectPresets(loadStack(cwd).manifest, 'run', args.presets);
       const jobId = engine.createJob(cwd, String(args.check));
       // Fire-and-forget — env/pool locks make it safe; the journaled verdict
       // outlives the client (decision 0015).
@@ -53,7 +56,7 @@ async function dispatch(verb: string, args: Record<string, unknown>, emit: (phas
       // client) — but a REJECTION here is process-fatal without a catch, and
       // the job would be lost with no record of why.
       void engine
-        .executeJob(jobId, { cwd, holder, callerEnv: args.callerEnv, check: String(args.check), hygiene: (args.hygiene as never) ?? undefined })
+        .executeJob(jobId, { cwd, holder, callerEnv: args.callerEnv, presets: args.presets, check: String(args.check), hygiene: (args.hygiene as never) ?? undefined })
         .catch((err) => logEvent({ level: 'error', kind: 'job', detail: `job ${jobId} failed outside the verdict path: ${String((err as Error).message ?? err)}` }));
       return { jobId, poll: `backlot job ${jobId}` };
     }
@@ -68,7 +71,7 @@ async function dispatch(verb: string, args: Record<string, unknown>, emit: (phas
     case 'sync':
       return engine.syncLease(cwd, holder, emit);
     case 'reset-data':
-      return engine.resetData(cwd, holder, emit);
+      return engine.resetData(cwd, holder, emit, args.presets);
     case 'exec':
       return engine.exec(cwd, String(args.cmd), holder);
     case 'logs':
