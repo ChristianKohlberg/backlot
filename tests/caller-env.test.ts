@@ -12,7 +12,7 @@ afterAll(async () => { for (const cleanup of cleanups) await cleanup(); });
 function fixture(mode: 'required' | 'optional' = 'optional', logReady = false) {
   // realpath: macOS's tmpdir is a symlink (/var -> /private/var), and a stack's
   // identity hashes its root path. A CLI child's process.cwd() reports the
-  // resolved path, so an MCP tool cwd given as the symlink would name a
+  // resolved path, so a caller cwd given as the symlink would name a
   // different stack than the CLI verbs that follow it.
   const root = realpathSync(mkdtempSync(join(tmpdir(), 'bl-inputs-')));
   const state = join(root, 'state');
@@ -275,36 +275,6 @@ describe('caller environment inputs', () => {
     expect(run.json.output).toContain('clean');
     expect((await f.cli(['status'], {}, f.root)).code).toBe(0);
     expect((await f.cli(['doctor'], {}, f.root)).code).toBe(0);
-  });
-
-  it('sanitizes cold MCP autospawn using tool cwd, not the adapter working directory', async () => {
-    const f = fixture('required');
-    writeFileSync(join(f.tree, 'assert-clean.mjs'), "if(process.env.TEST_CALLER_KEY !== undefined) process.exit(12);console.log('clean');\n");
-    const adapter = spawn(process.execPath, [join(import.meta.dirname, '../dist/mcp/index.js')], {
-      cwd: f.root,
-      env: { ...process.env, BACKLOT_STATE_DIR: f.state, TEST_CALLER_KEY: 'mcp-caller-secret' },
-      stdio: ['pipe', 'pipe', 'ignore'],
-    });
-    cleanups.push(async () => { adapter.kill(); });
-    const context = await new Promise<any>((resolve, reject) => {
-      const timeout = setTimeout(() => reject(new Error('MCP up did not return')), 20_000);
-      let output = '';
-      adapter.on('error', (error) => { clearTimeout(timeout); reject(error); });
-      adapter.stdout.on('data', (chunk) => {
-        output += String(chunk);
-        const newline = output.indexOf('\n');
-        if (newline < 0) return;
-        clearTimeout(timeout);
-        try { resolve(JSON.parse(JSON.parse(output.slice(0, newline)).result.content[0].text)); } catch (error) { reject(error); }
-      });
-      adapter.stdin.write(JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: {
-        name: 'backlot_up', arguments: { cwd: f.tree, holder: 'mcp-cold' },
-      } }) + '\n');
-    });
-    expect((await f.response(context)).value).toBe('mcp-caller-secret');
-    const exec = await f.cli(['exec', '--json', '--holder', 'mcp-cold', 'node assert-clean.mjs']);
-    expect(exec.json.exitCode, exec.stdout + exec.stderr).toBe(0);
-    expect(exec.json.stdout.trim()).toBe('clean');
   });
 
   it('refuses broker control names in env_from before autospawn', async () => {

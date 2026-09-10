@@ -93,8 +93,7 @@ export interface UpOptions {
   /**
    * The CALLER's process, so its lease can be released when it dies.
    * The CLI exits per invocation, so this must be the long-lived agent's pid —
-   * supplied via --holder-pid or BACKLOT_HOLDER_PID, and by the MCP adapter
-   * automatically since that process outlives its tool calls.
+   * supplied via --holder-pid or BACKLOT_HOLDER_PID.
    */
   holderPid?: number;
   /** Set by the daemon per-request; emits progress frames back to the client. */

@@ -1,7 +1,7 @@
 {
   "name": "backlot",
   "version": "0.11.1",
-  "description": "The repo-aware environment broker: puts a working, seeded, provable instance of your web application in front of coding agents and humans — warm pools, leases, bind-by-sync. Brokers environments; never provides them.",
+  "description": "The repo-aware environment broker: puts a working, seeded, provable instance of your web application in front of coding agents and humans \u2014 warm pools, leases, bind-by-sync. Brokers environments; never provides them.",
   "keywords": [
     "environment",
     "broker",
@@ -11,8 +11,7 @@
     "preview",
     "warm-pool",
     "sandbox",
-    "harness",
-    "mcp"
+    "harness"
   ],
   "license": "Apache-2.0",
   "type": "module",
@@ -20,8 +19,7 @@
     "node": ">=22.13.0"
   },
   "bin": {
-    "backlot": "dist/cli/index.js",
-    "backlot-mcp": "dist/mcp/index.js"
+    "backlot": "dist/cli/index.js"
   },
   "files": [
     "dist",
@@ -30,13 +28,14 @@
     "LICENSE"
   ],
   "scripts": {
-    "build": "tsc -p tsconfig.json",
+    "build": "node scripts/clean-dist.mjs && tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run",
     "coverage": "npm run build && rm -rf coverage && NODE_V8_COVERAGE=\"$PWD/coverage/tmp\" vitest run; c8 report --temp-directory coverage/tmp --report-dir coverage --reporter text --reporter lcov --exclude-after-remap --include 'src/**'",
     "lint": "eslint src",
     "pretest": "npm run build",
-    "prepublishOnly": "npm run build"
+    "prepublishOnly": "npm run build",
+    "prepack": "npm run build"
   },
   "devDependencies": {
     "@types/node": "^22.10.0",
