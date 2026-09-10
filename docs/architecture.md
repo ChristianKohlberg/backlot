@@ -56,7 +56,7 @@ Kubernetes, Windows, secrets management, and dashboards are not.
 | **Substrate** | Where environments physically live, behind a driver: `local` (supervised processes in a directory), later `docker`, `morph`, `sprites`, `ssh`. |
 | **Environment** | A pooled slot on a substrate: its own copy of the tree, warm caches, running services, allocated ports, a datastore namespace. Durable; belongs to the pool, never to a person or task. A lease may cover a **subset** of it — a service slice (`up <service>`), or the datastores alone (`up --data-only`, [decision 0023](decisions/0023-data-only-leases.md)) for a test lane that needs a seeded database rather than an application. |
 | **Binding** | A source state (ref + dirty diff) plus a data state (preset, at a hygiene level) attached to an environment. An immutable snapshot. |
-| **Lease** | Temporary ownership of an environment, with a TTL refreshed by the verbs that BIND (`up`, `sync`, `bind`, `run`). Read-only verbs (`ctx`, `logs`, `token`, `pull`, `status`) do not refresh it. Expiry returns the environment to the pool **warm** — nothing is torn down. |
+| **Lease** | Temporary ownership of an environment, with a TTL renewed by explicit `up` (or `bind --ref --ttl`); `run` takes a new lease. Content operations (`sync`, `bind`, watch saves, `reset-data`) preserve a continuing lease's absolute deadline. Read-only verbs (`ctx`, `logs`, `token`, `pull`, `status`) do not refresh it. Expiry returns the environment to the pool **warm** — nothing is torn down. |
 
 Plus one verb-noun: a **Run** — a named check executed against a binding, producing an
 exit code, a JSON verdict, and collected artifacts.
@@ -250,7 +250,7 @@ local/remote abstraction; the local substrate is enumerate-and-copy.)
   `@rebake-template` fingerprints — a lockfile, a migration — falls back to the full
   bind path, which runs the rule and restarts services; skipping the rule silently
   would hand out an environment the manifest says is stale. Stopped on
-  release/expiry/quiesce/recycle. Watch activity refreshes the lease.
+  release/expiry/quiesce/recycle. Watch activity preserves the lease deadline; explicit `up` renews it.
 - The environment-side reset restores tracked files hard on every bind. A **clean-slate**
   bind (`--reset-data` or `--pristine`) additionally removes untracked env-side files —
   droppings left by a check, service, or `exec` — **except** declared `caches:`
@@ -369,7 +369,7 @@ Every failure is classified — the field an agent branches on mechanically:
   "Untouched" counts real use — `exec`, `ctx`, `logs`, `pull` — not just binds, so an actively
   worked environment is never quiesced underneath its agent.
 - **Leases need no heartbeat daemon** because losing a lease is designed to be
-  worthless: a binding verb refreshes the TTL (read-only verbs deliberately do not,
+  worthless: an explicit `up` refreshes the TTL (content and read-only verbs deliberately do not,
   so an idle agent that only polls `ctx` does not hold an environment forever);
   expiry returns the env warm; the source
   of truth never left the worktree. Agents that vanish cost nothing.
