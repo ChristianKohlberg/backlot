@@ -60,11 +60,16 @@ already holding and hands back its raw stdout and exit code, so it **needs an
 `up` first**. Rule of thumb: **`run` to prove a change, `exec` to poke at the
 live environment.**
 
+The `backlot-mcp` executable and MCP adapter have been removed. Remove existing
+MCP launch entries from your agent configuration and invoke CLI commands through
+your shell tools, for example `backlot up --json` and `backlot run smoke --json`.
+The CLI, daemon RPC and Claude Code skill remain supported.
+
 ### Upgrading: `backlot update` after you install
 
 Installing a new backlot replaces the files on disk. It does **not** replace the
 daemon already running — that process keeps serving the old code for as long as
-it lives, and the socket carries no version. So an upgrade is two steps:
+it lives. So an upgrade is two steps:
 
 ```bash
 npm i -g backlot@latest    # or whatever installed it — backlot never installs itself

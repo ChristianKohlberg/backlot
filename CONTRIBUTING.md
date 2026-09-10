@@ -14,7 +14,8 @@ Thanks for looking at backlot. A few ground rules keep this project what it is:
 - **`examples/hello-web` is the contract.** Engine properties are proven as
   integration tests against it, on macOS *and* Linux. If your change can't be
   demonstrated there (or in a new equally-tiny example), that's a signal.
-- Node ≥ 22.5, `pnpm install`, `pnpm typecheck && pnpm test` before pushing.
+- Use the Node prerequisite in [README.md](README.md), then `npm ci`,
+  `npm run typecheck && npm test` before pushing.
 - Agent-authored contributions are welcome and expected — this tool exists for
   agents. The same review bar applies to everyone.
 - **Coverage** (optional, not a CI gate — it re-runs the whole integration suite):

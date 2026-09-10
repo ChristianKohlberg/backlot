@@ -490,8 +490,9 @@ see README §Security model.
 **Division of labor** (the bug-fix loop): the agent thinks, edits, greps, and commits
 in its own worktree with its own harness — backlot is where the code *runs*, never
 where the agent *works*. Fast unit tests that need no system don't pay the broker tax
-at all. Agents invoke the `backlot` CLI with `--json` for structured results.
-The former `backlot-mcp` adapter was removed; see [decision 0029](decisions/0029-cli-only-agent-interface.md).
+at all. See the [README](../README.md#quickstart) for the agent interface and migration
+from the former adapter, and [decision 0029](decisions/0029-cli-only-agent-interface.md)
+for the removal decision.
 
 ### Configuration
 

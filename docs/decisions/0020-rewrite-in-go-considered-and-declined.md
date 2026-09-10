@@ -1,5 +1,7 @@
 # 0020. A rewrite in Go was considered and declined
 
+> The MCP portion of this historical decision is superseded by [0029](0029-cli-only-agent-interface.md).
+
 - Status: Accepted
 - Date: 2026-07
 - Context: [0013](0013-typescript-node-npm-apache2.md) chose TypeScript on Node; this

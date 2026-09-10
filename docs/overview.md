@@ -100,7 +100,7 @@ backlot release             # or just walk away — the lease lapses harmlessly
 ```
 
 Every verb takes `--json`: stdout is one clean data object, stderr is for humans.
-Agents use the CLI with `--json`; the former MCP adapter has been removed.
+See the [README](../README.md#quickstart) for agent usage and MCP migration.
 
 ## When something fails
 

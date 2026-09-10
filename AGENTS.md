@@ -199,17 +199,9 @@ hand — `npm publish`, the annotated `vX.Y.Z` tag on the merge commit (`v0.9.1`
 what shipped since the last tag; follow semver off what actually changed
 (additive/back-compat = minor, fix-only = patch) rather than defaulting to patch.
 
-`dist/` is gitignored but **is** the published artifact (`files`, and both `bin`
-entries point into it), so packaging must rebuild the artifact. 0.11.0 shipped that way: published without a build,
-so the whole preview-tunnel feature it was cut for (`dist/drivers/preview.js`, plus
-the `engine`/`journal`/`cli`/`mcp` changes) was simply absent from npm, and 0.11.1
-exists only to republish it. Nothing catches this after the fact —
-`src/core/version.ts` reads `package.json`, so the stale install still *reports* the
-new version and the skew gate sees a matched pair while `backlot preview` does not
-exist. Hence `prepublishOnly` now builds; do not remove it, and do not read a green
-`npm test` as a good tarball (`pretest` builds into the same `dist/`, which is why
-local runs stayed green throughout). The tags are also behind — v0.10.0 and v0.11.0
-were never pushed.
+For packaging guarantees, see [decision 0029](docs/decisions/0029-cli-only-agent-interface.md).
+`tests/package-cli-only.test.ts` exercises the actual tarball with stale build outputs;
+a green integration suite alone does not verify the published artifact.
 
 ## Claude Code plugin
 
@@ -231,5 +223,3 @@ Keep this file for knowledge useful to almost every future agent session in this
 Do not repeat what the codebase already shows; point to the authoritative file or command instead.
 Prefer rewriting or pruning existing entries over appending new ones.
 When updating this file, preserve this bar for all agents and keep entries concise.
-
-`prepack` builds for `npm pack` as well as publishing; the build cleans stale outputs before compiling. `tests/package-cli-only.test.ts` exercises the packed artifact and prevents a removed executable from surviving in stale `dist`.

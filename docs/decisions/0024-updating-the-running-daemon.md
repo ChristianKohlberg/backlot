@@ -1,5 +1,7 @@
 # 0024. `backlot update` reconciles the running daemon to the installed build — skew is refused, and backlot never installs itself
 
+> The MCP portion of this historical decision is superseded by [0029](0029-cli-only-agent-interface.md).
+
 - Status: Accepted
 - Date: 2026-07
 - Context: the CLI spawns the daemon from its own `dist/` (decision 0009), so

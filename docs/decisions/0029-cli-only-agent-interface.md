@@ -4,14 +4,14 @@
 
 ## Decision
 
-Remove the MCP stdio adapter and the `backlot-mcp` executable. Agents use
-`backlot --json` through their existing shell tools; the daemon RPC, CLI and
-Claude Code skill remain supported. This intentionally breaks existing MCP
-launch configurations: remove those entries and use the CLI instead.
+Remove the MCP stdio adapter and the `backlot-mcp` executable. This is an
+intentional breaking removal; see the
+[README migration guidance](../../README.md#quickstart) for the supported interface
+and migration steps.
 
-This supersedes the MCP portion of decision 0014 and the MCP executable name
-in decision 0017. Historical reviews and milestone records describe the product
-at their original date, not a currently supported adapter.
+This supersedes the MCP portions of decisions 0014, 0017, 0020 and 0024.
+Historical reviews and milestone records describe the product at their original
+date, not a currently supported adapter.
 
 Builds clean `dist` before compilation, and `prepack` builds before npm creates
 a tarball, so outputs left by older checkouts cannot ship the removed adapter.
