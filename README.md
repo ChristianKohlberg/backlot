@@ -151,6 +151,12 @@ shapes still works in both directions, but now needs room in the shape you are
 switching *into* — otherwise the cheap ceiling would just be application capacity
 by another name ([decision 0025](docs/decisions/0025-data-only-environments-are-priced-separately.md)).
 
+During conversion to data-only, the old application slot stays reserved until
+its services have stopped. If preparation fails before teardown, the running
+application still counts against the application caps; retrying the conversion
+or returning to the application shape remains supported. A shape change waits
+for an operation already using the environment.
+
 ### How long you hold it: `--ttl` for agents, `--holder-pid` for shells
 
 A lease has a TTL, and there are two ways to say when you are done with an

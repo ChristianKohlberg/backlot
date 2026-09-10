@@ -448,7 +448,7 @@ variable > `$STATE_DIR/config.json` > built-in default.
 | `BACKLOT_POOL_MAX_DATA_ONLY` | `poolMaxDataOnly` | `max(4, 2 x heuristic)` — data-only envs, machine-wide, counted against neither application cap (decision 0025) |
 | `BACKLOT_LEASE_TTL_MS` | `sessionTtlMs` / `runTtlMs` | 30 min / 10 min |
 | `BACKLOT_IDLE_TTL_MS` | `idleTtlMs` | 30 min |
-| `BACKLOT_WAIT_MS` | `waitMs` | 60 s (queue-at-capacity timeout) |
+| `BACKLOT_WAIT_MS` | `waitMs` | 60 s (queue-at-capacity timeout; also bounds a shape change waiting on an operation in flight on the holder's own environment) |
 | `BACKLOT_ARTIFACT_DAYS` | `artifactDays` | 7 |
 | `BACKLOT_JOB_DAYS` | `jobDays` | 7 |
 | `BACKLOT_LOG_CAP_BYTES` | `logCapBytes` | 5 MB |
