@@ -187,8 +187,10 @@ frees the environment while you are still using it, the next bind takes it, and
 you are quietly looking at somebody else's database through the same URL.
 
 `backlot release` hands the environment back early. If it answers
-`{"released": false}`, read the `reason`: a lease is keyed by the directory that
-bound it, so releasing from a different worktree matches nothing.
+`{"released": false}`, read the `reason`: use the same holder that bound it
+(`--holder` if supplied, otherwise the caller directory). See
+[physical stack identity and legacy holder recovery](docs/architecture.md#physical-stack-identity)
+for symlink aliases and upgrade recovery.
 
 For your own repo: `npm i -g backlot`, write the `backlot.yml`, then the same
 verbs. Requires Node ≥ 22.13 and git. The daemon auto-spawns on first use (unix

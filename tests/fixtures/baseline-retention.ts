@@ -1,4 +1,12 @@
 /**
+ * Frozen compatibility fixture: src/core/retention.ts from
+ * fc5df5b87f3acf2256ade08e7a3d297344c113c0, before physical stack identity migration.
+ * Keep the legacy behavior unchanged. The stack-identity test transpiles this
+ * into dist/core so its imports resolve against the compiled runtime, then
+ * executes it against migrated state. Checking it in makes that proof work
+ * in shallow checkouts and source archives without Git history.
+ */
+/**
  * Disk retention: nothing backlot writes may grow forever. Called from the
  * daemon sweeper (~10 min cadence); every function is idempotent, best-effort,
  * and unit-testable in isolation.
@@ -8,7 +16,7 @@ import { join } from 'node:path';
 import { artifactsRoot, templatesRoot, envsRoot } from './paths.js';
 import { logEvent } from './events.js';
 import { runQuiet } from './util.js';
-import { hasOtherTemplateOwner, parseBakedMarker, withBakeLock } from '../drivers/datastores.js';
+import { parseBakedMarker, withBakeLock } from '../drivers/datastores.js';
 import type { Journal } from './journal.js';
 import type { Policy } from './policy.js';
 
@@ -91,7 +99,7 @@ export function pruneJobs(journal: Journal, p: Policy): number {
  * marker also DROPs the database instead of leaking it on the appliance
  * forever (vetbill-1i49). Legacy bare-string markers prune file-only.
  */
-export async function pruneTemplates(p: Policy, root = templatesRoot(), protectedStacks: ReadonlySet<string> = new Set()): Promise<number> {
+export async function pruneTemplates(p: Policy, root = templatesRoot()): Promise<number> {
   let pruned = 0;
   for (const stackDir of entriesOf(root)) {
     const dir = join(root, stackDir);
@@ -100,10 +108,8 @@ export async function pruneTemplates(p: Policy, root = templatesRoot(), protecte
     // the one remaining writer mutating this dir outside it, reopening the
     // deleted-mid-restore race the lock exists to close.
     pruned += await withBakeLock(stackDir, async () => {
-      if (protectedStacks.has(stackDir) || existsSync(join(dir, '.retired-stack.json'))) return 0;
       let count = 0;
       const files = entriesOf(dir)
-        .filter((f) => !f.startsWith('.') && !f.endsWith('.retirement.json'))
         .map((f) => {
           try {
             return { f, mtime: statSync(join(dir, f)).mtimeMs };
@@ -118,7 +124,6 @@ export async function pruneTemplates(p: Policy, root = templatesRoot(), protecte
         if (f.endsWith('.baked')) {
           try {
             const marker = parseBakedMarker(readFileSync(full, 'utf8'));
-            if (hasOtherTemplateOwner(full, marker.ns)) continue;
             if (marker.drop) {
               // This command came from a manifest that may no longer exist on
               // disk. Re-executing it silently is the part that deserves a
@@ -142,12 +147,11 @@ export async function pruneTemplates(p: Policy, root = templatesRoot(), protecte
 export async function retentionSweep(
   journal: Journal,
   p: Policy,
-  protectedStacks: ReadonlySet<string> = new Set(),
 ): Promise<{ artifacts: number; logs: number; jobs: number; templates: number }> {
   return {
     artifacts: pruneArtifacts(p),
     logs: truncateLogs(p),
     jobs: pruneJobs(journal, p),
-    templates: await pruneTemplates(p, templatesRoot(), protectedStacks),
+    templates: await pruneTemplates(p),
   };
 }

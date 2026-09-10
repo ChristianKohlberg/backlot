@@ -93,6 +93,14 @@ delete (it cannot take the env lock — `tryClaim` calls it under the pool lock)
 so no stale snapshot can forget a tunnel someone else just published. `tests/preview-tunnel.test.ts`
 covers all of it.
 
+## Physical stack identity
+
+See [physical stack identity](docs/architecture.md#physical-stack-identity) for
+canonical paths, legacy holder recovery, and template retirement safeguards.
+`callerHolder` / `adoptLegacyAliases` in `src/daemon/engine.ts` own identity
+reconciliation; `tests/stack-identity.test.ts` covers CLI/MCP compatibility,
+data preservation, deferred migration, and retirement (including old retention).
+
 ## Leases: `--ttl` is the agent form, `--holder-pid` is not
 
 `--holder-pid` / `BACKLOT_HOLDER_PID` frees the environment the moment the named process exits, which only helps a caller that outlives the command. `BACKLOT_HOLDER_PID=$$` from an agent harness names an already-exited shell, so the lease is reclaimable on arrival: the sweeper's dead-holder rule frees the env, the next binder takes it, and the first caller is left looking at a different, unseeded store through the same URL. It presents as a stale seed template — the wrong subsystem entirely. Binds naming a dead pid are now refused (exit 64). See the lease bullet in `docs/architecture.md`.
