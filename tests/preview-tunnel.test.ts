@@ -378,10 +378,9 @@ describe('preview tunnels', () => {
     expect(await goneWithin(pid, 10_000)).toBe(true);
   });
 
-  // A projection restarts nothing and allocates nothing: the renamed port key
-  // only takes effect at the next full bind, so until then the service is still
-  // listening exactly where the tunnel points.
-  it('keeps the tunnel on a projecting sync that only renames the port key', async () => {
+  // A startup configuration edit cannot be applied by projection. The full
+  // bind commits the new port and reconciles the tunnel against that result.
+  it('rebinds a port-key edit and stops the tunnel when its committed target moves', async () => {
     const { cli, wt, stateDir } = ctx({}, '', true);
     await cli(['up', '--json']);
     await cli(['preview', 'web', '--json']);
@@ -392,6 +391,23 @@ describe('preview tunnels', () => {
     );
     const synced = await cli(['sync', '--json']);
     expect(synced.code).toBe(0);
+    expect(synced.json?.bindDiagnostics?.reuse).toBe('rebound');
+    expect(synced.json?.previewUrls).toEqual({});
+    expect(String(synced.json?.previewNotice)).toMatch(/moved from port .* torn down/);
+    expect(alive(pid)).toBe(false);
+  });
+
+  it('keeps the tunnel when a startup env change rebinds on the same port', async () => {
+    const { cli, wt, stateDir } = ctx({}, '', true);
+    const before = await cli(['up', '--json']);
+    await cli(['preview', 'web', '--json']);
+    const pid = tunnelPid(stateDir);
+    writeFileSync(join(wt, 'stack.yaml'), readFileSync(join(wt, 'stack.yaml'), 'utf8')
+      .replace('env: { PORT:', 'env: { VALUE: changed, PORT:'));
+    const synced = await cli(['sync', '--json']);
+    expect(synced.code).toBe(0);
+    expect(synced.json?.bindDiagnostics?.reuse).toBe('rebound');
+    expect(synced.json?.urls).toEqual(before.json?.urls);
     expect(synced.json?.previewUrls).toEqual({ web: FAKE_URL });
     expect(synced.json?.previewNotice).toBeUndefined();
     expect(alive(pid)).toBe(true);

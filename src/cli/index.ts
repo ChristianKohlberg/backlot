@@ -327,7 +327,7 @@ async function main(): Promise<void> {
         process.exit(64);
       }
       if (flags.has('--detach')) {
-        res = await rpc('run-detach', { cwd, holder, check, hygiene: hygiene(), callerEnv, presets });
+        res = await rpc('run-detach', { cwd, holder, check, hygiene: hygiene(), pull: flags.has('--pull'), callerEnv, presets });
         if (res.ok) {
           out(res.data);
           return;

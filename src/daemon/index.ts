@@ -56,7 +56,7 @@ async function dispatch(verb: string, args: Record<string, unknown>, emit: (phas
       // client) — but a REJECTION here is process-fatal without a catch, and
       // the job would be lost with no record of why.
       void engine
-        .executeJob(jobId, { cwd, holder, callerEnv: args.callerEnv, presets: args.presets, check: String(args.check), hygiene: (args.hygiene as never) ?? undefined })
+        .executeJob(jobId, { cwd, holder, pull: Boolean(args.pull), callerEnv: args.callerEnv, presets: args.presets, check: String(args.check), hygiene: (args.hygiene as never) ?? undefined })
         .catch((err) => logEvent({ level: 'error', kind: 'job', detail: `job ${jobId} failed outside the verdict path: ${String((err as Error).message ?? err)}` }));
       return { jobId, poll: `backlot job ${jobId}` };
     }
