@@ -93,6 +93,10 @@ delete (it cannot take the env lock — `tryClaim` calls it under the pool lock)
 so no stale snapshot can forget a tunnel someone else just published. `tests/preview-tunnel.test.ts`
 covers all of it.
 
+For the successful-bind configuration ledger and projection/reuse eligibility, see
+[sync and bindings](docs/architecture.md#6-sync--verbs-sync-watch-streams) and
+`tests/projection-config-and-detached-pull.test.ts`.
+
 ## Physical stack identity
 
 See [physical stack identity](docs/architecture.md#physical-stack-identity) for

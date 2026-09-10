@@ -1,7 +1,7 @@
 /**
  * Lease-scoped public preview via Cloudflare quick tunnels (decision 0027).
  */
-import { describe, it, expect, afterAll } from 'vitest';
+import { describe, it, expect, afterEach } from 'vitest';
 import { execFile, execFileSync } from 'node:child_process';
 import { mkdtempSync, rmSync, writeFileSync, readFileSync, chmodSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -14,9 +14,9 @@ const repo = join(import.meta.dirname, '..');
 const CLI = join(repo, 'dist', 'cli', 'index.js');
 const FAKE_URL = 'https://fake-preview-test.trycloudflare.com';
 
-const cleanups: Array<() => void> = [];
-afterAll(() => {
-  for (const c of cleanups) c();
+const cleanups: Array<() => Promise<void>> = [];
+afterEach(async () => {
+  for (const c of cleanups.splice(0)) await c();
 });
 
 /**
@@ -118,7 +118,11 @@ function ctx(extraEnv: Record<string, string> = {}, stackExtra = '', hotReload =
         resolve({ code: err ? ((err as { code?: number }).code ?? 1) : 0, json, stdout: String(stdout), stderr: String(stderr) });
       });
     });
-  const cleanup = () => {
+  const cleanup = async () => {
+    // Reap detached services through their supervisor on both platforms before
+    // killing the daemon: scanTagged cannot find them on macOS. Do this after
+    // each test so idle daemons and services do not exhaust the runner's pids.
+    const stopped = await cli(['daemon', 'stop', '--json']);
     try {
       process.kill(Number(readFileSync(join(stateDir, 'daemon.pid'), 'utf8')), 'SIGKILL');
     } catch {
@@ -138,6 +142,7 @@ function ctx(extraEnv: Record<string, string> = {}, stackExtra = '', hotReload =
     }
     rmSync(stateDir, { recursive: true, force: true });
     rmSync(wt, { recursive: true, force: true });
+    expect(stopped.code, stopped.stdout + stopped.stderr).toBe(0);
   };
   cleanups.push(cleanup);
   return { wt, cli, stateDir, cleanup };
@@ -378,10 +383,9 @@ describe('preview tunnels', () => {
     expect(await goneWithin(pid, 10_000)).toBe(true);
   });
 
-  // A projection restarts nothing and allocates nothing: the renamed port key
-  // only takes effect at the next full bind, so until then the service is still
-  // listening exactly where the tunnel points.
-  it('keeps the tunnel on a projecting sync that only renames the port key', async () => {
+  // A startup configuration edit cannot be applied by projection. The full
+  // bind commits the new port and reconciles the tunnel against that result.
+  it('rebinds a port-key edit and stops the tunnel when its committed target moves', async () => {
     const { cli, wt, stateDir } = ctx({}, '', true);
     await cli(['up', '--json']);
     await cli(['preview', 'web', '--json']);
@@ -392,6 +396,23 @@ describe('preview tunnels', () => {
     );
     const synced = await cli(['sync', '--json']);
     expect(synced.code).toBe(0);
+    expect(synced.json?.bindDiagnostics?.reuse).toBe('rebound');
+    expect(synced.json?.previewUrls).toEqual({});
+    expect(String(synced.json?.previewNotice)).toMatch(/moved from port .* torn down/);
+    expect(alive(pid)).toBe(false);
+  });
+
+  it('keeps the tunnel when a startup env change rebinds on the same port', async () => {
+    const { cli, wt, stateDir } = ctx({}, '', true);
+    const before = await cli(['up', '--json']);
+    await cli(['preview', 'web', '--json']);
+    const pid = tunnelPid(stateDir);
+    writeFileSync(join(wt, 'stack.yaml'), readFileSync(join(wt, 'stack.yaml'), 'utf8')
+      .replace('env: { PORT:', 'env: { VALUE: changed, PORT:'));
+    const synced = await cli(['sync', '--json']);
+    expect(synced.code).toBe(0);
+    expect(synced.json?.bindDiagnostics?.reuse).toBe('rebound');
+    expect(synced.json?.urls).toEqual(before.json?.urls);
     expect(synced.json?.previewUrls).toEqual({ web: FAKE_URL });
     expect(synced.json?.previewNotice).toBeUndefined();
     expect(alive(pid)).toBe(true);
@@ -401,8 +422,11 @@ describe('preview tunnels', () => {
   // run leaves the caller with no preview and an error reading as a no-op.
   it('does not kill the live tunnel when the new publish cannot even start', async () => {
     const { cli, stateDir } = ctx();
-    await cli(['up', '--json']);
-    await cli(['preview', 'web', '--json']);
+    const up = await cli(['up', '--json']);
+    expect(up.code, up.stdout + up.stderr).toBe(0);
+    const published = await cli(['preview', 'web', '--json']);
+    expect(published.code, published.stdout + published.stderr).toBe(0);
+    expect(published.json?.url).toBe(FAKE_URL);
     const pid = tunnelPid(stateDir);
     rmSync(join(stateDir, 'fake-cloudflared'));
     const second = await cli(['preview', 'api', '--json']);

@@ -44,7 +44,7 @@ cd examples/hello-web
 backlot up --json          # lease a warm env: sync, seed, start — returns the full context blob (URLs + creds)
 backlot run smoke --json   # bind -> run the check -> JSON verdict -> release
 backlot ctx --json         # re-read that same blob later, read-only — no re-bind (up already returned it)
-backlot sync               # edit locally, project it in — seconds; hot_reload services keep running
+backlot sync               # source-only edits project in; startup configuration changes rebind
 backlot exec <cmd>         # run an arbitrary command in the env your lease holds (raw exit, not a verdict)
 backlot preview <service>  # publish one service on a public tunnel (requires cloudflared)
 backlot preview stop       # stop the preview tunnel on your lease
@@ -64,6 +64,17 @@ The `backlot-mcp` executable and MCP adapter have been removed. Remove existing
 MCP launch entries from your agent configuration and invoke CLI commands through
 your shell tools, for example `backlot up --json` and `backlot run smoke --json`.
 The CLI, daemon RPC and Claude Code skill remain supported.
+
+Source-only saves can keep `hot_reload` services running. Any change to the parsed
+manifest takes the full bind path so startup environment and commands are applied;
+comments and whitespace alone do not change the parsed configuration. See
+[projection eligibility](docs/architecture.md#6-sync--verbs-sync-watch-streams) and
+[preview reconciliation](docs/decisions/0027-lease-scoped-public-preview.md) for the
+full conditions.
+
+`backlot run CHECK --detach --pull` copies declared outputs back to the worktree
+before the completed job verdict is recorded. Without `--pull`, detached checks
+leave worktree outputs untouched, just like foreground checks.
 
 ### Upgrading: `backlot update` after you install
 
@@ -262,7 +273,7 @@ services:
     run: pnpm exec ng serve --port {{ports.web}}
     port: web
     ready: { http: / }
-    hot_reload: true      # ng serve reloads itself -> `sync` never restarts it
+    hot_reload: true      # see projection eligibility above
 datastores:
   main:
     driver: postgres

@@ -255,8 +255,13 @@ local/remote abstraction; the local substrate is enumerate-and-copy.)
   revision.
 - `backlot sync` takes the same source-only projection as a watch save — services
   kept, the dev servers' own watchers reload — when EVERY service declares
-  `hot_reload: true` (its `run:` watches its own tree) and the save fires no
-  upkeep rule. Any undeclared service forces the full rebind: projecting under
+  `hot_reload: true` (its `run:` watches its own tree), the parsed manifest matches
+  the last successful full bind, and the save fires no upkeep rule. The memory-only
+  `appliedManifests` ledger in `engine.ts` records that configuration only after a
+  successful full bind; both projection and ordinary reuse must match it even if
+  `@source` already advanced. Missing ledger entries require a full bind too. See
+  `tests/projection-config-and-detached-pull.test.ts` for regression coverage.
+  Any undeclared service forces the full rebind: projecting under
   a non-watching process silently serves stale code, the failure class this
   broker exists to prevent (owner decision, 2026-07-20).
 - `--watch` sessions opt into a daemon-side debounced worktree watcher that auto-syncs
@@ -265,7 +270,8 @@ local/remote abstraction; the local substrate is enumerate-and-copy.)
   sweeping untracked env files), updating the sync cache, the `@source` fingerprint and
   `lastUsedAt`; stage 2 belongs to the services' own dev watchers (`watch_run`), which
   pick the projected change up. Services are NOT stopped or restarted on an ordinary
-  save. **Caveat (deliberate):** a save that changes what an upkeep rule or
+  save meeting the projection conditions above. **Caveat (deliberate):** a save
+  that changes what an upkeep rule or
   `@rebake-template` fingerprints — a lockfile, a migration — falls back to the full
   bind path, which runs the rule and restarts services; skipping the rule silently
   would hand out an environment the manifest says is stale. Stopped on
@@ -480,11 +486,9 @@ service through a preview **publisher** adapter (default: a Cloudflare quick tun
 `backlot preview stop` ends it. It is opt-in per invocation and **scoped to the lease,
 not to the service incarnation** — a `sync`, a rebind or an idle quiesce leaves the
 tunnel up, while `release`, TTL lapse, teardown, `shutdown` and crash recovery all reap
-it. A bind — or a `sync`/`--watch` projection, which re-reads the manifest without
-allocating anything — that invalidates the tunnel (the manifest now sets
-`preview.forbidden`, the previewed service left the running set, or, binds only, its port
-moved) or merely reclassifies it (`--reset-data` under a live preview) says so in that
-bind's `previewNotice` rather than failing. The URL is **public and unauthenticated** —
+it. Exceptions and `previewNotice` reporting are defined by
+[preview reconciliation](decisions/0027-lease-scoped-public-preview.md).
+The URL is **public and unauthenticated** —
 see README §Security model.
 
 **Division of labor** (the bug-fix loop): the agent thinks, edits, greps, and commits
@@ -560,7 +564,7 @@ services:
     build: pnpm exec ng build myapp
     run:   npx serve-dist dist/myapp --proxy /api={{services.api.url}}
     watch_run: pnpm exec ng serve myapp --port {{ports.web}}
-    hot_reload: true                      # run: self-reloads -> `sync` projects, no restart
+    hot_reload: true                      # projection eligibility: see §6
     port:  web
     ready: { http: / }
   worker:

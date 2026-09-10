@@ -34,10 +34,11 @@ ports are stable for an environment's lifetime ([0004](0004-watchers-never-move-
 it is aimed at the same place when the services come back. Four things do break
 that, and none of them may be silent. The bind is the boundary that notices,
 because it is where the manifest is re-read and the running set decided — and so
-is the `--watch`/`sync` **projection**, which re-reads the manifest without
-rebinding and keeps the lease's deadline, so a kill switch flipped under a
-long-lived watcher must not wait for the next full bind. It **reports** rather
-than throws, since the bind itself is legitimate and failing it would strand the
+is `--watch`/`sync`, which re-reads the manifest and keeps the lease's deadline.
+A parsed manifest change requires a full bind (see
+[projection eligibility](../architecture.md#6-sync--verbs-sync-watch-streams)); the kill switch is
+enforced before that fallback, so even a failed bind cannot leave it published.
+Reconciliation **reports** rather than throws, since the bind itself is legitimate and failing it would strand the
 caller. Three tear the tunnel down:
 
 - **`preview.forbidden` is now set** (work-error class). The kill switch has to
@@ -54,8 +55,9 @@ caller. Three tear the tunnel down:
   rule applied to a tunnel that is already up.
 - **The service moved to a different local port** (env-error class; its `port`
   key was renamed — existing keys are never reassigned). Only a real bind
-  allocates for a renamed key, so a projection skips this one: until then the
-  service is still listening exactly where the tunnel points.
+  allocates for a renamed key. A port-key edit during `sync`/`--watch` therefore
+  falls back to a full bind, and its epilogue reconciles the committed port.
+  Source-only projection allocates nothing and skips the port comparison.
 
 The running set a reconcile judges against is the environment's **durable
 shape**, never the supervisor's live pid map — a service in restart backoff is

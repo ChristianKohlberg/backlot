@@ -208,6 +208,9 @@ export class Engine {
   /** Opaque in-memory revisions only; no secret values or hashes in the journal. */
   private appliedInputs = new Map<string, string>();
   private appliedInputSpecs = new Map<string, string>();
+  // Memory-only successful-bind configuration: projection may advance @source,
+  // but cannot apply startup env/commands or other manifest configuration.
+  private appliedManifests = new Map<string, string>();
   private inputRevision = 0;
 
   private poolLocked<T>(fn: () => Promise<T> | T): Promise<T> {
@@ -1044,6 +1047,8 @@ export class Engine {
       Object.entries(inputValues).every(([key, value]) => previousInputs.values[key] === value);
     const inputs = sameInputs ? previousInputs : { values: inputValues, revision: String(++this.inputRevision) };
     this.leaseInputs.set(inputLease.id, inputs);
+    const manifestKey = JSON.stringify(stack.manifest);
+    const manifestChanged = this.appliedManifests.get(env.id) !== manifestKey;
     const inputSpec = callerEnvSpec(stack.manifest);
     const inputsChanged = (inputSpec !== '[]' && this.appliedInputs.get(env.id) !== inputs.revision) ||
       inputSpec !== (this.appliedInputSpecs.get(env.id) ?? '[]');
@@ -1135,9 +1140,11 @@ export class Engine {
     if (!this.supervisor(env).allHealthyPids()) trace.result.reasons.push('service-process-unhealthy');
     if (!shapeMatches) trace.result.reasons.push('service-shape-changed');
     if (inputsChanged) trace.result.reasons.push('environment-inputs-changed');
+    if (manifestChanged) trace.result.reasons.push('manifest-changed');
     if (presetSelectionChanged) trace.result.reasons.push('datastore-preset-changed');
     if (hygiene !== 'reuse') trace.result.reasons.push(`hygiene-${hygiene}`);
     const unchanged =
+      !manifestChanged &&
       !inputsChanged &&
       !presetsChanged &&
       env.fingerprints['@source'] === sync.sourceHash &&
@@ -1376,6 +1383,7 @@ export class Engine {
     env.lastUsedAt = now();
     this.appliedInputs.set(env.id, inputs.revision);
     this.appliedInputSpecs.set(env.id, inputSpec);
+    this.appliedManifests.set(env.id, manifestKey);
     env.failStreak = 0; // a successful bind clears the escalation counter
     this.journal.saveEnv(env);
     return {
@@ -1492,7 +1500,7 @@ export class Engine {
       if (env.state !== 'hot' || !this.supervisor(env).allHealthyPids()) return fallback();
       // Changing declarations must reconfigure the process even for a hot-reload
       // service: its own watcher reloads source, not its startup environment.
-      if (callerEnvSpec(stack.manifest) !== (this.appliedInputSpecs.get(env.id) ?? '[]')) return fallback();
+      if (JSON.stringify(stack.manifest) !== this.appliedManifests.get(env.id)) return fallback();
 
       const dirs = this.envDirs(env.id);
       // The one sync implementation (constraint: no second copy path).
@@ -1517,9 +1525,8 @@ export class Engine {
       fresh.fingerprints['@source'] = sync.sourceHash;
       fresh.lastUsedAt = now();
       this.journal.saveEnv(fresh);
-      // A projection re-reads the manifest, so preview policy changes take
-      // effect without waiting for a full bind. The shape is this environment's
-      // DURABLE one, not the supervisor's live pids: nothing here restarted a
+      // Reconcile against the environment's durable shape, not the
+      // supervisor's live pids: nothing here restarted a
       // service, so a pid missing during a restart backoff is not a slice change.
       const shape = fresh.dataOnly
         ? new Set<string>()
@@ -1963,7 +1970,7 @@ export class Engine {
     return id;
   }
 
-  async executeJob(id: string, opts: UpOptions & { check: string }): Promise<void> {
+  async executeJob(id: string, opts: UpOptions & { check: string; pull?: boolean }): Promise<void> {
     this.journal.saveJob({ id, stackCwd: opts.cwd, check: opts.check, state: 'running' });
     try {
       const verdict = await this.run(opts);
@@ -3140,6 +3147,7 @@ export class Engine {
     if (lease) this.leaseInputs.delete(lease.id);
     this.appliedInputs.delete(env.id);
     this.appliedInputSpecs.delete(env.id);
+    this.appliedManifests.delete(env.id);
     this.envChains.delete(env.id); // don't leak a settled chain for a dead id
     return true;
   }
