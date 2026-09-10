@@ -1,4 +1,4 @@
-import { readFileSync, existsSync } from 'node:fs';
+import { readFileSync, existsSync, realpathSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { dirname, join, resolve } from 'node:path';
 import { parse } from 'yaml';
@@ -181,8 +181,24 @@ function manifestIn(dir: string): string | null {
   return null;
 }
 
+export function canonicalDirectory(from: string): string {
+  try { return realpathSync(resolve(from)); }
+  catch { throw new BrokerError('work-error', `cannot resolve project directory '${from}'`, 'manifest'); }
+}
+
+const IDENTITY_HASH_LENGTH = 8;
+
+export function stackIdentity(name: string, root: string): string {
+  return `${name}-${createHash('sha256').update(root).digest('base64url').slice(0, IDENTITY_HASH_LENGTH)}`;
+}
+
+/** The identity a migrated row carried while its root was still spelled `legacyRoot`. */
+export function retiredStackIdentity(stack: string, legacyRoot: string): string {
+  return stackIdentity(stack.slice(0, -(IDENTITY_HASH_LENGTH + 1)), legacyRoot);
+}
+
 export function findStackRoot(from: string): string {
-  let dir = resolve(from);
+  let dir = canonicalDirectory(from);
   for (;;) {
     if (manifestIn(dir)) return dir;
     const parent = dirname(dir);
@@ -202,7 +218,7 @@ export function loadStack(from: string): Stack {
   // Identity = absolute root + declared name; filesystem-safe. Hash the WHOLE
   // path: slicing base64url(root) kept only the last ~6 bytes, so sibling
   // worktrees like agent-1/myapp and agent-2/myapp collided into one pool.
-  const id = `${manifest.name}-${createHash('sha256').update(root).digest('base64url').slice(0, 8)}`;
+  const id = stackIdentity(manifest.name, root);
   return { manifest, root, id };
 }
 

@@ -84,6 +84,13 @@ backlot update --check     # cli vs daemon, who would have to rebind, and the up
 backlot update             # restart; no-op when the daemon is already the installed build
 ```
 
+`backlot daemon stop` waits up to 60 seconds after the shutdown acknowledgement
+for the old daemon and its service teardown to finish. Success includes
+`stopped: true` (and retains `stopping: true` for compatibility); if no daemon is
+running, it succeeds without starting one. A shutdown still in progress at the
+deadline returns `infra-error` (exit 3) saying so — the daemon is still shutting
+down, so wait for it to exit rather than issuing another stop.
+
 **What a restart costs.** Leases **survive** it. Services stop, environments drop
 to `warm`, and each holder's next verb rebinds — seconds, the same transition the
 idle sweeper already performs on a leased environment. `update` names every holder
@@ -151,6 +158,49 @@ shapes still works in both directions, but now needs room in the shape you are
 switching *into* — otherwise the cheap ceiling would just be application capacity
 by another name ([decision 0025](docs/decisions/0025-data-only-environments-are-priced-separately.md)).
 
+During conversion to data-only, the old application slot stays reserved until
+its services have stopped. If preparation fails before teardown, the running
+application still counts against the application caps; retrying the conversion
+or returning to the application shape remains supported. A shape change waits
+for an operation already using the environment. For failed teardown and recycle
+retries, see [survivor ownership](docs/architecture.md#journal-upgrade-barrier).
+
+### Choosing datastore presets
+
+`up`, `run` (including `--detach`) and `reset-data` accept `--preset NAME` when
+the stack has one datastore. For multiple stores, name each target explicitly:
+
+```bash
+backlot up --preset main=dev --preset audit=empty
+backlot reset-data --preset main=empty
+backlot run smoke --preset main=dev
+```
+
+Names must appear in that datastore's `presets` catalog, and so must the names a
+`default_preset` declares: a declared default outside the catalog fails every
+bind, with or without `--preset`. Without a catalog (omitted or empty), the
+implicit `default` and any manifest-declared `default_preset` names remain valid.
+Unknown stores, unknown presets, duplicate targets and ambiguous bare names are
+refused before acquiring an environment or changing data. Changing a preset
+restores that store even with ordinary reuse hygiene. Under reuse, unmentioned
+stores keep their data unless their inherited preset was removed or upkeep
+requires a template rebake. `reset-data` and `--pristine` restore every store.
+
+A continuing lease keeps its selections across `up`, `sync`, `reset-data`,
+`--pristine`, failed-bind retries and daemon restart unless explicitly overridden.
+If a manifest removes the selected preset, the next bind or sync selects the
+current default: `default_preset` for the lease kind (`session` or `run`), then
+the first catalog entry, then `default`. A new lease uses the manifest
+defaults and never inherits the previous holder's choices. In `ctx --json`,
+`.datastores.<name>.preset` reports the last completed restore, including earlier
+stores that succeeded when a later store failed; it is absent after a pristine
+wipe until that store is restored. A selection that differs from the one the
+environment last recorded appears as `datastore-preset-changed` in bind
+diagnostics (a first bind or a newly added store has none to differ from). MCP
+and RPC accept the same choices as a `presets` object mapping datastore names
+to preset names. Other CLI verbs reject `--preset` with exit 64 and a message
+on stderr.
+
 ### How long you hold it: `--ttl` for agents, `--holder-pid` for shells
 
 A lease has a TTL, and there are two ways to say when you are done with an
@@ -160,6 +210,15 @@ environment:
 backlot up --ttl 45                       # agents, scripts, CI: hold it for 45 minutes
 BACKLOT_HOLDER_PID=$$ backlot up          # an interactive shell: hold it until THIS shell exits
 ```
+
+Explicit `up` renews the lease. Content operations (`sync`, `bind`, watch saves,
+and `reset-data`) preserve a continuing lease's absolute deadline, including
+when sync falls back to a full bind. Use `up --ttl <minutes>` to extend it;
+`bind --ref <ref> --ttl <minutes>` and `preview <service> --ttl <minutes>` also
+renew explicitly. Read-only polling does not extend ownership. A fresh or
+expired acquisition takes a normal new deadline; `reset-data` requires a live
+lease and refuses an expired one before changing data. `run` always takes its
+own independent lease.
 
 **`--ttl` is the form for anything automated.** `--holder-pid <pid>` (or
 `BACKLOT_HOLDER_PID`) pins the lease to a process so the environment returns to
@@ -174,8 +233,10 @@ frees the environment while you are still using it, the next bind takes it, and
 you are quietly looking at somebody else's database through the same URL.
 
 `backlot release` hands the environment back early. If it answers
-`{"released": false}`, read the `reason`: a lease is keyed by the directory that
-bound it, so releasing from a different worktree matches nothing.
+`{"released": false}`, read the `reason`: use the same holder that bound it
+(`--holder` if supplied, otherwise the caller directory). See
+[physical stack identity and legacy holder recovery](docs/architecture.md#physical-stack-identity)
+for symlink aliases and upgrade recovery.
 
 For your own repo: `npm i -g backlot`, write the `backlot.yml`, then the same
 verbs. Requires Node ≥ 22.13 and git. The daemon auto-spawns on first use (unix
@@ -301,6 +362,12 @@ makes them, the manifest declares what exists, `ctx` reports it.
 it — right for "look at this for ten minutes", wrong for a bookmark, a ticket, a
 device you type an address into by hand, or an app pinned to a dev server. Every
 restart invalidates all of them.
+
+Preview launchers may fork children within their process group: Backlot preserves
+that leased group through sync and idle cleanup, and stops it when the lease ends.
+The launcher must remain alive and keep its tunnel children in that group;
+detached children that call `setsid` are outside this ownership guarantee. Orphan
+tag scanning is Linux-only; macOS uses recorded identity and group teardown.
 
 `cloudflare-named` publishes under a zone you own instead:
 

@@ -23,6 +23,8 @@ export type ErrorClass = 'work-error' | 'env-error' | 'infra-error';
 export interface ServicePid {
   pid: number;
   startTime?: number;
+  pgid?: number;
+  pgids?: number[];
 }
 
 export interface Environment {

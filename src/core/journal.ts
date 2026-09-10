@@ -11,9 +11,17 @@ import type { EnvState, Hygiene, LeaseKind, ServicePid } from './types.js';
  * The journal schema this build understands, stamped into `PRAGMA user_version`.
  *
  * Bump it when a change makes an OLDER daemon misread this journal — not for
- * every additive column. The additive migrations below are deliberately not
- * bumps: an old daemon selecting a known subset of columns reads a newer
- * journal correctly.
+ * every additive column: a bump is unnecessary when an old daemon selecting
+ * a known subset of columns still reads the journal correctly.
+ *
+ * Schema 2 separates lease-intended presets (`leases.presets`) from completed
+ * restores (`envs.presets`). Older daemons would inherit actual data as intent
+ * after a failed bind or pristine wipe. Existing leases migrate from their
+ * environment's recorded choices; tests/preset-selection.test.ts covers the
+ * retry and restart invariant.
+ *
+ * Schema 3's survivor-group compatibility barrier is documented in
+ * docs/architecture.md#journal-upgrade-barrier.
  *
  * What this exists to stop is the DOWNGRADE, which has already cost once. The
  * sha256 env-id migration stranded pre-upgrade rows that then counted against
@@ -24,7 +32,7 @@ import type { EnvState, Hygiene, LeaseKind, ServicePid } from './types.js';
  * test lane's database. Disk is truth (decision 0009), so the truth has to say
  * what wrote it.
  */
-export const JOURNAL_SCHEMA_VERSION = 1;
+export const JOURNAL_SCHEMA_VERSION = 3;
 
 /**
  * service_pids was once `{"web": 1234}` and is now
@@ -43,7 +51,9 @@ function parseServicePids(raw: string): Record<string, ServicePid> {
   for (const [name, v] of Object.entries(parsed as Record<string, unknown>)) {
     if (typeof v === 'number') out[name] = { pid: v };
     else if (v && typeof v === 'object' && typeof (v as ServicePid).pid === 'number') {
-      out[name] = { pid: (v as ServicePid).pid, startTime: (v as ServicePid).startTime };
+      out[name] = { pid: (v as ServicePid).pid, startTime: (v as ServicePid).startTime,
+        ...(typeof (v as ServicePid).pgid === 'number' ? { pgid: (v as ServicePid).pgid } : {}),
+        ...(Array.isArray((v as ServicePid).pgids) ? { pgids: (v as ServicePid).pgids!.filter(g => Number.isSafeInteger(g) && g > 0) } : {}) };
     }
   }
   return out;
@@ -53,6 +63,8 @@ export interface EnvRow {
   id: string;
   stack: string;
   stackRoot: string;
+  /** Retains the old default-holder spelling without rewriting opaque holder IDs. */
+  legacyStackRoot?: string;
   state: EnvState;
   root: string;
   ports: Record<string, number>;
@@ -86,6 +98,7 @@ export interface EnvRow {
 }
 
 export interface LeaseRow {
+  presets?: Record<string, string>;
   id: string;
   envId: string;
   kind: LeaseKind;
@@ -177,6 +190,12 @@ export class Journal {
         if (!/duplicate column name/i.test(String((err as Error).message ?? err))) throw err;
       }
     }
+    try {
+      this.db.exec('ALTER TABLE leases ADD COLUMN presets TEXT');
+      this.db.exec("UPDATE leases SET presets = COALESCE((SELECT presets FROM envs WHERE envs.id = leases.env_id), '{}')");
+    } catch (err) {
+      if (!/duplicate column name/i.test(String((err as Error).message ?? err))) throw err;
+    }
     // Migration for journals created before fail_streak existed. Swallowing
     // EVERY error here hid real failures (a corrupt journal, a locked file) as
     // "column already exists", so the daemon carried on against a schema it did
@@ -203,6 +222,11 @@ export class Journal {
     } catch (err) {
       const msg = String((err as Error).message ?? err);
       if (!/duplicate column name/i.test(msg)) throw err;
+    }
+    try {
+      this.db.exec('ALTER TABLE envs ADD COLUMN legacy_stack_root TEXT');
+    } catch (err) {
+      if (!/duplicate column name/i.test(String((err as Error).message ?? err))) throw err;
     }
     // Stamp LAST: every migration above has run, so the stamp means "this
     // journal has the schema that number describes" rather than "a build with
@@ -242,6 +266,7 @@ export class Journal {
       id: r.id as string,
       stack: r.stack as string,
       stackRoot: r.stack_root as string,
+      legacyStackRoot: (r.legacy_stack_root as string | null) ?? undefined,
       state: r.state as EnvState,
       root: r.root as string,
       ports: JSON.parse(r.ports as string),
@@ -295,6 +320,16 @@ export class Journal {
     );
   }
 
+  /** Normalize identity metadata atomically; env IDs, namespaces, leases and counters stay intact. */
+  canonicalizeStacks(changes: Array<{ id: string; stack: string; root: string }>): void {
+    this.withTx(() => {
+      const update = this.db.prepare(`UPDATE envs SET stack = ?,
+        legacy_stack_root = COALESCE(legacy_stack_root, CASE WHEN stack_root != ? THEN stack_root END),
+        stack_root = ? WHERE id = ?`);
+      for (const change of changes) update.run(change.stack, change.root, change.root, change.id);
+    });
+  }
+
   deleteEnv(id: string): void {
     // Atomic: a kill between these two deletes left a lease naming an env row
     // that no longer existed (the sweeper prunes that half-state as backstop).
@@ -335,13 +370,13 @@ export class Journal {
     this.db
       .prepare(
         `INSERT INTO leases (id, env_id, kind, holder, hygiene, expires_at, holder_pid, holder_start,
-           preview_service, preview_url, preview_pid, preview_start, preview_port)
-         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+           preview_service, preview_url, preview_pid, preview_start, preview_port, presets)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
          ON CONFLICT(id) DO UPDATE SET expires_at=excluded.expires_at, hygiene=excluded.hygiene,
            holder_pid=excluded.holder_pid, holder_start=excluded.holder_start,
            preview_service=excluded.preview_service, preview_url=excluded.preview_url,
            preview_pid=excluded.preview_pid, preview_start=excluded.preview_start,
-           preview_port=excluded.preview_port`,
+           preview_port=excluded.preview_port, presets=excluded.presets`,
       )
       .run(
         l.id,
@@ -357,6 +392,7 @@ export class Journal {
         l.previewPid ?? null,
         l.previewStart ?? null,
         l.previewPort ?? null,
+        l.presets === undefined ? null : JSON.stringify(l.presets),
       );
   }
 
@@ -383,6 +419,7 @@ export class Journal {
     return {
       id: r.id as string,
       envId: r.env_id as string,
+      presets: r.presets == null ? undefined : JSON.parse(r.presets as string),
       kind: r.kind as LeaseKind,
       holder: r.holder as string,
       hygiene: r.hygiene as Hygiene,
@@ -398,12 +435,17 @@ export class Journal {
   }
 
   leaseForHolder(holder: string, stack: string): LeaseRow | undefined {
-    const r = this.db
-      .prepare(
-        `SELECT l.* FROM leases l JOIN envs e ON e.id = l.env_id WHERE l.holder = ? AND e.stack = ?`,
-      )
-      .get(holder, stack);
-    return r ? this.rowToLease(r as Record<string, unknown>) : undefined;
+    const rows = this.db.prepare(
+      `SELECT l.* FROM leases l JOIN envs e ON e.id = l.env_id WHERE l.holder = ? AND e.stack = ?`,
+    ).all(holder, stack) as Record<string, unknown>[];
+    if (rows.length > 1) {
+      throw new BrokerError(
+        'env-error',
+        `ambiguous leases for holder '${holder}': ${rows.map((r) => r.env_id).join(', ')}; inspect 'backlot status', then retire one with 'backlot pool recycle <envId> --force' — that destroys the selected environment and its data and ends its lease`,
+        'lease',
+      );
+    }
+    return rows[0] ? this.rowToLease(rows[0]) : undefined;
   }
 
   leaseForEnv(envId: string): LeaseRow | undefined {

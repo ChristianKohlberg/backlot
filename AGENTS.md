@@ -24,7 +24,7 @@ Services are spawned detached (`detached: true` in `spawn`) so they outlive the 
 
 Consequence: a group kill (`killGroupVerified`) is not sufficient teardown — a service that called `setsid()` or spawned a detached grandchild escapes the `-pgid` signal and can keep holding its port. `stopAll()` must therefore always be followed by a reap of journal-recorded pids plus a tag scan before trusting any port-free check. **Every `stopAll()` call site is bound by this** — `bindAndStart`, `teardownClaimed`, the quiesce path, and `shutdown()`. Deferring the reap to "the next bind will handle it" is the bug (#34): a quiesced env can sit cold for hours, and a stopping daemon has no next anything. `reapEnvProcesses` in `src/daemon/engine.ts` owns this invariant (see its doc comment for the failure modes and the survivor-preservation contract); `tests/env-port-survivor.test.ts` and `tests/agent-lease-and-recycle.test.ts` are the regression tests. Crash recovery follows the same rule: `recover()` reaps recorded pids for every journaled env and re-runs `teardownClaimed` for `state='recycling'` rows.
 
-Recorded `servicePids` hold only the **top-level service pids** — a service's own children were never on the books, so the tag scan is the only thing that finds them. For anything that also scrubbed the tag, `reapEnvTree` reaps by cwd (`scanByCwd`, which matches a `(deleted)` cwd too). That path is **teardown-only**: a quiesced env keeps its tree on disk and someone's shell may legitimately be sitting in it.
+Supervision initially records top-level service pids; reclamation also records discovered survivors. `reapPids` in `src/daemon/supervisor.ts` owns their identity and group-preservation contract. For anything that also scrubbed the tag, `reapEnvTree` reaps by cwd (`scanByCwd`, which matches a `(deleted)` cwd too). That path is **teardown-only**: a quiesced env keeps its tree on disk and someone's shell may legitimately be sitting in it.
 
 ## Publishers own their dialect — the engine must not learn one
 
@@ -63,12 +63,17 @@ sweeper's torn-row prune), at `teardownClaimed` (before `deleteEnv` drops the ro
 that names it), at `shutdown()`, and in `recover()`.
 
 The sharp edge: because the tunnel outlives service restarts, the tag-based
-reclaim paths must **skip it** — `reapEnvProcesses`' scan filters out the pid the
-env's live lease records, and `poolGc` skips every leased preview pid. Do NOT
+reclaim paths must **skip it** — `reapEnvProcesses`' scan filters out the process
+group the env's live lease records, and `poolGc` skips every leased one. Do NOT
 "simplify" those filters away: without them Linux shoots the tunnel at a boundary
 where macOS keeps it, and that platform split is the whole bug class this feature
 had to close, and all three of them (`pool gc`, the scan, doctor's orphan report)
-must agree on `leasedPreviewPids()` or one will act on what another calls healthy.
+must agree on `leasedPreviewPids(tagged)` or one will act on what another calls
+healthy. That classifier exempts the verified leader's whole tagged process group
+(a launcher's same-group tunnel child included), never a bare pid or a `preview:`
+label, and `setsid` descendants are outside it — the contract is in
+[decision 0027](docs/decisions/0027-lease-scoped-public-preview.md) and
+`tests/preview-process-group.test.ts` is the regression test.
 
 `reconcilePreviewForBind` owns what a bind **and a `sync`/`--watch` projection**
 do to a live tunnel: it tears it
@@ -88,6 +93,14 @@ delete (it cannot take the env lock — `tryClaim` calls it under the pool lock)
 so no stale snapshot can forget a tunnel someone else just published. `tests/preview-tunnel.test.ts`
 covers all of it.
 
+## Physical stack identity
+
+See [physical stack identity](docs/architecture.md#physical-stack-identity) for
+canonical paths, legacy holder recovery, and template retirement safeguards.
+`callerHolder` / `adoptLegacyAliases` in `src/daemon/engine.ts` own identity
+reconciliation; `tests/stack-identity.test.ts` covers CLI/MCP compatibility,
+data preservation, deferred migration, and retirement (including old retention).
+
 ## Leases: `--ttl` is the agent form, `--holder-pid` is not
 
 `--holder-pid` / `BACKLOT_HOLDER_PID` frees the environment the moment the named process exits, which only helps a caller that outlives the command. `BACKLOT_HOLDER_PID=$$` from an agent harness names an already-exited shell, so the lease is reclaimable on arrival: the sweeper's dead-holder rule frees the env, the next binder takes it, and the first caller is left looking at a different, unseeded store through the same URL. It presents as a stale seed template — the wrong subsystem entirely. Binds naming a dead pid are now refused (exit 64). See the lease bullet in `docs/architecture.md`.
@@ -104,7 +117,10 @@ Pool commands are shared-box operations: `pool recycle` with no id targets **eve
 
 The consequence worth remembering: **waiting can never clear a machine-wide block**, because a release leaves the row behind. `structuralCapacityBlock` therefore treats it as structural unless something is evictable or transient — the old code explicitly assumed the opposite ("another stack will release") and burned the full window (#47). `tests/pool-machine-capacity.test.ts` covers all of it.
 
-There is a **third ceiling**: `poolMaxDataOnly` for data-only environments, which are charged against neither application cap ([decision 0025](docs/decisions/0025-data-only-environments-are-priced-separately.md)) — the app caps measure cores and memory, and a data lease runs nothing. So `poolMax`/`poolMaxTotal` now mean *application* environments (`appEnvs()`), and every capacity decision buckets by shape, eviction included. The sharp edge: because reuse is never capacity-checked, **changing an environment's shape is a capacity event** — `convertShape` moves the row between buckets only if the destination has room, and writes it at claim time so a concurrent claim sees the new bucket. Unmetered, that conversion turns the cheap ceiling into application capacity. Pinning the shape instead is simpler and was rejected: it silently removes 0023's supported both-ways lease switching (`tests/data-only-lease.test.ts` catches this — heed it).
+The data-only ceiling and shape-conversion accounting are defined in
+[decision 0025](docs/decisions/0025-data-only-environments-are-priced-separately.md).
+`stopForBind`, `pendingBinds` and `tryClaim` enforce the transition;
+`tests/conversion-capacity.test.ts` and `tests/data-only-lease.test.ts` cover it.
 
 ## Version skew is a first-class failure, and the daemon outlives the install
 
@@ -141,6 +157,13 @@ single object (the primary, manifest entry 0) — `allLogins` is where the set l
 user_version`; a daemon refuses to open a journal stamped newer than it understands.
 Bump it only when a change makes an older daemon **misread** this journal — the
 additive `ALTER TABLE` migrations are not bumps.
+
+For preset intent versus completed restores and its compatibility barrier, see
+the `JOURNAL_SCHEMA_VERSION` comment in `src/core/journal.ts`.
+
+See [journal upgrade barrier](docs/architecture.md#journal-upgrade-barrier) for
+survivor group ownership and old-reader refusal;
+`tests/conversion-capacity.test.ts` covers failed eviction and group retry.
 
 ## Caller environment inputs
 

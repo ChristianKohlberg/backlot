@@ -6,7 +6,8 @@
 
 Every bind carries a hygiene level:
 
-- `reuse` — keep everything (human inspect loop; fastest).
+- `reuse` — retain compatible state (human inspect loop; fastest); see
+  [preset selection](../../README.md#choosing-datastore-presets) for restore rules.
 - `reset-data` — restore the data template, keep build caches (default for runs).
 - `pristine` — a fresh environment (merge-grade verdicts).
 

@@ -4,11 +4,15 @@
  * human); exit codes are contractual — 0 ok, 1 work-error, 2 env-error,
  * 3 infra-error, 64 usage. See docs/architecture.md §11.
  */
-import { ensureDaemon, rpc, classifyClientError, awaitDaemonGone, type RpcError } from './client.js';
+import { ensureDaemon, daemonInfo, rpc, classifyClientError, awaitDaemonGone, DAEMON_STOP_TIMEOUT_MS, type RpcError, type RpcResponse } from './client.js';
 import { isAlive } from '../core/procscan.js';
+import { join } from 'node:path';
+import { stateRoot } from '../core/paths.js';
 import { VERSION, versionSkew } from '../core/version.js';
 import { installKind } from './install.js';
 import { collectCallerEnv } from '../core/caller-env.js';
+import { loadStack } from '../core/manifest.js';
+import { parsePresetArgs } from '../core/presets.js';
 import { BrokerError } from '../core/util.js';
 
 const USAGE = `backlot — puts a working instance of a web application in front of you.
@@ -80,6 +84,9 @@ already exited. Such a lease would be reclaimable the instant it was created —
 environment would be handed to the next caller while you were still using it — so
 backlot refuses the bind instead. Use --ttl.
 
+up, run and reset-data accept --preset NAME (one datastore), or repeatable
+--preset DATASTORE=NAME. ctx reports each datastore's selected preset.
+
 Every verb accepts --json. Long verbs (up/run/sync/bind/reset-data) show live progress
 on a terminal (stderr); force with --progress, silence with --quiet. stdout stays clean.
 Exit codes: 0 ok · 1 work-error · 2 env-error · 3 infra-error · 64 usage.`;
@@ -95,6 +102,7 @@ const VALUE_FLAGS = new Set(['--holder', '--holder-pid', '--ttl', '--role', '--l
 const BOOL_FLAGS = new Set(['--json', '--watch', '--reset-data', '--pristine', '--pull', '--detach', '--all', '--force', '--raw', '--data-only', '--progress', '--quiet', '--check']);
 
 const flagVals = new Map<string, string>();
+const presetArgs: string[] = [];
 const flags = new Set<string>();
 const positional: string[] = [];
 let passthrough: string[] | null = null; // for `exec` / after `--`
@@ -120,6 +128,7 @@ let passthrough: string[] | null = null; // for `exec` / after `--`
         process.exit(64);
       }
       flagVals.set(a, v);
+      if (a === '--preset') presetArgs.push(v);
       i++;
     } else if (BOOL_FLAGS.has(a)) {
       flags.add(a);
@@ -191,6 +200,10 @@ function hygiene(): string | undefined {
 }
 
 async function main(): Promise<void> {
+  if (presetArgs.length > 0 && !['up', 'run', 'reset-data'].includes(verb ?? '')) {
+    console.error('backlot: --preset is supported by up, run and reset-data');
+    process.exit(64);
+  }
   if (!verb || verb === 'help' || verb === '--help' || verb === '-h') {
     console.log(USAGE);
     return;
@@ -216,7 +229,17 @@ async function main(): Promise<void> {
   // Collect before autospawn: a malformed binding manifest must not start a
   // shared daemon with input values in its inherited environment.
   const callerEnv = ['up', 'run'].includes(verb) ? collectCallerEnv(process.cwd()) : undefined;
-  const daemon = await ensureDaemon(process.cwd());
+  let presets: Record<string, string> | undefined;
+  if (presetArgs.length > 0) {
+    const manifest = loadStack(process.cwd()).manifest;
+    presets = parsePresetArgs(manifest, presetArgs);
+  }
+  const stopping = verb === 'daemon' && positional[0] === 'stop';
+  const daemon = stopping ? await daemonInfo() : await ensureDaemon(process.cwd());
+  if (!daemon) {
+    out({ stopping: true, stopped: true });
+    return;
+  }
 
   // Version skew is REFUSED, not warned about.
   //
@@ -271,7 +294,7 @@ async function main(): Promise<void> {
     }
   }
 
-  let res;
+  let res: RpcResponse | undefined;
   switch (verb) {
     case 'up': {
       const ttl = flagValue('--ttl');
@@ -291,7 +314,7 @@ async function main(): Promise<void> {
       }
       res = await rpc(
         'up',
-        { cwd, holder, holderPid, hygiene: hygiene(), watch: flags.has('--watch'), ttlMs, services: positional, dataOnly, callerEnv },
+        { cwd, holder, holderPid, hygiene: hygiene(), watch: flags.has('--watch'), ttlMs, services: positional, dataOnly, callerEnv, presets },
         progress,
       );
       endProgress();
@@ -304,13 +327,13 @@ async function main(): Promise<void> {
         process.exit(64);
       }
       if (flags.has('--detach')) {
-        res = await rpc('run-detach', { cwd, holder, check, hygiene: hygiene(), callerEnv });
+        res = await rpc('run-detach', { cwd, holder, check, hygiene: hygiene(), callerEnv, presets });
         if (res.ok) {
           out(res.data);
           return;
         }
       } else {
-        res = await rpc('run', { cwd, holder, check, hygiene: hygiene(), pull: flags.has('--pull'), callerEnv }, progress);
+        res = await rpc('run', { cwd, holder, check, hygiene: hygiene(), pull: flags.has('--pull'), callerEnv, presets }, progress);
         endProgress();
 
       }
@@ -411,7 +434,7 @@ async function main(): Promise<void> {
       break;
     }
     case 'reset-data':
-      res = await rpc('reset-data', { cwd, holder }, progress);
+      res = await rpc('reset-data', { cwd, holder, presets }, progress);
       endProgress();
       break;
     case 'token': {
@@ -505,6 +528,19 @@ async function main(): Promise<void> {
         process.exit(64);
       }
       res = await rpc('shutdown', {});
+      if (!res.ok) break;
+      if (!(await awaitDaemonGone(daemon.pid, DAEMON_STOP_TIMEOUT_MS))) {
+        errExit({
+          class: 'infra-error',
+          message:
+            `the daemon accepted shutdown and is still shutting down after ${Math.round(DAEMON_STOP_TIMEOUT_MS / 1000)}s — ` +
+            `service teardown may still be in progress. Do not issue another stop; wait for ${daemon.pid !== undefined ? `pid ${daemon.pid}` : 'the daemon'} to exit, ` +
+            `and check ${join(stateRoot(), 'daemon.log')} if it never does.`,
+          source: 'daemon',
+        });
+        return;
+      }
+      res = { ok: true, data: { stopping: true, stopped: true } };
       break;
     }
     case 'update': {

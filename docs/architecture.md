@@ -9,6 +9,25 @@ This document is the founding design. It was produced by working a real system
 failure mode we could think of, then generalizing. Individual decisions are recorded
 in [`decisions/`](decisions/); this document is the connected whole.
 
+### Journal upgrade barrier
+
+Journal schema 3 retains every observed unresolved process group in
+`servicePids.*.pgid` and additional `pgids`, including groups a process leaves.
+A dead recorded process does not prove these groups are empty. Retries and
+recovery check every persisted group for liveness, and signal only through a
+process whose identity is verified.
+Failed teardown preserves a warm, retryable environment with its ownership and
+capacity charge; deletion waits for confirmed reclamation, including the final
+cwd scan. `pool recycle`, including `--force`, reports unreaped survivors
+separately from a busy or leased environment. Run `backlot doctor` to inspect
+them, then retry recycling once they can be reclaimed; force does not bypass
+unresolved ownership.
+
+Schema 2 readers would discard the group fields and incorrectly release capacity,
+so they must refuse a schema 3 journal. Upgrade the running daemon before using
+it; do not lower `PRAGMA user_version` to bypass the barrier. Schema 3 retains
+schema 2's lease preset intent and the additive physical-path identity migration.
+
 ---
 
 ## 1. The problem
@@ -56,7 +75,7 @@ Kubernetes, Windows, secrets management, and dashboards are not.
 | **Substrate** | Where environments physically live, behind a driver: `local` (supervised processes in a directory), later `docker`, `morph`, `sprites`, `ssh`. |
 | **Environment** | A pooled slot on a substrate: its own copy of the tree, warm caches, running services, allocated ports, a datastore namespace. Durable; belongs to the pool, never to a person or task. A lease may cover a **subset** of it — a service slice (`up <service>`), or the datastores alone (`up --data-only`, [decision 0023](decisions/0023-data-only-leases.md)) for a test lane that needs a seeded database rather than an application. |
 | **Binding** | A source state (ref + dirty diff) plus a data state (preset, at a hygiene level) attached to an environment. An immutable snapshot. |
-| **Lease** | Temporary ownership of an environment, with a TTL refreshed by the verbs that BIND (`up`, `sync`, `bind`, `run`). Read-only verbs (`ctx`, `logs`, `token`, `pull`, `status`) do not refresh it. Expiry returns the environment to the pool **warm** — nothing is torn down. |
+| **Lease** | Temporary ownership of an environment; see [lease deadlines and renewal](../README.md#how-long-you-hold-it---ttl-for-agents---holder-pid-for-shells). Expiry returns the environment to the pool **warm** — nothing is torn down. |
 
 Plus one verb-noun: a **Run** — a named check executed against a binding, producing an
 exit code, a JSON verdict, and collected artifacts.
@@ -73,6 +92,47 @@ running *for nobody* — the pool is a fixed, intentional set.
 different work into that tree. Source worktrees visit environments; environments never
 visit worktrees. Consequences: caches survive rebinds, ports (and therefore URLs) are
 stable for an environment's lifetime, and the consumer's worktree is never touched.
+
+### Physical stack identity
+
+Stack identity uses the physical project directory: symlink spellings refer to the
+same stack, while separate Git worktree directories remain distinct. CLI and MCP
+resolve paths in the caller process before RPC. Explicit holder strings stay
+opaque; new implicit holders use the physical caller directory.
+
+On upgrade, verified legacy alias identities migrate without changing environment
+IDs, ports, datastore namespaces, data, lease IDs, or holder strings. Reconciliation
+runs at recovery, holder verbs, and before ordinary retention and orphan checks.
+An unreadable manifest delays migration and protects its template ownership from
+ordinary pruning; renamed or unavailable sources do not prove an alias.
+
+Old path-shaped holders are never guessed to be implicit or rewritten. A caller's
+own live canonical lease takes precedence. Otherwise, a legacy directory holder
+that resolves to the caller (including a symlinked subdirectory on an already
+canonical stack), or whose mapping cannot be resolved, blocks the default request
+with the exact `--holder` needed to inspect or release it. If aliases converge on
+several leases for the same holder, Backlot refuses ambiguity and names the
+environments. Recovery requires inspecting `backlot status` and explicitly choosing
+`backlot pool recycle <envId> --force`: this destroys the selected environment and
+its data and ends its lease.
+
+Proven obsolete template directories move atomically under the bake lock into
+`retired-templates/` in the state root, outside older daemons' ordinary retention.
+A `.retired-stack.json` descriptor keeps cleanup discoverable after the last
+environment is recycled. Retirement waits until no environment carries the old
+identity and no canonical environment is busy. Namespace ownership checks across
+both template roots preserve shared or ambiguous server templates, including
+truncated-name collisions; ordinary retention respects those owners too.
+
+Recovery performs no external retirement drops. Each sweep or explicit
+`backlot pool gc` retirement batch attempts at most one external drop, capped at
+two seconds or the shorter configured command timeout. Unconfirmed drops retain
+their markers and `.retirement.json` records with durable backoff; automatic
+attempts stop after three failures. After repairing the appliance, run
+`backlot pool gc` to retry retained records despite backoff or the attempt limit;
+repeat for additional pending markers. This still preserves shared or ambiguous
+ownership. Ordinary retention never prunes retirement descriptors or failure
+records.
 
 ### The safety invariant
 
@@ -209,7 +269,7 @@ local/remote abstraction; the local substrate is enumerate-and-copy.)
   `@rebake-template` fingerprints — a lockfile, a migration — falls back to the full
   bind path, which runs the rule and restarts services; skipping the rule silently
   would hand out an environment the manifest says is stale. Stopped on
-  release/expiry/quiesce/recycle. Watch activity refreshes the lease.
+  release/expiry/quiesce/recycle. See [lease renewal](../README.md#how-long-you-hold-it---ttl-for-agents---holder-pid-for-shells) for watch activity.
 - The environment-side reset restores tracked files hard on every bind. A **clean-slate**
   bind (`--reset-data` or `--pristine`) additionally removes untracked env-side files —
   droppings left by a check, service, or `exec` — **except** declared `caches:`
@@ -264,7 +324,7 @@ first bind; no presets or templates).
 
 | Level | Meaning | Typical consumer |
 | --- | --- | --- |
-| `reuse` | keep everything | human inspect loop |
+| `reuse` | retain compatible state; see [preset selection](../README.md#choosing-datastore-presets) | human inspect loop |
 | `reset-data` | restore data template, keep all build caches | agent verify loops (default for runs) |
 | `pristine` | fresh environment | merge-grade verdicts; auto-escalation |
 
@@ -328,7 +388,7 @@ Every failure is classified — the field an agent branches on mechanically:
   "Untouched" counts real use — `exec`, `ctx`, `logs`, `pull` — not just binds, so an actively
   worked environment is never quiesced underneath its agent.
 - **Leases need no heartbeat daemon** because losing a lease is designed to be
-  worthless: a binding verb refreshes the TTL (read-only verbs deliberately do not,
+  worthless: an explicit `up` refreshes the TTL (content and read-only verbs deliberately do not,
   so an idle agent that only polls `ctx` does not hold an environment forever);
   expiry returns the env warm; the source
   of truth never left the worktree. Agents that vanish cost nothing.
@@ -367,7 +427,7 @@ backlot reset-data | pull | release
 backlot preview <service> [--ttl <minutes>] | preview stop   # publish one service publicly (below)
 backlot status | doctor                          # pool state | active health check
 backlot pool ls|recycle [--all]|reconcile|gc|doctor
-backlot daemon stop
+backlot daemon stop                              # waits until the daemon and its services are gone (README)
 backlot update [--check] [--force]               # run the INSTALLED build (below)
 backlot --version
 ```
@@ -448,14 +508,14 @@ variable > `$STATE_DIR/config.json` > built-in default.
 | `BACKLOT_POOL_MAX_DATA_ONLY` | `poolMaxDataOnly` | `max(4, 2 x heuristic)` — data-only envs, machine-wide, counted against neither application cap (decision 0025) |
 | `BACKLOT_LEASE_TTL_MS` | `sessionTtlMs` / `runTtlMs` | 30 min / 10 min |
 | `BACKLOT_IDLE_TTL_MS` | `idleTtlMs` | 30 min |
-| `BACKLOT_WAIT_MS` | `waitMs` | 60 s (queue-at-capacity timeout) |
+| `BACKLOT_WAIT_MS` | `waitMs` | 60 s (queue-at-capacity timeout; also bounds a shape change waiting on an operation in flight on the holder's own environment) |
 | `BACKLOT_ARTIFACT_DAYS` | `artifactDays` | 7 |
 | `BACKLOT_JOB_DAYS` | `jobDays` | 7 |
 | `BACKLOT_LOG_CAP_BYTES` | `logCapBytes` | 5 MB |
 | `BACKLOT_TEMPLATES_KEEP` | `templatesKeep` | 4 per stack |
 | `BACKLOT_SWEEP_MS` | — | 15 s (lease/idle sweep cadence) |
 | `BACKLOT_PREVIEW_PUBLISHER` | — | `cloudflare-quick` — the preview publisher adapter. The one knob a stack outranks: the manifest's `preview.publisher` wins over it |
-| `BACKLOT_CLOUDFLARED` | — | `cloudflared` off `PATH` — the binary that publisher runs |
+| `BACKLOT_CLOUDFLARED` | — | `cloudflared` off `PATH` — the executable that publisher runs. A launcher that forks the real tunnel must stay alive and keep it in its own process group (README, "A preview URL that is still valid tomorrow") |
 | `BACKLOT_PREVIEW_START_TIMEOUT_MS` | — | 45 s (wait for a quick tunnel to publish its URL) |
 | `BACKLOT_RETENTION_MS` | — | 10 min (disk retention cadence) |
 

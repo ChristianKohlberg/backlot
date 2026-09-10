@@ -268,10 +268,10 @@ export class EnvSupervisor {
         // Verify the group is actually gone rather than resolving as soon as
         // SIGKILL is *sent* — the caller goes on to delete the env root and
         // drop the pid, so a survivor here becomes an untrackable orphan.
-        const dead = await killGroupVerified(r.proc.pid, r.startTime);
-        if (!dead) {
+        const remaining = await reapPids({ [name]: { pid: r.proc.pid, startTime: r.startTime } });
+        if (remaining[name]) {
           this.note(name, `still running after SIGKILL (pid ${r.proc.pid})`);
-          survivors[name] = { pid: r.proc.pid, startTime: r.startTime };
+          survivors[name] = remaining[name];
         }
       }
       this.note(name, survivors[name] ? 'stop failed' : 'stopped');
@@ -318,12 +318,16 @@ function signalGroup(pgid: number, pid: number, signal: NodeJS.Signals): void {
  * survivor became unreachable forever. Escalation plus a verified verdict is
  * what makes "reaped" mean reaped.
  *
- * Returns true if the leader is confirmed gone.
+ * Returns true only when the observed and supplied recorded groups are empty.
+ * `observeGroup` hands the current group to reapPids before signalling so its
+ * ownership survives even if the recorded process exits during reclamation.
  */
 export async function killGroupVerified(
   pid: number,
   recordedStart?: number,
   graceMs = 2000,
+  recordedGroup?: number,
+  observeGroup?: (pgid: number) => void,
 ): Promise<boolean> {
   if (!sameProcess(pid, recordedStart)) {
     // The pid is no longer the process we recorded. Whatever now sits in that
@@ -331,12 +335,13 @@ export async function killGroupVerified(
     // are indistinguishable by pid alone — so signalling it is never safe.
     // Report gone only if the group is genuinely empty; otherwise leave it
     // unresolved for tag-based reclaim, which pid reuse cannot confuse.
-    return !groupAlive(pid);
+    return !groupAlive(recordedGroup ?? pid);
   }
   // Resolve the group BEFORE signalling: once the leader exits its /proc entry
   // is gone and the surviving siblings become unattributable.
   const pgid = processGroup(pid) ?? pid;
-  const gone = () => !groupAlive(pgid);
+  observeGroup?.(pgid);
+  const gone = () => !groupAlive(pgid) && (recordedGroup === undefined || !groupAlive(recordedGroup));
 
   signalGroup(pgid, pid, 'SIGTERM');
   const deadline = Date.now() + graceMs;
@@ -365,15 +370,47 @@ export async function killGroupVerified(
  * Returns the entries that were NOT confirmed dead. The caller must keep those
  * in the journal — a forgotten pid is an orphan nobody can ever reclaim.
  */
-export async function reapPids(pids: Record<string, ServicePid>): Promise<Record<string, ServicePid>> {
+export async function reapPids(pids: Record<string, ServicePid>, kill = killGroupVerified): Promise<Record<string, ServicePid>> {
   const survivors: Record<string, ServicePid> = {};
   await Promise.all(
     Object.entries(pids).map(async ([name, rec]) => {
-      // Recorded pids are group leaders (services spawn detached) — signal the
-      // group so the actual server dies too, not just the sh -c wrapper.
-      const dead = await killGroupVerified(rec.pid, rec.startTime);
-      if (!dead) survivors[name] = rec;
+      // Discovery can record nonleaders, and a process can move groups. Keep
+      // every observed live group even after its identifying process exits;
+      // only a verified process identity authorizes signalling a current group.
+      const groups = new Set(serviceGroups(rec));
+      if (sameProcess(rec.pid, rec.startTime)) groups.add(processGroup(rec.pid) ?? rec.pid);
+      const dead = await kill(rec.pid, rec.startTime, undefined, rec.pgid, group => groups.add(group));
+      const remaining = [...groups].filter(groupAlive);
+      if (remaining.length > 0) survivors[name] = withServiceGroups(rec, remaining);
+      else if (!dead && sameProcess(rec.pid, rec.startTime)) survivors[name] = rec;
     }),
   );
   return survivors;
+}
+
+export function serviceGroups(rec: ServicePid): number[] {
+  return [...new Set([rec.pgid ?? rec.pid, ...(rec.pgids ?? [])])];
+}
+
+function withServiceGroups(rec: ServicePid, groups: number[]): ServicePid {
+  const identity = { ...rec };
+  delete identity.pgid;
+  delete identity.pgids;
+  const [first, ...rest] = groups;
+  return { ...identity, ...(first !== rec.pid ? { pgid: first } : {}), ...(rest.length ? { pgids: rest } : {}) };
+}
+
+export function mergeServicePids(...sets: Array<Record<string, ServicePid> | undefined>): Record<string, ServicePid> {
+  const merged: Record<string, ServicePid> = {};
+  for (const set of sets) for (const [name, rec] of Object.entries(set ?? {})) {
+    const match = Object.entries(merged).find(([, other]) => other.pid === rec.pid && other.startTime === rec.startTime);
+    if (match) {
+      merged[match[0]] = withServiceGroups(rec, [...new Set([...serviceGroups(match[1]), ...serviceGroups(rec)])]);
+    } else {
+      let key = name;
+      while (Object.hasOwn(merged, key)) key += ':';
+      merged[key] = rec;
+    }
+  }
+  return merged;
 }
