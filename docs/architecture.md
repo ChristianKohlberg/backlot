@@ -455,7 +455,7 @@ variable > `$STATE_DIR/config.json` > built-in default.
 | `BACKLOT_TEMPLATES_KEEP` | `templatesKeep` | 4 per stack |
 | `BACKLOT_SWEEP_MS` | — | 15 s (lease/idle sweep cadence) |
 | `BACKLOT_PREVIEW_PUBLISHER` | — | `cloudflare-quick` — the preview publisher adapter. The one knob a stack outranks: the manifest's `preview.publisher` wins over it |
-| `BACKLOT_CLOUDFLARED` | — | `cloudflared` off `PATH` — the binary that publisher runs |
+| `BACKLOT_CLOUDFLARED` | — | `cloudflared` off `PATH` — the executable that publisher runs. A launcher that forks the real tunnel must stay alive and keep it in its own process group (README, "A preview URL that is still valid tomorrow") |
 | `BACKLOT_PREVIEW_START_TIMEOUT_MS` | — | 45 s (wait for a quick tunnel to publish its URL) |
 | `BACKLOT_RETENTION_MS` | — | 10 min (disk retention cadence) |
 

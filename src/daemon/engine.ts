@@ -22,7 +22,7 @@ import { makeDatastore, type DsHandle } from '../drivers/datastores.js';
 import { ensureAppliance, stopAppliance, probeTcp } from '../drivers/appliances.js';
 import { DEFAULT_PREVIEW_PUBLISHER, resolvePreviewPublisher } from '../drivers/preview.js';
 import { EnvSupervisor, killGroupVerified, reapPids } from './supervisor.js';
-import { isAlive, processGroup, procScanSupported, sameProcess, scanByCwd, scanTagged, serviceTag, startTime } from '../core/procscan.js';
+import { isAlive, processGroup, procScanSupported, sameProcess, scanByCwd, scanTagged, serviceTag, startTime, type TaggedProc } from '../core/procscan.js';
 import { policy } from '../core/policy.js';
 import { kernelSleepGap, readKernelSleepRecord } from '../core/sleep.js';
 import { retentionSweep } from '../core/retention.js';
@@ -317,7 +317,7 @@ export class Engine {
 
     // A preview tunnel recorded on a live lease is accounted for by that lease,
     // whatever heat its environment is in — a quiesced env keeps both.
-    const leasedPreviews = this.leasedPreviewPids();
+    const leasedPreviews = this.leasedPreviewPids(tagged);
 
     const reclaimed: Array<{ pid: number; envId: string; service: string }> = [];
     let skipped = 0;
@@ -1233,8 +1233,10 @@ export class Engine {
               // by group, not just leader pid: `sh -c` forks, so the real
               // server is a same-group sibling of the recorded leader.
               const own = new Set(Object.values(sup.pids()).map((r) => r.pid));
-              const stale = scanTagged(stateRoot()).filter(
-                (p) => p.envId === env.id && !own.has(p.pid) && !own.has(processGroup(p.pid) ?? -1),
+              const tagged = scanTagged(stateRoot());
+              const leasedPreviews = this.leasedPreviewPids(tagged);
+              const stale = tagged.filter(
+                (p) => p.envId === env.id && !leasedPreviews.has(p.pid) && !own.has(p.pid) && !own.has(processGroup(p.pid) ?? -1),
               );
               if (stale.length > 0) {
                 staleHint = ` — surviving process(es): ${stale.map((p) => `pid ${p.pid} (${p.service})`).join(', ')}; run 'backlot pool gc' to reclaim`;
@@ -2127,15 +2129,38 @@ export class Engine {
   }
 
   /**
-   * Preview pids a live lease still accounts for.
+   * Tagged members of a verified leased preview process group. A publisher's
+   * wrapper can fork its tunnel child; excluding only the leader lets a scan
+   * select the child and kill the whole leased group. All scan consumers share
+   * this classification, using the same state-root-scoped process snapshot.
    *
-   * Every tag-based reclaim path — `pool gc`, `reapEnvProcesses`' scan, and
-   * doctor's orphan report — must agree on this set, or one of them acts on a
-   * tunnel another one considers healthy.
+   * Ownership requires the recorded leader identity AND matching env tags.
+   * A stale/reused leader PID, an unreadable identity, or a generic preview:
+   * service label cannot exempt another process. Descendants that leave the
+   * group (setsid) need a separate ownership mechanism and are not protected.
    */
-  private leasedPreviewPids(): Set<number> {
+  private leasedPreviewPids(tagged: TaggedProc[]): Set<number> {
+    const byPid = new Map(tagged.map((p) => [p.pid, p]));
+    const groups = new Map<string, Set<number>>();
+    for (const lease of this.journal.allLeases()) {
+      if (lease.previewPid === undefined || lease.previewStart === undefined) continue;
+      const leader = byPid.get(lease.previewPid);
+      if (!leader || leader.envId !== lease.envId || leader.startTime !== lease.previewStart) continue;
+      const group = processGroup(leader.pid);
+      // Check identity after reading the group so an exited/reused leader
+      // cannot lend its replacement's process group to the old lease.
+      if (group === undefined || !sameProcess(leader.pid, lease.previewStart)) continue;
+      const owned = groups.get(lease.envId) ?? new Set<number>();
+      owned.add(group);
+      groups.set(lease.envId, owned);
+    }
     const pids = new Set<number>();
-    for (const l of this.journal.allLeases()) if (l.previewPid) pids.add(l.previewPid);
+    for (const proc of tagged) {
+      const owned = groups.get(proc.envId);
+      if (!owned) continue;
+      const group = processGroup(proc.pid);
+      if (group !== undefined && owned.has(group) && sameProcess(proc.pid, proc.startTime)) pids.add(proc.pid);
+    }
     return pids;
   }
 
@@ -2608,8 +2633,9 @@ export class Engine {
       // that quiesce by design — so the tag scan sees a tagged process with no
       // 'live' env and used to call it orphaned, permanently, while naming a
       // remedy (`pool gc`) that skips exactly this pid. A lease accounts for it.
-      const leasedPreviews = this.leasedPreviewPids();
-      const orphans = scanTagged(stateRoot()).filter((p) => !liveEnvs.has(p.envId) && !leasedPreviews.has(p.pid));
+      const tagged = scanTagged(stateRoot());
+      const leasedPreviews = this.leasedPreviewPids(tagged);
+      const orphans = tagged.filter((p) => !liveEnvs.has(p.envId) && !leasedPreviews.has(p.pid));
       for (const o of orphans) {
         issues.push({ level: 'error', envId: o.envId, issue: `orphaned process ${o.pid} ('${o.service}') is running with no live environment — run 'backlot pool gc' to reclaim it` });
       }
@@ -2696,8 +2722,9 @@ export class Engine {
       // place that would otherwise shoot it on Linux while macOS kept it, which
       // is the platform split the reap must never have. Its owner reaps it when
       // the lease ends.
-      const leasedPreview = this.journal.leaseForEnv(env.id)?.previewPid;
-      const orphans = scanTagged(stateRoot()).filter((p) => p.envId === env.id && p.pid !== leasedPreview);
+      const tagged = scanTagged(stateRoot());
+      const leasedPreviews = this.leasedPreviewPids(tagged);
+      const orphans = tagged.filter((p) => p.envId === env.id && !leasedPreviews.has(p.pid));
       if (orphans.length > 0) {
         await Promise.all(orphans.map((o) => killGroupVerified(o.pid, o.startTime)));
       }
