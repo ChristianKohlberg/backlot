@@ -109,6 +109,109 @@ datastores:
 }
 
 describe('application capacity survives an unfinished data-only conversion', () => {
+  it.each(['before GC', 'during discovery'] as const)('retains the original survivor group when its nonleader moves %s', async (moveAt) => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), 'bl-gc-moved-survivor-')));
+    const state = join(root, 'state');
+    const saved = { ...process.env };
+    Object.assign(process.env, {
+      BACKLOT_STATE_DIR: state, BACKLOT_POOL_MAX: '1', BACKLOT_POOL_MAX_TOTAL: '1',
+      BACKLOT_POOL_MAX_DATA_ONLY: '4', BACKLOT_SWEEP_MS: '60000', BACKLOT_WAIT_MS: '100',
+    });
+    let blocked: number | undefined;
+    const engine = new Engine(async (...args: Parameters<typeof killGroupVerified>) => {
+      if (args[0] === blocked) {
+        if (moveAt === 'before GC') return false;
+        writeFileSync(join(root, 'move'), '');
+        await waitFor(() => existsSync(join(root, 'moved')));
+      }
+      return killGroupVerified(...args);
+    });
+    let leader: ServicePid | undefined;
+    let moved: ServicePid | undefined;
+    let leaderExit: Promise<unknown[]> | undefined;
+    const waitFor = async (predicate: () => boolean) => {
+      for (let i = 0; i < 250; i++) {
+        if (predicate()) return;
+        await sleep(20);
+      }
+      throw new Error('moving service did not reach the expected process state');
+    };
+    try {
+      const tree = inProcessStack(root, 'app');
+      const other = inProcessStack(root, 'other');
+      const first = await engine.up({ cwd: tree, holder: 'a', dataOnly: true });
+      const launcher = join(root, 'launcher.mjs');
+      writeFileSync(launcher, `import {spawn} from 'node:child_process';
+const tagged=spawn('python3',[process.argv[2],process.argv[3]],{stdio:'ignore',env:{...process.env,...JSON.parse(process.argv[4])}});
+const untagged=spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{stdio:'ignore'});
+let remaining=2;
+for(const child of [tagged,untagged])child.on('exit',()=>{if(--remaining===0)process.exit(0)});
+process.on('SIGTERM',()=>{});
+console.log(JSON.stringify({tagged:tagged.pid,untagged:untagged.pid}));
+`);
+      const proc = spawn(process.execPath, [launcher, join(import.meta.dirname, 'fixtures/moving-service.py'), root,
+        JSON.stringify(serviceTag(first.envId, 'web', state))], { cwd: root, detached: true, stdio: ['ignore', 'pipe', 'ignore'] });
+      leader = { pid: proc.pid!, startTime: startTime(proc.pid!) };
+      leaderExit = once(proc, 'exit');
+      const lines = createInterface({ input: proc.stdout! });
+      const [line] = await once(lines, 'line');
+      lines.close();
+      const members = JSON.parse(line) as { tagged: number; untagged: number };
+      await waitFor(() => existsSync(join(root, 'ready')));
+      moved = { pid: members.tagged, startTime: startTime(members.tagged), pgid: leader.pid };
+      expect(moved.startTime).toBeDefined();
+      if (procScanSupported()) expect(processGroup(moved.pid)).toBe(leader.pid);
+      const journal = new Journal(join(state, 'journal.db'));
+      const row = journal.getEnv(first.envId)!;
+      row.dataOnly = false;
+      if (!procScanSupported()) row.servicePids.web = moved;
+      journal.saveEnv(row);
+      blocked = moved.pid;
+      await expect(engine.up({ cwd: tree, holder: 'a', dataOnly: true })).rejects.toThrow(/unreaped service processes/);
+      const retained = journal.getEnv(first.envId)!.servicePids;
+      expect(Object.values(retained)).toEqual([moved]);
+      blocked = undefined;
+      writeFileSync(join(root, 'move'), '');
+      await waitFor(() => existsSync(join(root, 'moved')));
+      expect(Number(readFileSync(join(root, 'moved'), 'utf8'))).toBe(moved.pid);
+      const gc = await engine.poolGc(false);
+      if (procScanSupported()) {
+        if (moveAt === 'before GC') expect(gc.reclaimed).toContainEqual({ pid: moved.pid, envId: first.envId, service: 'web' });
+      } else {
+        expect(gc.supported).toBe(false);
+        expect(await killGroupVerified(moved.pid, moved.startTime)).toBe(true);
+        expect(await reapPids(retained)).toEqual(retained);
+      }
+      expect(isAlive(moved.pid)).toBe(false);
+      expect(groupAlive(leader.pid)).toBe(true);
+      expect(isAlive(members.untagged)).toBe(true);
+      expect(journal.getEnv(first.envId)?.servicePids).toEqual(retained);
+      const report = await engine.doctor();
+      const ownedIssues = report.issues.filter(issue => issue.envId === first.envId);
+      expect(ownedIssues.some(issue => issue.issue.includes(`retained live process group ${leader!.pid}`))).toBe(true);
+      expect(ownedIssues.some(issue => issue.issue.includes('recovery drift'))).toBe(false);
+      await expect(engine.up({ cwd: other, holder: 'b' })).rejects.toThrow(/cap/);
+      (engine as unknown as { supervisor(env: EnvRow): unknown }).supervisor(journal.getEnv(first.envId)!);
+      await engine.shutdown();
+      expect(journal.getEnv(first.envId)?.servicePids).toEqual(retained);
+      expect(isAlive(members.untagged)).toBe(true);
+      expect(await killGroupVerified(leader.pid, leader.startTime)).toBe(true);
+      await leaderExit;
+      expect((await engine.up({ cwd: tree, holder: 'a', dataOnly: true })).dataOnly).toBe(true);
+      expect(journal.getEnv(first.envId)?.servicePids).toEqual({});
+      expect((await engine.up({ cwd: other, holder: 'b' })).dataOnly).toBe(false);
+    } finally {
+      blocked = undefined;
+      if (moved) await killGroupVerified(moved.pid, moved.startTime);
+      if (leader) await killGroupVerified(leader.pid, leader.startTime);
+      if (leaderExit) await leaderExit;
+      await engine.shutdown();
+      for (const key of Object.keys(process.env)) if (!(key in saved)) delete process.env[key];
+      Object.assign(process.env, saved);
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it('retains failed eviction ownership and releases it after confirmed cwd cleanup', async () => {
     const root = realpathSync(mkdtempSync(join(tmpdir(), 'bl-eviction-survivors-')));
     const state = join(root, 'state');
@@ -303,10 +406,10 @@ console.log(JSON.stringify({tagged:tagged.pid,untagged:untagged.pid}));
     });
     const blocked = new Set<number>();
     const staleVerdicts = new Set<number>();
-    const kill = vi.fn(async (pid: number, identity?: number) => {
-      if (blocked.has(pid)) return false;
-      const dead = await killGroupVerified(pid, identity);
-      return staleVerdicts.has(pid) ? false : dead;
+    const kill = vi.fn(async (...args: Parameters<typeof killGroupVerified>) => {
+      if (blocked.has(args[0])) return false;
+      const dead = await killGroupVerified(...args);
+      return staleVerdicts.has(args[0]) ? false : dead;
     });
     const engine = new Engine(kill);
     const children: Array<{ proc: ReturnType<typeof spawn>; exit: Promise<unknown[]>; record: ServicePid }> = [];
@@ -351,7 +454,10 @@ console.log(JSON.stringify({tagged:tagged.pid,untagged:untagged.pid}));
       expect(isAlive(children[2]!.record.pid)).toBe(false);
       expect(failed.presets).toEqual(original.presets);
       expect(readFileSync(original.datastoreNs.main)).toEqual(database);
-      for (const { record } of children) expect(kill).toHaveBeenCalledWith(record.pid, record.startTime);
+      for (const { record } of children) {
+        if (procScanSupported()) expect(kill).toHaveBeenCalledWith(record.pid, record.startTime, undefined, record.pid);
+        else expect(kill).toHaveBeenCalledWith(record.pid, record.startTime);
+      }
       expect(Object.values(original.servicePids).filter((r) => !blocked.has(r.pid)).every((r) => !groupAlive(r.pid))).toBe(true);
       await expect(fetch(first.urls.web.replace('localhost', '127.0.0.1'), { signal: AbortSignal.timeout(2000) })).rejects.toThrow();
       await expect(engine.up({ cwd: other, holder: 'b' })).rejects.toMatchObject({ message: expect.stringMatching(/cap/) });

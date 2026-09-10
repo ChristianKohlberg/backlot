@@ -353,13 +353,20 @@ export class Engine {
       // A reclaimed process may have been the one the journal was still
       // tracking — drop those records so doctor() doesn't report drift.
       for (const env of this.journal.allEnvs()) {
-        const keep = Object.fromEntries(
-          Object.entries(env.servicePids).filter(([, rec]) => !reclaimed.some((r) => r.pid === rec.pid)),
+        const candidates = Object.fromEntries(
+          Object.entries(env.servicePids).filter(([, rec]) => reclaimed.some((r) => r.envId === env.id && r.pid === rec.pid)),
         );
-        if (Object.keys(keep).length !== Object.keys(env.servicePids).length) {
-          env.servicePids = keep;
-          this.journal.saveEnv(env);
+        if (Object.keys(candidates).length === 0) continue;
+        const survivors = await reapPids(candidates);
+        const fresh = this.journal.getEnv(env.id);
+        if (!fresh) continue;
+        for (const [name, rec] of Object.entries(candidates)) {
+          const current = fresh.servicePids[name];
+          if (!survivors[name] && current?.pid === rec.pid && current.startTime === rec.startTime && current.pgid === rec.pgid) {
+            delete fresh.servicePids[name];
+          }
         }
+        this.journal.saveEnv(fresh);
       }
       logEvent({ level: 'info', kind: 'gc', detail: `reclaimed ${reclaimed.length} orphaned process(es)` });
     }
@@ -2768,7 +2775,11 @@ export class Engine {
       // Journal says these pids run — are they actually alive, and still ours?
       for (const [svc, rec] of Object.entries(env.servicePids)) {
         if (!isAlive(rec.pid)) {
-          issues.push({ level: 'error', envId: env.id, issue: `journal records pid ${rec.pid} for service '${svc}' but it is not running (recovery drift)` });
+          if (rec.pgid !== undefined && groupAlive(rec.pgid)) {
+            issues.push({ level: 'error', envId: env.id, issue: `service '${svc}' has a retained live process group ${rec.pgid} after recorded pid ${rec.pid} exited — ownership and application capacity remain retained until teardown is confirmed` });
+          } else {
+            issues.push({ level: 'error', envId: env.id, issue: `journal records pid ${rec.pid} for service '${svc}' but it is not running (recovery drift)` });
+          }
         } else if (!sameProcess(rec.pid, rec.startTime)) {
           // Alive, but a DIFFERENT process now holds that pid. Signalling it
           // would hit a bystander, so surface it rather than reaping it.
@@ -2899,7 +2910,7 @@ export class Engine {
   ): Promise<Record<string, ServicePid>> {
     const results = await Promise.all(processes.map(async (proc) => {
       const pgid = processGroup(proc.pid) ?? proc.pid;
-      return { proc, pgid, dead: await this.reapServiceGroup(proc.pid, proc.startTime) };
+      return { proc, pgid, dead: await this.reapServiceGroup(proc.pid, proc.startTime, undefined, pgid) };
     }));
     const survivors = await reapPids(recorded, this.reapServiceGroup);
     for (const { proc, pgid, dead } of results) {
@@ -3451,7 +3462,7 @@ export class Engine {
           // result was hundreds of orphaned service children with a deleted cwd
           // holding gigabytes, and cold pool entries whose port was still bound
           // so the next bind failed with "occupied by a foreign process".
-          const unreaped = await this.reapEnvProcesses(fresh, survivors);
+          const unreaped = await this.reapEnvProcesses(fresh, { ...fresh.servicePids, ...survivors });
           this.supervisors.delete(env.id);
           const post = this.journal.getEnv(env.id);
           if (post) {
@@ -3496,7 +3507,7 @@ export class Engine {
       // env can carry recorded survivors too, which is why this is not gated on
       // `hot`. reapEnvProcesses returns what it could NOT confirm dead, and
       // that — never an assumption — is what the next daemon life inherits.
-      const recorded = survivors.get(env.id) ?? env.servicePids;
+      const recorded = { ...env.servicePids, ...survivors.get(env.id) };
       // …except an in-flight operation, which is never interrupted — the rule
       // claimForTeardown, the sweeper and pool gc all already keep. A check runs
       // DETACHED so it can outlive the daemon (see runGroupCmd), and it carries
