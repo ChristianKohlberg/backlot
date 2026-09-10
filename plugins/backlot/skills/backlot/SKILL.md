@@ -55,7 +55,7 @@ stderr is human progress. Exit codes are contractual: `0` ok · `1` work-error �
 | `run <check>` | Run lease: bind → execute the check declared in `backlot.yml` → classified verdict → release. `--pristine` rebuilds from scratch; `--pull` copies declared outputs back; `--detach` returns a `jobId` immediately (poll with `job <jobId>`). |
 | `ctx` | Re-read the consumer **context blob** (service URLs, login creds, connection strings, recent events) for the env your lease holds — read-only, no re-bind. `up` already returned this once. **A stack may advertise several logins: `logins` is the primary one, `allLogins` is the whole set** — see below. |
 | `release` | Release the current lease; the environment stays warm in the pool. On `{"released": false}` read the `reason` — a lease is keyed by the directory that bound it, so releasing from elsewhere matches nothing. |
-| `sync` | Project the current worktree state into the leased env — seconds; `hot_reload` services keep running, others restart as needed. |
+| `sync` | Sync the current worktree into the leased env; see [projection and rebind conditions](https://github.com/ChristianKohlberg/backlot#quickstart). |
 | `exec <cmd...>` | Run an arbitrary command inside the env your lease holds; hands back raw stdout + exit code (not a verdict). Needs an `up` first. |
 | `logs <service> [--lines N]` | Tail a service's logs from the leased env. |
 | `reset-data` | Restore the data template on the current lease (fresh seeded state, declared caches kept). |

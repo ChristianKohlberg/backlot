@@ -1525,9 +1525,8 @@ export class Engine {
       fresh.fingerprints['@source'] = sync.sourceHash;
       fresh.lastUsedAt = now();
       this.journal.saveEnv(fresh);
-      // A projection re-reads the manifest, so preview policy changes take
-      // effect without waiting for a full bind. The shape is this environment's
-      // DURABLE one, not the supervisor's live pids: nothing here restarted a
+      // Reconcile against the environment's durable shape, not the
+      // supervisor's live pids: nothing here restarted a
       // service, so a pid missing during a restart backoff is not a slice change.
       const shape = fresh.dataOnly
         ? new Set<string>()

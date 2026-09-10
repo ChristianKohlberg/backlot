@@ -65,11 +65,12 @@ MCP launch entries from your agent configuration and invoke CLI commands through
 your shell tools, for example `backlot up --json` and `backlot run smoke --json`.
 The CLI, daemon RPC and Claude Code skill remain supported.
 
-With `hot_reload: true`, source-only saves keep services running. Changing the
+Source-only saves can keep `hot_reload` services running. Any change to the parsed
 manifest takes the full bind path so startup environment and commands are applied;
-a successful projection does not mark unapplied configuration as current. A
-preview stays alive through a rebind on the same port; if a port change moves its
-target, the bind stops it and returns a notice.
+comments and whitespace alone do not change the parsed configuration. See
+[projection eligibility](docs/architecture.md#6-sync--verbs-sync-watch-streams) and
+[preview reconciliation](docs/decisions/0027-lease-scoped-public-preview.md) for the
+full conditions.
 
 `backlot run CHECK --detach --pull` copies declared outputs back to the worktree
 before the completed job verdict is recorded. Without `--pull`, detached checks
@@ -272,7 +273,7 @@ services:
     run: pnpm exec ng serve --port {{ports.web}}
     port: web
     ready: { http: / }
-    hot_reload: true      # source-only `sync` keeps it running; manifest changes rebind
+    hot_reload: true      # see projection eligibility above
 datastores:
   main:
     driver: postgres

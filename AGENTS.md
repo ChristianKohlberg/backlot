@@ -93,11 +93,9 @@ delete (it cannot take the env lock — `tryClaim` calls it under the pool lock)
 so no stale snapshot can forget a tunnel someone else just published. `tests/preview-tunnel.test.ts`
 covers all of it.
 
-Projection may update `@source` without restarting services. The memory-only
-`appliedManifests` ledger in `engine.ts` advances only after a successful full bind;
-manifest changes must invalidate projection and ordinary reuse even if source was
-already copied. `tests/projection-config-and-detached-pull.test.ts` covers this and
-the CLI→detached-job `pull` option, whose write-back must precede job completion.
+For the successful-bind configuration ledger and projection/reuse eligibility, see
+[sync and bindings](docs/architecture.md#6-sync--verbs-sync-watch-streams) and
+`tests/projection-config-and-detached-pull.test.ts`.
 
 ## Physical stack identity
 
