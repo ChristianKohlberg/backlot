@@ -196,8 +196,8 @@ defaults and never inherits the previous holder's choices. In `ctx --json`,
 stores that succeeded when a later store failed; it is absent after a pristine
 wipe until that store is restored. A selection that differs from the one the
 environment last recorded appears as `datastore-preset-changed` in bind
-diagnostics (a first bind or a newly added store has none to differ from). MCP
-and RPC accept the same choices as a `presets` object mapping datastore names
+diagnostics (a first bind or a newly added store has none to differ from).
+RPC accepts the same choices as a `presets` object mapping datastore names
 to preset names. Other CLI verbs reject `--preset` with exit 64 and a message
 on stderr.
 
@@ -318,7 +318,7 @@ values, and changed inputs restart services even when source files are unchanged
 `sync`, `--watch`, `reset-data`, and `bind --ref` keep that lease's inputs. A new
 holder never inherits them: reusing its warm environment restarts input-configured
 services with the new holder's values. Each `run` takes fresh caller inputs for
-its own isolated service processes. The MCP adapter uses its own process environment.
+its own isolated service processes.
 
 Values remain in daemon/process memory, never in the journal or context/status
 responses. Broker service logs redact exact input values, including values split

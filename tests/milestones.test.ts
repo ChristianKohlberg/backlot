@@ -1,6 +1,6 @@
 /**
  * 0.3 + 0.4 surface: detached submit-and-poll runs, the deliberately-foreign
- * Python consumer, and the MCP adapter — all against the real daemon.
+ * Python consumer — all against the real daemon.
  */
 import { describe, it, expect, afterAll } from 'vitest';
 import { execFile, execFileSync, spawn } from 'node:child_process';
@@ -10,7 +10,6 @@ import { join } from 'node:path';
 
 const repo = join(import.meta.dirname, '..');
 const CLI = join(repo, 'dist', 'cli', 'index.js');
-const MCP = join(repo, 'dist', 'mcp', 'index.js');
 
 const hasPython = (() => {
   try {
@@ -109,66 +108,4 @@ describe.skipIf(!hasPython)('the foreign consumer (hello-python)', () => {
     expect(run.exitCode, `stdout: ${run.stdout ?? ''}\nstderr: ${run.stderr ?? ''}`).toBe(0);
     expect(run.json!.ok).toBe(true);
   });
-});
-
-// ---------------------------------------------------------------- 0.4: MCP adapter
-
-describe('MCP adapter (thin, over the same daemon)', () => {
-  const ctx = makeContext();
-  const wt = makeWorktree('hello-web');
-  afterAll(async () => {
-    await ctx.cleanup();
-    wt.drop();
-  });
-
-  it('initialize -> tools/list -> tools/call backlot_up + backlot_release', async () => {
-    const proc = spawn(process.execPath, [MCP], { env: ctx.env, stdio: ['pipe', 'pipe', 'pipe'] });
-    const responses: Record<string, unknown>[] = [];
-    let buf = '';
-    proc.stdout.on('data', (d) => {
-      buf += d.toString();
-      let idx;
-      while ((idx = buf.indexOf('\n')) >= 0) {
-        const line = buf.slice(0, idx);
-        buf = buf.slice(idx + 1);
-        if (line.trim()) responses.push(JSON.parse(line));
-      }
-    });
-    const send = (msg: Record<string, unknown>) => proc.stdin.write(JSON.stringify(msg) + '\n');
-    const waitFor = async (id: number): Promise<Record<string, unknown>> => {
-      for (let i = 0; i < 300; i++) {
-        const found = responses.find((r) => r.id === id);
-        if (found) return found;
-        await new Promise((r) => setTimeout(r, 100));
-      }
-      throw new Error(`no response for id ${id}; got ${JSON.stringify(responses)}`);
-    };
-
-    send({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2025-06-18', capabilities: {} } });
-    const init = await waitFor(1);
-    expect((init.result as { serverInfo: { name: string } }).serverInfo.name).toBe('backlot');
-
-    send({ jsonrpc: '2.0', id: 2, method: 'tools/list' });
-    const list = await waitFor(2);
-    const tools = (list.result as { tools: Array<{ name: string }> }).tools;
-    expect(tools.map((t) => t.name)).toContain('backlot_up');
-    expect(tools.map((t) => t.name)).toContain('backlot_run');
-
-    send({ jsonrpc: '2.0', id: 3, method: 'tools/call', params: { name: 'backlot_up', arguments: { cwd: wt.dir } } });
-    const up = await waitFor(3);
-    const content = (up.result as { content: Array<{ text: string }>; isError: boolean });
-    expect(content.isError).toBe(false);
-    const blob = JSON.parse(content.content[0]!.text);
-    expect(blob.state).toBe('hot');
-    expect(blob.urls.web).toMatch(/^http:\/\/localhost:\d+$/);
-    // The env the MCP tool leased genuinely serves.
-    const greetings = (await (await fetch(`${blob.urls.web}/api/greetings`)).json()) as unknown[];
-    expect(greetings.length).toBe(3);
-
-    send({ jsonrpc: '2.0', id: 4, method: 'tools/call', params: { name: 'backlot_release', arguments: { cwd: wt.dir } } });
-    const rel = await waitFor(4);
-    expect(JSON.parse((rel.result as { content: Array<{ text: string }> }).content[0]!.text).released).toBe(true);
-
-    proc.kill();
-  }, 60_000);
 });

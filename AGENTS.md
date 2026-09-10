@@ -6,7 +6,7 @@ This file is the project's committed home for project-intrinsic agent knowledge:
 
 ## Build & test
 
-- Build: `npm run build` (compiles TypeScript to `dist/`; required before running tests)
+- Build: `npm run build` (cleans `dist/`, then compiles TypeScript; required before running tests)
 - Test: `npm test` runs vitest over all files in `tests/`; tests use the compiled `dist/cli/index.js`
 - Single file: `npm test -- tests/foo.test.ts`
 
@@ -98,7 +98,7 @@ covers all of it.
 See [physical stack identity](docs/architecture.md#physical-stack-identity) for
 canonical paths, legacy holder recovery, and template retirement safeguards.
 `callerHolder` / `adoptLegacyAliases` in `src/daemon/engine.ts` own identity
-reconciliation; `tests/stack-identity.test.ts` covers CLI/MCP compatibility,
+reconciliation; `tests/stack-identity.test.ts` covers CLI alias compatibility,
 data preservation, deferred migration, and retirement (including old retention).
 
 ## Leases: `--ttl` is the agent form, `--holder-pid` is not
@@ -132,9 +132,7 @@ than rejecting them. `ping` therefore carries the daemon's version, and a mismat
 `infra-error`. `backlot update` is the remedy: it restarts the daemon (shared code
 path with `daemon stop`), and the next verb's autospawn is what makes the new daemon
 the installed build. Leases survive; an in-flight (`busy`) operation and a downgrade
-are the only refusals. **The MCP adapter enforces the same gate on its own** — the
-CLI's lives in `main()`, so an MCP client would otherwise be unprotected — and there
-is deliberately no MCP tool that restarts the daemon. See
+are the only refusals. See
 [decision 0024](docs/decisions/0024-updating-the-running-daemon.md) and
 `tests/daemon-update.test.ts`.
 
@@ -177,7 +175,7 @@ restart needs a fresh `up` to resupply them. New holders must restart configured
 services even on identical source: warm reuse must not inherit another lease's
 inputs. Declaration changes also invalidate the process configuration. See
 `src/core/caller-env.ts` and `tests/caller-env.test.ts`.
-CLI/MCP autospawn must use the target stack's cwd and strip declared input names
+CLI autospawn must use the target stack's cwd and strip declared input names
 from the daemon environment; otherwise the first caller contaminates every later
 check/exec/unconfigured service despite correct per-lease service masking.
 
@@ -202,8 +200,7 @@ what shipped since the last tag; follow semver off what actually changed
 (additive/back-compat = minor, fix-only = patch) rather than defaulting to patch.
 
 `dist/` is gitignored but **is** the published artifact (`files`, and both `bin`
-entries point into it), so the tarball only ever contains whatever the owner's
-working tree happened to hold. 0.11.0 shipped that way: published without a build,
+entries point into it), so packaging must rebuild the artifact. 0.11.0 shipped that way: published without a build,
 so the whole preview-tunnel feature it was cut for (`dist/drivers/preview.js`, plus
 the `engine`/`journal`/`cli`/`mcp` changes) was simply absent from npm, and 0.11.1
 exists only to republish it. Nothing catches this after the fact —
@@ -234,3 +231,5 @@ Keep this file for knowledge useful to almost every future agent session in this
 Do not repeat what the codebase already shows; point to the authoritative file or command instead.
 Prefer rewriting or pruning existing entries over appending new ones.
 When updating this file, preserve this bar for all agents and keep entries concise.
+
+`prepack` builds for `npm pack` as well as publishing; the build cleans stale outputs before compiling. `tests/package-cli-only.test.ts` exercises the packed artifact and prevents a removed executable from surviving in stale `dist`.

@@ -44,7 +44,7 @@ export type RpcResponse = { ok: true; data: unknown } | { ok: false; error: RpcE
 /**
  * The daemon streams newline-delimited frames: {type:'progress',phase} … then
  * one {type:'result',ok,…}. `onProgress` (optional) sees each phase; the
- * promise resolves on the result frame. Consumers that ignore progress (MCP,
+ * promise resolves on the result frame. Consumers that ignore progress (for example,
  * ping, most verbs) just don't pass it — the frames are consumed and dropped.
  */
 export function rpc(

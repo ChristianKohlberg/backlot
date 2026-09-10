@@ -1,7 +1,7 @@
 import ts from 'typescript';
 import { pathToFileURL } from 'node:url';
 import { expect, it } from 'vitest';
-import { execFile, execFileSync, spawn } from 'node:child_process';
+import { execFile, execFileSync } from 'node:child_process';
 import { mkdtempSync, mkdirSync, writeFileSync, symlinkSync, rmSync, readFileSync, existsSync, readdirSync, renameSync, realpathSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -13,7 +13,6 @@ import { pruneTemplates } from '../src/core/retention.js';
 import type { Policy } from '../src/core/policy.js';
 
 const CLI = join(import.meta.dirname, '..', 'dist/cli/index.js');
-const MCP = join(import.meta.dirname, '..', 'dist/mcp/index.js');
 type Context = { datastores: Record<string, { url: string }>; envId: string; urls: Record<string, string>; error?: { message: string }; lease: { id: string } };
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const legacyIdentity = (alias: string, name = 'identity') => `${name}-${createHash('sha256').update(alias).digest('base64url').slice(0, 8)}`;
@@ -32,9 +31,9 @@ function fixture(sweepMs = 60000, name = 'identity') {
   writeFileSync(join(wt, 'seed.mjs'), "import{DatabaseSync}from'node:sqlite';const db=new DatabaseSync(process.argv[2]);db.exec('CREATE TABLE IF NOT EXISTS notes (note TEXT)');db.close();");
   writeFileSync(join(wt, 'server.mjs'), "import{createServer}from'node:http';createServer((q,r)=>r.end('ok')).listen(+process.env.PORT,'127.0.0.1');");
   const env: NodeJS.ProcessEnv = { ...process.env, BACKLOT_STATE_DIR: state, BACKLOT_HOLDER_PID: '', BACKLOT_SWEEP_MS: String(sweepMs) };
-  const cli = async (args: string[]) => {
+  const cli = async (args: string[], cwd = wt) => {
     const result = await new Promise<Context>((resolve, reject) => {
-      execFile(process.execPath, [CLI, ...args, '--json'], { cwd: wt, env }, (err, out, stderr) => {
+      execFile(process.execPath, [CLI, ...args, '--json'], { cwd, env }, (err, out, stderr) => {
         try { resolve(JSON.parse(out)); } catch { reject(new Error(String(err) + stderr + out)); }
       });
     });
@@ -46,32 +45,20 @@ function fixture(sweepMs = 60000, name = 'identity') {
     }
     return result;
   };
-  const mcp = (verb: string, cwd: string, holder?: string) => new Promise<Context>((resolve, reject) => {
-    const p = spawn(process.execPath, [MCP], { cwd: wt, env, stdio: ['pipe', 'pipe', 'ignore'] });
-    const timer = setTimeout(() => { p.kill(); reject(new Error('MCP timeout')); }, 15000);
-    let text = '';
-    p.stdout.on('data', (chunk) => {
-      text += String(chunk);
-      const line = text.split('\n')[0];
-      if (!text.includes('\n')) return;
-      clearTimeout(timer); p.kill();
-      try { resolve(JSON.parse(JSON.parse(line).result.content[0].text)); } catch (err) { reject(err); }
-    });
-    p.stdin.write(JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: `backlot_${verb}`, arguments: { cwd, holder, holderPid: process.pid } } }) + '\n');
-  });
-  return { root, wt, alias, state, cli, mcp, env, name, cleanup: async () => {
+  const at = (verb: string, cwd: string, holder?: string) => cli([verb, ...(holder === undefined ? [] : ['--holder', holder])], cwd);
+  return { root, wt, alias, state, cli, at, env, name, cleanup: async () => {
     await cli(['pool', 'recycle', '--force']); await cli(['daemon', 'stop']); rmSync(root, { recursive: true, force: true });
   } };
 }
 
-it('canonical CLI and symlink MCP share one lease for the same holder', async () => {
+it('canonical CLI and symlink CLI share one lease for the same holder', async () => {
   const f = fixture();
   try {
     const first = await f.cli(['up', '--holder', 'owner']);
-    const context = await f.mcp('ctx', f.alias, 'owner');
+    const context = await f.at('ctx', f.alias, 'owner');
     expect(context.error).toBeUndefined();
     expect(context.envId).toBe(first.envId);
-    const again = await f.mcp('up', f.alias, 'owner');
+    const again = await f.at('up', f.alias, 'owner');
     expect(again.envId).toBe(first.envId);
     expect(again.urls).toEqual(first.urls);
     expect(again.lease.id).toBe(first.lease.id);
@@ -133,8 +120,8 @@ it('new implicit holders also canonicalize, while distinct Git worktrees stay se
     const other = join(f.root, 'other-worktree');
     execFileSync('git', ['worktree', 'add', '--detach', other], { cwd: f.wt, stdio: 'ignore' });
     const first = await f.cli(['up']);
-    expect((await f.mcp('ctx', f.alias)).envId).toBe(first.envId);
-    const distinct = await f.mcp('up', other);
+    expect((await f.at('ctx', f.alias)).envId).toBe(first.envId);
+    const distinct = await f.at('up', other);
     expect(distinct.error).toBeUndefined();
     expect(distinct.envId).not.toBe(first.envId);
     expect(distinct.urls).not.toEqual(first.urls);
@@ -221,7 +208,7 @@ for (const oldDefault of [false, true]) {
       await f.cli(['status']);
       writeFileSync(manifest, good);
       if (oldDefault) {
-        const implicit = await f.mcp('up', f.wt);
+        const implicit = await f.at('up', f.wt);
         expect(implicit.error?.message).toContain(`pass holder ${JSON.stringify(f.alias)} (--holder on the CLI)`);
         expect(journal.allEnvs()).toHaveLength(1);
       }
@@ -462,11 +449,11 @@ for (const missingLink of [false, true]) {
       await f.cli(['daemon', 'stop']);
       const journal = journalAsLegacyAlias(f, first.envId, true);
       if (missingLink) rmSync(link);
-      const result = await f.mcp('up', sub);
+      const result = await f.at('up', sub);
       expect(result.error?.message).toContain(`pass holder ${JSON.stringify(holder)} (--holder on the CLI)`);
       expect(journal.allEnvs()).toHaveLength(1);
       expect(journal.allLeases()).toHaveLength(1);
-      const retained = await f.mcp('ctx', sub, holder);
+      const retained = await f.at('ctx', sub, holder);
       expect(retained.envId).toBe(first.envId);
       expect(retained.lease.id).toBe(first.lease.id);
       expect(retained.urls).toEqual(first.urls);
@@ -524,7 +511,7 @@ it('canonical stack rows recognize a legacy holder whose subdirectory alone was 
     mkdirSync(sub);
     const holder = join(f.wt, 'link');
     symlinkSync(sub, holder, 'dir');
-    const first = await f.mcp('up', holder, holder);
+    const first = await f.at('up', holder, holder);
     expect(first.error).toBeUndefined();
     const db = new DatabaseSync(first.datastores.main.url);
     db.prepare('INSERT INTO notes VALUES (?)').run('canonical legacy owner');
@@ -532,17 +519,17 @@ it('canonical stack rows recognize a legacy holder whose subdirectory alone was 
     await f.cli(['daemon', 'stop']);
     const journal = new Journal(join(f.state, 'journal.db'));
     expect(journal.getEnv(first.envId)!.legacyStackRoot).toBeFalsy();
-    const implicit = await f.mcp('up', sub);
+    const implicit = await f.at('up', sub);
     expect(implicit.error?.message).toContain(`pass holder ${JSON.stringify(holder)} (--holder on the CLI)`);
     expect(journal.allEnvs()).toHaveLength(1);
     expect(journal.leaseForEnv(first.envId)!.holder).toBe(holder);
-    const retained = await f.mcp('ctx', sub, holder);
+    const retained = await f.at('ctx', sub, holder);
     expect(retained.envId).toBe(first.envId);
     expect(retained.lease.id).toBe(first.lease.id);
     expect(notesIn(retained.datastores.main.url)).toEqual([{ note: 'canonical legacy owner' }]);
-    const canonical = await f.mcp('up', sub, sub);
+    const canonical = await f.at('up', sub, sub);
     expect(canonical.error).toBeUndefined();
-    expect((await f.mcp('up', sub)).envId).toBe(canonical.envId);
+    expect((await f.at('up', sub)).envId).toBe(canonical.envId);
     expect(journal.leaseForEnv(first.envId)!.holder).toBe(holder);
   } finally { await f.cleanup(); }
 }, 30000);

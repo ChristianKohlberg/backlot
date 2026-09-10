@@ -25,7 +25,7 @@ Thanks for looking at backlot. A few ground rules keep this project what it is:
   V8 coverage, then `c8` merges it against `dist/` and maps it back to `src/` via
   sourcemaps. Numbers therefore reflect what the *real* product loop executed.
   Two known blind spots when reading them: a process that dies by SIGKILL never
-  writes its dump (so suites that SIGKILL their daemon/MCP process in cleanup
+  writes its dump (so suites that SIGKILL their daemon process in cleanup
   contribute nothing for that process's whole life — prefer a plain
   `process.kill(pid)`, which the daemon handles gracefully), and tests that
   import `../src/*.ts` in-process run through vitest's transform, which this

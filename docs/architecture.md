@@ -96,7 +96,7 @@ stable for an environment's lifetime, and the consumer's worktree is never touch
 ### Physical stack identity
 
 Stack identity uses the physical project directory: symlink spellings refer to the
-same stack, while separate Git worktree directories remain distinct. CLI and MCP
+same stack, while separate Git worktree directories remain distinct. CLI calls
 resolve paths in the caller process before RPC. Explicit holder strings stay
 opaque; new implicit holders use the physical caller directory.
 
@@ -368,8 +368,7 @@ Every failure is classified — the field an agent branches on mechanically:
   there; on Linux it detects wall-clock outrunning the monotonic clock (which halts
   through suspend). One sleep is pardoned exactly once, and every pardon is logged
   as a `pardon` event naming the gap and the detector.
-- **A lease can name its holder's process** (`--holder-pid`, `BACKLOT_HOLDER_PID`; the MCP
-  adapter supplies its own automatically). The default holder is a worktree PATH, and nothing
+- **A lease can name its holder's process** (`--holder-pid`, `BACKLOT_HOLDER_PID`). The default holder is a worktree PATH, and nothing
   about a path can die — so a crashed agent held its environment for the whole TTL. A named
   process is checked against its start time, and a dead holder's lease is released in seconds.
   **This makes it a form for callers that outlive the command, and `--ttl` the form for
@@ -491,8 +490,8 @@ see README §Security model.
 **Division of labor** (the bug-fix loop): the agent thinks, edits, greps, and commits
 in its own worktree with its own harness — backlot is where the code *runs*, never
 where the agent *works*. Fast unit tests that need no system don't pay the broker tax
-at all. The MCP adapter (`backlot-mcp`) is a thin stdio wrapper over the same daemon
-socket — the same verbs as tools, never a second implementation.
+at all. Agents invoke the `backlot` CLI with `--json` for structured results.
+The former `backlot-mcp` adapter was removed; see [decision 0029](decisions/0029-cli-only-agent-interface.md).
 
 ### Configuration
 
@@ -661,5 +660,5 @@ buy the substrate, declare the stack, broker the environments.
 4. **0.4 — public-ready. ✅ CORE SHIPPED.** The generality gate passed with a
    deliberately-foreign consumer (stdlib-Python + sqlite — different runtime, same
    verbs); the MCP adapter shipped as a thin stdio wrapper over the same daemon RPC
-   (`backlot-mcp`), protocol-tested. Remaining before an actual announce: the remote
+   (`backlot-mcp`), protocol-tested; it was later removed by decision 0029. Remaining before an actual announce: the remote
    substrate (0.3's tail), npm publish, and a docs site.

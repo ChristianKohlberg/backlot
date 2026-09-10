@@ -285,15 +285,10 @@ real product gap someone reading the docs would expect to work.
   and nothing exercises the seam. The local paths hard-code local assumptions
   (process groups, /proc tags, file copies), so the first real driver will
   find the seam narrower than the spec suggests.
-- [x] **P3 · MCP has no long-running-operation story.** PARTLY CLOSED
-  2026-07-19: the adapter now exposes the detach/job verbs as tools —
-  `backlot_run_detach` (submit, returns `{jobId}` immediately), `backlot_job`
-  (poll by id to the journaled verdict), `backlot_job_ls` — thin over the
-  same `run-detach`/`job`/`job-ls` RPCs the CLI's `run --detach` and
-  `job <id>` use, so an agent driving a slow bind over MCP no longer has to
-  block. Still open: progress frames are still dropped and there is no
-  cancel — both need daemon-side work (a cancel path through the serialized
-  queue, MCP progress notifications) and a design decision, not adapter code.
+- [x] **P3 · MCP long-running-operation story.** SUPERSEDED by
+  [decision 0029](docs/decisions/0029-cli-only-agent-interface.md): the adapter
+  has been removed. CLI submit-and-poll remains supported; daemon-side job
+  progress and cancellation remain separate future work.
 - [x] **P3 · Probe host and advertised host disagree.** DECIDED 2026-07-19 (owner): keep advertising `localhost`, document the IPv4-only caveat (architecture §11) — every mainstream client falls back to 127.0.0.1, proven across this repo's own test history. Original entry: Port probing binds
   `127.0.0.1` (and now the wildcard) while `ctx` advertises `http://localhost:…`.
   On a dual-stack host `localhost` can resolve to `::1`, where a service bound

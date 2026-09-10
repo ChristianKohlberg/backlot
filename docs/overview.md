@@ -32,7 +32,7 @@ flowchart LR
         WT["code + dirty edits"]
     end
     subgraph broker["backlot (per-machine daemon)"]
-        CLI["CLI / MCP verbs<br/>up · run · sync · ctx · exec"]
+        CLI["CLI verbs<br/>up · run · sync · ctx · exec"]
         subgraph pool["warm pool"]
             E1["env 1 · leased<br/>services up · ports 491xx<br/>db ns e1 · caches warm"]
             E2["env 2 · hot, free"]
@@ -99,8 +99,8 @@ backlot run e2e --json      # second env from the pool, fresh data, JSON verdict
 backlot release             # or just walk away — the lease lapses harmlessly
 ```
 
-Every verb takes `--json`: stdout is one clean data object, stderr is for humans. The
-MCP adapter (`backlot-mcp`) exposes the same verbs as tools over the same daemon socket.
+Every verb takes `--json`: stdout is one clean data object, stderr is for humans.
+Agents use the CLI with `--json`; the former MCP adapter has been removed.
 
 ## When something fails
 

@@ -1,5 +1,6 @@
 # 0017. Rename: infront → backlot
 
+> The MCP portion of this historical decision is superseded by [0029](0029-cli-only-agent-interface.md).
 - Status: Accepted
 
 ## Decision

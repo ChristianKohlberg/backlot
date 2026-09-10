@@ -102,7 +102,7 @@ async function dispatch(verb: string, args: Record<string, unknown>, emit: (phas
     case 'update-plan':
       return engine.updatePlan(args.cliVersion === undefined ? undefined : String(args.cliVersion));
     case 'daemon-restart':
-      // The refusal lives in the ENGINE, not the CLI, so an MCP client or any
+      // The refusal lives in the ENGINE, not the CLI, so any
       // other RPC caller cannot restart past an in-flight operation just by
       // not implementing the check (the same reason the three --data-only
       // contradictions were moved out of the CLI in 0.8.0).

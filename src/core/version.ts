@@ -70,7 +70,7 @@ export interface VersionSkew {
   cli: string;
   daemon: string;
   direction: SkewDirection;
-  /** Human sentence, ending in the remedy. Reused verbatim by CLI, doctor and MCP. */
+  /** Human sentence, ending in the remedy. Reused verbatim by CLI and doctor. */
   message: string;
 }
 
