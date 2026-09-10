@@ -1,9 +1,10 @@
-import { afterAll, describe, expect, it } from 'vitest';
+import { afterAll, describe, expect, it, vi } from 'vitest';
 import { execFile, execFileSync } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { Journal } from '../src/core/journal.js';
+import { Journal, type EnvRow } from '../src/core/journal.js';
+import type { ServicePid } from '../src/core/types.js';
 import { Engine } from '../dist/daemon/engine.js';
 
 const CLI = join(import.meta.dirname, '../dist/cli/index.js');
@@ -103,6 +104,68 @@ datastores:
 }
 
 describe('application capacity survives an unfinished data-only conversion', () => {
+  it.each(['reuse', 'pristine'] as const)('retains simulated teardown survivors through a %s bind and releases capacity after retry', async (hygiene) => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), 'bl-convert-survivors-')));
+    const saved = { ...process.env };
+    Object.assign(process.env, {
+      BACKLOT_STATE_DIR: join(root, 'state'), BACKLOT_POOL_MAX: '1', BACKLOT_POOL_MAX_TOTAL: '1',
+      BACKLOT_POOL_MAX_DATA_ONLY: '4', BACKLOT_SWEEP_MS: '60000', BACKLOT_WAIT_MS: '100',
+    });
+    const engine = new Engine();
+    const lifecycle = engine as unknown as {
+      reapEnvProcesses(env: EnvRow, pids?: Record<string, ServicePid>): Promise<Record<string, ServicePid>>;
+    };
+    const reap = vi.spyOn(lifecycle, 'reapEnvProcesses');
+    try {
+      const tree = inProcessStack(root, 'app');
+      const other = inProcessStack(root, 'other');
+      const first = await engine.up({ cwd: tree, holder: 'a' });
+      const journal = new Journal(join(root, 'state', 'journal.db'));
+      const original = journal.getEnv(first.envId)!;
+      expect(Object.keys(original.servicePids)).toEqual(['web']);
+      const database = readFileSync(original.datastoreNs.main);
+      reap.mockImplementationOnce(async (env, pids) => {
+        expect(env.id).toBe(first.envId);
+        expect(pids).toEqual(original.servicePids);
+        return original.servicePids;
+      });
+      await expect(engine.up({ cwd: tree, holder: 'a', dataOnly: true, hygiene })).rejects.toMatchObject({
+        message: expect.stringContaining('still has unreaped service processes'),
+      });
+      const failed = journal.getEnv(first.envId)!;
+      expect(failed.dataOnly).toBe(true);
+      expect(failed.state).toBe('warm');
+      expect(failed.servicePids).toEqual(original.servicePids);
+      expect(failed.presets).toEqual(original.presets);
+      expect(readFileSync(original.datastoreNs.main)).toEqual(database);
+      const competing = await Promise.allSettled([
+        engine.up({ cwd: tree, holder: 'b' }),
+        engine.up({ cwd: other, holder: 'c' }),
+      ]);
+      for (const result of competing) {
+        expect(result.status).toBe('rejected');
+        if (result.status === 'rejected') expect(result.reason.message).toMatch(/cap/);
+      }
+      expect(journal.allEnvs()).toHaveLength(1);
+      expect(journal.getEnv(first.envId)?.servicePids).toEqual(original.servicePids);
+      const converted = await engine.up({ cwd: tree, holder: 'a', dataOnly: true, hygiene });
+      expect(converted.envId).toBe(first.envId);
+      expect(converted.dataOnly).toBe(true);
+      expect(converted.state).toBe('warm');
+      expect(journal.getEnv(first.envId)?.servicePids).toEqual({});
+      const admitted = await engine.up({ cwd: other, holder: 'c' });
+      expect(admitted.dataOnly).toBe(false);
+      const response = await fetch(admitted.urls.web.replace('localhost', '127.0.0.1'), { signal: AbortSignal.timeout(2000) });
+      expect(await response.text()).toBe('alive');
+    } finally {
+      reap.mockRestore();
+      await engine.shutdown();
+      for (const key of Object.keys(process.env)) if (!(key in saved)) delete process.env[key];
+      Object.assign(process.env, saved);
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it('keeps the per-stack charge after early upkeep failure and permits returning to the app', async () => {
     const f = fixture(2, 1);
     const tree = f.stack('app');

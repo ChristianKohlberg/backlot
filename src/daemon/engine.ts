@@ -2843,6 +2843,9 @@ export class Engine {
       env.state = live.state;
     }
     env.servicePids = unreaped;
+    if (Object.keys(unreaped).length > 0) {
+      throw new BrokerError('env-error', `environment ${env.id} still has unreaped service processes — retry once teardown can complete`, 'services');
+    }
   }
 
   /**
