@@ -55,9 +55,9 @@ checks:
     const url = context.urls.web.replace('localhost', '127.0.0.1');
     return await (await fetch(url)).json() as { value: string | null; pid: number; extra: string | null };
   };
-  // `daemon stop` answers BEFORE the deferred shutdown runs, so a verb sent
-  // straight after it can still reach the old daemon (memory intact) or a
-  // half-closed socket. Wait until the pid is gone before the next autospawn.
+  // `daemon stop` now blocks until the old pid is gone; the poll below is a
+  // belt-and-braces guard so a fixture failure surfaces here, not as a verb
+  // that reached a half-closed socket.
   const restartDaemon = async () => {
     const pid = Number(readFileSync(join(state, 'daemon.pid'), 'utf8'));
     expect((await cli(['daemon', 'stop'])).code).toBe(0);

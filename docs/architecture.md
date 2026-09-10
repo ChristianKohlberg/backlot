@@ -367,7 +367,7 @@ backlot reset-data | pull | release
 backlot preview <service> [--ttl <minutes>] | preview stop   # publish one service publicly (below)
 backlot status | doctor                          # pool state | active health check
 backlot pool ls|recycle [--all]|reconcile|gc|doctor
-backlot daemon stop
+backlot daemon stop                              # waits until the daemon and its services are gone (README)
 backlot update [--check] [--force]               # run the INSTALLED build (below)
 backlot --version
 ```

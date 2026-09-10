@@ -82,8 +82,8 @@ describe('a surviving lease on a restarted daemon', () => {
     const okExec = await cli(['exec', 'true']);
     expect(okExec.code).toBe(0);
 
-    // Daemon restart: stop it and WAIT until it is actually gone (stop returns
-    // before the shutdown timer fires).
+    // Daemon restart: `daemon stop` blocks until the old pid is gone; the poll
+    // below only guards the fixture against a stop that lied.
     const daemonPid = Number(readFileSync(join(stateDir, 'daemon.pid'), 'utf8'));
     const stop = await cli(['daemon', 'stop', '--json']);
     expect(stop.code).toBe(0);
