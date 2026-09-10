@@ -109,6 +109,121 @@ datastores:
 }
 
 describe('application capacity survives an unfinished data-only conversion', () => {
+  it.each(['recorded', 'discovered', 'GC', 'both groups'] as const)('retains a newly observed surviving group through %s reclamation and retry', async (path) => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), 'bl-new-group-')));
+    const state = join(root, 'state');
+    const saved = { ...process.env };
+    Object.assign(process.env, {
+      BACKLOT_STATE_DIR: state, BACKLOT_POOL_MAX: '1', BACKLOT_POOL_MAX_TOTAL: '1',
+      BACKLOT_POOL_MAX_DATA_ONLY: '4', BACKLOT_SWEEP_MS: '60000', BACKLOT_WAIT_MS: '100',
+    });
+    let victim: ServicePid | undefined;
+    let child: ServicePid | undefined;
+    let leader: ServicePid | undefined;
+    let intercept = true;
+    const waitFor = async (predicate: () => boolean) => {
+      for (let i = 0; i < 250; i++) {
+        if (predicate()) return;
+        await sleep(20);
+      }
+      throw new Error('new-group fixture did not reach expected state');
+    };
+    let engine = new Engine(async (...args: Parameters<typeof killGroupVerified>) => {
+      if (intercept && args[0] === victim?.pid) {
+        writeFileSync(join(root, 'move'), '');
+        await waitFor(() => existsSync(join(root, 'child')));
+        child = { pid: Number(readFileSync(join(root, 'child'), 'utf8')) };
+        if (path !== 'both groups') await waitFor(() => !groupAlive(leader!.pid));
+        const original = process.kill.bind(process);
+        const signal = vi.spyOn(process, 'kill').mockImplementation((pid, sig) => {
+          if (pid === -victim!.pid && sig !== 0) {
+            if (isAlive(victim!.pid)) original(victim!.pid, 'SIGKILL');
+            return true;
+          }
+          return original(pid, sig);
+        });
+        try { return await killGroupVerified(args[0], args[1], 0, args[3], ...args.slice(4)); }
+        finally { signal.mockRestore(); intercept = false; }
+      }
+      return killGroupVerified(...args);
+    });
+    try {
+      const tree = inProcessStack(root, 'app');
+      const other = inProcessStack(root, 'other');
+      const first = await engine.up({ cwd: tree, holder: 'a', dataOnly: true });
+      writeFileSync(join(root, 'move.py'), `import os, sys, time
+root=sys.argv[1]
+with open(root+'/ready','w') as f: f.write(str(os.getpid()))
+while not os.path.exists(root+'/move'): time.sleep(.02)
+os.setsid()
+pid=os.fork()
+if pid == 0:
+    os.execve(sys.executable,[sys.executable,'-c','import time; time.sleep(120)'],{})
+with open(root+'/child','w') as f: f.write(str(pid))
+while True: time.sleep(1)
+`);
+      const launcher = spawn(process.execPath, ['-e', `const {spawn}=require('child_process');
+const p=spawn('python3',process.argv.slice(1),{stdio:'ignore',env:{...process.env,...${JSON.stringify(serviceTag(first.envId, 'web', state))}}});
+console.log(p.pid);p.unref();${path === 'both groups' ? 'setInterval(()=>{},1000);' : ''}`, join(root, 'move.py'), root], {
+        cwd: root, detached: true, stdio: ['ignore', 'pipe', 'ignore'],
+        env: { ...process.env },
+      });
+      leader = { pid: launcher.pid!, startTime: startTime(launcher.pid!) };
+      const exited = once(launcher, 'exit');
+      const lines = createInterface({ input: launcher.stdout! });
+      const [line] = await once(lines, 'line');
+      lines.close();
+      if (path !== 'both groups') await exited;
+      await waitFor(() => existsSync(join(root, 'ready')));
+      victim = { pid: Number(line), startTime: startTime(Number(line)), pgid: leader.pid };
+      const journal = new Journal(join(state, 'journal.db'));
+      const row = journal.getEnv(first.envId)!;
+      row.dataOnly = false;
+      if (path !== 'discovered' || !procScanSupported()) row.servicePids.web = victim;
+      journal.saveEnv(row);
+      if (path === 'GC' && procScanSupported()) await engine.poolGc(false);
+      else await expect(engine.up({ cwd: tree, holder: 'a', dataOnly: true })).rejects.toThrow(/unreaped service processes/);
+      expect(isAlive(victim.pid)).toBe(false);
+      expect(groupAlive(leader.pid)).toBe(path === 'both groups');
+      expect(groupAlive(victim.pid)).toBe(true);
+      expect(scanTagged(state).some(p => p.pid === child!.pid)).toBe(false);
+      let retained = journal.getEnv(first.envId)!.servicePids;
+      await engine.shutdown();
+      engine = new Engine();
+      await engine.recover();
+      expect(journal.getEnv(first.envId)!.servicePids).toEqual(retained);
+      if (path === 'both groups') {
+        expect(Object.values(retained)[0]!.pgids).toContain(victim.pid);
+        process.kill(leader.pid, 'SIGKILL');
+        await exited;
+        retained = await reapPids(retained);
+        expect(Object.values(retained)).toEqual([{ pid: victim.pid, startTime: victim.startTime }]);
+      }
+      expect(Object.keys(retained).length).toBeGreaterThan(0);
+      expect(await reapPids(retained)).toEqual(retained);
+      await expect(engine.up({ cwd: tree, holder: 'a', dataOnly: true })).rejects.toThrow(/unreaped service processes/);
+      await expect(engine.up({ cwd: other, holder: 'b' })).rejects.toThrow(/cap/);
+      await engine.shutdown();
+      expect(journal.getEnv(first.envId)!.servicePids).toEqual(retained);
+      const report = await engine.doctor();
+      expect(report.issues.some(i => i.envId === first.envId && i.issue.includes(`retained live process group ${victim!.pid}`))).toBe(true);
+      process.kill(child!.pid, 'SIGKILL');
+      await waitFor(() => !groupAlive(victim!.pid));
+      expect((await engine.up({ cwd: tree, holder: 'a', dataOnly: true })).dataOnly).toBe(true);
+      expect(journal.getEnv(first.envId)!.servicePids).toEqual({});
+      expect((await engine.up({ cwd: other, holder: 'b' })).dataOnly).toBe(false);
+    } finally {
+      intercept = false;
+      for (const rec of [child, victim, leader]) {
+        if (rec) { try { process.kill(rec.pid, 'SIGKILL'); } catch {} }
+      }
+      await engine.shutdown();
+      for (const key of Object.keys(process.env)) if (!(key in saved)) delete process.env[key];
+      Object.assign(process.env, saved);
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it.each(['before GC', 'during discovery'] as const)('retains the original survivor group when its nonleader moves %s', async (moveAt) => {
     const root = realpathSync(mkdtempSync(join(tmpdir(), 'bl-gc-moved-survivor-')));
     const state = join(root, 'state');
@@ -455,8 +570,8 @@ console.log(JSON.stringify({tagged:tagged.pid,untagged:untagged.pid}));
       expect(failed.presets).toEqual(original.presets);
       expect(readFileSync(original.datastoreNs.main)).toEqual(database);
       for (const { record } of children) {
-        if (procScanSupported()) expect(kill).toHaveBeenCalledWith(record.pid, record.startTime, undefined, record.pid);
-        else expect(kill).toHaveBeenCalledWith(record.pid, record.startTime);
+        if (procScanSupported()) expect(kill).toHaveBeenCalledWith(record.pid, record.startTime, undefined, record.pid, expect.any(Function));
+        else expect(kill).toHaveBeenCalledWith(record.pid, record.startTime, undefined, undefined, expect.any(Function));
       }
       expect(Object.values(original.servicePids).filter((r) => !blocked.has(r.pid)).every((r) => !groupAlive(r.pid))).toBe(true);
       await expect(fetch(first.urls.web.replace('localhost', '127.0.0.1'), { signal: AbortSignal.timeout(2000) })).rejects.toThrow();

@@ -49,7 +49,8 @@ function parseServicePids(raw: string): Record<string, ServicePid> {
     if (typeof v === 'number') out[name] = { pid: v };
     else if (v && typeof v === 'object' && typeof (v as ServicePid).pid === 'number') {
       out[name] = { pid: (v as ServicePid).pid, startTime: (v as ServicePid).startTime,
-        ...(typeof (v as ServicePid).pgid === 'number' ? { pgid: (v as ServicePid).pgid } : {}) };
+        ...(typeof (v as ServicePid).pgid === 'number' ? { pgid: (v as ServicePid).pgid } : {}),
+        ...(Array.isArray((v as ServicePid).pgids) ? { pgids: (v as ServicePid).pgids!.filter(g => Number.isSafeInteger(g) && g > 0) } : {}) };
     }
   }
   return out;

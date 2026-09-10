@@ -24,6 +24,7 @@ export interface ServicePid {
   pid: number;
   startTime?: number;
   pgid?: number;
+  pgids?: number[];
 }
 
 export interface Environment {

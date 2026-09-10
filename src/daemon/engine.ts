@@ -22,7 +22,7 @@ import { cmdTimeoutS, runBounded, runBoundedIO, LONG_CMD_TIMEOUT_S } from '../co
 import { makeDatastore, retireBakedTemplates, withBakeLock, tryWithBakeLock, type DsHandle } from '../drivers/datastores.js';
 import { ensureAppliance, stopAppliance, probeTcp } from '../drivers/appliances.js';
 import { DEFAULT_PREVIEW_PUBLISHER, resolvePreviewPublisher } from '../drivers/preview.js';
-import { EnvSupervisor, killGroupVerified, reapPids } from './supervisor.js';
+import { EnvSupervisor, killGroupVerified, reapPids, mergeServicePids, serviceGroups } from './supervisor.js';
 import { groupAlive, isAlive, processGroup, procScanSupported, sameProcess, scanByCwd, scanTagged, serviceTag, startTime, type TaggedProc } from '../core/procscan.js';
 import { policy } from '../core/policy.js';
 import { kernelSleepGap, readKernelSleepRecord } from '../core/sleep.js';
@@ -339,37 +339,34 @@ export class Engine {
 
     const reclaimed: Array<{ pid: number; envId: string; service: string }> = [];
     let skipped = 0;
-    for (const proc of tagged) {
+    const eligible = tagged.filter(proc => {
       if (live.has(proc.envId) || leasedPreviews.has(proc.pid)) {
         skipped++;
-        continue;
+        return false;
       }
-      // Pin identity to the exact process the scan saw: between the scan and
-      // this kill the pid could have exited and been reused.
-      const dead = await killGroupVerified(proc.pid, proc.startTime);
-      if (dead) reclaimed.push({ pid: proc.pid, envId: proc.envId, service: proc.service });
-    }
-    if (reclaimed.length) {
-      // A reclaimed process may have been the one the journal was still
-      // tracking — drop those records so doctor() doesn't report drift.
-      for (const env of this.journal.allEnvs()) {
-        const candidates = Object.fromEntries(
-          Object.entries(env.servicePids).filter(([, rec]) => reclaimed.some((r) => r.envId === env.id && r.pid === rec.pid)),
-        );
-        if (Object.keys(candidates).length === 0) continue;
-        const survivors = await reapPids(candidates);
-        const fresh = this.journal.getEnv(env.id);
-        if (!fresh) continue;
-        for (const [name, rec] of Object.entries(candidates)) {
-          const current = fresh.servicePids[name];
-          if (!survivors[name] && current?.pid === rec.pid && current.startTime === rec.startTime && current.pgid === rec.pgid) {
-            delete fresh.servicePids[name];
-          }
+      return true;
+    });
+    for (const envId of new Set(eligible.map(proc => proc.envId))) {
+      const processes = eligible.filter(proc => proc.envId === envId);
+      const observedGroups = new Map(processes.map(proc => [proc.pid, processGroup(proc.pid) ?? proc.pid]));
+      const env = this.journal.getEnv(envId);
+      const candidates = Object.fromEntries(Object.entries(env?.servicePids ?? {}).filter(([, rec]) =>
+        processes.some(proc => proc.pid === rec.pid && proc.startTime === rec.startTime)));
+      const survivors = await this.reapDiscoveredProcesses(processes, candidates);
+      for (const proc of processes) {
+        if (!sameProcess(proc.pid, proc.startTime) && !groupAlive(observedGroups.get(proc.pid) ?? proc.pid)) {
+          reclaimed.push({ pid: proc.pid, envId, service: proc.service });
         }
-        this.journal.saveEnv(fresh);
       }
-      logEvent({ level: 'info', kind: 'gc', detail: `reclaimed ${reclaimed.length} orphaned process(es)` });
+      const fresh = this.journal.getEnv(envId);
+      if (!fresh) continue;
+      for (const [name, rec] of Object.entries(candidates)) {
+        if (JSON.stringify(fresh.servicePids[name]) === JSON.stringify(rec)) delete fresh.servicePids[name];
+      }
+      fresh.servicePids = mergeServicePids(fresh.servicePids, survivors);
+      this.journal.saveEnv(fresh);
     }
+    if (reclaimed.length) logEvent({ level: 'info', kind: 'gc', detail: `reclaimed ${reclaimed.length} orphaned process(es)` });
     return { supported: true, reclaimed, skipped };
   }
 
@@ -2775,8 +2772,9 @@ export class Engine {
       // Journal says these pids run — are they actually alive, and still ours?
       for (const [svc, rec] of Object.entries(env.servicePids)) {
         if (!isAlive(rec.pid)) {
-          if (rec.pgid !== undefined && groupAlive(rec.pgid)) {
-            issues.push({ level: 'error', envId: env.id, issue: `service '${svc}' has a retained live process group ${rec.pgid} after recorded pid ${rec.pid} exited — ownership and application capacity remain retained until teardown is confirmed` });
+          const groups = serviceGroups(rec).filter(groupAlive);
+          if (groups.length > 0) {
+            issues.push({ level: 'error', envId: env.id, issue: `service '${svc}' has a retained live process group ${groups.join(', ')} after recorded pid ${rec.pid} exited — ownership and application capacity remain retained until teardown is confirmed` });
           } else {
             issues.push({ level: 'error', envId: env.id, issue: `journal records pid ${rec.pid} for service '${svc}' but it is not running (recovery drift)` });
           }
@@ -2847,7 +2845,7 @@ export class Engine {
   private async stopForBind(env: EnvRow): Promise<void> {
     const survivors = await this.supervisor(env).stopAll();
     this.supervisors.delete(env.id);
-    const unreaped = await this.reapEnvProcesses(env, { ...env.servicePids, ...survivors });
+    const unreaped = await this.reapEnvProcesses(env, mergeServicePids(env.servicePids, survivors));
     const live = this.journal.getEnv(env.id);
     if (live) {
       if (live.state === 'hot') live.state = 'warm';
@@ -2908,19 +2906,12 @@ export class Engine {
     processes: Array<{ pid: number; startTime: number; service?: string }>,
     recorded: Record<string, ServicePid>,
   ): Promise<Record<string, ServicePid>> {
-    const results = await Promise.all(processes.map(async (proc) => {
-      const pgid = processGroup(proc.pid) ?? proc.pid;
-      return { proc, pgid, dead: await this.reapServiceGroup(proc.pid, proc.startTime, undefined, pgid) };
-    }));
-    const survivors = await reapPids(recorded, this.reapServiceGroup);
-    for (const { proc, pgid, dead } of results) {
-      if (dead || (!isAlive(proc.pid) && !groupAlive(pgid))) continue;
-      if (Object.values(survivors).some((rec) => rec.pid === proc.pid && rec.startTime === proc.startTime && (rec.pgid ?? rec.pid) === pgid)) continue;
-      let key = `${proc.service ?? 'cwd'}:${proc.pid}`;
-      while (Object.hasOwn(survivors, key)) key += ':';
-      survivors[key] = { pid: proc.pid, startTime: proc.startTime, ...(pgid !== proc.pid ? { pgid } : {}) };
-    }
-    return survivors;
+    const discovered = Object.fromEntries(processes.map(proc => [
+      `${proc.service ?? 'cwd'}:${proc.pid}`,
+      { pid: proc.pid, startTime: proc.startTime, pgid: sameProcess(proc.pid, proc.startTime) ? processGroup(proc.pid) ?? proc.pid : proc.pid },
+    ]));
+    const survivors = await reapPids(mergeServicePids(recorded, discovered), this.reapServiceGroup);
+    return reapPids(survivors, this.reapServiceGroup);
   }
 
   /** Enforce the kill switch under the env lock before preset validation can fail. */
@@ -3092,7 +3083,7 @@ export class Engine {
     // the thing that just tried to kill it holds the newer number, and reaping
     // the stale one would leave the live process behind.
     const recorded = this.journal.getEnv(env.id)?.servicePids ?? env.servicePids;
-    let unresolved = await this.reapEnvProcesses(env, { ...recorded, ...survivors });
+    let unresolved = await this.reapEnvProcesses(env, mergeServicePids(recorded, survivors));
     const stopping = this.journal.getEnv(env.id);
     if (stopping) {
       stopping.servicePids = unresolved;
@@ -3462,7 +3453,7 @@ export class Engine {
           // result was hundreds of orphaned service children with a deleted cwd
           // holding gigabytes, and cold pool entries whose port was still bound
           // so the next bind failed with "occupied by a foreign process".
-          const unreaped = await this.reapEnvProcesses(fresh, { ...fresh.servicePids, ...survivors });
+          const unreaped = await this.reapEnvProcesses(fresh, mergeServicePids(fresh.servicePids, survivors));
           this.supervisors.delete(env.id);
           const post = this.journal.getEnv(env.id);
           if (post) {
@@ -3507,7 +3498,7 @@ export class Engine {
       // env can carry recorded survivors too, which is why this is not gated on
       // `hot`. reapEnvProcesses returns what it could NOT confirm dead, and
       // that — never an assumption — is what the next daemon life inherits.
-      const recorded = { ...env.servicePids, ...survivors.get(env.id) };
+      const recorded = mergeServicePids(env.servicePids, survivors.get(env.id));
       // …except an in-flight operation, which is never interrupted — the rule
       // claimForTeardown, the sweeper and pool gc all already keep. A check runs
       // DETACHED so it can outlive the daemon (see runGroupCmd), and it carries
