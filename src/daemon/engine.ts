@@ -2887,19 +2887,27 @@ export class Engine {
       const leasedPreviews = this.leasedPreviewPids(tagged);
       const orphans = tagged.filter((p) => p.envId === env.id && !leasedPreviews.has(p.pid));
       if (orphans.length > 0) {
-        const results = await Promise.all(orphans.map(async (o) => {
-          const pgid = processGroup(o.pid) ?? o.pid;
-          return { orphan: o, pgid, dead: await this.reapServiceGroup(o.pid, o.startTime) };
-        }));
-        if (Object.keys(survivors).length > 0) survivors = await reapPids(survivors, this.reapServiceGroup);
-        for (const { orphan, pgid, dead } of results) {
-          if (dead || (!isAlive(orphan.pid) && !groupAlive(pgid))) continue;
-          if (Object.values(survivors).some((rec) => rec.pid === orphan.pid && rec.startTime === orphan.startTime)) continue;
-          let key = `${orphan.service}:${orphan.pid}`;
-          while (Object.hasOwn(survivors, key)) key += ':';
-          survivors[key] = { pid: orphan.pid, startTime: orphan.startTime };
-        }
+        survivors = await this.reapDiscoveredProcesses(orphans, survivors);
       }
+    }
+    return survivors;
+  }
+
+  private async reapDiscoveredProcesses(
+    processes: Array<{ pid: number; startTime: number; service?: string }>,
+    recorded: Record<string, ServicePid>,
+  ): Promise<Record<string, ServicePid>> {
+    const results = await Promise.all(processes.map(async (proc) => {
+      const pgid = processGroup(proc.pid) ?? proc.pid;
+      return { proc, pgid, dead: await this.reapServiceGroup(proc.pid, proc.startTime) };
+    }));
+    const survivors = await reapPids(recorded, this.reapServiceGroup);
+    for (const { proc, pgid, dead } of results) {
+      if (dead || (!isAlive(proc.pid) && !groupAlive(pgid))) continue;
+      if (Object.values(survivors).some((rec) => rec.pid === proc.pid && rec.startTime === proc.startTime && (rec.pgid ?? rec.pid) === pgid)) continue;
+      let key = `${proc.service ?? 'cwd'}:${proc.pid}`;
+      while (Object.hasOwn(survivors, key)) key += ':';
+      survivors[key] = { pid: proc.pid, startTime: proc.startTime, ...(pgid !== proc.pid ? { pgid } : {}) };
     }
     return survivors;
   }
@@ -3027,12 +3035,12 @@ export class Engine {
    * may be in it; being wrong there would kill a stranger's process, which is
    * the one outcome this whole module is written to avoid.
    */
-  private async reapEnvTree(env: EnvRow): Promise<void> {
-    if (!procScanSupported()) return;
+  private async reapEnvTree(env: EnvRow, recorded: Record<string, ServicePid>): Promise<Record<string, ServicePid>> {
+    if (!procScanSupported()) return recorded;
     const inTree = scanByCwd(env.root);
-    if (inTree.length === 0) return;
-    const dead = await Promise.all(inTree.map((p) => killGroupVerified(p.pid, p.startTime)));
-    const killed = inTree.filter((_, i) => dead[i]);
+    const survivors = await this.reapDiscoveredProcesses(inTree, recorded);
+    if (inTree.length === 0) return survivors;
+    const killed = inTree.filter((p) => !Object.values(survivors).some((rec) => rec.pid === p.pid));
     // Never silent: this path kills by location rather than by tag, so the
     // evidence for every one of those decisions has to be on the record.
     logEvent({
@@ -3043,10 +3051,11 @@ export class Engine {
         `${killed.length}/${inTree.length} untagged process(es) were still running inside the environment tree and were reclaimed by cwd` +
         ` (${inTree.map((p) => `${p.pid}:${p.cwd}`).join(', ')})`,
     });
+    return survivors;
   }
 
   /** Slow teardown of an already-claimed ('recycling') env. */
-  private async teardownClaimed(env: EnvRow): Promise<void> {
+  private async teardownClaimed(env: EnvRow): Promise<boolean> {
     this.stopWatch(env.id);
     // deleteEnv drops the lease row by raw SQL, taking the only record of its
     // preview tunnel with it — so the tunnel has to be reaped here, while it can
@@ -3072,15 +3081,27 @@ export class Engine {
     // the thing that just tried to kill it holds the newer number, and reaping
     // the stale one would leave the live process behind.
     const recorded = this.journal.getEnv(env.id)?.servicePids ?? env.servicePids;
-    const unresolved = await this.reapEnvProcesses(env, { ...recorded, ...survivors });
-    await this.reapEnvTree(env);
+    let unresolved = await this.reapEnvProcesses(env, { ...recorded, ...survivors });
+    const stopping = this.journal.getEnv(env.id);
+    if (stopping) {
+      stopping.servicePids = unresolved;
+      this.journal.saveEnv(stopping);
+    }
+    unresolved = await this.reapEnvTree(env, unresolved);
     if (Object.keys(unresolved).length > 0) {
+      const live = this.journal.getEnv(env.id);
+      if (live) {
+        live.state = 'warm';
+        live.servicePids = unresolved;
+        this.journal.saveEnv(live);
+      }
       logEvent({
         level: 'warn',
         kind: 'teardown',
         envId: env.id,
-        detail: `${Object.keys(unresolved).length} service process(es) outlived teardown — 'backlot pool gc' reclaims them by tag`,
+        detail: `${Object.keys(unresolved).length} service process(es) outlived teardown — ownership and capacity retained; retry recycling once they can be reclaimed`,
       });
+      return false;
     }
     // Drop server-side namespaces too (best effort — the manifest may be gone).
     try {
@@ -3113,13 +3134,13 @@ export class Engine {
     this.appliedInputs.delete(env.id);
     this.appliedInputSpecs.delete(env.id);
     this.envChains.delete(env.id); // don't leak a settled chain for a dead id
+    return true;
   }
 
   private async recycleOne(envId: string, force: boolean): Promise<boolean> {
     const claimed = await this.claimForTeardown(envId, force);
     if (!claimed) return false;
-    await this.teardownClaimed(claimed);
-    return true;
+    return this.teardownClaimed(claimed);
   }
 
   /**

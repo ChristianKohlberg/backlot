@@ -324,6 +324,7 @@ export async function killGroupVerified(
   pid: number,
   recordedStart?: number,
   graceMs = 2000,
+  recordedGroup?: number,
 ): Promise<boolean> {
   if (!sameProcess(pid, recordedStart)) {
     // The pid is no longer the process we recorded. Whatever now sits in that
@@ -331,12 +332,12 @@ export async function killGroupVerified(
     // are indistinguishable by pid alone — so signalling it is never safe.
     // Report gone only if the group is genuinely empty; otherwise leave it
     // unresolved for tag-based reclaim, which pid reuse cannot confuse.
-    return !groupAlive(pid);
+    return !groupAlive(recordedGroup ?? pid);
   }
   // Resolve the group BEFORE signalling: once the leader exits its /proc entry
   // is gone and the surviving siblings become unattributable.
   const pgid = processGroup(pid) ?? pid;
-  const gone = () => !groupAlive(pgid);
+  const gone = () => !groupAlive(pgid) && (recordedGroup === undefined || !groupAlive(recordedGroup));
 
   signalGroup(pgid, pid, 'SIGTERM');
   const deadline = Date.now() + graceMs;
@@ -371,7 +372,9 @@ export async function reapPids(pids: Record<string, ServicePid>, kill = killGrou
     Object.entries(pids).map(async ([name, rec]) => {
       // Recorded pids are group leaders (services spawn detached) — signal the
       // group so the actual server dies too, not just the sh -c wrapper.
-      const dead = await kill(rec.pid, rec.startTime);
+      const dead = rec.pgid === undefined
+        ? await kill(rec.pid, rec.startTime)
+        : await kill(rec.pid, rec.startTime, undefined, rec.pgid);
       if (!dead) survivors[name] = rec;
     }),
   );

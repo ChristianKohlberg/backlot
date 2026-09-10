@@ -73,7 +73,7 @@ it('composes canonical ownership, selected preset, preview group and preserved d
     check(await f.cli(['reset-data'], f.alias));
     const db = new DatabaseSync(join(f.state, 'journal.db'), { readOnly: true });
     try {
-      expect(db.prepare('PRAGMA user_version').get()!.user_version).toBe(2);
+      expect(db.prepare('PRAGMA user_version').get()!.user_version).toBe(3);
       expect(db.prepare('PRAGMA table_info(envs)').all().map(r => r.name)).toContain('legacy_stack_root');
       const lease = db.prepare('SELECT presets FROM leases WHERE id=?').get(first.data.lease.id)!;
       expect(JSON.parse(String(lease.presets))).toEqual({ main: 'alternate' });

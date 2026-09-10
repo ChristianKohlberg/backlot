@@ -29,7 +29,7 @@ import type { EnvState, Hygiene, LeaseKind, ServicePid } from './types.js';
  * test lane's database. Disk is truth (decision 0009), so the truth has to say
  * what wrote it.
  */
-export const JOURNAL_SCHEMA_VERSION = 2;
+export const JOURNAL_SCHEMA_VERSION = 3;
 
 /**
  * service_pids was once `{"web": 1234}` and is now
@@ -48,7 +48,8 @@ function parseServicePids(raw: string): Record<string, ServicePid> {
   for (const [name, v] of Object.entries(parsed as Record<string, unknown>)) {
     if (typeof v === 'number') out[name] = { pid: v };
     else if (v && typeof v === 'object' && typeof (v as ServicePid).pid === 'number') {
-      out[name] = { pid: (v as ServicePid).pid, startTime: (v as ServicePid).startTime };
+      out[name] = { pid: (v as ServicePid).pid, startTime: (v as ServicePid).startTime,
+        ...(typeof (v as ServicePid).pgid === 'number' ? { pgid: (v as ServicePid).pgid } : {}) };
     }
   }
   return out;

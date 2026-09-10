@@ -158,6 +158,12 @@ additive `ALTER TABLE` migrations are not bumps.
 For preset intent versus completed restores and its compatibility barrier, see
 the `JOURNAL_SCHEMA_VERSION` comment in `src/core/journal.ts`.
 
+Schema 3 preserves observed `servicePids.*.pgid` for nonleader survivors: after
+the recorded process exits, its original group can still hold capacity. Schema 2
+readers discard that field and must refuse this journal. Teardown retains a warm,
+retryable row until recorded, tagged and cwd-discovered survivors are confirmed
+gone; `tests/conversion-capacity.test.ts` covers failed eviction and group retry.
+
 ## Caller environment inputs
 
 `services.*.env_from` allowlists caller variables (`required`/`optional`). Explicit

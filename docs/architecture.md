@@ -9,6 +9,20 @@ This document is the founding design. It was produced by working a real system
 failure mode we could think of, then generalizing. Individual decisions are recorded
 in [`decisions/`](decisions/); this document is the connected whole.
 
+### Journal upgrade barrier
+
+Journal schema 3 retains the observed process group (`servicePids.*.pgid`) when
+a surviving service process is not its group leader. A dead recorded process
+does not prove that this group is empty. Retries and recovery check the persisted
+group's liveness, and signal only through a process whose identity is verified.
+Failed teardown preserves the environment's ownership and capacity charge;
+deletion waits for confirmed reclamation, including the final cwd scan.
+
+Schema 2 readers would discard the group field and incorrectly release capacity,
+so they must refuse a schema 3 journal. Upgrade the running daemon before using
+it; do not lower `PRAGMA user_version` to bypass the barrier. Schema 3 retains
+schema 2's lease preset intent and the additive physical-path identity migration.
+
 ---
 
 ## 1. The problem
