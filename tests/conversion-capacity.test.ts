@@ -1,11 +1,15 @@
 import { afterAll, describe, expect, it, vi } from 'vitest';
-import { execFile, execFileSync } from 'node:child_process';
+import { execFile, execFileSync, spawn } from 'node:child_process';
+import { once } from 'node:events';
+import { createInterface } from 'node:readline';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Journal, type EnvRow } from '../src/core/journal.js';
 import type { ServicePid } from '../src/core/types.js';
 import { Engine } from '../dist/daemon/engine.js';
+import { killGroupVerified, reapPids } from '../dist/daemon/supervisor.js';
+import { groupAlive, isAlive, procScanSupported, processGroup, scanTagged, serviceTag, startTime } from '../src/core/procscan.js';
 
 const CLI = join(import.meta.dirname, '../dist/cli/index.js');
 interface Result { code: number; data: any; stdout: string; stderr: string }
@@ -104,6 +108,89 @@ datastores:
 }
 
 describe('application capacity survives an unfinished data-only conversion', () => {
+  it('reconciles an exited leader after reclaiming its tagged child through bind', async () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), 'bl-convert-orphan-')));
+    const state = join(root, 'state');
+    const saved = { ...process.env };
+    Object.assign(process.env, {
+      BACKLOT_STATE_DIR: state, BACKLOT_POOL_MAX: '1', BACKLOT_POOL_MAX_TOTAL: '1',
+      BACKLOT_POOL_MAX_DATA_ONLY: '4', BACKLOT_SWEEP_MS: '60000', BACKLOT_WAIT_MS: '100',
+    });
+    const engine = new Engine();
+    let orphan: { leader: number; child: number } | undefined;
+    let childStart: number | undefined;
+    let reaper: ReturnType<typeof spawn> | undefined;
+    let reaperExit: Promise<unknown[]> | undefined;
+    const waitFor = async (predicate: () => boolean) => {
+      for (let i = 0; i < 250; i++) {
+        if (predicate()) return;
+        await sleep(20);
+      }
+      throw new Error('orphan fixture did not reach the expected process state');
+    };
+    try {
+      const tree = inProcessStack(root, 'app');
+      const other = inProcessStack(root, 'other');
+      const first = await engine.up({ cwd: tree, holder: 'a', dataOnly: true });
+      const journal = new Journal(join(state, 'journal.db'));
+      reaper = spawn('python3', [join(import.meta.dirname, 'fixtures/exited-service-leader.py'),
+        process.execPath, JSON.stringify(serviceTag(first.envId, 'web', state))], { stdio: ['ignore', 'pipe', 'pipe'] });
+      reaperExit = once(reaper, 'exit');
+      const lines = createInterface({ input: reaper.stdout! });
+      let stderr = '';
+      reaper.stderr!.on('data', (chunk) => { stderr += chunk; });
+      const ready = await Promise.race([
+        once(lines, 'line').then(([line]) => JSON.parse(line) as { leader: number; child: number }),
+        reaperExit.then(() => { throw new Error(`orphan fixture exited before reporting pids: ${stderr}`); }),
+      ]);
+      orphan = ready;
+      lines.close();
+      await waitFor(() => startTime(ready.child) !== undefined && (!procScanSupported() ||
+        scanTagged(state).some((p) => p.pid === ready.child)));
+      childStart = startTime(ready.child);
+      expect(isAlive(ready.leader)).toBe(false);
+      expect(isAlive(ready.child)).toBe(true);
+      expect(groupAlive(ready.leader)).toBe(true);
+      if (procScanSupported()) expect(processGroup(ready.child)).toBe(ready.leader);
+      const recorded = { web: { pid: ready.leader } };
+      expect(await reapPids(recorded)).toEqual(recorded);
+      const row = journal.getEnv(first.envId)!;
+      row.dataOnly = false;
+      row.state = 'warm';
+      row.servicePids = recorded;
+      journal.saveEnv(row);
+      await expect(engine.up({ cwd: other, holder: 'b' })).rejects.toMatchObject({ message: expect.stringMatching(/cap/) });
+      if (!procScanSupported()) {
+        await expect(engine.up({ cwd: tree, holder: 'a', dataOnly: true })).rejects.toMatchObject({
+          message: expect.stringContaining('still has unreaped service processes'),
+        });
+        expect(journal.getEnv(first.envId)?.servicePids).toEqual(recorded);
+        process.kill(ready.child, 'SIGTERM');
+        await waitFor(() => !groupAlive(ready.leader));
+      }
+      const converted = await engine.up({ cwd: tree, holder: 'a', dataOnly: true });
+      expect(converted.envId).toBe(first.envId);
+      expect(converted.dataOnly).toBe(true);
+      expect(converted.state).toBe('warm');
+      expect(isAlive(ready.child)).toBe(false);
+      expect(groupAlive(ready.leader)).toBe(false);
+      expect(journal.getEnv(first.envId)?.servicePids).toEqual({});
+      const admitted = await engine.up({ cwd: other, holder: 'b' });
+      const response = await fetch(admitted.urls.web.replace('localhost', '127.0.0.1'), { signal: AbortSignal.timeout(2000) });
+      expect(await response.text()).toBe('alive');
+    } finally {
+      if (orphan) {
+        if (procScanSupported()) await killGroupVerified(orphan.child, childStart);
+        else if (isAlive(orphan.child) && startTime(orphan.child) === childStart) process.kill(orphan.child, 'SIGKILL');
+      }
+      if (reaperExit) await reaperExit;
+      await engine.shutdown();
+      for (const key of Object.keys(process.env)) if (!(key in saved)) delete process.env[key];
+      Object.assign(process.env, saved);
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it.each(['reuse', 'pristine'] as const)('retains simulated teardown survivors through a %s bind and releases capacity after retry', async (hygiene) => {
     const root = realpathSync(mkdtempSync(join(tmpdir(), 'bl-convert-survivors-')));
     const saved = { ...process.env };

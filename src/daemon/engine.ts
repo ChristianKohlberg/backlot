@@ -2886,6 +2886,7 @@ export class Engine {
       const orphans = tagged.filter((p) => p.envId === env.id && !leasedPreviews.has(p.pid));
       if (orphans.length > 0) {
         await Promise.all(orphans.map((o) => killGroupVerified(o.pid, o.startTime)));
+        if (Object.keys(survivors).length > 0) survivors = await reapPids(survivors);
       }
     }
     return survivors;
