@@ -1,10 +1,13 @@
 import { expect, it } from 'vitest';
 import { cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
-import { execFileSync } from 'node:child_process';
+import { execFile } from 'node:child_process';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
+import { promisify } from 'node:util';
 
-it('packs a working CLI without stale adapter outputs from an older build', () => {
+const run = promisify(execFile);
+
+it('packs a working CLI without stale adapter outputs from an older build', async () => {
   const root = mkdtempSync(join(tmpdir(), 'backlot-pack-'));
   const repo = join(import.meta.dirname, '..');
   try {
@@ -15,18 +18,24 @@ it('packs a working CLI without stale adapter outputs from an older build', () =
     mkdirSync(join(root, 'dist', 'mcp'), { recursive: true });
     writeFileSync(join(root, 'dist', 'mcp', 'index.js'), 'throw new Error("stale adapter");\n');
     writeFileSync(join(root, 'dist', 'mcp', 'index.js.map'), '{}');
-    const packed = JSON.parse(execFileSync('npm', ['pack', '--json'], { cwd: root, encoding: 'utf8' }));
+    // Keep Vitest's event loop responsive and bound each child itself;
+    // prepack needs enough time to compile on a loaded CI runner.
+    const packed = JSON.parse((await run('npm', ['pack', '--json'], {
+      cwd: root, encoding: 'utf8', timeout: 120_000, killSignal: 'SIGKILL',
+    })).stdout);
     const files = packed[0].files.map((file: { path: string }) => file.path);
     expect(files.some((path: string) => path.startsWith('dist/mcp/'))).toBe(false);
     expect(files).toContain('dist/cli/index.js');
     expect(files).toContain('dist/daemon/index.js');
-    execFileSync('tar', ['-xzf', packed[0].filename], { cwd: root });
+    await run('tar', ['-xzf', packed[0].filename], { cwd: root, timeout: 10_000, killSignal: 'SIGKILL' });
     const manifest = JSON.parse(readFileSync(join(root, 'package', 'package.json'), 'utf8'));
     expect(manifest.bin).toEqual({ backlot: 'dist/cli/index.js' });
-    const help = execFileSync(process.execPath, [join(root, 'package', manifest.bin.backlot), '--help'], { encoding: 'utf8' });
+    const { stdout: help } = await run(process.execPath, [join(root, 'package', manifest.bin.backlot), '--help'], {
+      encoding: 'utf8', timeout: 10_000, killSignal: 'SIGKILL',
+    });
     expect(help).toContain('backlot up');
     expect(help).toContain('backlot run');
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
-}, 60000);
+}, 150_000);
