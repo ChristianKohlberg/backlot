@@ -318,7 +318,9 @@ function signalGroup(pgid: number, pid: number, signal: NodeJS.Signals): void {
  * survivor became unreachable forever. Escalation plus a verified verdict is
  * what makes "reaped" mean reaped.
  *
- * Returns true if the leader is confirmed gone.
+ * Returns true only when the observed and supplied recorded groups are empty.
+ * `observeGroup` hands the current group to reapPids before signalling so its
+ * ownership survives even if the recorded process exits during reclamation.
  */
 export async function killGroupVerified(
   pid: number,
@@ -372,8 +374,9 @@ export async function reapPids(pids: Record<string, ServicePid>, kill = killGrou
   const survivors: Record<string, ServicePid> = {};
   await Promise.all(
     Object.entries(pids).map(async ([name, rec]) => {
-      // Recorded pids are group leaders (services spawn detached) — signal the
-      // group so the actual server dies too, not just the sh -c wrapper.
+      // Discovery can record nonleaders, and a process can move groups. Keep
+      // every observed live group even after its identifying process exits;
+      // only a verified process identity authorizes signalling a current group.
       const groups = new Set(serviceGroups(rec));
       if (sameProcess(rec.pid, rec.startTime)) groups.add(processGroup(rec.pid) ?? rec.pid);
       const dead = await kill(rec.pid, rec.startTime, undefined, rec.pgid, group => groups.add(group));

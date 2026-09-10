@@ -1,12 +1,17 @@
 import { expect, it } from 'vitest';
 import { execFile } from 'node:child_process';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { appendFileSync, chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 
 const CLI = join(import.meta.dirname, '../dist/cli/index.js');
 const publicUrl = 'https://integration-preview.trycloudflare.com';
+// Opt-in product evidence from these private, synthetic fixtures only.
+function evidence(record: unknown) {
+  const file = process.env.BACKLOT_TEST_EVIDENCE_FILE;
+  if (file) appendFileSync(file, JSON.stringify(record) + '\n');
+}
 function fixture() {
   const root = realpathSync(mkdtempSync(join(tmpdir(), 'bl-series-')));
   const tree = join(root, 'tree'); const alias = join(root, 'alias'); const state = join(root, 'state');
@@ -29,11 +34,12 @@ function fixture() {
   const cli = (args: string[], cwd = tree) => new Promise<{ code: number; data: any; output: string }>(resolve => {
     execFile(process.execPath, [CLI, ...args, '--json'], { cwd, env, timeout: 25000 }, (error, stdout, stderr) => {
       let data; try { data = JSON.parse(stdout); } catch { data = null; }
+      evidence({ cwd, command: ['backlot', ...args, '--json'], code: error ? Number(error.code ?? 1) : 0, stdout, stderr });
       resolve({ code: error ? Number(error.code ?? 1) : 0, data, output: stdout + stderr });
     });
   });
   const pids = () => ['leader', 'child'].map(name => Number(readFileSync(join(root, `${name}.pid`), 'utf8')));
-  const value = (ctx: any) => { const db = new DatabaseSync(ctx.datastores.main.url); try { return db.prepare('SELECT value FROM marker').get()!.value; } finally { db.close(); } };
+  const value = (ctx: any) => { const db = new DatabaseSync(ctx.datastores.main.url); try { const value = db.prepare('SELECT value FROM marker').get()!.value; evidence({ database: ctx.datastores.main.url, query: 'SELECT value FROM marker', value }); return value; } finally { db.close(); } };
   const cleanup = async () => {
     try {
       await cli(['release']);
@@ -48,6 +54,7 @@ async function stopped(pids: number[]) {
   const end = Date.now() + 10000;
   while (pids.some(alive) && Date.now() < end) await new Promise(r => setTimeout(r, 50));
   expect(pids.map(alive)).toEqual(pids.map(() => false));
+  evidence({ publisherPids: pids, alive: pids.map(alive) });
 }
 
 it('composes canonical ownership, selected preset, preview group and preserved deadline across content operations', async () => {
@@ -76,6 +83,7 @@ it('composes canonical ownership, selected preset, preview group and preserved d
       expect(db.prepare('PRAGMA user_version').get()!.user_version).toBe(3);
       expect(db.prepare('PRAGMA table_info(envs)').all().map(r => r.name)).toContain('legacy_stack_root');
       const lease = db.prepare('SELECT presets FROM leases WHERE id=?').get(first.data.lease.id)!;
+      evidence({ schema: db.prepare('PRAGMA user_version').get(), lease });
       expect(JSON.parse(String(lease.presets))).toEqual({ main: 'alternate' });
     } finally { db.close(); }
   } finally { await f.cleanup(); }

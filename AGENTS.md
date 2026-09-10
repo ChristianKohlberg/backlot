@@ -24,7 +24,7 @@ Services are spawned detached (`detached: true` in `spawn`) so they outlive the 
 
 Consequence: a group kill (`killGroupVerified`) is not sufficient teardown — a service that called `setsid()` or spawned a detached grandchild escapes the `-pgid` signal and can keep holding its port. `stopAll()` must therefore always be followed by a reap of journal-recorded pids plus a tag scan before trusting any port-free check. **Every `stopAll()` call site is bound by this** — `bindAndStart`, `teardownClaimed`, the quiesce path, and `shutdown()`. Deferring the reap to "the next bind will handle it" is the bug (#34): a quiesced env can sit cold for hours, and a stopping daemon has no next anything. `reapEnvProcesses` in `src/daemon/engine.ts` owns this invariant (see its doc comment for the failure modes and the survivor-preservation contract); `tests/env-port-survivor.test.ts` and `tests/agent-lease-and-recycle.test.ts` are the regression tests. Crash recovery follows the same rule: `recover()` reaps recorded pids for every journaled env and re-runs `teardownClaimed` for `state='recycling'` rows.
 
-Recorded `servicePids` hold only the **top-level service pids** — a service's own children were never on the books, so the tag scan is the only thing that finds them. For anything that also scrubbed the tag, `reapEnvTree` reaps by cwd (`scanByCwd`, which matches a `(deleted)` cwd too). That path is **teardown-only**: a quiesced env keeps its tree on disk and someone's shell may legitimately be sitting in it.
+Supervision initially records top-level service pids; reclamation also records discovered survivors. `reapPids` in `src/daemon/supervisor.ts` owns their identity and group-preservation contract. For anything that also scrubbed the tag, `reapEnvTree` reaps by cwd (`scanByCwd`, which matches a `(deleted)` cwd too). That path is **teardown-only**: a quiesced env keeps its tree on disk and someone's shell may legitimately be sitting in it.
 
 ## Publishers own their dialect — the engine must not learn one
 
@@ -117,7 +117,10 @@ Pool commands are shared-box operations: `pool recycle` with no id targets **eve
 
 The consequence worth remembering: **waiting can never clear a machine-wide block**, because a release leaves the row behind. `structuralCapacityBlock` therefore treats it as structural unless something is evictable or transient — the old code explicitly assumed the opposite ("another stack will release") and burned the full window (#47). `tests/pool-machine-capacity.test.ts` covers all of it.
 
-There is a **third ceiling**: `poolMaxDataOnly` for data-only environments, which are charged against neither application cap ([decision 0025](docs/decisions/0025-data-only-environments-are-priced-separately.md)) — the app caps measure cores and memory, and a data lease runs nothing. So `poolMax`/`poolMaxTotal` now mean *application* environments (`appEnvs()`), and every capacity decision buckets by shape, eviction included. The sharp edge: because reuse is never capacity-checked, **changing an environment's shape is a capacity event** — `convertShape` moves the row between buckets only if the destination has room, and writes it at claim time so a concurrent claim sees the new bucket. Unmetered, that conversion turns the cheap ceiling into application capacity. A conversion to data-only retains its application charge while the row is hot or records service pids: upkeep may fail before stopping the old app. The bind's stop phase (`stopForBind`) journals `warm` and the unreaped survivors the moment the services are gone, so a failure after that point releases the slot rather than holding it until the next sweep. Shape changes wait for an in-flight environment operation — `tryClaim` answers `deferred` rather than `null`, so the wait neither evicts nor consults the capacity checks and its timeout names the operation, not a cap — and a claim reserves the bind (`pendingBinds`) until it holds the environment lock, since `busy` is set several microtasks after the claim resolves. Returning to an already-charged app does not need a second slot (`tests/conversion-capacity.test.ts`). Pinning the shape instead is simpler and was rejected: it silently removes 0023's supported both-ways lease switching (`tests/data-only-lease.test.ts` catches this — heed it).
+The data-only ceiling and shape-conversion accounting are defined in
+[decision 0025](docs/decisions/0025-data-only-environments-are-priced-separately.md).
+`stopForBind`, `pendingBinds` and `tryClaim` enforce the transition;
+`tests/conversion-capacity.test.ts` and `tests/data-only-lease.test.ts` cover it.
 
 ## Version skew is a first-class failure, and the daemon outlives the install
 
@@ -158,11 +161,9 @@ additive `ALTER TABLE` migrations are not bumps.
 For preset intent versus completed restores and its compatibility barrier, see
 the `JOURNAL_SCHEMA_VERSION` comment in `src/core/journal.ts`.
 
-Schema 3 preserves observed `servicePids.*.pgid` and additional `pgids` for survivors: after
-the recorded process exits, its original group can still hold capacity. Schema 2
-readers discard that field and must refuse this journal. Teardown retains a warm,
-retryable row until recorded, tagged and cwd-discovered survivors are confirmed
-gone; `tests/conversion-capacity.test.ts` covers failed eviction and group retry.
+See [journal upgrade barrier](docs/architecture.md#journal-upgrade-barrier) for
+survivor group ownership and old-reader refusal;
+`tests/conversion-capacity.test.ts` covers failed eviction and group retry.
 
 ## Caller environment inputs
 

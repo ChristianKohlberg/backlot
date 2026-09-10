@@ -16,8 +16,12 @@ Journal schema 3 retains every observed unresolved process group in
 A dead recorded process does not prove these groups are empty. Retries and
 recovery check every persisted group for liveness, and signal only through a
 process whose identity is verified.
-Failed teardown preserves the environment's ownership and capacity charge;
-deletion waits for confirmed reclamation, including the final cwd scan.
+Failed teardown preserves a warm, retryable environment with its ownership and
+capacity charge; deletion waits for confirmed reclamation, including the final
+cwd scan. `pool recycle`, including `--force`, reports unreaped survivors
+separately from a busy or leased environment. Run `backlot doctor` to inspect
+them, then retry recycling once they can be reclaimed; force does not bypass
+unresolved ownership.
 
 Schema 2 readers would discard the group fields and incorrectly release capacity,
 so they must refuse a schema 3 journal. Upgrade the running daemon before using
@@ -71,7 +75,7 @@ Kubernetes, Windows, secrets management, and dashboards are not.
 | **Substrate** | Where environments physically live, behind a driver: `local` (supervised processes in a directory), later `docker`, `morph`, `sprites`, `ssh`. |
 | **Environment** | A pooled slot on a substrate: its own copy of the tree, warm caches, running services, allocated ports, a datastore namespace. Durable; belongs to the pool, never to a person or task. A lease may cover a **subset** of it — a service slice (`up <service>`), or the datastores alone (`up --data-only`, [decision 0023](decisions/0023-data-only-leases.md)) for a test lane that needs a seeded database rather than an application. |
 | **Binding** | A source state (ref + dirty diff) plus a data state (preset, at a hygiene level) attached to an environment. An immutable snapshot. |
-| **Lease** | Temporary ownership of an environment, with a TTL renewed by explicit `up` (or `bind --ref --ttl`); `run` takes a new lease. Content operations (`sync`, `bind`, watch saves, `reset-data`) preserve a continuing lease's absolute deadline. Read-only verbs (`ctx`, `logs`, `token`, `pull`, `status`) do not refresh it. Expiry returns the environment to the pool **warm** — nothing is torn down. |
+| **Lease** | Temporary ownership of an environment; see [lease deadlines and renewal](../README.md#how-long-you-hold-it---ttl-for-agents---holder-pid-for-shells). Expiry returns the environment to the pool **warm** — nothing is torn down. |
 
 Plus one verb-noun: a **Run** — a named check executed against a binding, producing an
 exit code, a JSON verdict, and collected artifacts.
@@ -265,7 +269,7 @@ local/remote abstraction; the local substrate is enumerate-and-copy.)
   `@rebake-template` fingerprints — a lockfile, a migration — falls back to the full
   bind path, which runs the rule and restarts services; skipping the rule silently
   would hand out an environment the manifest says is stale. Stopped on
-  release/expiry/quiesce/recycle. Watch activity preserves the lease deadline; explicit `up` renews it.
+  release/expiry/quiesce/recycle. See [lease renewal](../README.md#how-long-you-hold-it---ttl-for-agents---holder-pid-for-shells) for watch activity.
 - The environment-side reset restores tracked files hard on every bind. A **clean-slate**
   bind (`--reset-data` or `--pristine`) additionally removes untracked env-side files —
   droppings left by a check, service, or `exec` — **except** declared `caches:`

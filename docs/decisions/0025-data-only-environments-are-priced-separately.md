@@ -74,7 +74,9 @@ stopped result at once so a later failure releases the slot instead of holding i
 until the next sweep. A claim also carries a bind reservation until its bind holds
 the environment lock, since a concurrent shape change could otherwise rewrite the
 row in the gap before `busy` is set. `tests/conversion-capacity.test.ts` proves
-each of these; the agent-facing summary lives in `AGENTS.md`.
+each of these. Unresolved survivors retain the charge; the
+[journal upgrade barrier](../architecture.md#journal-upgrade-barrier) describes
+durable group ownership and confirmed teardown.
 
 ## Consequences
 

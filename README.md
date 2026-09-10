@@ -162,7 +162,8 @@ During conversion to data-only, the old application slot stays reserved until
 its services have stopped. If preparation fails before teardown, the running
 application still counts against the application caps; retrying the conversion
 or returning to the application shape remains supported. A shape change waits
-for an operation already using the environment.
+for an operation already using the environment. For failed teardown and recycle
+retries, see [survivor ownership](docs/architecture.md#journal-upgrade-barrier).
 
 ### Choosing datastore presets
 
@@ -209,6 +210,15 @@ environment:
 backlot up --ttl 45                       # agents, scripts, CI: hold it for 45 minutes
 BACKLOT_HOLDER_PID=$$ backlot up          # an interactive shell: hold it until THIS shell exits
 ```
+
+Explicit `up` renews the lease. Content operations (`sync`, `bind`, watch saves,
+and `reset-data`) preserve a continuing lease's absolute deadline, including
+when sync falls back to a full bind. Use `up --ttl <minutes>` to extend it;
+`bind --ref <ref> --ttl <minutes>` and `preview <service> --ttl <minutes>` also
+renew explicitly. Read-only polling does not extend ownership. A fresh or
+expired acquisition takes a normal new deadline; `reset-data` requires a live
+lease and refuses an expired one before changing data. `run` always takes its
+own independent lease.
 
 **`--ttl` is the form for anything automated.** `--holder-pid <pid>` (or
 `BACKLOT_HOLDER_PID`) pins the lease to a process so the environment returns to

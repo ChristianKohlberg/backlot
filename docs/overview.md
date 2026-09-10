@@ -47,10 +47,9 @@ flowchart LR
 
 Two inversions carry the whole design:
 
-- **Environments are durable; leases are disposable.** A lease has a TTL, renewed only
-  by an explicit `up` (or `bind --ref --ttl`); `run` takes its own lease. Content
-  operations (`sync`, `bind`, watch saves, `reset-data`) keep a continuing lease's
-  absolute deadline, and read-only polling does not touch it. When an agent crashes or a
+- **Environments are durable; leases are disposable.** See the README for
+  [lease deadlines and renewal](../README.md#how-long-you-hold-it---ttl-for-agents---holder-pid-for-shells).
+  When an agent crashes or a
   human forgets, the lease lapses and the environment returns to the pool **warm**, heat
   intact. Abandonment costs nothing, so nothing gets hoarded.
 - **Watchers never move; bindings move.** An environment's dev servers watch the

@@ -20,6 +20,9 @@ import type { EnvState, Hygiene, LeaseKind, ServicePid } from './types.js';
  * environment's recorded choices; tests/preset-selection.test.ts covers the
  * retry and restart invariant.
  *
+ * Schema 3's survivor-group compatibility barrier is documented in
+ * docs/architecture.md#journal-upgrade-barrier.
+ *
  * What this exists to stop is the DOWNGRADE, which has already cost once. The
  * sha256 env-id migration stranded pre-upgrade rows that then counted against
  * POOL_MAX_TOTAL and held their ports forever (BACKLOG.md), because nothing on
