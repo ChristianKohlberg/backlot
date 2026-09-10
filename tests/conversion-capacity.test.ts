@@ -606,7 +606,7 @@ console.log(JSON.stringify({tagged:tagged.pid,untagged:untagged.pid}));
     }
   });
 
-  it('reconciles an exited leader after reclaiming its tagged child through bind', async () => {
+  it.each(['bind', 'GC', 'GC concurrent'] as const)('reconciles an exited leader after reclaiming its tagged child through %s', async (boundary) => {
     const root = realpathSync(mkdtempSync(join(tmpdir(), 'bl-convert-orphan-')));
     const state = join(root, 'state');
     const saved = { ...process.env };
@@ -614,7 +614,18 @@ console.log(JSON.stringify({tagged:tagged.pid,untagged:untagged.pid}));
       BACKLOT_STATE_DIR: state, BACKLOT_POOL_MAX: '1', BACKLOT_POOL_MAX_TOTAL: '1',
       BACKLOT_POOL_MAX_DATA_ONLY: '4', BACKLOT_SWEEP_MS: '60000', BACKLOT_WAIT_MS: '100',
     });
-    const engine = new Engine();
+    let duringReap: (() => void) | undefined;
+    const engine = new Engine(async (...args: Parameters<typeof killGroupVerified>) => {
+      const dead = await killGroupVerified(...args);
+      if (duringReap) {
+        const update = duringReap;
+        duringReap = undefined;
+        update();
+      }
+      return dead;
+    });
+    let concurrent: ReturnType<typeof spawn> | undefined;
+    let concurrentExit: Promise<unknown[]> | undefined;
     let orphan: { leader: number; child: number } | undefined;
     let childStart: number | undefined;
     let reaper: ReturnType<typeof spawn> | undefined;
@@ -653,7 +664,7 @@ console.log(JSON.stringify({tagged:tagged.pid,untagged:untagged.pid}));
       const recorded = { web: { pid: ready.leader } };
       expect(await reapPids(recorded)).toEqual(recorded);
       const row = journal.getEnv(first.envId)!;
-      row.dataOnly = false;
+      row.dataOnly = boundary !== 'bind';
       row.state = 'warm';
       row.servicePids = recorded;
       journal.saveEnv(row);
@@ -666,10 +677,37 @@ console.log(JSON.stringify({tagged:tagged.pid,untagged:untagged.pid}));
         process.kill(ready.child, 'SIGTERM');
         await waitFor(() => !groupAlive(ready.leader));
       }
-      const converted = await engine.up({ cwd: tree, holder: 'a', dataOnly: true });
-      expect(converted.envId).toBe(first.envId);
-      expect(converted.dataOnly).toBe(true);
-      expect(converted.state).toBe('warm');
+      if (boundary === 'GC concurrent' && procScanSupported()) {
+        concurrent = spawn(process.execPath, ['-e', 'setInterval(()=>{},1000)'], { detached: true, stdio: 'ignore' });
+        concurrentExit = once(concurrent, 'exit');
+        const concurrentPid = concurrent.pid!;
+        await waitFor(() => startTime(concurrentPid) !== undefined);
+        const added = { pid: concurrentPid, startTime: startTime(concurrentPid) };
+        duringReap = () => {
+          const fresh = journal.getEnv(first.envId)!;
+          fresh.servicePids.web = { ...recorded.web, pgids: [concurrentPid] };
+          fresh.servicePids.concurrent = added;
+          journal.saveEnv(fresh);
+        };
+        await engine.poolGc(false);
+        expect(journal.getEnv(first.envId)?.servicePids).toEqual({
+          web: { ...recorded.web, pgids: [concurrentPid] }, concurrent: added,
+        });
+        await expect(engine.up({ cwd: other, holder: 'b' })).rejects.toThrow(/cap/);
+        expect(await killGroupVerified(concurrentPid, added.startTime)).toBe(true);
+        await concurrentExit;
+        await engine.shutdown();
+      } else if (boundary === 'GC' && procScanSupported()) {
+        const reclaimed = await engine.poolGc(false);
+        expect(reclaimed.reclaimed).toContainEqual({ pid: ready.child, envId: first.envId, service: 'web' });
+        expect(journal.getEnv(first.envId)?.dataOnly).toBe(true);
+        expect(journal.getEnv(first.envId)?.state).toBe('warm');
+      } else {
+        const converted = await engine.up({ cwd: tree, holder: 'a', dataOnly: true });
+        expect(converted.envId).toBe(first.envId);
+        expect(converted.dataOnly).toBe(true);
+        expect(converted.state).toBe('warm');
+      }
       expect(isAlive(ready.child)).toBe(false);
       expect(groupAlive(ready.leader)).toBe(false);
       expect(journal.getEnv(first.envId)?.servicePids).toEqual({});
@@ -677,6 +715,9 @@ console.log(JSON.stringify({tagged:tagged.pid,untagged:untagged.pid}));
       const response = await fetch(admitted.urls.web.replace('localhost', '127.0.0.1'), { signal: AbortSignal.timeout(2000) });
       expect(await response.text()).toBe('alive');
     } finally {
+      duringReap = undefined;
+      if (concurrent?.pid) await killGroupVerified(concurrent.pid);
+      if (concurrentExit) await concurrentExit;
       if (orphan) {
         if (procScanSupported()) await killGroupVerified(orphan.child, childStart);
         else if (isAlive(orphan.child) && startTime(orphan.child) === childStart) process.kill(orphan.child, 'SIGKILL');

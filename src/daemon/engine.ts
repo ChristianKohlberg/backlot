@@ -364,6 +364,12 @@ export class Engine {
         if (JSON.stringify(fresh.servicePids[name]) === JSON.stringify(rec)) delete fresh.servicePids[name];
       }
       fresh.servicePids = mergeServicePids(fresh.servicePids, survivors);
+      for (const [name, rec] of Object.entries(env?.servicePids ?? {})) {
+        if (!leasedPreviews.has(rec.pid) && JSON.stringify(fresh.servicePids[name]) === JSON.stringify(rec) &&
+            !sameProcess(rec.pid, rec.startTime) && serviceGroups(rec).every(group => !groupAlive(group))) {
+          delete fresh.servicePids[name];
+        }
+      }
       this.journal.saveEnv(fresh);
     }
     if (reclaimed.length) logEvent({ level: 'info', kind: 'gc', detail: `reclaimed ${reclaimed.length} orphaned process(es)` });
