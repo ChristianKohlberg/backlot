@@ -655,7 +655,7 @@ export class Engine {
       const human = (ms: number) => (ms >= 60_000 ? `${Math.round(ms / 60_000)}m` : `${Math.max(1, Math.round(ms / 1000))}s`);
       const idleFor = human(now() - cand.lastUsedAt);
       const wasState = cand.state;
-      if (!(await this.recycleOne(cand.id, false))) continue; // leased or busy in the gap
+      if (await this.recycleOne(cand.id, false) !== 'recycled') continue;
       logEvent({
         level: 'info',
         kind: 'pool-evict',
@@ -3137,10 +3137,10 @@ export class Engine {
     return true;
   }
 
-  private async recycleOne(envId: string, force: boolean): Promise<boolean> {
+  private async recycleOne(envId: string, force: boolean): Promise<'recycled' | 'unclaimed' | 'survivors'> {
     const claimed = await this.claimForTeardown(envId, force);
-    if (!claimed) return false;
-    return this.teardownClaimed(claimed);
+    if (!claimed) return 'unclaimed';
+    return await this.teardownClaimed(claimed) ? 'recycled' : 'survivors';
   }
 
   /**
@@ -3159,6 +3159,7 @@ export class Engine {
   async poolRecycle(opts: { envId?: string; force: boolean }) {
     const { envId, force } = opts;
     const skipped: Array<{ envId: string; reason: string }> = [];
+    const survivorReason = (id: string) => `environment ${id} has unreaped service processes — ownership and capacity retained; run 'backlot doctor' to inspect them, then retry recycling once they can be reclaimed`;
     if (envId) {
       const env = this.journal.getEnv(envId);
       if (!env) {
@@ -3177,7 +3178,9 @@ export class Engine {
           'pool',
         );
       }
-      if (!(await this.recycleOne(envId, force))) {
+      const outcome = await this.recycleOne(envId, force);
+      if (outcome === 'survivors') throw new BrokerError('env-error', survivorReason(envId), 'pool');
+      if (outcome === 'unclaimed') {
         // claimForTeardown declines for three reasons, and only these are left
         // after the checks above: an operation in flight, a teardown already
         // under way, or a lease that appeared in the gap. Never claim which.
@@ -3192,8 +3195,13 @@ export class Engine {
     }
     const recycled: string[] = [];
     for (const env of this.journal.allEnvs()) {
-      if (await this.recycleOne(env.id, force)) {
+      const outcome = await this.recycleOne(env.id, force);
+      if (outcome === 'recycled') {
         recycled.push(env.id);
+        continue;
+      }
+      if (outcome === 'survivors') {
+        skipped.push({ envId: env.id, reason: survivorReason(env.id) });
         continue;
       }
       // Say what survived and why. A silent skip reads as "recycle did not
@@ -3216,7 +3224,7 @@ export class Engine {
   async poolReconcile() {
     const reaped: string[] = [];
     for (const env of this.journal.allEnvs()) {
-      if (env.state === 'degraded' && (await this.recycleOne(env.id, true))) reaped.push(env.id);
+      if (env.state === 'degraded' && await this.recycleOne(env.id, true) === 'recycled') reaped.push(env.id);
     }
     logEvent({ level: 'info', kind: 'pool-reconcile', detail: `reaped ${reaped.length} degraded env(s)` });
     return { reaped };
