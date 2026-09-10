@@ -108,6 +108,98 @@ datastores:
 }
 
 describe('application capacity survives an unfinished data-only conversion', () => {
+  it('retains same-service detached survivors until every kill is confirmed', async () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), 'bl-convert-detached-')));
+    const state = join(root, 'state');
+    const saved = { ...process.env };
+    Object.assign(process.env, {
+      BACKLOT_STATE_DIR: state, BACKLOT_POOL_MAX: '1', BACKLOT_POOL_MAX_TOTAL: '1',
+      BACKLOT_POOL_MAX_DATA_ONLY: '4', BACKLOT_SWEEP_MS: '60000', BACKLOT_WAIT_MS: '100',
+    });
+    const blocked = new Set<number>();
+    const staleVerdicts = new Set<number>();
+    const kill = vi.fn(async (pid: number, identity?: number) => {
+      if (blocked.has(pid)) return false;
+      const dead = await killGroupVerified(pid, identity);
+      return staleVerdicts.has(pid) ? false : dead;
+    });
+    const engine = new Engine(kill);
+    const children: Array<{ proc: ReturnType<typeof spawn>; exit: Promise<unknown[]>; record: ServicePid }> = [];
+    try {
+      const tree = inProcessStack(root, 'app');
+      const other = inProcessStack(root, 'other');
+      const first = await engine.up({ cwd: tree, holder: 'a' });
+      const journal = new Journal(join(state, 'journal.db'));
+      const original = journal.getEnv(first.envId)!;
+      const database = readFileSync(original.datastoreNs.main);
+      for (let i = 0; i < 3; i++) {
+        const proc = spawn(process.execPath, ['-e', 'console.log("ready");setInterval(() => {}, 1000)'], {
+          detached: true, stdio: ['ignore', 'pipe', 'ignore'], env: { ...process.env, ...serviceTag(first.envId, 'web', state) },
+        });
+        const exit = once(proc, 'exit');
+        const record = { pid: proc.pid!, startTime: startTime(proc.pid!) };
+        children.push({ proc, exit, record });
+        await once(proc.stdout!, 'data');
+        record.startTime = startTime(record.pid);
+        expect(record.startTime).toBeDefined();
+        expect(isAlive(record.pid)).toBe(true);
+        if (procScanSupported()) {
+          expect(processGroup(record.pid)).toBe(record.pid);
+          expect(scanTagged(state).some((p) => p.pid === record.pid && p.service === 'web')).toBe(true);
+        } else {
+          original.servicePids[`web:${record.pid}`] = record;
+        }
+        if (i < 2) blocked.add(record.pid);
+        else if (procScanSupported()) staleVerdicts.add(record.pid);
+      }
+      if (!procScanSupported()) journal.saveEnv(original);
+      const manifest = readFileSync(join(tree, 'backlot.yml'), 'utf8');
+      writeFileSync(join(tree, 'backlot.yml'), manifest.replace('create: node seed.mjs {{ns}}', 'create: "false"'));
+      const refuse = () => expect(engine.up({ cwd: tree, holder: 'a', dataOnly: true, hygiene: 'reset-data' })).rejects.toMatchObject({
+        message: expect.stringContaining('still has unreaped service processes'),
+      });
+      await refuse();
+      const failed = journal.getEnv(first.envId)!;
+      expect(failed.state).toBe('warm');
+      expect(failed.dataOnly).toBe(true);
+      expect(Object.values(failed.servicePids).sort((a, b) => a.pid - b.pid)).toEqual(children.slice(0, 2).map((c) => c.record).sort((a, b) => a.pid - b.pid));
+      expect(isAlive(children[2]!.record.pid)).toBe(false);
+      expect(failed.presets).toEqual(original.presets);
+      expect(readFileSync(original.datastoreNs.main)).toEqual(database);
+      for (const { record } of children) expect(kill).toHaveBeenCalledWith(record.pid, record.startTime);
+      expect(Object.values(original.servicePids).filter((r) => !blocked.has(r.pid)).every((r) => !groupAlive(r.pid))).toBe(true);
+      await expect(fetch(first.urls.web.replace('localhost', '127.0.0.1'), { signal: AbortSignal.timeout(2000) })).rejects.toThrow();
+      await expect(engine.up({ cwd: other, holder: 'b' })).rejects.toMatchObject({ message: expect.stringMatching(/cap/) });
+      blocked.delete(children[0]!.record.pid);
+      await refuse();
+      expect(isAlive(children[0]!.record.pid)).toBe(false);
+      expect(Object.values(journal.getEnv(first.envId)!.servicePids)).toEqual([children[1]!.record]);
+      expect(readFileSync(original.datastoreNs.main)).toEqual(database);
+      await expect(engine.up({ cwd: other, holder: 'b' })).rejects.toMatchObject({ message: expect.stringMatching(/cap/) });
+      blocked.clear();
+      writeFileSync(join(tree, 'backlot.yml'), manifest);
+      const converted = await engine.up({ cwd: tree, holder: 'a', dataOnly: true, hygiene: 'reset-data' });
+      expect(converted.envId).toBe(first.envId);
+      expect(converted.state).toBe('warm');
+      expect(converted.urls).toEqual({});
+      expect(journal.getEnv(first.envId)?.servicePids).toEqual({});
+      expect(children.every(({ record }) => !isAlive(record.pid))).toBe(true);
+      const admitted = await engine.up({ cwd: other, holder: 'b' });
+      const response = await fetch(admitted.urls.web.replace('localhost', '127.0.0.1'), { signal: AbortSignal.timeout(2000) });
+      expect(await response.text()).toBe('alive');
+    } finally {
+      blocked.clear();
+      for (const child of children) {
+        await killGroupVerified(child.record.pid, child.record.startTime);
+        await child.exit;
+      }
+      await engine.shutdown();
+      for (const key of Object.keys(process.env)) if (!(key in saved)) delete process.env[key];
+      Object.assign(process.env, saved);
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it('reconciles an exited leader after reclaiming its tagged child through bind', async () => {
     const root = realpathSync(mkdtempSync(join(tmpdir(), 'bl-convert-orphan-')));
     const state = join(root, 'state');

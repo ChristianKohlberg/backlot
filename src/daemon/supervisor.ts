@@ -365,13 +365,13 @@ export async function killGroupVerified(
  * Returns the entries that were NOT confirmed dead. The caller must keep those
  * in the journal — a forgotten pid is an orphan nobody can ever reclaim.
  */
-export async function reapPids(pids: Record<string, ServicePid>): Promise<Record<string, ServicePid>> {
+export async function reapPids(pids: Record<string, ServicePid>, kill = killGroupVerified): Promise<Record<string, ServicePid>> {
   const survivors: Record<string, ServicePid> = {};
   await Promise.all(
     Object.entries(pids).map(async ([name, rec]) => {
       // Recorded pids are group leaders (services spawn detached) — signal the
       // group so the actual server dies too, not just the sh -c wrapper.
-      const dead = await killGroupVerified(rec.pid, rec.startTime);
+      const dead = await kill(rec.pid, rec.startTime);
       if (!dead) survivors[name] = rec;
     }),
   );

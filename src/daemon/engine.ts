@@ -23,7 +23,7 @@ import { makeDatastore, retireBakedTemplates, withBakeLock, tryWithBakeLock, typ
 import { ensureAppliance, stopAppliance, probeTcp } from '../drivers/appliances.js';
 import { DEFAULT_PREVIEW_PUBLISHER, resolvePreviewPublisher } from '../drivers/preview.js';
 import { EnvSupervisor, killGroupVerified, reapPids } from './supervisor.js';
-import { isAlive, processGroup, procScanSupported, sameProcess, scanByCwd, scanTagged, serviceTag, startTime, type TaggedProc } from '../core/procscan.js';
+import { groupAlive, isAlive, processGroup, procScanSupported, sameProcess, scanByCwd, scanTagged, serviceTag, startTime, type TaggedProc } from '../core/procscan.js';
 import { policy } from '../core/policy.js';
 import { kernelSleepGap, readKernelSleepRecord } from '../core/sleep.js';
 import { retentionSweep } from '../core/retention.js';
@@ -168,6 +168,8 @@ function holderIdentity(pid?: number): { holderPid?: number; holderStart?: numbe
 }
 
 export class Engine {
+  constructor(private readonly reapServiceGroup: typeof killGroupVerified = killGroupVerified) {}
+
   readonly journal = new Journal();
   private supervisors = new Map<string, EnvSupervisor>();
   private lastSweep = now();
@@ -2872,7 +2874,7 @@ export class Engine {
     const recorded = pids ?? env.servicePids;
     let survivors: Record<string, ServicePid> = {};
     if (Object.keys(recorded).length > 0) {
-      survivors = await reapPids(recorded);
+      survivors = await reapPids(recorded, this.reapServiceGroup);
     }
     if (procScanSupported()) {
       // A preview tunnel carries this env's tag but belongs to the LEASE, not to
@@ -2885,8 +2887,18 @@ export class Engine {
       const leasedPreviews = this.leasedPreviewPids(tagged);
       const orphans = tagged.filter((p) => p.envId === env.id && !leasedPreviews.has(p.pid));
       if (orphans.length > 0) {
-        await Promise.all(orphans.map((o) => killGroupVerified(o.pid, o.startTime)));
-        if (Object.keys(survivors).length > 0) survivors = await reapPids(survivors);
+        const results = await Promise.all(orphans.map(async (o) => {
+          const pgid = processGroup(o.pid) ?? o.pid;
+          return { orphan: o, pgid, dead: await this.reapServiceGroup(o.pid, o.startTime) };
+        }));
+        if (Object.keys(survivors).length > 0) survivors = await reapPids(survivors, this.reapServiceGroup);
+        for (const { orphan, pgid, dead } of results) {
+          if (dead || (!isAlive(orphan.pid) && !groupAlive(pgid))) continue;
+          if (Object.values(survivors).some((rec) => rec.pid === orphan.pid && rec.startTime === orphan.startTime)) continue;
+          let key = `${orphan.service}:${orphan.pid}`;
+          while (Object.hasOwn(survivors, key)) key += ':';
+          survivors[key] = { pid: orphan.pid, startTime: orphan.startTime };
+        }
       }
     }
     return survivors;
