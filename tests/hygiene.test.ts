@@ -14,7 +14,7 @@ const repo = join(import.meta.dirname, '..');
 const CLI = join(repo, 'dist', 'cli', 'index.js');
 
 function makeContext(extraEnv: Record<string, string> = {}) {
-  const stateDir = mkdtempSync(join(tmpdir(), 'backlot-hyg-'));
+  const stateDir = mkdtempSync(join(tmpdir(), 'runly-hyg-'));
   const env = { ...process.env, BACKLOT_STATE_DIR: stateDir, BACKLOT_SWEEP_MS: '300', ...extraEnv };
   const cli = (args: string[], cwd: string): Promise<{ exitCode: number; json?: Record<string, unknown> }> =>
     new Promise((resolve) => {
@@ -44,7 +44,7 @@ const envsOf = async (ctx: ReturnType<typeof makeContext>, cwd: string) =>
 
 describe('auto-escalation: two failures -> pristine bind heals a poisoned cache', () => {
   const ctx = makeContext();
-  const wt = mkdtempSync(join(tmpdir(), 'backlot-esc-'));
+  const wt = mkdtempSync(join(tmpdir(), 'runly-esc-'));
   afterAll(() => {
     ctx.cleanup();
     rmSync(wt, { recursive: true, force: true });
@@ -93,7 +93,7 @@ caches: [poison.txt]
 
 describe('degraded marking + auto-reap for a flapping service', () => {
   const ctx = makeContext();
-  const wt = mkdtempSync(join(tmpdir(), 'backlot-flap-'));
+  const wt = mkdtempSync(join(tmpdir(), 'runly-flap-'));
   afterAll(() => {
     ctx.cleanup();
     rmSync(wt, { recursive: true, force: true });
@@ -130,7 +130,7 @@ services:
 
 describe('idle quiesce (hot -> warm) and rebind', () => {
   const ctx = makeContext({ BACKLOT_IDLE_TTL_MS: '800', BACKLOT_LEASE_TTL_MS: '600' });
-  const wt = mkdtempSync(join(tmpdir(), 'backlot-idle-'));
+  const wt = mkdtempSync(join(tmpdir(), 'runly-idle-'));
   afterAll(() => {
     ctx.cleanup();
     rmSync(wt, { recursive: true, force: true });
@@ -174,7 +174,7 @@ services:
 
 describe('sleep pardon (journal level)', () => {
   it('pardon shifts every lease deadline and idle timestamp by the gap', () => {
-    const dir = mkdtempSync(join(tmpdir(), 'backlot-pardon-'));
+    const dir = mkdtempSync(join(tmpdir(), 'runly-pardon-'));
     const j = new Journal(join(dir, 'j.db'));
     const base = Date.now();
     j.saveEnv({
@@ -192,7 +192,7 @@ describe('sleep pardon (journal level)', () => {
 
 describe('the clean-slate sweep cannot outrun the fingerprint ledger', () => {
   const ctx = makeContext();
-  const wt = mkdtempSync(join(tmpdir(), 'backlot-ledger-'));
+  const wt = mkdtempSync(join(tmpdir(), 'runly-ledger-'));
   afterAll(() => {
     ctx.cleanup();
     rmSync(wt, { recursive: true, force: true });
@@ -227,7 +227,7 @@ checks:
 
 describe('environments stranded by a stack-identity change are reaped', () => {
   const ctx = makeContext({ BACKLOT_SWEEP_MS: '400' });
-  const wt = mkdtempSync(join(tmpdir(), 'backlot-strand-'));
+  const wt = mkdtempSync(join(tmpdir(), 'runly-strand-'));
   afterAll(() => {
     ctx.cleanup();
     rmSync(wt, { recursive: true, force: true });

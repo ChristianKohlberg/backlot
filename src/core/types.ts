@@ -83,7 +83,7 @@ export interface Verdict {
   durationMs: number;
 }
 
-/** What `backlot ctx --json` returns — the consumer's entire interface. */
+/** What `runly ctx --json` returns — the consumer's entire interface. */
 export interface Context {
   /** Present on bind responses only; ctx never replays another request's timings. */
   bindDiagnostics?: BindDiagnostics;
@@ -92,7 +92,7 @@ export interface Context {
   lease: Lease;
   urls: Record<string, string>;
   /**
-   * Public preview URLs for services explicitly published via `backlot preview`.
+   * Public preview URLs for services explicitly published via `runly preview`.
    * Each URL is world-readable and unauthenticated — anyone with the link reaches
    * the service. Empty when no preview is active on this lease.
    */
@@ -122,7 +122,7 @@ export interface Context {
   allLogins?: Login[];
   /** The manifest's internal auth.token hook, still templated — informational. */
   tokenCommand?: string;
-  /** How a CONSUMER actually mints a token: `backlot token --role <role> --raw`. */
+  /** How a CONSUMER actually mints a token: `runly token --role <role> --raw`. */
   tokenVia?: string;
   datastores: Record<string, { url: string }>;
   artifactsDir: string;

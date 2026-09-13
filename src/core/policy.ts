@@ -66,7 +66,7 @@ function configFile(): ConfigFile {
  * The floor is 2, not 1, because the documented core loop needs two
  * environments: a session `up` holds one, and `run` always mints its own
  * ephemeral holder, so it must be able to take a second. A pool of 1 cannot run
- * backlot as documented at all — it fails with 'pool at capacity (1/1)', which
+ * runly as documented at all — it fails with 'pool at capacity (1/1)', which
  * is what small CI runners hit (3 vCPU / 7 GB gives 1 on both terms).
  *
  * This does raise peak memory on the smallest machines, which is a real cost.

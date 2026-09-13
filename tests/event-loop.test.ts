@@ -27,11 +27,11 @@ afterAll(() => {
 
 describe('a large bind does not block the daemon', () => {
   it('status answers promptly while a many-file sync is in flight', async () => {
-    const stateDir = mkdtempSync(join(tmpdir(), 'backlot-loop-'));
-    const wt = mkdtempSync(join(tmpdir(), 'backlot-loop-wt-'));
+    const stateDir = mkdtempSync(join(tmpdir(), 'runly-loop-'));
+    const wt = mkdtempSync(join(tmpdir(), 'runly-loop-wt-'));
     dirs.push(stateDir, wt);
     writeFileSync(
-      join(wt, 'backlot.yml'),
+      join(wt, 'runly.yml'),
       `name: bigtree\nservices:\n  idle: { run: "echo ready; sleep 300", ready: { log: "ready", timeout: 60 } }\n`,
     );
     // A tree big enough that enumerate+hash+copy occupies the sync phase for

@@ -1,8 +1,12 @@
-# backlot
+# runly
 
-[![npm](https://img.shields.io/npm/v/backlot)](https://www.npmjs.com/package/backlot) [![ci](https://github.com/ChristianKohlberg/backlot/actions/workflows/ci.yml/badge.svg)](https://github.com/ChristianKohlberg/backlot/actions/workflows/ci.yml) [![release](https://img.shields.io/github/v/release/ChristianKohlberg/backlot)](https://github.com/ChristianKohlberg/backlot/releases)
+Previously **Backlot**. Install with `npm install -g runly`; use `runly up` and `runly ctx`.
 
-**backlot puts a working instance of your web application in front of a coding agent
+The `backlot` command and `backlot.yml` manifests remain accepted. `runly.yml` takes precedence. State stays in `~/.local/state/backlot`; `.backlot` files, process tags and `BACKLOT_*` environment variables retain their names so existing leases and services remain discoverable. After upgrading, run `runly update` to update the running daemon. The GitHub repository remains `ChristianKohlberg/backlot`.
+
+[![npm](https://img.shields.io/npm/v/runly)](https://www.npmjs.com/package/runly) [![ci](https://github.com/ChristianKohlberg/backlot/actions/workflows/ci.yml/badge.svg)](https://github.com/ChristianKohlberg/backlot/actions/workflows/ci.yml) [![release](https://img.shields.io/github/v/release/ChristianKohlberg/backlot)](https://github.com/ChristianKohlberg/backlot/releases)
+
+**runly puts a working instance of your web application in front of a coding agent
 (or a human) — running, seeded, authenticated, provable — as a cheap, repeatable act.**
 
 It brokers environments; it never provides them. Local processes today, your own cloud
@@ -11,7 +15,7 @@ sandboxes (Morph, Sprites, SSH) tomorrow — same verbs, same model.
 > **Status: 0.10.** The local loop — pool, leases, bind-by-sync, data states,
 > verdicts — is complete, hardened by two full review cycles, and proven end to
 > end against a real .NET + Angular + MSSQL monorepo (its Playwright e2e suite
-> runs as a backlot check, and each release is verified by driving a real session
+> runs as a runly check, and each release is verified by driving a real session
 > before publish). The one unbuilt milestone is the remote substrate driver
 > (Morph/SSH). Details live in the
 > [release notes](https://github.com/ChristianKohlberg/backlot/releases).
@@ -23,7 +27,7 @@ seeded instance to **inspect**, a deterministic environment to **prove** changes
 (e2e, with a machine-readable verdict), and a seconds-fast **iterate** loop — all for
 *uncommitted worktree state*, which CI can never serve. Hand-rolled harnesses converge
 on the same machinery in every repo (port allocation, DB namespacing, capacity gating,
-zombie reaping) and stay welded to that repo. backlot is that machinery, extracted,
+zombie reaping) and stay welded to that repo. runly is that machinery, extracted,
 with the repo-specific knowledge moved into one declarative file.
 
 The core trick: **environments are pooled, durable, and warm; work visits them.**
@@ -33,26 +37,26 @@ the environment returns to the pool with its heat intact. ([Why not checkpointin
 
 ## Quickstart
 
-The one prerequisite: a `backlot.yml` at the repo root (the manifest — see the
+The one prerequisite: a `runly.yml` at the repo root (the manifest — see the
 example below). Every runnable fixture in [`examples/`](examples/) ships one, so
 the fastest first contact is a checkout:
 
 ```bash
-git clone https://github.com/ChristianKohlberg/backlot && cd backlot
-npm install && npm run build && npm link   # (or, for your own repos: npm i -g backlot)
+git clone https://github.com/ChristianKohlberg/runly runly && cd runly
+npm install && npm run build && npm link   # (or, for your own repos: npm i -g runly)
 cd examples/hello-web
-backlot up --json          # lease a warm env: sync, seed, start — returns the full context blob (URLs + creds)
-backlot run smoke --json   # bind -> run the check -> JSON verdict -> release
-backlot ctx --json         # re-read that same blob later, read-only — no re-bind (up already returned it)
-backlot sync               # source-only edits project in; startup configuration changes rebind
-backlot exec <cmd>         # run an arbitrary command in the env your lease holds (raw exit, not a verdict)
-backlot preview <service>  # publish one service on a public tunnel (requires cloudflared)
-backlot preview stop       # stop the preview tunnel on your lease
-backlot release            # environment returns to the pool, warm
+runly up --json          # lease a warm env: sync, seed, start — returns the full context blob (URLs + creds)
+runly run smoke --json   # bind -> run the check -> JSON verdict -> release
+runly ctx --json         # re-read that same blob later, read-only — no re-bind (up already returned it)
+runly sync               # source-only edits project in; startup configuration changes rebind
+runly exec <cmd>         # run an arbitrary command in the env your lease holds (raw exit, not a verdict)
+runly preview <service>  # publish one service on a public tunnel (requires cloudflared)
+runly preview stop       # stop the preview tunnel on your lease
+runly release            # environment returns to the pool, warm
 ```
 
 **`run` vs `exec`.** `run <check>` is self-contained: it takes its *own*
-environment, executes a check declared in `backlot.yml`, returns a classified
+environment, executes a check declared in `runly.yml`, returns a classified
 verdict (`work` / `env` / `infra` — a dead dev-server is never reported as your
 test failing) with artifacts, then releases — **no prior `up` needed**. `exec
 <cmd>` runs an arbitrary command inside the environment your `up` lease is
@@ -62,7 +66,7 @@ live environment.**
 
 The `backlot-mcp` executable and MCP adapter have been removed. Remove existing
 MCP launch entries from your agent configuration and invoke CLI commands through
-your shell tools, for example `backlot up --json` and `backlot run smoke --json`.
+your shell tools, for example `runly up --json` and `runly run smoke --json`.
 The CLI, daemon RPC and Claude Code skill remain supported.
 
 Source-only saves can keep `hot_reload` services running. Any change to the parsed
@@ -72,22 +76,40 @@ comments and whitespace alone do not change the parsed configuration. See
 [preview reconciliation](docs/decisions/0027-lease-scoped-public-preview.md) for the
 full conditions.
 
-`backlot run CHECK --detach --pull` copies declared outputs back to the worktree
+`runly run CHECK --detach --pull` copies declared outputs back to the worktree
 before the completed job verdict is recorded. Without `--pull`, detached checks
 leave worktree outputs untouched, just like foreground checks.
 
-### Upgrading: `backlot update` after you install
+### Moving from Backlot to Runly
 
-Installing a new backlot replaces the files on disk. It does **not** replace the
+For an existing global npm install, remove the old package first: both packages
+provide the compatibility command `backlot`, so installing
+Runly alongside Backlot otherwise fails with `EEXIST`.
+
+```bash
+npm uninstall -g backlot
+npm install -g runly
+runly update
+```
+
+Uninstalling the npm package leaves the state directory and databases intact.
+For a source checkout already linked as Backlot, rebuild and use
+`npm link --force` to replace the old links, then run `runly update`.
+The update command refuses while operations are busy; retry once they finish.
+Existing `backlot.yml` files need no rename. New manifests use `runly.yml`.
+
+### Upgrading: `runly update` after you install
+
+Installing a new runly replaces the files on disk. It does **not** replace the
 daemon already running — that process keeps serving the old code for as long as
 it lives. So an upgrade is two steps:
 
 ```bash
-npm i -g backlot@latest    # or whatever installed it — backlot never installs itself
-backlot update             # restart the daemon onto the build you just installed
+npm i -g runly@latest    # or whatever installed it — runly never installs itself
+runly update             # restart the daemon onto the build you just installed
 ```
 
-Skip the second step and backlot tells you, rather than quietly serving you the
+Skip the second step and runly tells you, rather than quietly serving you the
 old behaviour: every verb except `update`, `doctor` and `daemon stop` fails with
 `infra-error` (exit 3) naming both versions. That refusal is deliberate — an old
 daemon does not reject a flag it has never heard of, it *ignores* it, so
@@ -95,12 +117,12 @@ daemon does not reject a flag it has never heard of, it *ignores* it, so
 what you asked to be a database-only lease and report success.
 
 ```bash
-backlot --version          # this CLI
-backlot update --check     # cli vs daemon, who would have to rebind, and the upgrade command for your install
-backlot update             # restart; no-op when the daemon is already the installed build
+runly --version          # this CLI
+runly update --check     # cli vs daemon, who would have to rebind, and the upgrade command for your install
+runly update             # restart; no-op when the daemon is already the installed build
 ```
 
-`backlot daemon stop` waits up to 60 seconds after the shutdown acknowledgement
+`runly daemon stop` waits up to 60 seconds after the shutdown acknowledgement
 for the old daemon and its service teardown to finish. Success includes
 `stopped: true` (and retains `stopping: true` for compatibility); if no daemon is
 running, it succeeds without starting one. A shutdown still in progress at the
@@ -116,19 +138,19 @@ a newer daemon). `--force` overrides either.
 
 ### Partial `up`: lease one slice, not the whole app
 
-`backlot up` with **no service** brings up the whole app. Name one or more
-services and backlot starts **only that slice plus its transitive `depends_on`
+`runly up` with **no service** brings up the whole app. Name one or more
+services and runly starts **only that slice plus its transitive `depends_on`
 closure** — nothing else boots. This is how you lease a single vertical or a lone
 SPA without paying for the rest of the stack.
 
-Take [`examples/hello-multi`](examples/hello-multi/backlot.yml): `web`
+Take [`examples/hello-multi`](examples/hello-multi/runly.yml): `web`
 `depends_on: [api]`, and `worker` stands alone.
 
 ```bash
 cd examples/hello-multi
-backlot up web       # starts web + api (its depends_on closure) — worker stays down
-backlot up worker    # starts worker alone — no api, no web
-backlot up           # the whole app: api + web + worker
+runly up web       # starts web + api (its depends_on closure) — worker stays down
+runly up worker    # starts worker alone — no api, no web
+runly up           # the whole app: api + web + worker
 ```
 
 Because the closure is transitive, naming a leaf pulls in everything it needs to
@@ -145,10 +167,10 @@ Testcontainers, where every lane starts its own container and restores a full
 backup per test collection.
 
 ```bash
-backlot up --data-only --ttl 30      # seeded store, leased; no services, no builds
-backlot ctx --json                   # .datastores.main.url — point your fixture at it
-backlot reset-data                   # back to the baseline between runs
-backlot release
+runly up --data-only --ttl 30      # seeded store, leased; no services, no builds
+runly ctx --json                   # .datastores.main.url — point your fixture at it
+runly reset-data                   # back to the baseline between runs
+runly release
 ```
 
 Everything else about the lease is unchanged: it is pooled, isolated per holder,
@@ -187,9 +209,9 @@ retries, see [survivor ownership](docs/architecture.md#journal-upgrade-barrier).
 the stack has one datastore. For multiple stores, name each target explicitly:
 
 ```bash
-backlot up --preset main=dev --preset audit=empty
-backlot reset-data --preset main=empty
-backlot run smoke --preset main=dev
+runly up --preset main=dev --preset audit=empty
+runly reset-data --preset main=empty
+runly run smoke --preset main=dev
 ```
 
 Names must appear in that datastore's `presets` catalog, and so must the names a
@@ -223,8 +245,8 @@ A lease has a TTL, and there are two ways to say when you are done with an
 environment:
 
 ```bash
-backlot up --ttl 45                       # agents, scripts, CI: hold it for 45 minutes
-BACKLOT_HOLDER_PID=$$ backlot up          # an interactive shell: hold it until THIS shell exits
+runly up --ttl 45                       # agents, scripts, CI: hold it for 45 minutes
+BACKLOT_HOLDER_PID=$$ runly up          # an interactive shell: hold it until THIS shell exits
 ```
 
 Explicit `up` renews the lease. Content operations (`sync`, `bind`, watch saves,
@@ -242,24 +264,24 @@ the pool the instant that process exits instead of waiting out the TTL — which
 only useful if the process genuinely outlives the command.
 
 It does **not** work from an agent harness, because those run each command in a
-fresh shell: by the time `backlot up` returns, the `$$` it was given is a shell
-that has already exited. Backlot refuses such a bind (exit `64`) rather than
+fresh shell: by the time `runly up` returns, the `$$` it was given is a shell
+that has already exited. Runly refuses such a bind (exit `64`) rather than
 create a lease that is reclaimable the moment it exists — otherwise the sweeper
 frees the environment while you are still using it, the next bind takes it, and
 you are quietly looking at somebody else's database through the same URL.
 
-`backlot release` hands the environment back early. If it answers
+`runly release` hands the environment back early. If it answers
 `{"released": false}`, read the `reason`: use the same holder that bound it
 (`--holder` if supplied, otherwise the caller directory). See
 [physical stack identity and legacy holder recovery](docs/architecture.md#physical-stack-identity)
 for symlink aliases and upgrade recovery.
 
-For your own repo: `npm i -g backlot`, write the `backlot.yml`, then the same
+For your own repo: `npm i -g runly`, write the `runly.yml`, then the same
 verbs. Requires Node ≥ 22.13 and git. The daemon auto-spawns on first use (unix
 socket, per-machine state under `~/.local/state/backlot`; isolate with
 `BACKLOT_STATE_DIR`).
 
-The manifest, by example ([schema](schema/backlot.schema.json)):
+The manifest, by example ([schema](schema/runly.schema.json)):
 
 ```yaml
 name: myapp
@@ -300,9 +322,9 @@ and completion on stderr; command text and output are not streamed, and `--json`
 stdout stays machine-readable. Successful unchanged rules remain skipped.
 
 Services are commands, not containers. Backing infrastructure (your DB server) stays
-externally run — backlot probes it and classifies its absence honestly
+externally run — runly probes it and classifies its absence honestly
 (`infra-error`, never blaming your code). If the repo has one blessed way to start
-that infrastructure, declare it as an **appliance** and backlot ensures it without
+that infrastructure, declare it as an **appliance** and runly ensures it without
 ever owning it ([decision 0018](docs/decisions/0018-appliances-ensured-not-owned.md)).
 
 ### Caller environment inputs
@@ -318,7 +340,7 @@ services:
       API_ENDPOINT: required
 ```
 
-Export those names in your shell, then run `backlot up`. The CLI sends only
+Export those names in your shell, then run `runly up`. The CLI sends only
 declared names over the local socket; the shared daemon does not need a restart.
 When autospawning, it removes those names from the new daemon's environment so
 the first caller's inputs cannot become ambient configuration for other leases.
@@ -368,12 +390,12 @@ list. A single-login stack reports the same object in both places. An empty list
 rejected — omitting the key remains how a stack says it has no logins
 ([decision 0026](docs/decisions/0026-a-stack-may-advertise-several-logins.md)).
 
-Backlot does not create these logins, verify them, or know what a role means: the seed
+Runly does not create these logins, verify them, or know what a role means: the seed
 makes them, the manifest declares what exists, `ctx` reports it.
 
 ### A preview URL that is still valid tomorrow
 
-`backlot preview` publishes through a **publisher**. The default,
+`runly preview` publishes through a **publisher**. The default,
 `cloudflare-quick`, takes whatever `*.trycloudflare.com` name Cloudflare hands
 it — right for "look at this for ten minutes", wrong for a bookmark, a ticket, a
 device you type an address into by hand, or an app pinned to a dev server. Every
@@ -399,7 +421,7 @@ address next week. Backlot creates the named tunnel and its DNS record on first
 use and reuses them; `preview stop` ends the process, not the name.
 
 **It needs a login, once:** `cloudflared tunnel login` for the zone, which leaves
-the origin certificate the publisher checks for. No API token, and backlot holds
+the origin certificate the publisher checks for. No API token, and runly holds
 no new secret.
 
 **Leave `prefix` unset unless you mean it.** It defaults to the environment id,
@@ -439,11 +461,11 @@ still running, use `--progress`, including alongside `--json`.
 
 ## What it is / is not
 
-| backlot is | backlot is not |
+| runly is | runly is not |
 | --- | --- |
 | a warm pool of leased, isolated environments | a compute provider (bring your own, local or cloud) |
 | bind-by-sync: your dirty worktree, in front, in seconds | a build system (it invokes your commands, never understands them) |
-| seeded, template-restored data states | CI (CI may call backlot; never the reverse) |
+| seeded, template-restored data states | CI (CI may call runly; never the reverse) |
 | machine verdicts with a work/env/infra error taxonomy | an agent (no LLM calls, no browser driving) |
 
 ## Learn more
@@ -455,11 +477,11 @@ still running, use `--progress`, including alongside `--json`.
 
 ## Security model
 
-Be clear-eyed about what running backlot means:
+Be clear-eyed about what running runly means:
 
-- **`backlot.yml` commands execute with your privileges.** Services, seeds, upkeep
+- **`runly.yml` commands execute with your privileges.** Services, seeds, upkeep
   rules, and checks are shell commands from the repo — exactly like `make`, npm
-  scripts, or a Justfile. Cloning an untrusted repo and running `backlot up` runs
+  scripts, or a Justfile. Cloning an untrusted repo and running `runly up` runs
   that repo's commands as you. Review manifests you didn't write.
 - **The daemon has no network surface.** It listens on a unix socket in your
   per-user state dir (filesystem permissions are the auth) — no TCP, no remote
@@ -469,33 +491,34 @@ Be clear-eyed about what running backlot means:
   is namespacing (ports, directories, database namespaces), not a security
   boundary — code in an environment runs as you, on your machine. For untrusted
   code, put the *substrate* in a sandbox (a VM, a cloud box), not your laptop.
-- **Public preview URLs are world-readable.** `backlot preview` publishes the
+- **Public preview URLs are world-readable.** `runly preview` publishes the
   chosen service through a quick tunnel (Cloudflare by default). The URL is
   **unauthenticated** — anyone with the link reaches the service, and under
   `cloudflare-named` (below) that link still works tomorrow, so put an access
   policy in front of the zone if what you publish is not meant for everyone.
   Stacks that must never be published set `preview.forbidden: true` in
-  `backlot.yml`. The
+  `runly.yml`. The
   tunnel lives as long as your **lease**, not as long as a service process: a
   `sync`, a rebind or an idle quiesce leaves it up. A bind tears it down if the
   manifest starts forbidding preview, if the previewed service drops out of the
   running set, or if its port moves — and if `--reset-data` leaves the *same* URL
-  serving *new* data, it says so in the bind's `previewNotice`. `backlot preview
-  stop` and `backlot release` both end it.
+  serving *new* data, it says so in the bind's `previewNotice`. `runly preview
+  stop` and `runly release` both end it.
 
 ## Claude Code
 
-backlot ships an official [Claude Code](https://claude.com/claude-code) plugin —
+runly ships an official [Claude Code](https://claude.com/claude-code) plugin —
 a stack-agnostic skill that teaches an agent the lease model and the verb table so
-it drives backlot correctly against any repo's `backlot.yml`. This repository
+it drives runly correctly against any repo's `runly.yml`. This repository
 doubles as its own plugin marketplace. From inside Claude Code:
 
 ```
 /plugin marketplace add ChristianKohlberg/backlot
-/plugin install backlot
+/plugin install runly
 ```
 
-CLI-only, no MCP server — see [`plugins/backlot`](plugins/backlot/).
+CLI-only, no MCP server — see [`plugins/runly`](plugins/runly/).
+Already using `backlot@backlot`? Follow the [plugin migration instructions](plugins/runly/README.md#existing-backlot-installations); updating the CLI does not rename an installed plugin.
 
 ## License
 

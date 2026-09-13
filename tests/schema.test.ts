@@ -10,12 +10,12 @@ import { parse } from 'yaml';
 import Ajv2020 from 'ajv/dist/2020.js';
 
 const root = join(import.meta.dirname, '..');
-const schema = JSON.parse(readFileSync(join(root, 'schema/backlot.schema.json'), 'utf8'));
+const schema = JSON.parse(readFileSync(join(root, 'schema/runly.schema.json'), 'utf8'));
 const ajv = new Ajv2020({ allErrors: true });
 const validate = ajv.compile(schema);
 
 const loadStack = (example: string) =>
-  parse(readFileSync(join(root, 'examples', example, 'backlot.yml'), 'utf8'));
+  parse(readFileSync(join(root, 'examples', example, 'runly.yml'), 'utf8'));
 
 describe('stack.schema.json', () => {
   it('accepts examples/hello-web', () => {
@@ -118,12 +118,12 @@ describe('stack identity (loadStack)', () => {
   it('sibling worktrees with the same repo dir name get DISTINCT stack ids', async () => {
     // The id used to key on base64url(root).slice(-8) — the last ~6 BYTES of
     // the path — so /work/agent-1/myapp and /work/agent-2/myapp (the
-    // agent-per-worktree layout backlot targets) collided and silently shared
+    // agent-per-worktree layout runly targets) collided and silently shared
     // one pool, one journal namespace, and one template store.
     const { mkdtempSync, mkdirSync, writeFileSync, rmSync } = await import('node:fs');
     const { tmpdir } = await import('node:os');
     const { loadStack } = await import('../src/core/manifest.js');
-    const base = mkdtempSync(join(tmpdir(), 'backlot-id-'));
+    const base = mkdtempSync(join(tmpdir(), 'runly-id-'));
     try {
       const manifest = 'name: myapp\nservices:\n  web:\n    run: node s.mjs\n    port: web\n';
       for (const agent of ['agent-1', 'agent-2']) {
@@ -141,23 +141,30 @@ describe('stack identity (loadStack)', () => {
   });
 });
 
-describe('manifest filename (backlot.yml, stack.yaml accepted)', () => {
-  it('loads backlot.yml as the canonical manifest, preferring it over stack.yaml', async () => {
+describe('manifest filename (runly.yml, backlot.yml, stack.yaml accepted)', () => {
+  it('loads runly.yml as the canonical manifest, preferring it over stack.yaml', async () => {
     const { mkdtempSync, mkdirSync, writeFileSync, rmSync } = await import('node:fs');
     const { tmpdir } = await import('node:os');
     const { loadStack } = await import('../src/core/manifest.js');
-    const base = mkdtempSync(join(tmpdir(), 'backlot-manifest-'));
+    const base = mkdtempSync(join(tmpdir(), 'runly-manifest-'));
     try {
       const svc = 'services:\n  web:\n    run: node s.mjs\n    port: web\n';
-      // backlot.yml alone: the canonical name must work.
+      // runly.yml alone: the canonical name must work.
       mkdirSync(join(base, 'canonical'));
-      writeFileSync(join(base, 'canonical', 'backlot.yml'), `name: canonical\n${svc}`);
+      writeFileSync(join(base, 'canonical', 'runly.yml'), `name: canonical\n${svc}`);
       expect(loadStack(join(base, 'canonical')).manifest.name).toBe('canonical');
-      // Both present: backlot.yml wins (the rename, not a coin toss).
+      // Both present: runly.yml wins (the rename, not a coin toss).
       mkdirSync(join(base, 'both'));
-      writeFileSync(join(base, 'both', 'backlot.yml'), `name: new-name\n${svc}`);
+      writeFileSync(join(base, 'both', 'runly.yml'), `name: new-name\n${svc}`);
       writeFileSync(join(base, 'both', 'stack.yaml'), `name: old-name\n${svc}`);
+      writeFileSync(join(base, 'both', 'backlot.yml'), `name: backlot-name\n${svc}`);
       expect(loadStack(join(base, 'both')).manifest.name).toBe('new-name');
+      // Existing Backlot repos remain valid and beat the older stack.yaml name.
+      mkdirSync(join(base, 'backlot'));
+      writeFileSync(join(base, 'backlot', 'backlot.yml'), `name: backlot-name\n${svc}`);
+      expect(loadStack(join(base, 'backlot')).manifest.name).toBe('backlot-name');
+      writeFileSync(join(base, 'backlot', 'stack.yaml'), `name: oldest-name\n${svc}`);
+      expect(loadStack(join(base, 'backlot')).manifest.name).toBe('backlot-name');
       // stack.yaml alone: pre-rename repos keep working across the upgrade.
       mkdirSync(join(base, 'legacy'));
       writeFileSync(join(base, 'legacy', 'stack.yaml'), `name: legacy\n${svc}`);

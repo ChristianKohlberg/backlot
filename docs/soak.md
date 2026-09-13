@@ -1,6 +1,6 @@
 # The soak: the test the fixtures can't be
 
-The vitest suite proves backlot's invariants in seconds-long fixture runs. What
+The vitest suite proves runly's invariants in seconds-long fixture runs. What
 no fixture run can prove is **longevity**: a daemon that is still correct after
 hours of editor-realistic watch traffic, pool churn, capacity pressure, and the
 occasional violent death. Leaks, journal drift, and unbounded growth are

@@ -46,7 +46,7 @@ describe('a socket path over the AF_UNIX sun_path limit fails loudly', () => {
   };
 
   it('throws an error naming the limit and the offending path', () => {
-    const base = mkdtempSync(join(tmpdir(), 'backlot-sun-'));
+    const base = mkdtempSync(join(tmpdir(), 'runly-sun-'));
     const deep = join(base, 'x'.repeat(120)); // socket path lands well past 104 bytes
     try {
       const err = withStateDir(deep, () => {
@@ -70,7 +70,7 @@ describe('a socket path over the AF_UNIX sun_path limit fails loudly', () => {
   });
 
   it('leaves an ordinary state dir alone', () => {
-    const base = mkdtempSync(join(tmpdir(), 'backlot-sun-ok-'));
+    const base = mkdtempSync(join(tmpdir(), 'runly-sun-ok-'));
     try {
       expect(withStateDir(base, () => socketPath())).toBe(join(base, 'daemon.sock'));
     } finally {

@@ -43,8 +43,8 @@ afterAll(() => {
 });
 
 function ctx(extraEnv: Record<string, string> = {}) {
-  const stateDir = mkdtempSync(join(tmpdir(), 'backlot-atom-'));
-  const wt = mkdtempSync(join(tmpdir(), 'backlot-atom-wt-'));
+  const stateDir = mkdtempSync(join(tmpdir(), 'runly-atom-'));
+  const wt = mkdtempSync(join(tmpdir(), 'runly-atom-wt-'));
   dirs.push(stateDir, wt);
   writeFileSync(
     join(wt, 'stack.yaml'),

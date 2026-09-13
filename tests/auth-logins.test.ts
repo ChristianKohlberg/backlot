@@ -32,15 +32,15 @@ afterAll(() => {
 
 /** An isolated daemon + worktree carrying the given `auth:` block verbatim. */
 function ctx(authBlock: string) {
-  const stateDir = mkdtempSync(join(tmpdir(), 'backlot-auth-'));
-  const wt = mkdtempSync(join(tmpdir(), 'backlot-auth-wt-'));
+  const stateDir = mkdtempSync(join(tmpdir(), 'runly-auth-'));
+  const wt = mkdtempSync(join(tmpdir(), 'runly-auth-wt-'));
   dirs.push(stateDir, wt);
   writeFileSync(
     join(wt, 'srv.mjs'),
     `import{createServer}from'node:http';console.log('up');createServer((q,s)=>s.end('ok')).listen(Number(process.env.PORT), '127.0.0.1');\n`,
   );
   writeFileSync(
-    join(wt, 'backlot.yml'),
+    join(wt, 'runly.yml'),
     `name: authstack\nservices:\n  web: { run: node srv.mjs, port: web, env: { PORT: "{{ports.web}}" }, ready: { http: /, timeout: 20 } }\n${authBlock}`,
   );
   execFileSync('git', ['init', '-q'], { cwd: wt });

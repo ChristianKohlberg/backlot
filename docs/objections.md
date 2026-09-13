@@ -2,7 +2,7 @@
 
 Three questions every skeptical engineer asks, in the order they ask them. Each
 gets the honest version: where the objection is *right*, and where it stops
-being right. backlot was extracted from a hand-rolled harness that lived
+being right. runly was extracted from a hand-rolled harness that lived
 through every failure below — this page is that experience, not advocacy.
 
 ## "Why copy the source at all? Repo, worktree, *and* an env tree?"
@@ -12,7 +12,7 @@ Yes: three materializations — and only one of them is heavy.
 ```
 repo (.git object store)              history; shared by all worktrees
  └─ git worktree   /work/agent-1/app  SOURCE files; the agent edits here (truth)
-     └─ env tree   ~/.cache/backlot/… SOURCE files again (projected copy)
+     └─ env tree   ~/.cache/runly/… SOURCE files again (projected copy)
                                       + env-OWNED state: node_modules,
                                         build output, the seeded database
 ```
@@ -41,7 +41,7 @@ What that one extra copy of the source buys:
   worktree-side they would pollute the agent's `git status` and its commits.
 
 If none of those matter to you — one human, one checkout, pausing while tests
-run — you don't need the copy, or backlot.
+run — you don't need the copy, or runly.
 
 ## "My agent just runs `dotnet run` and `ng serve` itself — just as good."
 
@@ -59,7 +59,7 @@ usually made to defend. What arrives, in order:
    the code.
 3. **The crash.** An agent dies; its `dotnet` and `node` processes don't.
    Nothing owns them, nothing records them, and a fleet manufactures orphans
-   daily. (backlot spends real machinery here: process-group kills, pid
+   daily. (runly spends real machinery here: process-group kills, pid
    identity pinning, tag-based reclaim — because even *with* supervision this
    is hard.)
 4. **The cold start, every task.** Restore, build, seed — minutes per task,
@@ -67,15 +67,15 @@ usually made to defend. What arrives, in order:
    is that environments do.
 5. **The raw error.** "Connection refused": my bug, stale deps, or the DB
    server being down? A DIY agent burns its context debugging the environment.
-   backlot's error taxonomy (work / env / infra) exists because each of those
+   runly's error taxonomy (work / env / infra) exists because each of those
    demands a *different next action*.
 6. **The knowledge in prompts.** Ports, seeding, when migrations rerun —
-   re-taught per agent, drifting per agent. `backlot.yml` is that knowledge as
+   re-taught per agent, drifting per agent. `runly.yml` is that knowledge as
    one reviewed file, and the agent's protocol shrinks to "run verbs from your
    worktree."
 
 The rhetorical key: open the manifest — `dotnet run` and `ng serve` are
-*literally in it*. backlot is those commands plus the machinery every DIY
+*literally in it*. runly is those commands plus the machinery every DIY
 setup grows anyway, grown once and tested, instead of half-grown per repo.
 
 The question that decides it: **how many agents, how many tasks a day, and who
@@ -94,7 +94,7 @@ overlap. The structural gaps:
    one worktree cannot back two differently-bound stacks), plus the
    well-documented macOS bind-mount I/O tax on exactly the watcher-heavy dev
    loops agents hammer, plus the `node_modules` inside-vs-outside volume
-   dance. backlot's projection is neither: a real copy, cheap, with snapshot
+   dance. runly's projection is neither: a real copy, cheap, with snapshot
    semantics.
 2. **`up`/`down` is not a pool.** No leases, no reclaim, no warm reuse:
    nothing distinguishes an abandoned stack from a used one, and every fresh
@@ -110,12 +110,12 @@ overlap. The structural gaps:
    That script *is* the hand-rolled harness, with compose as one ingredient.
 4. **Real dev loops are often host-native.** Debugger attachment, watch
    performance, toolchain reality: the founding monorepo's loop is host
-   `dotnet` + `ng serve`, by choice. backlot is process-first by decision —
+   `dotnet` + `ng serve`, by choice. runly is process-first by decision —
    services are commands, not containers.
 
 And they compose, literally: a service's `run:` may start a container, and
-appliances routinely `docker run` the database (backlot's own mssql test
-does). Compose answers *how do my containers run*. backlot answers *who gets
+appliances routinely `docker run` the database (runly's own mssql test
+does). Compose answers *how do my containers run*. runly answers *who gets
 which running, seeded instance, in what data state, with what proof — and who
 cleans up when they vanish.* Building the second thing on top of the first is
 exactly the half-finished harness this project was extracted from.
@@ -168,5 +168,5 @@ Every load-bearing claim above was verified against primary sources
 The 2024–26 wave of agent-sandbox infrastructure (E2B, Daytona, Modal, Fly
 Sprites, Morph, Dagger's container-use) is the industry conceding the premise:
 agents need isolated, persistent, provable environments. Those products sell
-the *substrate*. backlot is the repo-aware layer above it — see
+the *substrate*. runly is the repo-aware layer above it — see
 [architecture §14](architecture.md) for the landscape.
