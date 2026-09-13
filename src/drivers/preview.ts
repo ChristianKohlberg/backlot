@@ -28,7 +28,7 @@ export interface PreviewPublisher {
   checkPrerequisite(): void;
   /**
    * Start a supervised tunnel to `localUrl`. The process is spawned detached with
-   * backlot tags so `pool gc` and lease teardown can reap it.
+   * runly tags so `pool gc` and lease teardown can reap it.
    *
    * An adapter OWNS the process it spawned until it hands back a pid: if it
    * throws, it must already have killed it. Nothing downstream can clean up a

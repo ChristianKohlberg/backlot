@@ -22,13 +22,13 @@ const hasDocker = (() => {
   }
 })();
 
-const CONTAINER = `backlot-pg-test-${Math.random().toString(36).slice(2, 8)}`;
+const CONTAINER = `runly-pg-test-${Math.random().toString(36).slice(2, 8)}`;
 const pg = (args: string) =>
   execFileSync('sh', ['-c', `docker exec ${CONTAINER} ${args}`], { encoding: 'utf8', timeout: 30_000 });
 
 describe.skipIf(!hasDocker)('postgres datastore (docker-gated)', () => {
-  const stateDir = mkdtempSync(join(tmpdir(), 'backlot-pg-'));
-  const wt = mkdtempSync(join(tmpdir(), 'backlot-pg-wt-'));
+  const stateDir = mkdtempSync(join(tmpdir(), 'runly-pg-'));
+  const wt = mkdtempSync(join(tmpdir(), 'runly-pg-wt-'));
   const env = { ...process.env, BACKLOT_STATE_DIR: stateDir, BACKLOT_SWEEP_MS: '500' };
   const cli = (args: string[]): Promise<{ exitCode: number; json?: Record<string, unknown>; out: string }> =>
     new Promise((resolve) => {

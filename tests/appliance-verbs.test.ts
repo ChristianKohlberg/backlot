@@ -64,8 +64,8 @@ interface CliResult {
 }
 
 function makeStack(port: number) {
-  const stateDir = mkdtempSync(join(tmpdir(), 'backlot-applv-'));
-  const wt = mkdtempSync(join(tmpdir(), 'backlot-applv-wt-'));
+  const stateDir = mkdtempSync(join(tmpdir(), 'runly-applv-'));
+  const wt = mkdtempSync(join(tmpdir(), 'runly-applv-wt-'));
   dirs.push(stateDir, wt);
   // A tiny TCP listener that daemonizes the way real appliance starts do
   // (`docker run -d` style): the start command backgrounds it and returns.

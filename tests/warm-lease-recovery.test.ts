@@ -10,10 +10,10 @@
  *
  * Regressions this catches:
  *  - the classification drifting: this MUST be env-error (exit 2) so the
- *    agent's mechanical branch (decision 0010) sends it back to `backlot up`,
+ *    agent's mechanical branch (decision 0010) sends it back to `runly up`,
  *    not into its own diff;
  *  - the guidance disappearing: the message is the only place the fix
- *    ("run 'backlot up' to rebind") is named;
+ *    ("run 'runly up' to rebind") is named;
  *  - the recovery loop breaking: after the advised rebind, the SAME lease and
  *    environment must work again — that round-trip is the crash-recovery
  *    contract (decision 0009) as a consumer experiences it.
@@ -52,8 +52,8 @@ afterAll(async () => {
 
 describe('a surviving lease on a restarted daemon', () => {
   it('exec is refused as env-error telling the holder to rebind — and the rebind works', async () => {
-    const stateDir = mkdtempSync(join(tmpdir(), 'backlot-warm-'));
-    const wt = mkdtempSync(join(tmpdir(), 'backlot-warm-wt-'));
+    const stateDir = mkdtempSync(join(tmpdir(), 'runly-warm-'));
+    const wt = mkdtempSync(join(tmpdir(), 'runly-warm-wt-'));
     dirs.push(stateDir, wt);
     writeFileSync(
       join(wt, 'stack.yaml'),
@@ -104,7 +104,7 @@ describe('a surviving lease on a restarted daemon', () => {
     expect(refused.code).toBe(2); // env-error, per the exit-code contract
     const error = (refused.json as { error: { class: string; message: string } }).error;
     expect(error.class).toBe('env-error');
-    expect(error.message).toMatch(/backlot up/); // names the actual fix
+    expect(error.message).toMatch(/runly up/); // names the actual fix
     expect(error.message).toMatch(/daemon restarted|not running/i);
 
     // The advised recovery must complete the loop: rebind the SAME env

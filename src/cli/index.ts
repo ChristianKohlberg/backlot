@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * backlot CLI. Contract: every verb accepts --json (stdout = data, stderr =
+ * runly CLI. Contract: every verb accepts --json (stdout = data, stderr =
  * human); exit codes are contractual — 0 ok, 1 work-error, 2 env-error,
  * 3 infra-error, 64 usage. See docs/architecture.md §11.
  */
@@ -15,49 +15,49 @@ import { loadStack } from '../core/manifest.js';
 import { parsePresetArgs } from '../core/presets.js';
 import { BrokerError } from '../core/util.js';
 
-const USAGE = `backlot — puts a working instance of a web application in front of you.
+const USAGE = `runly — puts a working instance of a web application in front of you.
 
 Usage:
-  backlot up [service...] [--watch] [--reset-data|--pristine] [--ttl <minutes>] [--holder-pid <pid>]
+  runly up [service...] [--watch] [--reset-data|--pristine] [--ttl <minutes>] [--holder-pid <pid>]
                           (no service = whole app; named services start only that
                            slice plus its depends_on closure)
                           session lease: sync, upkeep, start services, print context
-  backlot up --data-only  lease the DATASTORES alone — a seeded database, no
+  runly up --data-only  lease the DATASTORES alone — a seeded database, no
                           services, no builds. For test lanes that need a
                           database per run rather than a whole application.
                           Connection strings arrive in the same ctx blob.
-  backlot run <check> [--pristine] [--pull] [--detach]
+  runly run <check> [--pristine] [--pull] [--detach]
                           run lease: bind -> execute the check -> verdict -> release
                           --detach: submit-and-poll — returns a jobId immediately
-  backlot job <jobId>     poll a detached run (pending|running|done + verdict)
-  backlot ctx             the consumer context blob (URLs, logins, conn strings)
-  backlot sync            project the worktree state into the current lease
-  backlot exec <cmd...>   run a command inside the leased environment
-  backlot logs <service> [--lines N]
-  backlot reset-data      restore the data template on the current lease
-  backlot token --role <r> [--raw]
+  runly job <jobId>     poll a detached run (pending|running|done + verdict)
+  runly ctx             the consumer context blob (URLs, logins, conn strings)
+  runly sync            project the worktree state into the current lease
+  runly exec <cmd...>   run a command inside the leased environment
+  runly logs <service> [--lines N]
+  runly reset-data      restore the data template on the current lease
+  runly token --role <r> [--raw]
                           mint an auth token via the stack's auth.token hook.
                           Default output is JSON ({token, role}); --raw prints the
                           bare token, which is what an Authorization header wants
-  backlot pull            copy declared outputs back into the worktree
-  backlot release         release the current lease (environment stays warm)
-  backlot preview <service> [--ttl ...]
+  runly pull            copy declared outputs back into the worktree
+  runly release         release the current lease (environment stays warm)
+  runly preview <service> [--ttl ...]
                           publish a service from your lease on a public quick
                           tunnel (Cloudflare by default). The URL is unauthenticated
                           — anyone with the link reaches the service. Requires
                           cloudflared on PATH (or BACKLOT_CLOUDFLARED).
-  backlot preview stop    stop the preview tunnel on your lease
-  backlot status          daemon, pool, and lease overview
-  backlot appliance ls|start|stop [name]
+  runly preview stop    stop the preview tunnel on your lease
+  runly status          daemon, pool, and lease overview
+  runly appliance ls|start|stop [name]
                           shared backing servers: probe, ensure up, explicit stop
-  backlot pool ls|recycle [<env-id>] [--force]|reconcile|gc|doctor
+  runly pool ls|recycle [<env-id>] [--force]|reconcile|gc|doctor
                           recycle with an env-id recycles exactly that one; with
                           none, the whole pool. A LEASED environment is never
                           taken without --force (--all is the old spelling).
                           gc reclaims service processes orphaned by an ungraceful
                           exit; doctor reports drift without acting on it
-  backlot daemon stop     stop the daemon (environments are recovered on next use)
-  backlot update [--check] [--force]
+  runly daemon stop     stop the daemon (environments are recovered on next use)
+  runly update [--check] [--force]
                           make the RUNNING daemon be the INSTALLED build. An
                           upgrade replaces the files on disk but not the daemon
                           already in memory, and the socket carries no version —
@@ -65,9 +65,9 @@ Usage:
                           This restarts it. Leases SURVIVE; services stop and
                           each holder's next verb rebinds. --check reports the
                           versions and who would rebind, and changes nothing.
-                          backlot never installs itself: it prints the command
+                          runly never installs itself: it prints the command
                           for your install and leaves it to you.
-  backlot --version       the version of this CLI
+  runly --version       the version of this CLI
 
 Holding an environment — two forms, and the right one depends on who you are:
 
@@ -78,11 +78,11 @@ Holding an environment — two forms, and the right one depends on who you are:
                            returns to the pool the moment it exits, rather than
                            waiting out the TTL.
 
-'BACKLOT_HOLDER_PID=$$ backlot up' works at a shell prompt and CANNOT work from an
+'BACKLOT_HOLDER_PID=$$ runly up' works at a shell prompt and CANNOT work from an
 agent harness: each command runs in a fresh shell, so '$$' names a process that has
 already exited. Such a lease would be reclaimable the instant it was created — the
 environment would be handed to the next caller while you were still using it — so
-backlot refuses the bind instead. Use --ttl.
+runly refuses the bind instead. Use --ttl.
 
 up, run and reset-data accept --preset NAME (one datastore), or repeatable
 --preset DATASTORE=NAME. ctx reports each datastore's selected preset.
@@ -124,7 +124,7 @@ let passthrough: string[] | null = null; // for `exec` / after `--`
     if (VALUE_FLAGS.has(a)) {
       const v = body[i + 1];
       if (v === undefined) {
-        console.error(`backlot: ${a} needs a value`);
+        console.error(`runly: ${a} needs a value`);
         process.exit(64);
       }
       flagVals.set(a, v);
@@ -133,7 +133,7 @@ let passthrough: string[] | null = null; // for `exec` / after `--`
     } else if (BOOL_FLAGS.has(a)) {
       flags.add(a);
     } else if (a.startsWith('--')) {
-      console.error(`backlot: unknown flag '${a}'`);
+      console.error(`runly: unknown flag '${a}'`);
       process.exit(64);
     } else {
       positional.push(a);
@@ -149,7 +149,7 @@ const errExit = (e: RpcError): never => {
   const code = e.class === 'work-error' ? 1 : e.class === 'infra-error' ? 3 : 2;
   if (json) console.log(JSON.stringify({ ok: false, error: e }));
   else {
-    console.error(`backlot: [${e.class ?? e.code ?? 'error'}] ${e.message}${e.source ? ` (${e.source})` : ''}`);
+    console.error(`runly: [${e.class ?? e.code ?? 'error'}] ${e.message}${e.source ? ` (${e.source})` : ''}`);
     if (e.logExcerpt) console.error(`--- log excerpt ---\n${e.logExcerpt}`);
   }
   process.exit(code);
@@ -201,7 +201,7 @@ function hygiene(): string | undefined {
 
 async function main(): Promise<void> {
   if (presetArgs.length > 0 && !['up', 'run', 'reset-data'].includes(verb ?? '')) {
-    console.error('backlot: --preset is supported by up, run and reset-data');
+    console.error('runly: --preset is supported by up, run and reset-data');
     process.exit(64);
   }
   if (!verb || verb === 'help' || verb === '--help' || verb === '-h') {
@@ -213,7 +213,7 @@ async function main(): Promise<void> {
   // the daemon is down, wedged, or refusing to start — those are exactly the
   // moments someone asks.
   if (verb === '--version' || verb === '-v' || verb === 'version') {
-    // Bare string on stdout for a human and for `$(backlot --version)`; out()
+    // Bare string on stdout for a human and for `$(runly --version)`; out()
     // would JSON-quote it. --json keeps the object shape every other verb has.
     if (json) out({ version: VERSION });
     else console.log(VERSION);
@@ -222,7 +222,7 @@ async function main(): Promise<void> {
 
   const known = ['up', 'run', 'job', 'ctx', 'sync', 'bind', 'exec', 'logs', 'token', 'reset-data', 'pull', 'release', 'preview', 'status', 'doctor', 'appliance', 'pool', 'daemon', 'update'];
   if (!known.includes(verb)) {
-    console.error(`backlot: unknown verb '${verb}'\n\n${USAGE}`);
+    console.error(`runly: unknown verb '${verb}'\n\n${USAGE}`);
     process.exit(64);
   }
 
@@ -274,21 +274,21 @@ async function main(): Promise<void> {
   if (holderPidRaw !== undefined && holderPidRaw !== '') {
     holderPid = Number(holderPidRaw);
     if (!Number.isInteger(holderPid) || holderPid <= 0) {
-      console.error(`backlot: ${holderPidSource} expects a process id, got '${holderPidRaw}'`);
+      console.error(`runly: ${holderPidSource} expects a process id, got '${holderPidRaw}'`);
       process.exit(64);
     }
     // A holder that is ALREADY dead is worse than no holder at all: the daemon
     // releases such a lease on its very next sweep, so the environment goes
     // back in the pool while the caller is still using it — and the next bind
     // hands that caller's database to somebody else, silently. The pattern
-    // that produces this is `BACKLOT_HOLDER_PID=$$ backlot up` from an agent
+    // that produces this is `BACKLOT_HOLDER_PID=$$ runly up` from an agent
     // harness, which runs every command in a fresh shell: `$$` is a shell that
     // has already exited. Refuse, and name the form that works.
     if (!isAlive(holderPid)) {
       console.error(
-        `backlot: ${holderPidSource} ${holderPid} is not a live process — the lease would be reclaimable the moment it is created.\n` +
+        `runly: ${holderPidSource} ${holderPid} is not a live process — the lease would be reclaimable the moment it is created.\n` +
           `  If this came from '$$': each agent command runs in a fresh shell, so that shell is already gone.\n` +
-          `  Use 'backlot ${verb} --ttl <minutes>' instead; ${holderPidSource} is for interactive shells that outlive the command.`,
+          `  Use 'runly ${verb} --ttl <minutes>' instead; ${holderPidSource} is for interactive shells that outlive the command.`,
       );
       process.exit(64);
     }
@@ -302,14 +302,14 @@ async function main(): Promise<void> {
       if (ttl !== undefined) {
         ttlMs = parseTtlMinutes(ttl);
         if (ttlMs === undefined) {
-          console.error(`backlot: --ttl expects minutes (a positive number), got '${ttl}'`);
+          console.error(`runly: --ttl expects minutes (a positive number), got '${ttl}'`);
           process.exit(64);
         }
       }
       const dataOnly = flags.has('--data-only');
       if (dataOnly && flags.has('--watch')) {
         // Nothing runs, so there is nothing for a watcher to reload.
-        console.error('backlot up: --watch has nothing to do under --data-only (no services run)');
+        console.error('runly up: --watch has nothing to do under --data-only (no services run)');
         process.exit(64);
       }
       res = await rpc(
@@ -323,7 +323,7 @@ async function main(): Promise<void> {
     case 'run': {
       const check = positional[0];
       if (!check) {
-        console.error(`backlot run: which check? (usage: backlot run <check>)`);
+        console.error(`runly run: which check? (usage: runly run <check>)`);
         process.exit(64);
       }
       if (flags.has('--detach')) {
@@ -342,7 +342,7 @@ async function main(): Promise<void> {
     case 'job': {
       const jobId = positional[0];
       if (!jobId) {
-        console.error('backlot job: which job? (usage: backlot job <jobId> | backlot job ls)');
+        console.error('runly job: which job? (usage: runly job <jobId> | runly job ls)');
         process.exit(64);
       }
       res = jobId === 'ls' ? await rpc('job-ls', {}) : await rpc('job', { jobId });
@@ -372,14 +372,14 @@ async function main(): Promise<void> {
       if (ttl !== undefined) {
         ttlMs = parseTtlMinutes(ttl);
         if (ttlMs === undefined) {
-          console.error(`backlot: --ttl expects minutes (a positive number), got '${ttl}'`);
+          console.error(`runly: --ttl expects minutes (a positive number), got '${ttl}'`);
           process.exit(64);
         }
         if (!ref) {
           // Plain `bind` (sync) has no ttl to set — accepting --ttl here would
           // silently drop it and mislead the caller into thinking the lease was
           // extended.
-          console.error('backlot: --ttl requires --ref (plain `bind` projects the worktree and keeps the current lease clock)');
+          console.error('runly: --ttl requires --ref (plain `bind` projects the worktree and keeps the current lease clock)');
           process.exit(64);
         }
       }
@@ -397,7 +397,7 @@ async function main(): Promise<void> {
       const parts = passthrough ?? positional;
       const cmd = parts.length === 1 ? parts[0]! : parts.map(shellQuote).join(' ');
       if (!cmd) {
-        console.error('backlot exec: no command given');
+        console.error('runly exec: no command given');
         process.exit(64);
       }
       res = await rpc('exec', { cwd, holder, cmd });
@@ -415,7 +415,7 @@ async function main(): Promise<void> {
     case 'logs': {
       const service = positional[0];
       if (!service) {
-        console.error('backlot logs: which service?');
+        console.error('runly logs: which service?');
         process.exit(64);
       }
       const rawLines = flagValue('--lines');
@@ -423,7 +423,7 @@ async function main(): Promise<void> {
       // NaN reached the daemon as slice(-NaN) and quietly returned the WHOLE
       // log — the opposite of what a bounded --lines asks for.
       if (!Number.isInteger(lines) || lines <= 0) {
-        console.error(`backlot logs: --lines expects a positive integer, got '${rawLines}'`);
+        console.error(`runly logs: --lines expects a positive integer, got '${rawLines}'`);
         process.exit(64);
       }
       res = await rpc('logs', { cwd, holder, service, lines });
@@ -462,7 +462,7 @@ async function main(): Promise<void> {
       if (sub === 'stop') {
         res = await rpc('preview-stop', { cwd, holder });
       } else if (!sub) {
-        console.error('backlot preview: which service? (usage: backlot preview <service> | backlot preview stop)');
+        console.error('runly preview: which service? (usage: runly preview <service> | runly preview stop)');
         process.exit(64);
       } else {
         const ttl = flagValue('--ttl');
@@ -470,7 +470,7 @@ async function main(): Promise<void> {
         if (ttl !== undefined) {
           ttlMs = parseTtlMinutes(ttl);
           if (ttlMs === undefined) {
-            console.error(`backlot: --ttl expects minutes (a positive number), got '${ttl}'`);
+            console.error(`runly: --ttl expects minutes (a positive number), got '${ttl}'`);
             process.exit(64);
           }
         }
@@ -495,12 +495,12 @@ async function main(): Promise<void> {
       else if (sub === 'start') res = await rpc('appliance-start', { cwd, name });
       else if (sub === 'stop') {
         if (!name) {
-          console.error('backlot appliance stop: a name is required (stopping everything is never implicit)');
+          console.error('runly appliance stop: a name is required (stopping everything is never implicit)');
           process.exit(64);
         }
         res = await rpc('appliance-stop', { cwd, name });
       } else {
-        console.error(`backlot appliance: unknown subcommand '${sub}' (ls | start | stop)`);
+        console.error(`runly appliance: unknown subcommand '${sub}' (ls | start | stop)`);
         process.exit(64);
       }
       break;
@@ -517,14 +517,14 @@ async function main(): Promise<void> {
       else if (sub === 'gc') res = await rpc('pool-gc', {});
       else if (sub === 'doctor') res = await rpc('doctor', { cliVersion: VERSION });
       else {
-        console.error(`backlot pool: unknown subcommand '${sub}' (ls | recycle | reconcile | gc | doctor)`);
+        console.error(`runly pool: unknown subcommand '${sub}' (ls | recycle | reconcile | gc | doctor)`);
         process.exit(64);
       }
       break;
     }
     case 'daemon': {
       if (positional[0] !== 'stop') {
-        console.error('backlot daemon: only `stop` is supported');
+        console.error('runly daemon: only `stop` is supported');
         process.exit(64);
       }
       res = await rpc('shutdown', {});
@@ -620,13 +620,13 @@ async function main(): Promise<void> {
       }
 
       // Already the installed build: say so and stop. An update that restarts
-      // unconditionally would make `backlot update` in a script a recurring
+      // unconditionally would make `runly update` in a script a recurring
       // outage for every lease holder on the box, for no gain.
       if (!skew) {
         out({
           ...report,
           restarted: false,
-          note: `the running daemon is already backlot ${plan.daemon} — nothing to do. If you have not upgraded yet: ${install.upgradeHint}`,
+          note: `the running daemon is already runly ${plan.daemon} — nothing to do. If you have not upgraded yet: ${install.upgradeHint}`,
         });
         process.exit(0);
       }
@@ -662,7 +662,7 @@ async function main(): Promise<void> {
           class: 'infra-error',
           message:
             `restarted, but the daemon now answering is ${now.version ?? 'unversioned'} rather than ${VERSION} — ` +
-            `another backlot install owns this state root (${install.root} is this one). Check which one is on your PATH.`,
+            `another runly install owns this state root (${install.root} is this one). Check which one is on your PATH.`,
           source: 'daemon',
         });
       }
@@ -698,6 +698,6 @@ main().catch((err) => {
   // daemon. Anything that is not a classified daemon response is infra.
   const cls = classifyClientError(err);
   if (json) console.log(JSON.stringify({ ok: false, error: { class: cls, message: msg } }));
-  else console.error(`backlot: [${cls}] ${msg}`);
+  else console.error(`runly: [${cls}] ${msg}`);
   process.exit(cls === 'infra-error' ? 3 : 2);
 });

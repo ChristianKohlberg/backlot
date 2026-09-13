@@ -102,7 +102,7 @@ export function normalizeLogins(spec: LoginsSpec | undefined): Login[] {
 
 export interface PreviewSpec {
   /**
-   * When true, `backlot preview` is refused (work-error). Stacks with fixed dev
+   * When true, `runly preview` is refused (work-error). Stacks with fixed dev
    * credentials or a known signing key must set this.
    */
   forbidden?: boolean;
@@ -151,7 +151,7 @@ export interface Stack {
 }
 
 const schemaPath = () =>
-  join(dirname(fileURLToPath(import.meta.url)), '..', '..', 'schema', 'backlot.schema.json');
+  join(dirname(fileURLToPath(import.meta.url)), '..', '..', 'schema', 'runly.schema.json');
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 let validator: any;
@@ -164,15 +164,15 @@ function validate(data: unknown): void {
     validator = ajv.compile(JSON.parse(readFileSync(schemaPath(), 'utf8')));
   }
   if (!validator(data)) {
-    throw new BrokerError('work-error', `the backlot manifest is invalid: ${JSON.stringify(validator.errors)}`, 'manifest');
+    throw new BrokerError('work-error', `the runly manifest is invalid: ${JSON.stringify(validator.errors)}`, 'manifest');
   }
 }
 
 /** Walk upward from cwd to the nearest manifest. */
-/** backlot.yml is canonical; stack.yaml (the pre-0.6 name) stays accepted so
- * existing consumers survive the upgrade. When both exist, backlot.yml wins —
+/** runly.yml is canonical; backlot.yml and stack.yaml stay accepted so
+ * existing consumers survive the upgrade. When several exist, runly.yml wins —
  * a rename, not a coin toss. */
-export const MANIFEST_NAMES = ['backlot.yml', 'stack.yaml'] as const;
+export const MANIFEST_NAMES = ['runly.yml', 'backlot.yml', 'stack.yaml'] as const;
 
 function manifestIn(dir: string): string | null {
   for (const name of MANIFEST_NAMES) {
@@ -203,7 +203,7 @@ export function findStackRoot(from: string): string {
     if (manifestIn(dir)) return dir;
     const parent = dirname(dir);
     if (parent === dir) {
-      throw new BrokerError('work-error', `no backlot.yml (or stack.yaml) found from ${from} upward`, 'manifest');
+      throw new BrokerError('work-error', `no runly.yml (or backlot.yml / stack.yaml) found from ${from} upward`, 'manifest');
     }
     dir = parent;
   }
@@ -212,7 +212,7 @@ export function findStackRoot(from: string): string {
 export function loadStack(from: string): Stack {
   const root = findStackRoot(from);
   const file = manifestIn(root);
-  if (!file) throw new BrokerError('work-error', `no backlot.yml (or stack.yaml) in ${root}`, 'manifest');
+  if (!file) throw new BrokerError('work-error', `no runly.yml (or backlot.yml / stack.yaml) in ${root}`, 'manifest');
   const manifest = parse(readFileSync(file, 'utf8')) as Manifest;
   validate(manifest);
   // Identity = absolute root + declared name; filesystem-safe. Hash the WHOLE

@@ -65,7 +65,7 @@ export interface UpOptions {
   preserveLeaseDeadline?: boolean;
   /**
    * Bring up only these services (plus their transitive depends_on closure)
-   * instead of the whole app — `backlot up sherlock audit`. An empty array is
+   * instead of the whole app — `runly up sherlock audit`. An empty array is
    * the explicit "whole app" the `up` verb always sends. Undefined is DISTINCT:
    * it means "keep the lease's current shape" and is what the internal
    * reset-data/watch/bind rebinds pass, so a slice survives a rebind rather than
@@ -73,7 +73,7 @@ export interface UpOptions {
    */
   services?: string[];
   /**
-   * Lease the DATASTORES ONLY — no services, no builds. `backlot up --data-only`.
+   * Lease the DATASTORES ONLY — no services, no builds. `runly up --data-only`.
    *
    * The unit a test lane actually needs is "a warm, seeded database, leased per
    * consumer, reset on release", which is a strict subset of an environment. Without
@@ -314,7 +314,7 @@ export class Engine {
   }
 
   /**
-   * Reclaim backlot-spawned processes that no live environment accounts for.
+   * Reclaim runly-spawned processes that no live environment accounts for.
    *
    * A process is an orphan when it carries this state root's tag but its env
    * either no longer exists in the journal, or exists in a state that must have
@@ -787,16 +787,16 @@ export class Engine {
         `Data-only environments are counted separately from application ones, so ${counts} is not what stopped this. ` +
         `Releasing a lease will not help — the count is of environments, not leases — and nothing data-only was cold enough to evict.` +
         (blocking ? ` Holding: ${blocking}.` : '') +
-        ` Raise BACKLOT_POOL_MAX_DATA_ONLY (it bounds disk, not CPU), or 'backlot pool recycle <env-id>' a lane you no longer need.`
+        ` Raise BACKLOT_POOL_MAX_DATA_ONLY (it bounds disk, not CPU), or 'runly pool recycle <env-id>' a lane you no longer need.`
       );
     }
     if (scope === 'machine') {
       return (
         `pool at capacity${waited}: the MACHINE-WIDE cap is what refused — ${counts}. ` +
         `Releasing a lease will not help, because the machine-wide count is of environments, not leases: the row survives a release. ` +
-        `Every environment on this box is either leased or too recently used to evict, so backlot had nothing cold to give up.` +
+        `Every environment on this box is either leased or too recently used to evict, so runly had nothing cold to give up.` +
         (blocking ? ` Holding: ${blocking}.` : '') +
-        ` Raise BACKLOT_POOL_MAX_TOTAL if the host can take it, or 'backlot pool recycle <env-id>' an environment you no longer need.`
+        ` Raise BACKLOT_POOL_MAX_TOTAL if the host can take it, or 'runly pool recycle <env-id>' an environment you no longer need.`
       );
     }
     return (
@@ -970,7 +970,7 @@ export class Engine {
       if (closure.has(name)) return;
       const spec = all[name];
       if (!spec) {
-        throw new BrokerError('work-error', `no service '${name}' in backlot.yml (have: ${Object.keys(all).join(', ') || 'none'})`, 'manifest');
+        throw new BrokerError('work-error', `no service '${name}' in runly.yml (have: ${Object.keys(all).join(', ') || 'none'})`, 'manifest');
       }
       closure.add(name);
       for (const dep of spec.depends_on ?? []) visit(dep);
@@ -996,7 +996,7 @@ export class Engine {
     // bind commits, and is reconciled at the epilogue instead.
     const forbiddenNotice = await this.enforcePreviewForbidden(env, stack, say);
     const presetLease = this.journal.leaseForEnv(env.id);
-    if (!presetLease) throw new BrokerError('env-error', 'lease ended before bind; run backlot up again', 'lease');
+    if (!presetLease) throw new BrokerError('env-error', 'lease ended before bind; run runly up again', 'lease');
     const presets = selectPresets(stack.manifest, kind, requestedPresets, presetLease.presets ?? (freshClaim ? undefined : env.presets));
     this.journal.saveLease({ ...presetLease, presets });
     const presetsChanged = Object.entries(presets).some(([name, preset]) => env.presets[name] !== preset);
@@ -1038,7 +1038,7 @@ export class Engine {
     }
     const active = dataOnly ? new Set<string>() : this.resolveServiceClosure(stack, requestedNames);
     const inputLease = this.journal.leaseForEnv(env.id);
-    if (!inputLease) throw new BrokerError('env-error', 'lease ended before bind; run backlot up again', 'lease');
+    if (!inputLease) throw new BrokerError('env-error', 'lease ended before bind; run runly up again', 'lease');
     const previousInputs = this.leaseInputs.get(inputLease.id);
     const inputValues = callerEnv === undefined ? selectCallerEnv(stack.manifest, previousInputs?.values ?? {}) : validateCallerEnv(stack.manifest, callerEnv);
     requireCallerEnv(stack.manifest, active, inputValues);
@@ -1260,7 +1260,7 @@ export class Engine {
     const entries = Object.entries(stack.manifest.services).filter(([n]) => active.has(n));
     while (started.size < entries.length) {
       const ready = entries.filter(([n, s]) => !started.has(n) && (s.depends_on ?? []).every((d) => started.has(d)));
-      if (ready.length === 0) throw new BrokerError('work-error', 'depends_on cycle in backlot.yml', 'manifest');
+      if (ready.length === 0) throw new BrokerError('work-error', 'depends_on cycle in runly.yml', 'manifest');
       for (const [name, spec] of ready) {
         if (spec.port) {
           // The allocation loop at the top of this bind fills every declared
@@ -1268,7 +1268,7 @@ export class Engine {
           // instead of crashing on the undefined a few lines down.
           const port = env.ports[spec.port];
           if (port === undefined) {
-            throw new BrokerError('env-error', `environment ${env.id} has no port recorded for service '${name}' — the port ledger is inconsistent; try 'backlot pool recycle ${env.id}'`, name);
+            throw new BrokerError('env-error', `environment ${env.id} has no port recorded for service '${name}' — the port ledger is inconsistent; try 'runly pool recycle ${env.id}'`, name);
           }
           // Grace window: the previous holder may be this env's own just-
           // signalled service still tearing down (SIGTERM handlers, FD
@@ -1281,7 +1281,7 @@ export class Engine {
             // Try to name the holder so the error is actionable. After
             // reapEnvProcesses ran, any remaining tagged process survived our
             // SIGKILL (extremely unlikely) or is truly foreign (not from
-            // backlot). Either way, naming it beats a bare port number.
+            // runly). Either way, naming it beats a bare port number.
             let staleHint = '';
             if (procScanSupported()) {
               // Earlier iterations of this start loop already launched healthy
@@ -1295,7 +1295,7 @@ export class Engine {
                 (p) => p.envId === env.id && !leasedPreviews.has(p.pid) && !own.has(p.pid) && !own.has(processGroup(p.pid) ?? -1),
               );
               if (stale.length > 0) {
-                staleHint = ` — surviving process(es): ${stale.map((p) => `pid ${p.pid} (${p.service})`).join(', ')}; run 'backlot pool gc' to reclaim`;
+                staleHint = ` — surviving process(es): ${stale.map((p) => `pid ${p.pid} (${p.service})`).join(', ')}; run 'runly pool gc' to reclaim`;
               }
             }
             throw new BrokerError(
@@ -1305,7 +1305,7 @@ export class Engine {
               // shared box tears down other people's live leases to fix one
               // stuck port.
               `port ${port} for service '${name}' is occupied${
-                staleHint || ` by a foreign process — 'backlot pool gc' reclaims strays, or 'backlot pool recycle ${env.id}' rebuilds just this environment`
+                staleHint || ` by a foreign process — 'runly pool gc' reclaims strays, or 'runly pool recycle ${env.id}' rebuilds just this environment`
               }`,
               name,
             );
@@ -1448,7 +1448,7 @@ export class Engine {
   /**
    * One debounced save — the two-stage reload (architecture.md §6). Stage 1
    * projects the changed files into the env tree source-only; stage 2 belongs
-   * to the services' own dev watchers (watch_run), so backlot must not bounce
+   * to the services' own dev watchers (watch_run), so runly must not bounce
    * services on save.
    *
    * DELIBERATE FALLBACK: a save that changes what an upkeep rule or
@@ -1648,7 +1648,7 @@ export class Engine {
           dir, existsSync(descriptor.root) ? descriptor.root : templatesRoot(), force,
         );
         if (deferred > 0) {
-          if (attempted > 0) logEvent({ level: 'warn', kind: 'retention', detail: `retired templates for '${retired}' remain; failed drops retain .retirement.json records with bounded retries. Check the appliance, then run backlot pool gc to retry.` });
+          if (attempted > 0) logEvent({ level: 'warn', kind: 'retention', detail: `retired templates for '${retired}' remain; failed drops retain .retirement.json records with bounded retries. Check the appliance, then run runly pool gc to retry.` });
           return attempted > 0;
         }
         rmSync(dir, { recursive: true, force: true });
@@ -1707,7 +1707,7 @@ export class Engine {
       if (Object.keys(stack.manifest.datastores ?? {}).length === 0) {
         throw new BrokerError(
           'work-error',
-          `--data-only needs at least one datastore, and backlot.yml declares none — there is nothing to lease`,
+          `--data-only needs at least one datastore, and runly.yml declares none — there is nothing to lease`,
           'manifest',
         );
       }
@@ -1801,7 +1801,7 @@ export class Engine {
     if (!env) {
       throw new BrokerError(
         'env-error',
-        `your lease points at environment ${lease.envId}, which no longer exists (it was recycled) — run 'backlot up' to bind a fresh one`,
+        `your lease points at environment ${lease.envId}, which no longer exists (it was recycled) — run 'runly up' to bind a fresh one`,
         'lease',
       );
     }
@@ -1814,11 +1814,11 @@ export class Engine {
     const lease = this.journal.leaseForHolder(h, stack.id);
     const targetId = envId ?? lease?.envId;
     if (!targetId) {
-      throw new BrokerError('env-error', `no active lease for this worktree — run 'backlot up' first`, 'lease');
+      throw new BrokerError('env-error', `no active lease for this worktree — run 'runly up' first`, 'lease');
     }
     const env = this.journal.getEnv(targetId);
     if (!env) {
-      throw new BrokerError('env-error', `environment ${targetId} no longer exists (it was recycled) — run 'backlot up' to bind a fresh one`, 'lease');
+      throw new BrokerError('env-error', `environment ${targetId} no longer exists (it was recycled) — run 'runly up' to bind a fresh one`, 'lease');
     }
     this.touch(env.id); // asking for context means an agent is still working here
     const ctx = this.templateCtx(stack, env);
@@ -1861,7 +1861,7 @@ export class Engine {
        * permissions problem. `tokenVia` is the supported path.
        */
       tokenCommand: stack.manifest.auth?.token ?? null,
-      tokenVia: stack.manifest.auth?.token ? 'backlot token --role <role> --raw' : null,
+      tokenVia: stack.manifest.auth?.token ? 'runly token --role <role> --raw' : null,
       datastores: Object.fromEntries(Object.entries(ctx.datastores).map(([n, d]) => [n, { url: d.url, ns: d.ns, preset: env.presets[n] }])),
       artifactsDir: join(artifactsRoot(), env.id),
       events: this.supervisors.get(env.id)?.events.slice(-20) ?? [],
@@ -1872,7 +1872,7 @@ export class Engine {
     const stack = loadStack(opts.cwd);
     const check = stack.manifest.checks?.[opts.check];
     if (!check) {
-      throw new BrokerError('work-error', `no check '${opts.check}' in backlot.yml (have: ${Object.keys(stack.manifest.checks ?? {}).join(', ') || 'none'})`, 'manifest');
+      throw new BrokerError('work-error', `no check '${opts.check}' in runly.yml (have: ${Object.keys(stack.manifest.checks ?? {}).join(', ') || 'none'})`, 'manifest');
     }
     // A run ALWAYS gets its own ephemeral holder — never the caller's session
     // holder — so `run` can't reset-data-wipe or delete a live `up` session
@@ -2068,7 +2068,7 @@ export class Engine {
     }
     // Ref binds preserve the same absolute deadline as sync/watch/reset.
     // Resolve it under the claim lock, after archive work, unless explicitly renewed.
-    const tmp = mkdtempSync(join(tmpdir(), 'backlot-ref-'));
+    const tmp = mkdtempSync(join(tmpdir(), 'runly-ref-'));
     try {
       // Bounded AND off the sync path for the same reason as the worker: a
       // large archive extraction must not hold the event loop.
@@ -2089,7 +2089,7 @@ export class Engine {
   async resetData(cwd: string, holder?: string, onProgress?: Progress, presets?: unknown) {
     const stack = loadStack(cwd);
     const h = this.callerHolder(cwd, holder, stack);
-    const noLease = () => new BrokerError('env-error', `no active lease — run 'backlot up' first`, 'lease');
+    const noLease = () => new BrokerError('env-error', `no active lease — run 'runly up' first`, 'lease');
     const forbiddenNotice = await this.enforceHolderPreviewForbidden(stack, h, onProgress);
     selectPresets(stack.manifest, 'session', presets);
     const lease = this.journal.leaseForHolder(h, stack.id);
@@ -2156,7 +2156,7 @@ export class Engine {
     if (fresh.state === 'warm' && !fresh.dataOnly) {
       throw new BrokerError(
         'env-error',
-        `environment ${envId} holds your lease but its services are not running (the daemon restarted) — run 'backlot up' to rebind before exec/token`,
+        `environment ${envId} holds your lease but its services are not running (the daemon restarted) — run 'runly up' to rebind before exec/token`,
         'lease',
       );
     }
@@ -2167,7 +2167,7 @@ export class Engine {
     const stack = loadStack(cwd);
     const h = this.callerHolder(cwd, holder, stack);
     const lease = this.journal.leaseForHolder(h, stack.id);
-    if (!lease) throw new BrokerError('env-error', `no active lease — run 'backlot up' first`, 'lease');
+    if (!lease) throw new BrokerError('env-error', `no active lease — run 'runly up' first`, 'lease');
     const env = this.envForLease(lease);
     const dirs = this.envDirs(env.id);
     const ctx = this.templateCtx(stack, env);
@@ -2205,9 +2205,9 @@ export class Engine {
   async token(cwd: string, role: string, holder?: string) {
     const stack = loadStack(cwd);
     const spec = stack.manifest.auth?.token;
-    if (!spec) throw new BrokerError('work-error', `backlot.yml declares no auth.token command`, 'manifest');
+    if (!spec) throw new BrokerError('work-error', `runly.yml declares no auth.token command`, 'manifest');
     const lease = this.journal.leaseForHolder(this.callerHolder(cwd, holder, stack), stack.id);
-    if (!lease) throw new BrokerError('env-error', `no active lease — run 'backlot up' first`, 'lease');
+    if (!lease) throw new BrokerError('env-error', `no active lease — run 'runly up' first`, 'lease');
     const env = this.envForLease(lease);
     const dirs = this.envDirs(env.id);
     const ctx = { ...this.templateCtx(stack, env), role };
@@ -2229,10 +2229,10 @@ export class Engine {
     // A name the manifest never declared is the caller's mistake — name the
     // services that exist, the way an unknown check does.
     if (!stack.manifest.services[service]) {
-      throw new BrokerError('work-error', `no service '${service}' in backlot.yml (have: ${Object.keys(stack.manifest.services).join(', ')})`, service);
+      throw new BrokerError('work-error', `no service '${service}' in runly.yml (have: ${Object.keys(stack.manifest.services).join(', ')})`, service);
     }
     const lease = this.journal.leaseForHolder(this.callerHolder(cwd, holder, stack), stack.id);
-    if (!lease) throw new BrokerError('env-error', `no active lease — run 'backlot up' first`, 'lease');
+    if (!lease) throw new BrokerError('env-error', `no active lease — run 'runly up' first`, 'lease');
     const env = this.envForLease(lease);
     this.touch(env.id);
     const logFile = join(this.envDirs(env.id).logs, `${service}.log`);
@@ -2245,7 +2245,7 @@ export class Engine {
   pull(cwd: string, holder?: string) {
     const stack = loadStack(cwd);
     const lease = this.journal.leaseForHolder(this.callerHolder(cwd, holder, stack), stack.id);
-    if (!lease) throw new BrokerError('env-error', `no active lease — run 'backlot up' first`, 'lease');
+    if (!lease) throw new BrokerError('env-error', `no active lease — run 'runly up' first`, 'lease');
     const env = this.envForLease(lease);
     this.touch(env.id);
     return { pulled: pullOutputs(stack.root, this.envDirs(env.id).tree, stack.manifest) };
@@ -2296,7 +2296,7 @@ export class Engine {
     if (stack.manifest.preview?.forbidden) {
       throw new BrokerError(
         'work-error',
-        `this stack forbids public preview in backlot.yml (preview.forbidden) — the manifest must not be published to the internet`,
+        `this stack forbids public preview in runly.yml (preview.forbidden) — the manifest must not be published to the internet`,
         'manifest',
       );
     }
@@ -2392,7 +2392,7 @@ export class Engine {
    */
   private unreapedPreview(lease: LeaseRow): string {
     const where = procScanSupported()
-      ? `'backlot pool gc' can still reclaim it by tag`
+      ? `'runly pool gc' can still reclaim it by tag`
       : `there is no tag scan on this platform — kill pid ${lease.previewPid} by hand`;
     return (
       `the preview tunnel (pid ${lease.previewPid}) could not be confirmed dead —` +
@@ -2444,7 +2444,7 @@ export class Engine {
     }
     const spec = stack.manifest.services[service];
     if (!spec) {
-      throw new BrokerError('work-error', `no service '${service}' in backlot.yml`, 'manifest');
+      throw new BrokerError('work-error', `no service '${service}' in runly.yml`, 'manifest');
     }
     const activeSet = env.activeServices ? new Set(env.activeServices) : null;
     if (activeSet && !activeSet.has(service)) {
@@ -2470,7 +2470,7 @@ export class Engine {
     const h = this.callerHolder(cwd, holder, stack);
     const lease = this.journal.leaseForHolder(h, stack.id);
     if (!lease) {
-      throw new BrokerError('env-error', `no active lease for this worktree — run 'backlot up' first`, 'lease');
+      throw new BrokerError('env-error', `no active lease for this worktree — run 'runly up' first`, 'lease');
     }
     // Fast fail before queueing behind a bind that may hold the lock for
     // minutes; re-run authoritatively INSIDE the lock below.
@@ -2593,7 +2593,7 @@ export class Engine {
     const stack = loadStack(cwd);
     const specs = Object.entries(stack.manifest.appliances ?? {}).filter(([n]) => !name || n === name);
     if (name && specs.length === 0) {
-      throw new BrokerError('work-error', `no appliance '${name}' in backlot.yml`, 'appliance');
+      throw new BrokerError('work-error', `no appliance '${name}' in runly.yml`, 'appliance');
     }
     const results: Record<string, string> = {};
     for (const [n, spec] of specs) {
@@ -2607,7 +2607,7 @@ export class Engine {
   async applianceStop(cwd: string, name: string) {
     const stack = loadStack(cwd);
     const spec = stack.manifest.appliances?.[name];
-    if (!spec) throw new BrokerError('work-error', `no appliance '${name}' in backlot.yml`, 'appliance');
+    if (!spec) throw new BrokerError('work-error', `no appliance '${name}' in runly.yml`, 'appliance');
     await stopAppliance(name, spec, stack.root);
     logEvent({ level: 'info', kind: 'appliance', detail: `'${name}' stopped (${spec.probe})` });
     return { stopped: name };
@@ -2666,7 +2666,7 @@ export class Engine {
   }
 
   /**
-   * What a `backlot update` restart would cost, without doing it.
+   * What a `runly update` restart would cost, without doing it.
    *
    * Reported rather than inferred by the CLI because the two facts that decide
    * whether a restart is safe — which environments are BUSY, and who holds a
@@ -2702,7 +2702,7 @@ export class Engine {
    * A LIVE LEASE is deliberately NOT a refusal. A restart stops services, keeps
    * the lease, and the holder's next verb rebinds — which is exactly what the
    * idle quiesce already does to leased environments without anyone's consent,
-   * and what assertUsable already tells the holder to do ("run 'backlot up' to
+   * and what assertUsable already tells the holder to do ("run 'runly up' to
    * rebind"). Refusing here would mean an update on any busy shared box always
    * needs --force, and a flag you always pass is a flag that stops meaning
    * anything: that habituation is what made issue #40 destructive. Holders are
@@ -2729,7 +2729,7 @@ export class Engine {
       if (order !== undefined && order < 0) {
         throw new BrokerError(
           'work-error',
-          `this CLI is backlot ${cliVersion} but the running daemon is ${VERSION} — restarting would DOWNGRADE the daemon, ` +
+          `this CLI is runly ${cliVersion} but the running daemon is ${VERSION} — restarting would DOWNGRADE the daemon, ` +
             `which is the direction that can strand journal state; invoke the newer CLI, or pass --force if you mean to roll back`,
           'daemon',
         );
@@ -2793,7 +2793,7 @@ export class Engine {
         } else if (!sameProcess(rec.pid, rec.startTime)) {
           // Alive, but a DIFFERENT process now holds that pid. Signalling it
           // would hit a bystander, so surface it rather than reaping it.
-          issues.push({ level: 'error', envId: env.id, issue: `pid ${rec.pid} recorded for service '${svc}' now belongs to another process (pid reuse) — 'backlot pool gc' will re-derive ownership from process tags` });
+          issues.push({ level: 'error', envId: env.id, issue: `pid ${rec.pid} recorded for service '${svc}' now belongs to another process (pid reuse) — 'runly pool gc' will re-derive ownership from process tags` });
         }
       }
       // (Port liveness is intentionally NOT probed here: a service bound to ::
@@ -2816,7 +2816,7 @@ export class Engine {
       const leasedPreviews = this.leasedPreviewPids(tagged);
       const orphans = tagged.filter((p) => !liveEnvs.has(p.envId) && !leasedPreviews.has(p.pid));
       for (const o of orphans) {
-        issues.push({ level: 'error', envId: o.envId, issue: `orphaned process ${o.pid} ('${o.service}') is running with no live environment — run 'backlot pool gc' to reclaim it` });
+        issues.push({ level: 'error', envId: o.envId, issue: `orphaned process ${o.pid} ('${o.service}') is running with no live environment — run 'runly pool gc' to reclaim it` });
       }
     }
     logEvent({ level: issues.length ? 'warn' : 'info', kind: 'doctor', detail: `${issues.length} issue(s)` });
@@ -2955,8 +2955,8 @@ export class Engine {
     const url = lease.previewUrl ?? 'the preview tunnel';
     const confirmed = await this.stopPreviewForLease(lease);
     const detail = confirmed
-      ? `work-error: backlot.yml now sets preview.forbidden, and a stack that forbids preview must not stay published — ${url} has been torn down`
-      : `work-error: backlot.yml now sets preview.forbidden but the tunnel could NOT be confirmed dead — ${url} may still be serving, unauthenticated`;
+      ? `work-error: runly.yml now sets preview.forbidden, and a stack that forbids preview must not stay published — ${url} has been torn down`
+      : `work-error: runly.yml now sets preview.forbidden but the tunnel could NOT be confirmed dead — ${url} may still be serving, unauthenticated`;
     logEvent({ level: 'error', kind: 'preview', envId: env.id, detail });
     say(detail);
     return detail;
@@ -3009,7 +3009,7 @@ export class Engine {
     const port = portKey ? env.ports[portKey] : undefined;
 
     const cause = stack.manifest.preview?.forbidden
-      ? { klass: 'work-error', why: `backlot.yml now sets preview.forbidden, and a stack that forbids preview must not stay published` }
+      ? { klass: 'work-error', why: `runly.yml now sets preview.forbidden, and a stack that forbids preview must not stay published` }
       : !active.has(service)
         ? { klass: 'env-error', why: `service '${service}' is not in this bind's running set${active.size ? ` (${[...active].map((n) => `'${n}'`).join(', ')})` : ' (this lease is data-only)'}, so its preview would publish a port with nothing behind it for the rest of the lease` }
         : opts.portsReallocated && port !== lease.previewPort
@@ -3019,7 +3019,7 @@ export class Engine {
     if (cause) {
       const confirmed = await this.stopPreviewForLease(lease);
       const detail = confirmed
-        ? `${cause.klass}: ${cause.why} — ${url} has been torn down; run 'backlot preview ${service}' again for a new URL`
+        ? `${cause.klass}: ${cause.why} — ${url} has been torn down; run 'runly preview ${service}' again for a new URL`
         : `${cause.klass}: ${cause.why}, and the tunnel could NOT be confirmed dead — ${url} may still be serving, unauthenticated`;
       logEvent({ level: 'error', kind: 'preview', envId: env.id, detail });
       say(detail);
@@ -3028,7 +3028,7 @@ export class Engine {
     if (opts.hygiene !== 'reuse') {
       const detail =
         `the preview tunnel for '${service}' is still published at ${url} — this ${opts.hygiene} bind replaced the data behind it,` +
-        ` so that PUBLIC, unauthenticated URL now serves different content. Run 'backlot preview stop' if that must not be visible.`;
+        ` so that PUBLIC, unauthenticated URL now serves different content. Run 'runly preview stop' if that must not be visible.`;
       logEvent({ level: 'warn', kind: 'preview', envId: env.id, detail });
       say(detail);
       return detail;
@@ -3174,7 +3174,7 @@ export class Engine {
   async poolRecycle(opts: { envId?: string; force: boolean }) {
     const { envId, force } = opts;
     const skipped: Array<{ envId: string; reason: string }> = [];
-    const survivorReason = (id: string) => `environment ${id} has unreaped service processes — ownership and capacity retained; run 'backlot doctor' to inspect them, then retry recycling once they can be reclaimed`;
+    const survivorReason = (id: string) => `environment ${id} has unreaped service processes — ownership and capacity retained; run 'runly doctor' to inspect them, then retry recycling once they can be reclaimed`;
     if (envId) {
       const env = this.journal.getEnv(envId);
       if (!env) {
@@ -3316,7 +3316,7 @@ export class Engine {
       }
     }
 
-    // Disk retention (~10 min cadence): nothing backlot writes grows forever.
+    // Disk retention (~10 min cadence): nothing runly writes grows forever.
     if (t - this.lastRetention > Number(process.env.BACKLOT_RETENTION_MS ?? 10 * 60_000)) {
       this.lastRetention = t;
       try {
@@ -3379,7 +3379,7 @@ export class Engine {
           level: 'warn',
           kind: 'preview',
           envId: lease.envId,
-          detail: `the preview tunnel for '${service}' exited on its own — its URL is no longer published; run 'backlot preview ${service}' again for a new one`,
+          detail: `the preview tunnel for '${service}' exited on its own — its URL is no longer published; run 'runly preview ${service}' again for a new one`,
         });
       }
       // A holder that named its process and is now gone releases IMMEDIATELY.

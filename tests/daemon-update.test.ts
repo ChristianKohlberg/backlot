@@ -1,8 +1,8 @@
 /**
- * `backlot update`: make the RUNNING daemon be the INSTALLED build.
+ * `runly update`: make the RUNNING daemon be the INSTALLED build.
  *
  * The gap this closes is silent. `ensureDaemon` spawns the daemon from the CLI's
- * own `dist/`, so upgrading backlot replaces the files on disk but never the
+ * own `dist/`, so upgrading runly replaces the files on disk but never the
  * daemon already in memory — and the socket carries no version, so a new CLI
  * goes on being served by old code for as long as that process lives. An old
  * daemon does not reject arguments it has never heard of; it IGNORES them. A
@@ -50,8 +50,8 @@ afterAll(() => {
  * lets a daemon claim a different version than the CLI driving it.
  */
 function ctx(opts: { service?: boolean } = {}) {
-  const stateDir = mkdtempSync(join(tmpdir(), 'backlot-update-'));
-  const wt = mkdtempSync(join(tmpdir(), 'backlot-update-wt-'));
+  const stateDir = mkdtempSync(join(tmpdir(), 'runly-update-'));
+  const wt = mkdtempSync(join(tmpdir(), 'runly-update-wt-'));
   if (opts.service) {
     writeFileSync(
       join(wt, 'srv.mjs'),
@@ -107,7 +107,7 @@ describe('version reporting', () => {
     // version am I" is asked precisely when the daemon is down or wedged.
     const plain = await cli(['--version']);
     expect(plain.code).toBe(0);
-    expect(plain.stdout.trim()).toBe(PKG_VERSION); // bare, so $(backlot --version) works
+    expect(plain.stdout.trim()).toBe(PKG_VERSION); // bare, so $(runly --version) works
     const asJson = await cli(['--version', '--json']);
     expect(asJson.json).toEqual({ version: PKG_VERSION });
   });
@@ -128,7 +128,7 @@ describe('version reporting', () => {
     // level, so it has to be treated as proof of an older daemon.
     const skew = versionSkew('0.9.0', undefined);
     expect(skew?.direction).toBe('daemon-unversioned');
-    expect(skew?.message).toContain('backlot update');
+    expect(skew?.message).toContain('runly update');
     expect(versionSkew('0.9.0', '0.9.0')).toBeNull();
     expect(versionSkew('0.9.0', '0.8.0')?.direction).toBe('daemon-older');
     expect(versionSkew('0.8.0', '0.9.0')?.direction).toBe('daemon-newer');
@@ -156,11 +156,11 @@ describe('skew is refused, not warned about', () => {
     const doc = await cli(['doctor', '--json']);
     expect(doc.code).toBe(0);
     const issues = (doc.json as { issues: Array<{ issue: string }> }).issues;
-    expect(issues.some((i) => /running daemon is backlot 0\.7\.0/.test(i.issue))).toBe(true);
+    expect(issues.some((i) => /running daemon is runly 0\.7\.0/.test(i.issue))).toBe(true);
   });
 });
 
-describe('backlot update', () => {
+describe('runly update', () => {
   it('--check reports the versions and changes nothing', async () => {
     const { cli } = ctx();
     await cli(['status', '--json'], { fakeVersion: '0.7.0' });
@@ -169,7 +169,7 @@ describe('backlot update', () => {
     expect(before.cli).toBe(PKG_VERSION);
     expect(before.restarted).toBe(false);
     expect((before.skew as { direction: string }).direction).toBe('daemon-older');
-    // Names the command for THIS install rather than running one: backlot does
+    // Names the command for THIS install rather than running one: runly does
     // not own what it did not install (decision 0018's rule, applied to itself).
     expect(String(before.upgradeHint)).toMatch(/git pull|npm install|pnpm add/);
 
@@ -194,7 +194,7 @@ describe('backlot update', () => {
     const ctxRes = await cli(['ctx', '--json']);
     expect(ctxRes.code).not.toBe(3);
 
-    // Idempotent: a second update must NOT restart. `backlot update` in a
+    // Idempotent: a second update must NOT restart. `runly update` in a
     // script would otherwise be a recurring outage for every lease holder.
     const second = await cli(['update', '--json']);
     expect(second.code).toBe(0);
@@ -260,11 +260,11 @@ describe('a daemon that predates `update` itself', () => {
    * a version, `status` in the old shape, the daemon's own "does not know verb"
    * error for anything newer, and `shutdown` by actually closing the socket.
    *
-   * This is the case `backlot update` exists for, and the case it failed. The
+   * This is the case `runly update` exists for, and the case it failed. The
    * fake-version tests could never catch it: BACKLOT_FAKE_VERSION runs THIS build
    * while claiming an old version, so the stand-in always knew `update-plan`.
    * Shipped 0.9.0 therefore could not update any daemon anyone was running —
-   * `backlot update` died with "daemon does not know verb 'update-plan'".
+   * `runly update` died with "daemon does not know verb 'update-plan'".
    */
   function oldDaemon(sock: string, onShutdown: () => void) {
     // A pid that really dies on shutdown. `update` waits for the OLD daemon's
@@ -343,7 +343,7 @@ describe('an in-flight operation is never interrupted', () => {
     // the CLI would race the check's own duration. `busy` is the same set every
     // other reclaim path consults (claimForTeardown, both sweeper branches,
     // pool gc, and shutdown's reap since 0.8.0).
-    const dir = mkdtempSync(join(tmpdir(), 'backlot-busy-'));
+    const dir = mkdtempSync(join(tmpdir(), 'runly-busy-'));
     mkdirSync(dir, { recursive: true });
     const prev = process.env.BACKLOT_STATE_DIR;
     process.env.BACKLOT_STATE_DIR = dir;
@@ -368,7 +368,7 @@ describe('an in-flight operation is never interrupted', () => {
 
 describe('journal schema stamping', () => {
   it('stamps the schema it wrote', () => {
-    const dir = mkdtempSync(join(tmpdir(), 'backlot-schema-'));
+    const dir = mkdtempSync(join(tmpdir(), 'runly-schema-'));
     try {
       const path = join(dir, 'journal.db');
       new Journal(path);
@@ -385,8 +385,8 @@ describe('journal schema stamping', () => {
     }
   });
 
-  it('refuses a journal written by a newer backlot, without touching it', () => {
-    const dir = mkdtempSync(join(tmpdir(), 'backlot-schema-future-'));
+  it('refuses a journal written by a newer runly, without touching it', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'runly-schema-future-'));
     try {
       const path = join(dir, 'journal.db');
       new Journal(path);
@@ -397,14 +397,14 @@ describe('journal schema stamping', () => {
       // and then writing that misreading back as truth — disk is truth
       // (decision 0009), so the truth must say what wrote it. The sha256 env-id
       // migration stranded rows for exactly this reason.
-      expect(() => new Journal(path)).toThrow(/newer backlot/);
+      expect(() => new Journal(path)).toThrow(/newer runly/);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
   });
 
   it('adopts a pre-stamp journal rather than refusing it', () => {
-    const dir = mkdtempSync(join(tmpdir(), 'backlot-schema-old-'));
+    const dir = mkdtempSync(join(tmpdir(), 'runly-schema-old-'));
     try {
       const path = join(dir, 'journal.db');
       new Journal(path);

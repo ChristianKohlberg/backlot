@@ -84,7 +84,7 @@ function ctx(stackExtra: string, extraEnv: Record<string, string> = {}) {
   execFileSync('git', ['init', '-q'], { cwd: wt });
 
   // The publisher refuses without an origin certificate. Its CONTENT is never
-  // read by backlot — only cloudflared would care — so an empty file is a
+  // read by runly — only cloudflared would care — so an empty file is a
   // faithful stand-in for "the operator has logged in".
   const cert = join(stateDir, 'cert.pem');
   writeFileSync(cert, '');

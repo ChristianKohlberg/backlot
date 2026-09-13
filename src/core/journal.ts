@@ -79,7 +79,7 @@ export interface EnvRow {
   failStreak: number;
   /**
    * The services this environment currently has up, when that is a SUBSET of
-   * the manifest — `backlot up sherlock` starts only that slice plus its
+   * the manifest — `runly up sherlock` starts only that slice plus its
    * transitive depends_on closure. Undefined means the whole app is up (the
    * default). reset-data/watch rebinds read this to preserve the lease's shape;
    * a fresh `up` re-declares it.
@@ -115,7 +115,7 @@ export interface LeaseRow {
    */
   holderPid?: number;
   holderStart?: number;
-  /** Active lease-scoped public preview tunnel, when `backlot preview` is running. */
+  /** Active lease-scoped public preview tunnel, when `runly preview` is running. */
   previewService?: string;
   previewUrl?: string;
   previewPid?: number;
@@ -133,7 +133,7 @@ export class Journal {
     // the daemon runs), and without a busy timeout any overlap is an immediate
     // SQLITE_BUSY rather than a short wait. Set before the first read below.
     this.db.exec('PRAGMA busy_timeout = 5000');
-    // Refuse a journal from the FUTURE before touching it. A newer backlot may
+    // Refuse a journal from the FUTURE before touching it. A newer runly may
     // have written rows whose semantics this build does not know, and the
     // failure mode is silent: we would read a default where the newer build
     // stored meaning, then write that misreading back as truth. Checked before
@@ -144,8 +144,8 @@ export class Journal {
     if (stamped > JOURNAL_SCHEMA_VERSION) {
       throw new BrokerError(
         'infra-error',
-        `journal at ${path} was written by a newer backlot (schema ${stamped}; this build understands ${JOURNAL_SCHEMA_VERSION}) — ` +
-          `run the newer backlot, upgrade this one, or point BACKLOT_STATE_DIR at a different state root`,
+        `journal at ${path} was written by a newer runly (schema ${stamped}; this build understands ${JOURNAL_SCHEMA_VERSION}) — ` +
+          `run the newer runly, upgrade this one, or point BACKLOT_STATE_DIR at a different state root`,
         'journal',
       );
     }
@@ -441,7 +441,7 @@ export class Journal {
     if (rows.length > 1) {
       throw new BrokerError(
         'env-error',
-        `ambiguous leases for holder '${holder}': ${rows.map((r) => r.env_id).join(', ')}; inspect 'backlot status', then retire one with 'backlot pool recycle <envId> --force' — that destroys the selected environment and its data and ends its lease`,
+        `ambiguous leases for holder '${holder}': ${rows.map((r) => r.env_id).join(', ')}; inspect 'runly status', then retire one with 'runly pool recycle <envId> --force' — that destroys the selected environment and its data and ends its lease`,
         'lease',
       );
     }

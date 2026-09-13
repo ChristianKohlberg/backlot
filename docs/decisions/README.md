@@ -34,3 +34,4 @@ supersedes it and update this index — never edit a decision in place.
 | [0027](0027-lease-scoped-public-preview.md) | Lease-scoped public preview is explicit, supervised, and separate from `expose` |
 | [0028](0028-named-preview-hostnames.md) | A preview may publish under a hostname we own, and the publisher is where that lives |
 | [0029](0029-cli-only-agent-interface.md) | Agents use the CLI; remove the MCP adapter |
+| [0030](0030-rename-backlot-to-runly.md) | Rename Backlot to Runly while preserving existing state, namespaces and the CLI alias |

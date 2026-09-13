@@ -1,0 +1,18 @@
+{
+  "name": "runly",
+  "version": "0.8.0",
+  "description": "Teaches an agent to drive runly \u2014 the repo-aware environment broker \u2014 against any repo's runly.yml: lease a warm, seeded, authenticated env by bind-by-sync, run classified checks, partial/per-service up, then ctx/release. CLI-only, no MCP server; bundles the stack-agnostic runly skill.",
+  "author": {
+    "name": "ChristianKohlberg"
+  },
+  "homepage": "https://github.com/ChristianKohlberg/backlot",
+  "repository": "https://github.com/ChristianKohlberg/backlot",
+  "license": "Apache-2.0",
+  "keywords": [
+    "environments",
+    "dev-environment",
+    "testing",
+    "agents",
+    "broker"
+  ]
+}

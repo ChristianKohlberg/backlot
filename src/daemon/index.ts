@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * The backlot daemon: HTTP over a unix socket, auto-spawned by the CLI
+ * The runly daemon: HTTP over a unix socket, auto-spawned by the CLI
  * (decision 0009). One RPC endpoint; the CLI is a thin client. Serializes
  * requests through a simple queue — policy code stays race-free.
  */
@@ -58,7 +58,7 @@ async function dispatch(verb: string, args: Record<string, unknown>, emit: (phas
       void engine
         .executeJob(jobId, { cwd, holder, pull: Boolean(args.pull), callerEnv: args.callerEnv, presets: args.presets, check: String(args.check), hygiene: (args.hygiene as never) ?? undefined })
         .catch((err) => logEvent({ level: 'error', kind: 'job', detail: `job ${jobId} failed outside the verdict path: ${String((err as Error).message ?? err)}` }));
-      return { jobId, poll: `backlot job ${jobId}` };
+      return { jobId, poll: `runly job ${jobId}` };
     }
     case 'job':
       return engine.jobStatus(String(args.jobId));
@@ -139,7 +139,7 @@ let ownsLock = false;
  *
  * The 50ms delay is what lets the result frame reach the client before the
  * process goes: exiting inside the handler leaves the CLI reading a socket that
- * closed without a result. `backlot update` and `daemon stop` share this path
+ * closed without a result. `runly update` and `daemon stop` share this path
  * on purpose — a restart is a stop plus the next verb's autospawn (decision
  * 0009), so there is no second teardown implementation to keep in step.
  */
@@ -306,7 +306,7 @@ async function start(): Promise<void> {
 void start().catch((err) => {
   // Nothing has been established yet, so there is no graceful path — but dying
   // silently left the client waiting on a daemon that would never answer.
-  console.error(`backlot daemon failed to start: ${String((err as Error).stack ?? err)}`);
+  console.error(`runly daemon failed to start: ${String((err as Error).stack ?? err)}`);
   process.exit(1);
 });
 

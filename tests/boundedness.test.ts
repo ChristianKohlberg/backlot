@@ -41,8 +41,8 @@ afterAll(async () => {
 });
 
 function mkStack(yaml: string, extraFiles: Record<string, string> = {}) {
-  const stateDir = mkdtempSync(join(tmpdir(), 'backlot-bnd-'));
-  const wt = mkdtempSync(join(tmpdir(), 'backlot-bnd-wt-'));
+  const stateDir = mkdtempSync(join(tmpdir(), 'runly-bnd-'));
+  const wt = mkdtempSync(join(tmpdir(), 'runly-bnd-wt-'));
   dirs.push(stateDir, wt);
   writeFileSync(join(wt, 'stack.yaml'), yaml);
   for (const [rel, content] of Object.entries(extraFiles)) writeFileSync(join(wt, rel), content);
@@ -155,14 +155,14 @@ describe('the auth.token hook is bounded', () => {
 
 describe('template pruning survives a hung persisted drop command (unit)', () => {
   it('bounds the marker drop instead of stalling the retention sweep', async () => {
-    process.env.BACKLOT_STATE_DIR = mkdtempSync(join(tmpdir(), 'backlot-bnd-ret-'));
+    process.env.BACKLOT_STATE_DIR = mkdtempSync(join(tmpdir(), 'runly-bnd-ret-'));
     dirs.push(process.env.BACKLOT_STATE_DIR);
     const saved = process.env.BACKLOT_CMD_TIMEOUT_S;
     process.env.BACKLOT_CMD_TIMEOUT_S = '1';
     try {
       const { pruneTemplates } = await import('../src/core/retention.js');
       const { policy } = await import('../src/core/policy.js');
-      const root = mkdtempSync(join(tmpdir(), 'backlot-bnd-tpl-'));
+      const root = mkdtempSync(join(tmpdir(), 'runly-bnd-tpl-'));
       dirs.push(root);
       mkdirSync(join(root, 'stk'));
       // Oldest file first: a marker whose persisted drop hangs.

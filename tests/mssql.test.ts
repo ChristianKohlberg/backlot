@@ -23,7 +23,7 @@ const repo = join(import.meta.dirname, '..');
 const CLI = join(repo, 'dist', 'cli', 'index.js');
 
 const IMAGE = 'mcr.microsoft.com/mssql/server:2022-latest';
-const PASS = 'Backlot_Test_Pass123'; // throwaway, container-local — not a secret
+const PASS = 'Runly_Test_Pass123'; // throwaway, container-local — not a secret
 
 // Gate on docker AND a locally-present image: unlike postgres:16-alpine, the
 // SQL Server image is a 2.3 GB amd64-only pull — CI should skip, not download.
@@ -37,10 +37,10 @@ const hasMssql = (() => {
   }
 })();
 
-const CONTAINER = `backlot-mssql-test-${Math.random().toString(36).slice(2, 8)}`;
+const CONTAINER = `runly-mssql-test-${Math.random().toString(36).slice(2, 8)}`;
 const SQLCMD = `/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P ${PASS} -C -b`;
 // All mechanics go through docker exec — the url is handed to services but
-// never dialed by backlot itself (zero embedded DB clients).
+// never dialed by runly itself (zero embedded DB clients).
 const sql = (q: string, db?: string) =>
   execFileSync(
     'sh',
@@ -52,8 +52,8 @@ const count = (db: string) => sql('SELECT COUNT(*) FROM items', db).replace(/\s/
 const T = 240_000; // per-test budget: MSSQL under amd64 emulation is slow
 
 describe.skipIf(!hasMssql)('mssql datastore (docker-gated)', () => {
-  const stateDir = mkdtempSync(join(tmpdir(), 'backlot-mssql-'));
-  const wt = mkdtempSync(join(tmpdir(), 'backlot-mssql-wt-'));
+  const stateDir = mkdtempSync(join(tmpdir(), 'runly-mssql-'));
+  const wt = mkdtempSync(join(tmpdir(), 'runly-mssql-wt-'));
   const env = { ...process.env, BACKLOT_STATE_DIR: stateDir, BACKLOT_SWEEP_MS: '500' };
   const cli = (args: string[]): Promise<{ exitCode: number; json?: Record<string, unknown>; out: string; stdout?: string; stderr?: string }> =>
     new Promise((resolve) => {

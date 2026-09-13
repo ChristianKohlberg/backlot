@@ -5,7 +5,7 @@
  *
  * Observed failure (2026-07-18): a service process survived ~26 minutes after
  * env teardown with its cwd deleted, still binding its port and blocking two
- * subsequent `backlot up` attempts.
+ * subsequent `runly up` attempts.
  *
  * Root cause: `bindAndStart` called `stopAll()` on a fresh (post-restart or
  * post-quiesce) supervisor that had no in-memory services, making it a no-op.
@@ -30,7 +30,7 @@ const repo = join(import.meta.dirname, '..');
 const CLI = join(repo, 'dist', 'cli', 'index.js');
 
 function makeContext(extra: Record<string, string> = {}) {
-  const stateDir = mkdtempSync(join(tmpdir(), 'backlot-surv-'));
+  const stateDir = mkdtempSync(join(tmpdir(), 'runly-surv-'));
   const env = { ...process.env, BACKLOT_STATE_DIR: stateDir, BACKLOT_SWEEP_MS: '300', ...extra };
   const cli = (
     args: string[],
@@ -67,7 +67,7 @@ function makeContext(extra: Record<string, string> = {}) {
 }
 
 function makeWt(name: string): string {
-  const dir = mkdtempSync(join(tmpdir(), `backlot-surv-${name}-`));
+  const dir = mkdtempSync(join(tmpdir(), `runly-surv-${name}-`));
   // A polite server: exits cleanly on SIGTERM. The tests below kill it
   // manually so the daemon's group-kill record is clean.
   writeFileSync(
@@ -108,7 +108,7 @@ async function waitFor(pred: () => boolean, timeoutMs = 15_000): Promise<boolean
 /** Spawn a port-holding process in its OWN process group, with BACKLOT tags. */
 function spawnEscapee(port: number, envId: string, stateDir: string): { pid: number } {
   // Uses a raw TCP server (not HTTP) so the service doesn't accidentally answer
-  // the backlot readiness probe and cause a bind race with the real service.
+  // the runly readiness probe and cause a bind race with the real service.
   // SIGTERM is ignored so the process is a faithful "stubborn escapee".
   const proc = spawn(
     process.execPath,
@@ -256,7 +256,7 @@ describe('env port-survivor: bind reaps tagged escapees instead of blocking', ()
     async () => {
       const ctx = makeContext({ BACKLOT_IDLE_TTL_MS: '500', BACKLOT_GC_MS: '999999999' });
       ctxList.push(ctx.cleanup);
-      const wt = mkdtempSync(join(tmpdir(), 'backlot-surv-quiesce-'));
+      const wt = mkdtempSync(join(tmpdir(), 'runly-surv-quiesce-'));
       dirList.push(wt);
       // The service itself spawns the escapee: a detached grandchild in its own
       // process group that binds the service port and ignores SIGTERM.

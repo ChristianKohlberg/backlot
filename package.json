@@ -1,6 +1,6 @@
 {
-  "name": "backlot",
-  "version": "0.11.1",
+  "name": "runly",
+  "version": "0.12.0",
   "description": "The repo-aware environment broker: puts a working, seeded, provable instance of your web application in front of coding agents and humans \u2014 warm pools, leases, bind-by-sync. Brokers environments; never provides them.",
   "keywords": [
     "environment",
@@ -19,6 +19,7 @@
     "node": ">=22.13.0"
   },
   "bin": {
+    "runly": "dist/cli/index.js",
     "backlot": "dist/cli/index.js"
   },
   "files": [

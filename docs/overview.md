@@ -1,6 +1,6 @@
-# backlot in two pages
+# runly in two pages
 
-> backlot puts a **working instance of your web app in front of a coding agent** (or a
+> runly puts a **working instance of your web app in front of a coding agent** (or a
 > human) — running, seeded, logged-in, provable — as a cheap, repeatable act. It brokers
 > environments; it never provides them.
 
@@ -15,12 +15,12 @@ machine-readable verdict), and a fix-sync-retest loop that runs in **seconds** �
 any commit, long before CI. Hand-rolled harnesses all reinvent the same machinery (port
 allocation, DB namespacing, zombie reaping) welded to one repo. And because environments
 are expensive to make, everyone hoards them "just in case" until the machine is full of
-half-dead stacks. backlot's answer: keep a small warm **pool** of durable environments,
+half-dead stacks. runly's answer: keep a small warm **pool** of durable environments,
 and make *ownership* — not the environment — the disposable thing.
 
 ## How it works
 
-One `backlot.yml` at your repo root declares services, datastores, seed presets, and
+One `runly.yml` at your repo root declares services, datastores, seed presets, and
 checks. A per-machine daemon (auto-spawned by the CLI, nothing to deploy) supervises a
 pool of environments, each with its own copy of the tree, its own ports, and its own
 datastore namespace. Verbs *lease* an environment, *sync* your worktree into it, and hand
@@ -31,7 +31,7 @@ flowchart LR
     subgraph you["your worktree (source of truth)"]
         WT["code + dirty edits"]
     end
-    subgraph broker["backlot (per-machine daemon)"]
+    subgraph broker["runly (per-machine daemon)"]
         CLI["CLI verbs<br/>up · run · sync · ctx · exec"]
         subgraph pool["warm pool"]
             E1["env 1 · leased<br/>services up · ports 491xx<br/>db ns e1 · caches warm"]
@@ -56,7 +56,7 @@ Two inversions carry the whole design:
   environment's *own* tree forever. Pointing them at new work means syncing that work in
   — so caches survive rebinds, ports and URLs stay stable, and your worktree is never
   written to (the sole exception: manifest-declared `outputs:`, copied back only by an
-  explicit `backlot pull`).
+  explicit `runly pull`).
 
 The safety invariant underneath both: **an environment never holds the only copy of
 anything.** Your worktree stays the source of truth; the environment's tree is a
@@ -89,14 +89,14 @@ heisenbugs.
 ## A session, concretely
 
 ```bash
-backlot up                  # lease an env, sync your worktree, start services
-                            # (name services — `backlot up web` — to start only
+runly up                  # lease an env, sync your worktree, start services
+                            # (name services — `runly up web` — to start only
                             #  that slice plus its depends_on closure)
-backlot ctx --json          # URLs, login creds, DB strings, recent events — all an agent needs
+runly ctx --json          # URLs, login creds, DB strings, recent events — all an agent needs
 # …edit code in your worktree…
-backlot sync                # project the edits in; watchers/caches do the rest
-backlot run e2e --json      # second env from the pool, fresh data, JSON verdict
-backlot release             # or just walk away — the lease lapses harmlessly
+runly sync                # project the edits in; watchers/caches do the rest
+runly run e2e --json      # second env from the pool, fresh data, JSON verdict
+runly release             # or just walk away — the lease lapses harmlessly
 ```
 
 Every verb takes `--json`: stdout is one clean data object, stderr is for humans.
@@ -112,23 +112,23 @@ the class is what an agent branches on:
 | Class | Meaning | Exit | Who acts |
 | --- | --- | --- | --- |
 | `work-error` | your synced code is at fault | 1 | you fix, re-sync |
-| `env-error` | the environment is at fault | 2 | backlot recycles it |
+| `env-error` | the environment is at fault | 2 | runly recycles it |
 | `infra-error` | something external (DB down, registry) | 3 | actionable message, nobody's code blamed |
 
 A service that dies mid-check fails the run *explicitly* as `env-error` — never a
 silently wrong verdict that sends an agent off to "fix" healthy code.
 
-## What backlot never does
+## What runly never does
 
 No compute ownership (local processes now; BYO cloud sandboxes via drivers later). No
 build-system knowledge — it invokes your repo's commands, it never understands them. Not
-CI — CI may call backlot, never the reverse. Not the agent — no LLM calls, no browser
+CI — CI may call runly, never the reverse. Not the agent — no LLM calls, no browser
 driving; it guarantees URLs, credentials, data states, and verdicts, and what you do with
 them is your business.
 
 ## Where to go next
 
 - [`architecture.md`](architecture.md) — the full design, argued
-- [`../schema/backlot.schema.json`](../schema/backlot.schema.json) — the manifest contract;
+- [`../schema/runly.schema.json`](../schema/runly.schema.json) — the manifest contract;
   [`../examples/`](../examples/) — three runnable fixtures, smallest first
 - [`decisions/`](decisions/) — why it is the way it is; a recorded decision outranks code
