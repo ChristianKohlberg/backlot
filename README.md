@@ -50,7 +50,7 @@ runly run smoke --json   # bind -> run the check -> JSON verdict -> release
 runly ctx --json         # re-read that same blob later, read-only — no re-bind (up already returned it)
 runly sync               # source-only edits project in; startup configuration changes rebind
 runly exec <cmd>         # run an arbitrary command in the env your lease holds (raw exit, not a verdict)
-runly preview <service>  # publish one service on a public tunnel (requires cloudflared)
+runly preview <service>  # publish one service (public tunnel via cloudflared, or the tailnet via tailscale)
 runly preview stop       # stop the preview tunnel on your lease
 runly release            # environment returns to the pool, warm
 ```
@@ -434,6 +434,35 @@ remember, and only where one environment of the stack runs at a time.
 policy over the zone; it matches on hostname, so one policy covers every preview
 you will ever publish there ([decision 0028](docs/decisions/0028-named-preview-hostnames.md)).
 
+### A preview only your tailnet can reach
+
+`tailscale` publishes on this machine's own tailnet name instead of the internet:
+
+```yaml
+preview:
+  publisher: tailscale
+  https_port: 20601       # optional — see below
+```
+
+`web` then appears at `https://<machine>.<tailnet>.ts.net:20601` for every device
+on your tailnet, and for nobody else. runly runs `tailscale serve` in the
+**foreground** as a child of your lease, so the mapping exists exactly as long as
+that process: `preview stop`, `release`, a moved port or a reaped environment
+takes the URL down with it, and nothing is left in tailscale's persistent config
+([decision 0031](docs/decisions/0031-tailscale-preview-publisher.md)).
+
+**It needs the operator, once:** `sudo tailscale set --operator=$USER`, plus
+MagicDNS and HTTPS Certificates enabled for the tailnet. runly never calls sudo —
+sudo would move `tailscale serve` out of the process group and environment it
+reaps by.
+
+**Leave `https_port` unset unless you mean it.** Unset, the port is derived from
+the environment id and service (in 21000–21999, past anything this machine
+already serves), so the same environment gets the same address every time it
+publishes. Pin it only for an address a human has to remember, and only where
+one environment of the stack publishes at a time; a pinned port that is already
+served is refused, not taken over.
+
 ### Understanding a slow bind
 
 `up --json`, `sync --json`, `reset-data --json`, and `bind --ref --json` return
@@ -492,7 +521,8 @@ Be clear-eyed about what running runly means:
   boundary — code in an environment runs as you, on your machine. For untrusted
   code, put the *substrate* in a sandbox (a VM, a cloud box), not your laptop.
 - **Public preview URLs are world-readable.** `runly preview` publishes the
-  chosen service through a quick tunnel (Cloudflare by default). The URL is
+  chosen service through a quick tunnel (Cloudflare by default; the `tailscale`
+  publisher reaches only your tailnet instead). The URL is
   **unauthenticated** — anyone with the link reaches the service, and under
   `cloudflare-named` (below) that link still works tomorrow, so put an access
   policy in front of the zone if what you publish is not meant for everyone.

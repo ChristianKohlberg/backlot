@@ -50,6 +50,18 @@ one tunnel, which forces one shared cloudflared process for every previewed
 service — and a shared process cannot honour 0027's `stop()` contract, because
 the pid another publication still references may not be killed.
 
+## `tailscale` serves in the foreground, as the operator — never `--bg`, never sudo
+
+The `tailscale` publisher runs `tailscale serve --https=<port> <url>` WITHOUT
+`--bg`. A foreground serve config dies with the process (SIGTERM and SIGKILL
+alike, measured on 1.102), which is what lets the lease-scoped preview machinery
+reap the URL by reaping a pid. Do not "fix" it to `--bg`: that writes persistent
+config nothing in the journal can name again. Do not wrap it in sudo either —
+`use_pty` moves the command out of the process group and `env_reset` strips the
+runly tags, so a SIGKILLed sudo leaves an unreapable live serve. The machine's
+tailscale operator must be the daemon's user (`tailscale set --operator=…`);
+`checkPrerequisite` says so ([decision 0031](docs/decisions/0031-tailscale-preview-publisher.md)).
+
 ## The preview tunnel is scoped to the lease, not to the services it publishes
 
 `runly preview` journals its tunnel on the **lease row** (`preview_*`), not in
