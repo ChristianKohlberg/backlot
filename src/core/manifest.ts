@@ -106,7 +106,11 @@ export interface PreviewSpec {
    * credentials or a known signing key must set this.
    */
   forbidden?: boolean;
-  /** Named preview publisher adapter (default: cloudflare-quick). */
+  /**
+   * Named preview publisher adapter (default: cloudflare-quick). Known:
+   * `cloudflare-quick`, `cloudflare-named`, `tailscale` (tailnet-only HTTPS via
+   * `tailscale serve`, decision 0031).
+   */
   publisher?: string;
   /**
    * Zone a naming publisher publishes under, e.g. `example.dev`. Required by
@@ -126,6 +130,16 @@ export interface PreviewSpec {
    * of this stack runs at a time.
    */
   prefix?: string;
+  /**
+   * The HTTPS port on this machine's tailnet name that the `tailscale` publisher
+   * serves on (`https://<machine>.<tailnet>.ts.net:<port>`). Unset means a port
+   * derived from the environment id and service, stable for the environment's
+   * lifetime and moved past any port this machine already serves. Pin it only
+   * for an address a human has to remember, and only where one environment of
+   * this stack publishes at a time — a second publish of a pinned port is
+   * refused rather than taken over. Ignored by the Cloudflare publishers.
+   */
+  https_port?: number;
 }
 
 export interface Manifest {

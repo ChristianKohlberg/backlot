@@ -119,7 +119,7 @@
         },
         "publisher": {
           "type": "string",
-          "description": "Named preview publisher adapter (default: cloudflare-quick)."
+          "description": "Named preview publisher adapter (default: cloudflare-quick). Known: cloudflare-quick, cloudflare-named, tailscale (tailnet-only HTTPS via `tailscale serve`)."
         },
         "domain": {
           "type": "string",
@@ -128,6 +128,12 @@
         "prefix": {
           "type": "string",
           "description": "What makes a hostname this environment's own (<service>-<prefix>.<domain>). Unset means the environment id, which is unique by construction; set it only to pin a memorable name, and only where one environment of this stack runs at a time."
+        },
+        "https_port": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65535,
+          "description": "tailscale publisher only: the HTTPS port on this machine's tailnet name. Unset means a port derived from the environment id and service, stable for the environment's lifetime. Pin it only where one environment of this stack publishes at a time; ignored by the Cloudflare publishers."
         }
       }
     }
