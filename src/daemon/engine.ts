@@ -2509,7 +2509,13 @@ export class Engine {
       const { url, pid } = await pub.start({
         envId: env.id,
         service,
-        localUrl: `http://127.0.0.1:${localPort}`,
+        // `localhost`, the same origin ctx advertises for the service — never a
+        // literal 127.0.0.1. Node 17+ resolves `localhost` to ::1 first, so a dev
+        // server bound to `localhost` (ng serve, vite) often listens on [::1]
+        // ONLY, and a tunnel aimed at 127.0.0.1 then answers 502 for a service
+        // that is perfectly up. Both cloudflared and tailscale resolve
+        // `localhost` to whichever loopback is listening.
+        localUrl: `http://localhost:${localPort}`,
         logDir: dirs.logs,
         // A caller's --https-port outranks the manifest for this publish only;
         // publishers that do not serve on a port ignore it (decision 0031).

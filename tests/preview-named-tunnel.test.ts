@@ -170,7 +170,7 @@ describe('the cloudflare-named preview publisher', () => {
     expect(cfg).toBeTruthy();
     const text = readFileSync(cfg as string, 'utf8');
     expect(text).toMatch(/hostname: web-probe\.example\.dev/);
-    expect(text).toMatch(/service: http:\/\/127\.0\.0\.1:\d+/);
+    expect(text).toMatch(/service: http:\/\/localhost:\d+/);
     // cloudflared refuses to start without one, so its absence is not cosmetic.
     expect(text).toMatch(/service: http_status:404/);
   });
