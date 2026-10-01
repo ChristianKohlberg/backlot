@@ -8,7 +8,7 @@ import { tmpdir } from 'node:os';
 import { mkdirSync, rmSync, copyFileSync, readdirSync, statSync, existsSync, readFileSync, writeFileSync, renameSync, watch as fsWatch, constants as fsConstants } from 'node:fs';
 import { isAbsolute, join, sep } from 'node:path';
 import { Journal, JOURNAL_SCHEMA_VERSION, type EnvRow, type LeaseRow } from '../core/journal.js';
-import { VERSION, compareVersions, versionSkew } from '../core/version.js';
+import { BUILD, VERSION, compareVersions, versionSkew } from '../core/version.js';
 import { canonicalDirectory, stackIdentity, retiredStackIdentity, loadStack, normalizeLogins, type Stack } from '../core/manifest.js';
 import { changedOutputs, pullOutputs } from '../core/sync.js';
 import { syncIntoEnvThreaded } from '../core/sync-thread.js';
@@ -2676,6 +2676,7 @@ export class Engine {
     const skew = cliVersion === undefined ? null : versionSkew(cliVersion, VERSION);
     return {
       daemon: VERSION,
+      daemonBuild: BUILD,
       cli: cliVersion ?? null,
       daemonPid: process.pid,
       journalSchema: JOURNAL_SCHEMA_VERSION,

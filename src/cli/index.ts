@@ -8,7 +8,7 @@ import { ensureDaemon, daemonInfo, rpc, classifyClientError, awaitDaemonGone, DA
 import { isAlive } from '../core/procscan.js';
 import { join } from 'node:path';
 import { stateRoot } from '../core/paths.js';
-import { VERSION, versionSkew } from '../core/version.js';
+import { BUILD, VERSION, rebuiltSince, versionSkew } from '../core/version.js';
 import { installKind } from './install.js';
 import { collectCallerEnv } from '../core/caller-env.js';
 import { loadStack } from '../core/manifest.js';
@@ -568,6 +568,7 @@ async function main(): Promise<void> {
       // learn the pid to wait on.
       let plan: {
         daemon: string;
+        daemonBuild?: string;
         daemonPid?: number;
         journalSchema?: number;
         busy: string[];
@@ -590,9 +591,14 @@ async function main(): Promise<void> {
       } else {
         plan = planRes.data as typeof plan;
       }
+      // Same version, different build: a checkout rebuilt (or a package
+      // reinstalled) since the daemon started. Not skew — nothing refuses on it —
+      // but exactly what `update` is for.
+      const rebuilt = !skew && rebuiltSince(BUILD, plan.daemonBuild);
       const report = {
         cli: VERSION,
         daemon: plan.daemon,
+        build: { cli: BUILD, daemon: plan.daemonBuild ?? null, rebuilt },
         journalSchema: plan.journalSchema,
         install: install.kind,
         installRoot: install.root,
@@ -622,7 +628,7 @@ async function main(): Promise<void> {
       // Already the installed build: say so and stop. An update that restarts
       // unconditionally would make `runly update` in a script a recurring
       // outage for every lease holder on the box, for no gain.
-      if (!skew) {
+      if (!skew && !rebuilt) {
         out({
           ...report,
           restarted: false,
@@ -666,7 +672,7 @@ async function main(): Promise<void> {
           source: 'daemon',
         });
       }
-      out({ ...report, restarted: true, from: plan.daemon, to: now.version, daemonPid: now.pid });
+      out({ ...report, restarted: true, from: plan.daemon, to: now.version, daemonPid: now.pid, ...(rebuilt ? { reason: 'rebuilt' } : {}) });
       break;
     }
     default:
