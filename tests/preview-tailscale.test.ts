@@ -177,7 +177,7 @@ describe('the tailscale preview publisher', () => {
     // Foreground — never --bg, whose config would outlive every reap path —
     // and aimed at the service's loopback port.
     const calls = readFileSync(join(tsDir, 'calls.txt'), 'utf8');
-    expect(calls).toMatch(/^serve --https=20601 http:\/\/127\.0\.0\.1:\d+$/m);
+    expect(calls).toMatch(/^serve --https=20601 http:\/\/localhost:\d+$/m);
     expect(calls).not.toMatch(/--bg/);
   });
 
@@ -270,6 +270,24 @@ describe('the tailscale preview publisher', () => {
     expect(await goneWithin(pid, 5000)).toBe(true);
     const c = await cli(['ctx', '--json']);
     expect(c.json?.previewUrls ?? {}).toEqual({});
+  });
+});
+
+describe('the origin a publisher is aimed at', () => {
+  it('is the service URL ctx advertises (localhost), so an IPv6-only dev server is reachable', async () => {
+    // ng serve / vite bound to `localhost` listen on [::1] only under Node 17+;
+    // a tunnel aimed at a literal 127.0.0.1 answered 502 for a healthy service.
+    const { cli, wt, tsDir } = ctx(`${TS}  https_port: 20601\n`);
+    writeFileSync(
+      join(wt, 'srv.mjs'),
+      `import{createServer}from'node:http';console.log('ready');createServer((q,s)=>s.end('ok')).listen(Number(process.env.PORT), '::1');\n`,
+    );
+    expect((await cli(['up', '--json'])).code).toBe(0);
+    expect((await cli(['preview', 'web', '--json'])).code).toBe(0);
+    const urls = ((await cli(['ctx', '--json'])).json?.urls ?? {}) as Record<string, string>;
+    const served = /^serve --https=20601 (\S+)$/m.exec(readFileSync(join(tsDir, 'calls.txt'), 'utf8'))?.[1];
+    expect(served).toBe(urls.web);
+    expect(served).toMatch(/^http:\/\/localhost:\d+$/);
   });
 });
 
