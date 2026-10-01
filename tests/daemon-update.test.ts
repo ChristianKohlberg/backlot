@@ -24,7 +24,7 @@
 import { describe, it, expect, afterAll } from 'vitest';
 import { execFile, execFileSync, spawn } from 'node:child_process';
 import { createServer } from 'node:http';
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
@@ -66,11 +66,13 @@ function ctx(opts: { service?: boolean } = {}) {
     execFileSync('git', ['init', '-q'], { cwd: wt });
   }
   /** `fakeVersion` makes THIS invocation (and any daemon it spawns) claim that version. */
-  const cli = (args: string[], o: { fakeVersion?: string } = {}) =>
+  const cli = (args: string[], o: { fakeVersion?: string; fakeBuild?: string } = {}) =>
     new Promise<{ code: number; json?: Record<string, unknown>; stdout: string; stderr: string }>((resolve) => {
       const env: NodeJS.ProcessEnv = { ...process.env, BACKLOT_STATE_DIR: stateDir, BACKLOT_SWEEP_MS: '400' };
       if (o.fakeVersion) env.BACKLOT_FAKE_VERSION = o.fakeVersion;
       else delete env.BACKLOT_FAKE_VERSION;
+      if (o.fakeBuild) env.BACKLOT_FAKE_BUILD = o.fakeBuild;
+      else delete env.BACKLOT_FAKE_BUILD;
       execFile(process.execPath, [CLI, ...args], { cwd: wt, env, maxBuffer: 16 * 1024 * 1024 }, (err, stdout, stderr) => {
         let json: Record<string, unknown> | undefined;
         try {
@@ -201,6 +203,38 @@ describe('runly update', () => {
     const s = second.json as Record<string, unknown>;
     expect(s.restarted).toBe(false);
     expect(String(s.note)).toContain('already');
+  });
+
+  it('restarts a daemon running an older BUILD of the same version (a rebuilt checkout)', async () => {
+    // `git pull && npm run build` keeps package.json at the same version, so the
+    // version alone used to say "already runly X — nothing to do" and leave the
+    // old code serving. The daemon here claims an older build of THIS version.
+    const { cli } = ctx();
+    await cli(['status', '--json'], { fakeBuild: 'built-before-the-pull' });
+
+    const check = await cli(['update', '--check', '--json']);
+    const plan = check.json as { skew: unknown; build: { daemon: string; rebuilt: boolean } };
+    expect(plan.skew).toBeNull();
+    expect(plan.build.daemon).toBe('built-before-the-pull');
+    expect(plan.build.rebuilt).toBe(true);
+
+    const first = await cli(['update', '--json']);
+    expect(first.code).toBe(0);
+    const r = first.json as Record<string, unknown>;
+    expect(r.restarted).toBe(true);
+    expect(r.reason).toBe('rebuilt');
+    expect(r.to).toBe(PKG_VERSION);
+
+    // …and once the daemon IS this build, update is a no-op again.
+    const second = await cli(['update', '--json']);
+    expect((second.json as Record<string, unknown>).restarted).toBe(false);
+  });
+
+  it('leaves the bin executable after a build (a checkout install links straight to it)', () => {
+    const pkg = JSON.parse(readFileSync(join(repo, 'package.json'), 'utf8')) as { bin: Record<string, string> };
+    for (const rel of new Set(Object.values(pkg.bin))) {
+      expect(statSync(join(repo, rel)).mode & 0o111).not.toBe(0);
+    }
   });
 
   it('refuses to downgrade the daemon unless forced', async () => {

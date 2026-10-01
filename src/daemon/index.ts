@@ -11,7 +11,7 @@ import { existsSync, rmSync, writeFileSync, chmodSync } from 'node:fs';
 import { socketPath, pidPath, stateRoot } from '../core/paths.js';
 import { electSelf, releaseSelf } from './election.js';
 import { BrokerError } from '../core/util.js';
-import { VERSION } from '../core/version.js';
+import { BUILD, VERSION } from '../core/version.js';
 import { JOURNAL_SCHEMA_VERSION } from '../core/journal.js';
 import { Engine } from './engine.js';
 import { logEvent } from '../core/events.js';
@@ -31,7 +31,7 @@ async function dispatch(verb: string, args: Record<string, unknown>, emit: (phas
     case 'ping':
       // The version rides on ping because the CLI already pings on EVERY
       // invocation (ensureDaemon), so skew detection costs no extra round trip.
-      return { pid: process.pid, version: VERSION, journalSchema: JOURNAL_SCHEMA_VERSION };
+      return { pid: process.pid, version: VERSION, build: BUILD, journalSchema: JOURNAL_SCHEMA_VERSION };
     case 'up':
       return engine.up({
         cwd, holder, holderPid, callerEnv: args.callerEnv, presets: args.presets,

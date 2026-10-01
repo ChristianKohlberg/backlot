@@ -8,7 +8,7 @@
  * driving. One path serves both installs — the npm tarball ships package.json
  * beside `dist/`, and a git checkout has it at the same relative position.
  */
-import { readFileSync } from 'node:fs';
+import { readFileSync, statSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -35,6 +35,37 @@ function readVersion(): string {
 }
 
 export const VERSION: string = readVersion();
+
+/**
+ * Which BUILD of this version is running — the modification time of this very
+ * module, as the process saw it when it loaded.
+ *
+ * The version alone cannot tell a rebuilt checkout from the build it replaced:
+ * `git pull && npm run build` on a checkout install keeps package.json at the
+ * same version while every file under dist/ changes, so `runly update` used to
+ * report "already runly 0.12.0 — nothing to do" and leave the old code serving.
+ * The daemon reads this once at start and keeps it; the CLI reads it fresh, so
+ * any rebuild or reinstall since the daemon started shows up as a difference.
+ * `unknown` (unreadable) never counts as a difference, for the same reason an
+ * unknown version never counts as skew.
+ */
+function readBuild(): string {
+  const fake = process.env.BACKLOT_FAKE_BUILD;
+  if (fake) return fake;
+  try {
+    return String(Math.trunc(statSync(fileURLToPath(import.meta.url)).mtimeMs));
+  } catch {
+    return 'unknown';
+  }
+}
+
+export const BUILD: string = readBuild();
+
+/** True only when both builds are known and differ — a same-version rebuild or reinstall. */
+export function rebuiltSince(cliBuild: string, daemonBuild: string | undefined): boolean {
+  if (daemonBuild === undefined || daemonBuild === 'unknown' || cliBuild === 'unknown') return false;
+  return cliBuild !== daemonBuild;
+}
 
 /**
  * Order two versions, or return undefined when they cannot be ordered.
