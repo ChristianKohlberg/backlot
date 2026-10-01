@@ -83,7 +83,13 @@ async function dispatch(verb: string, args: Record<string, unknown>, emit: (phas
     case 'release':
       return engine.release(cwd, holder);
     case 'preview':
-      return engine.previewStart(cwd, String(args.service), holder, args.ttlMs ? Number(args.ttlMs) : undefined);
+      return engine.previewStart(
+        cwd,
+        String(args.service),
+        holder,
+        args.ttlMs ? Number(args.ttlMs) : undefined,
+        args.httpsPort !== undefined ? Number(args.httpsPort) : undefined,
+      );
     case 'preview-stop':
       return engine.previewStop(cwd, holder);
     case 'appliance-ls':

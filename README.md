@@ -463,6 +463,10 @@ publishes. Pin it only for an address a human has to remember, and only where
 one environment of the stack publishes at a time; a pinned port that is already
 served is refused, not taken over.
 
+For one long-lived environment that should keep a remembered address — a demo box,
+say — pin the port on the command instead of in the shared manifest:
+`runly preview web --https-port 20601`. It applies to that publish only.
+
 ### Understanding a slow bind
 
 `up --json`, `sync --json`, `reset-data --json`, and `bind --ref --json` return

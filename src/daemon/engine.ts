@@ -2464,7 +2464,7 @@ export class Engine {
     return port;
   }
 
-  async previewStart(cwd: string, service: string, holder?: string, ttlMs?: number): Promise<{ service: string; url: string }> {
+  async previewStart(cwd: string, service: string, holder?: string, ttlMs?: number, httpsPort?: number): Promise<{ service: string; url: string }> {
     const stack = loadStack(cwd);
     this.assertPreviewAllowed(stack);
     const h = this.callerHolder(cwd, holder, stack);
@@ -2511,7 +2511,9 @@ export class Engine {
         service,
         localUrl: `http://127.0.0.1:${localPort}`,
         logDir: dirs.logs,
-        settings: stack.manifest.preview,
+        // A caller's --https-port outranks the manifest for this publish only;
+        // publishers that do not serve on a port ignore it (decision 0031).
+        settings: httpsPort !== undefined ? { ...stack.manifest.preview, https_port: httpsPort } : stack.manifest.preview,
       });
       // Identity, not mere existence: `pub.start` can take up to 45s holding only
       // this env's lock, and a concurrent release + `up` in that window hands the
