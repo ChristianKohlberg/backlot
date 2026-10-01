@@ -195,6 +195,22 @@ describe('the tailscale preview publisher', () => {
     expect(again.json?.url).toBe(url);
   });
 
+  it('--https-port pins the port for this publish, over the manifest', async () => {
+    const { cli, tsDir } = ctx(`${TS}  https_port: 20601\n`);
+    await cli(['up', '--json']);
+    const prev = await cli(['preview', 'web', '--https-port', '20777', '--json']);
+    expect(prev.code).toBe(0);
+    expect(prev.json?.url).toBe('https://box.tail1234.ts.net:20777');
+    expect(readFileSync(join(tsDir, 'calls.txt'), 'utf8')).toMatch(/^serve --https=20777 /m);
+  });
+
+  it('rejects a --https-port that is not a port (usage)', async () => {
+    const { cli } = ctx(TS);
+    await cli(['up', '--json']);
+    const prev = await cli(['preview', 'web', '--https-port', 'abc', '--json']);
+    expect(prev.code).toBe(64);
+  });
+
   it('refuses a pinned port another publication holds, and serves nothing (work-error)', async () => {
     const { cli, tsDir } = ctx(`${TS}  https_port: 20601\n`, { FAKE_TS_BUSY: '20601' });
     await cli(['up', '--json']);

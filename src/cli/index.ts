@@ -41,11 +41,14 @@ Usage:
                           bare token, which is what an Authorization header wants
   runly pull            copy declared outputs back into the worktree
   runly release         release the current lease (environment stays warm)
-  runly preview <service> [--ttl ...]
+  runly preview <service> [--ttl ...] [--https-port N]
                           publish a service from your lease on a public quick
                           tunnel (Cloudflare by default). The URL is unauthenticated
                           — anyone with the link reaches the service. Requires
                           cloudflared on PATH (or BACKLOT_CLOUDFLARED).
+                          With preview.publisher: tailscale it is served on this
+                          machine's tailnet name instead (tailnet only);
+                          --https-port pins that port for this publish.
   runly preview stop    stop the preview tunnel on your lease
   runly status          daemon, pool, and lease overview
   runly appliance ls|start|stop [name]
@@ -98,7 +101,7 @@ const verb = rawArgv[0];
 // flag's value is never mis-bound as a positional (and an inner command's own
 // flags survive) — the F1 class of argv bugs. Everything after a lone `--`, and
 // EVERYTHING for `exec`, is treated as a raw passthrough command.
-const VALUE_FLAGS = new Set(['--holder', '--holder-pid', '--ttl', '--role', '--lines', '--ref', '--spec', '--preset']);
+const VALUE_FLAGS = new Set(['--holder', '--holder-pid', '--ttl', '--role', '--lines', '--ref', '--spec', '--preset', '--https-port']);
 const BOOL_FLAGS = new Set(['--json', '--watch', '--reset-data', '--pristine', '--pull', '--detach', '--all', '--force', '--raw', '--data-only', '--progress', '--quiet', '--check']);
 
 const flagVals = new Map<string, string>();
@@ -474,11 +477,26 @@ async function main(): Promise<void> {
             process.exit(64);
           }
         }
-        if (ttlMs !== undefined) {
-          res = await rpc('preview', { cwd, holder, service: sub, ttlMs });
-        } else {
-          res = await rpc('preview', { cwd, holder, service: sub });
+        // --https-port pins the tailnet port for THIS publish only (tailscale
+        // publisher), so one long-lived environment can keep a remembered
+        // address without pinning it in the shared manifest — where every other
+        // environment of the stack would then collide on it.
+        const portFlag = flagValue('--https-port');
+        let httpsPort: number | undefined;
+        if (portFlag !== undefined) {
+          httpsPort = Number(portFlag);
+          if (!Number.isInteger(httpsPort) || httpsPort < 1 || httpsPort > 65535) {
+            console.error(`runly: --https-port expects a port number (1-65535), got '${portFlag}'`);
+            process.exit(64);
+          }
         }
+        res = await rpc('preview', {
+          cwd,
+          holder,
+          service: sub,
+          ...(ttlMs !== undefined ? { ttlMs } : {}),
+          ...(httpsPort !== undefined ? { httpsPort } : {}),
+        });
       }
       break;
     }
