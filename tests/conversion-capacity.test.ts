@@ -387,7 +387,7 @@ console.log(JSON.stringify({tagged:tagged.pid,untagged:untagged.pid}));
       expect(readFileSync(original.datastoreNs.main)).toEqual(database);
       expect(existsSync(original.root)).toBe(true);
       expect(children.every(({ rec }) => isAlive(rec.pid))).toBe(true);
-      const reason = `environment ${first.envId} has unreaped service processes — ownership and capacity retained; run 'backlot doctor' to inspect them, then retry recycling once they can be reclaimed`;
+      const reason = `environment ${first.envId} has unreaped service processes — ownership and capacity retained; run 'runly doctor' to inspect them, then retry recycling once they can be reclaimed`;
       await expect(engine.poolRecycle({ envId: first.envId, force: true })).rejects.toMatchObject({ message: reason });
       for (const force of [true, false]) {
         expect(await engine.poolRecycle({ force })).toEqual({ recycled: [], skipped: [{ envId: first.envId, reason }] });

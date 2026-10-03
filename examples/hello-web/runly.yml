@@ -1,4 +1,4 @@
-# yaml-language-server: $schema=../../schema/backlot.schema.json
+# yaml-language-server: $schema=../../schema/runly.schema.json
 name: hello-web
 
 services:

@@ -14,7 +14,7 @@ afterAll(() => {
 
 describe('log truncation survives a very large log', () => {
   it('trims by reading the tail, not the whole file as one string', () => {
-    const root = mkdtempSync(join(tmpdir(), 'backlot-logs-'));
+    const root = mkdtempSync(join(tmpdir(), 'runly-logs-'));
     dirs.push(root);
     const logDir = join(root, 'env-1', 'logs');
     rmSync(logDir, { recursive: true, force: true });
@@ -42,7 +42,7 @@ describe('log truncation survives a very large log', () => {
   });
 
   it('leaves a log under the cap untouched', () => {
-    const root = mkdtempSync(join(tmpdir(), 'backlot-logs2-'));
+    const root = mkdtempSync(join(tmpdir(), 'runly-logs2-'));
     dirs.push(root);
     const { mkdirSync } = require('node:fs') as typeof import('node:fs');
     const logDir = join(root, 'env-1', 'logs');
@@ -59,8 +59,8 @@ describe('ports are reserved pool-wide', () => {
   it('never hands the same port to two environments', async () => {
     const { execFile, execFileSync } = await import('node:child_process');
     const { mkdirSync } = await import('node:fs');
-    const stateDir = mkdtempSync(join(tmpdir(), 'backlot-ports-'));
-    const wt = mkdtempSync(join(tmpdir(), 'backlot-ports-wt-'));
+    const stateDir = mkdtempSync(join(tmpdir(), 'runly-ports-'));
+    const wt = mkdtempSync(join(tmpdir(), 'runly-ports-wt-'));
     dirs.push(stateDir, wt);
     mkdirSync(wt, { recursive: true });
     writeFileSync(join(wt, 'srv.mjs'), `import{createServer}from'node:http';console.log('up');createServer((q,s)=>s.end('ok')).listen(Number(process.env.PORT), '127.0.0.1');\n`);

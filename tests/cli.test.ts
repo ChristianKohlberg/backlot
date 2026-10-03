@@ -21,7 +21,7 @@ interface CliResult {
 }
 
 function makeContext(extraEnv: Record<string, string> = {}) {
-  const stateDir = mkdtempSync(join(tmpdir(), 'backlot-it-'));
+  const stateDir = mkdtempSync(join(tmpdir(), 'runly-it-'));
   const env = { ...process.env, BACKLOT_STATE_DIR: stateDir, BACKLOT_SWEEP_MS: '400', ...extraEnv };
   const cli = (args: string[], cwd: string): Promise<CliResult> =>
     new Promise((resolve) => {
@@ -49,7 +49,7 @@ function makeContext(extraEnv: Record<string, string> = {}) {
 
 /** A consumer worktree: a git-initialized copy of an example (agents edit HERE). */
 function makeWorktree(example: string): { dir: string; drop: () => void } {
-  const dir = mkdtempSync(join(tmpdir(), `backlot-wt-${example}-`));
+  const dir = mkdtempSync(join(tmpdir(), `runly-wt-${example}-`));
   cpSync(join(repo, 'examples', example), dir, { recursive: true });
   execFileSync('git', ['init', '-q'], { cwd: dir });
   execFileSync('git', ['add', '-A'], { cwd: dir });
@@ -189,7 +189,7 @@ describe('verdicts, outputs, and the error taxonomy', () => {
 
   it('a failing check is a work-error verdict with the check exit code', async () => {
     appendFileSync(
-      join(wt.dir, 'backlot.yml'),
+      join(wt.dir, 'runly.yml'),
       `  fail:\n    run: node -e 'console.error("boom"); process.exit(3)'\n`,
     );
     const res = await ctx.cli(['run', 'fail', '--json'], wt.dir);
@@ -207,7 +207,7 @@ describe('verdicts, outputs, and the error taxonomy', () => {
   });
 
   it('outputs contract: env-produced files are reported, pulled only explicitly', async () => {
-    appendFileSync(join(wt.dir, 'backlot.yml'), `outputs: [generated.txt]\n`);
+    appendFileSync(join(wt.dir, 'runly.yml'), `outputs: [generated.txt]\n`);
     await ctx.cli(['up'], wt.dir);
     await ctx.cli(['exec', 'echo produced-in-env > generated.txt'], wt.dir);
     expect(existsSync(join(wt.dir, 'generated.txt'))).toBe(false); // never written silently
@@ -220,7 +220,7 @@ describe('verdicts, outputs, and the error taxonomy', () => {
     const bare = makeWorktree('hello-web');
     const res = await ctx.cli(['ctx', '--json'], bare.dir);
     expect(res.exitCode, `stdout: ${res.stdout ?? ''}\nstderr: ${res.stderr ?? ''}`).toBe(2);
-    expect((res.json!.error as { message: string }).message).toContain("backlot up");
+    expect((res.json!.error as { message: string }).message).toContain("runly up");
     bare.drop();
   });
 });
@@ -391,12 +391,12 @@ describe('a failed first bind on a re-claimed env keeps ctx truthful (hello-mult
 
     // Break the worktree so holder B's first (full) bind fails BEFORE it stops or
     // starts anything: a failing upkeep rule that fires on the manifest itself.
-    const mf = join(wt.dir, 'backlot.yml');
+    const mf = join(wt.dir, 'runly.yml');
     writeFileSync(
       mf,
       readFileSync(mf, 'utf8').replace(
         '- { when: seed.mjs, run: "@rebake-template main" }',
-        '- { when: backlot.yml, run: "false" }',
+        '- { when: runly.yml, run: "false" }',
       ),
     );
     const failed = await ctx.cli(['up', '--holder', 'fbB', '--json'], wt.dir);
@@ -417,9 +417,9 @@ describe('a failed first bind on a re-claimed env keeps ctx truthful (hello-mult
 // ---------------------------------------------------------------------------
 
 describe('a slice builds per service, not gated by the whole-source stamp', () => {
-  const stateDir = mkdtempSync(join(tmpdir(), 'backlot-bf-'));
+  const stateDir = mkdtempSync(join(tmpdir(), 'runly-bf-'));
   const cliEnv = { ...process.env, BACKLOT_STATE_DIR: stateDir, BACKLOT_SWEEP_MS: '400' };
-  const wt = mkdtempSync(join(tmpdir(), 'backlot-bfwt-'));
+  const wt = mkdtempSync(join(tmpdir(), 'runly-bfwt-'));
   const cli = (args: string[]): Promise<CliResult> =>
     new Promise((resolve) => {
       execFile(process.execPath, [CLI, ...args], { cwd: wt, env: cliEnv, maxBuffer: 16 * 1024 * 1024 }, (err, stdout, stderr) => {
@@ -437,7 +437,7 @@ describe('a slice builds per service, not gated by the whole-source stamp', () =
     // `built` produces its run artifact in a build step; if the build is skipped
     // the run command has nothing to launch. `keep` is a plain always-up service.
     writeFileSync(
-      join(wt, 'backlot.yml'),
+      join(wt, 'runly.yml'),
       [
         'name: buildfp',
         'services:',
@@ -498,7 +498,7 @@ describe('logs for a silent service (BACKLOG P3, 2026-07-03)', () => {
   const ctx = makeContext();
   // A service that boots (cmd readiness) but never writes a byte — so no
   // .log file ever exists for it.
-  const dir = mkdtempSync(join(tmpdir(), 'backlot-wt-silent-'));
+  const dir = mkdtempSync(join(tmpdir(), 'runly-wt-silent-'));
   writeFileSync(
     join(dir, 'stack.yaml'),
     `name: silent\nservices:\n  quiet:\n    run: sleep 300\n    ready: { cmd: "true", timeout: 20 }\n`,

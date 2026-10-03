@@ -1,7 +1,7 @@
 # 0017. Rename: infront → backlot
 
 > The MCP portion of this historical decision is superseded by [0029](0029-cli-only-agent-interface.md).
-- Status: Accepted
+- Status: Superseded by [0030](0030-rename-backlot-to-runly.md) (naming and migration policy)
 
 ## Decision
 

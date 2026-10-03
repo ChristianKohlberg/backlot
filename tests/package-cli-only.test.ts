@@ -29,12 +29,12 @@ it('packs a working CLI without stale adapter outputs from an older build', asyn
     expect(files).toContain('dist/daemon/index.js');
     await run('tar', ['-xzf', packed[0].filename], { cwd: root, timeout: 10_000, killSignal: 'SIGKILL' });
     const manifest = JSON.parse(readFileSync(join(root, 'package', 'package.json'), 'utf8'));
-    expect(manifest.bin).toEqual({ backlot: 'dist/cli/index.js' });
+    expect(manifest.bin).toEqual({ runly: 'dist/cli/index.js', backlot: 'dist/cli/index.js' });
     const { stdout: help } = await run(process.execPath, [join(root, 'package', manifest.bin.backlot), '--help'], {
       encoding: 'utf8', timeout: 10_000, killSignal: 'SIGKILL',
     });
-    expect(help).toContain('backlot up');
-    expect(help).toContain('backlot run');
+    expect(help).toContain('runly up');
+    expect(help).toContain('runly run');
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

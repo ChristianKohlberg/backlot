@@ -32,8 +32,8 @@ afterAll(() => {
 
 /** A stack whose service dies immediately, so it burns its restart budget fast. */
 function ctx(serviceRun: string, extraEnv: Record<string, string> = {}) {
-  const stateDir = mkdtempSync(join(tmpdir(), 'backlot-lu-'));
-  const wt = mkdtempSync(join(tmpdir(), 'backlot-lu-wt-'));
+  const stateDir = mkdtempSync(join(tmpdir(), 'runly-lu-'));
+  const wt = mkdtempSync(join(tmpdir(), 'runly-lu-wt-'));
   dirs.push(stateDir, wt);
   writeFileSync(
     join(wt, 'stack.yaml'),
@@ -115,8 +115,8 @@ describe('recycled environments are not operated on', () => {
   }, 90_000);
 
   it('refuses token against a recycling environment too', async () => {
-    const stateDir = mkdtempSync(join(tmpdir(), 'backlot-lu2-'));
-    const wt = mkdtempSync(join(tmpdir(), 'backlot-lu2-wt-'));
+    const stateDir = mkdtempSync(join(tmpdir(), 'runly-lu2-'));
+    const wt = mkdtempSync(join(tmpdir(), 'runly-lu2-wt-'));
     dirs.push(stateDir, wt);
     writeFileSync(
       join(wt, 'stack.yaml'),
@@ -176,8 +176,8 @@ describe('the sweeper does not run before recovery finishes', () => {
 
 describe('a detached run interrupted by a daemon crash is resolved, not left pending', () => {
   it('reports a lost job as done with a failed verdict after recovery', async () => {
-    const stateDir = mkdtempSync(join(tmpdir(), 'backlot-job-'));
-    const wt = mkdtempSync(join(tmpdir(), 'backlot-job-wt-'));
+    const stateDir = mkdtempSync(join(tmpdir(), 'runly-job-'));
+    const wt = mkdtempSync(join(tmpdir(), 'runly-job-wt-'));
     dirs.push(stateDir, wt);
     writeFileSync(
       join(wt, 'stack.yaml'),
@@ -216,8 +216,8 @@ describe('a detached run interrupted by a daemon crash is resolved, not left pen
 
 describe('a check that fails because the environment died is not blamed on the code', () => {
   it('classifies the verdict env-error, not work-error', async () => {
-    const stateDir = mkdtempSync(join(tmpdir(), 'backlot-verdict-'));
-    const wt = mkdtempSync(join(tmpdir(), 'backlot-verdict-wt-'));
+    const stateDir = mkdtempSync(join(tmpdir(), 'runly-verdict-'));
+    const wt = mkdtempSync(join(tmpdir(), 'runly-verdict-wt-'));
     dirs.push(stateDir, wt);
     // The service reports ready, then dies. The check then fails against a
     // dead dependency — which is the environment failing, not the repo's code.

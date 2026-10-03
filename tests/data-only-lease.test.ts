@@ -1,8 +1,8 @@
 /**
- * `backlot up --data-only`: lease the datastores, not the application (issue #39).
+ * `runly up --data-only`: lease the datastores, not the application (issue #39).
  *
- * The reported shape: a repo whose application environments backlot already
- * brokers well runs its integration tests outside backlot, because the unit a
+ * The reported shape: a repo whose application environments runly already
+ * brokers well runs its integration tests outside runly, because the unit a
  * test lane needs — "a warm, seeded database, leased per consumer, reset on
  * release" — was not available on its own. So every agent started its own SQL
  * Server container and restored a full legacy backup into it, per test
@@ -41,8 +41,8 @@ afterAll(() => {
 /** A stack with one service AND one datastore, so both halves can be observed. */
 function ctx(opts: { datastores?: boolean } = {}) {
   const withStore = opts.datastores !== false;
-  const stateDir = mkdtempSync(join(tmpdir(), 'backlot-dataonly-'));
-  const wt = mkdtempSync(join(tmpdir(), 'backlot-dataonly-wt-'));
+  const stateDir = mkdtempSync(join(tmpdir(), 'runly-dataonly-'));
+  const wt = mkdtempSync(join(tmpdir(), 'runly-dataonly-wt-'));
   writeFileSync(
     join(wt, 'srv.mjs'),
     `import{createServer}from'node:http';console.log('ready');createServer((q,s)=>s.end('ok')).listen(Number(process.env.PORT), '127.0.0.1');\n`,

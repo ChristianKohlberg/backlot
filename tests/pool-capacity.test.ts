@@ -29,8 +29,8 @@ afterAll(() => {
 });
 
 function ctx() {
-  const stateDir = mkdtempSync(join(tmpdir(), 'backlot-cap-'));
-  const wt = mkdtempSync(join(tmpdir(), 'backlot-cap-wt-'));
+  const stateDir = mkdtempSync(join(tmpdir(), 'runly-cap-'));
+  const wt = mkdtempSync(join(tmpdir(), 'runly-cap-wt-'));
   dirs.push(stateDir, wt);
   writeFileSync(join(wt, 'srv.mjs'), `import{createServer}from'node:http';console.log('up');createServer((q,s)=>s.end('ok')).listen(Number(process.env.PORT), '127.0.0.1');\n`);
   writeFileSync(
@@ -59,7 +59,7 @@ describe('pool capacity diagnostics', () => {
     // The raw terms genuinely reach 1 on a 3 vCPU / 7 GB runner...
     expect(Math.min(Math.floor(3 / 2), Math.floor(7 / 4))).toBe(1);
     // ...but the floor is 2, because `up` + `run` structurally needs two envs.
-    // A pool of 1 cannot run backlot as documented.
+    // A pool of 1 cannot run runly as documented.
     expect(poolMaxHeuristic()).toBeGreaterThanOrEqual(2);
     expect(poolMaxHeuristic()).toBeLessThanOrEqual(8);
   });
@@ -98,10 +98,10 @@ describe('the capacity queue is per-stack, and holders bypass it', () => {
     // used to make (a) stack B's up — free capacity, instantly satisfiable —
     // and (b) A1's own rebind — refreshes its existing lease, consumes no
     // capacity — wait behind A2's ticket for the full expiry dance.
-    const stateDir = mkdtempSync(join(tmpdir(), 'backlot-q-'));
+    const stateDir = mkdtempSync(join(tmpdir(), 'runly-q-'));
     dirs.push(stateDir);
     const mkwt = (name: string) => {
-      const wt = mkdtempSync(join(tmpdir(), `backlot-q-${name}-`));
+      const wt = mkdtempSync(join(tmpdir(), `runly-q-${name}-`));
       dirs.push(wt);
       writeFileSync(join(wt, 'srv.mjs'), `import{createServer}from'node:http';console.log('up');createServer((q,s)=>s.end('ok')).listen(Number(process.env.PORT), '127.0.0.1');\n`);
       writeFileSync(
@@ -164,9 +164,9 @@ describe('an expired-but-unswept lease cannot jump the queue', () => {
     // lapsed leases. In the window between expiry and the sweep, a returning
     // holder's queue bypass used to refresh the corpse for a full new TTL —
     // jumping a waiter who was queued on precisely that expiry.
-    const stateDir = mkdtempSync(join(tmpdir(), 'backlot-exp-'));
+    const stateDir = mkdtempSync(join(tmpdir(), 'runly-exp-'));
     dirs.push(stateDir);
-    const wt = mkdtempSync(join(tmpdir(), 'backlot-exp-wt-'));
+    const wt = mkdtempSync(join(tmpdir(), 'runly-exp-wt-'));
     dirs.push(wt);
     writeFileSync(join(wt, 'srv.mjs'), `import{createServer}from'node:http';console.log('up');createServer((q,s)=>s.end('ok')).listen(Number(process.env.PORT), '127.0.0.1');\n`);
     writeFileSync(

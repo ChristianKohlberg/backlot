@@ -21,7 +21,7 @@ const hasPython = (() => {
 })();
 
 function makeContext() {
-  const stateDir = mkdtempSync(join(tmpdir(), 'backlot-m34-'));
+  const stateDir = mkdtempSync(join(tmpdir(), 'runly-m34-'));
   const env = { ...process.env, BACKLOT_STATE_DIR: stateDir, BACKLOT_SWEEP_MS: '400' };
   const cli = (args: string[], cwd: string): Promise<{ exitCode: number; json?: Record<string, unknown>; out: string }> =>
     new Promise((resolve) => {
@@ -47,7 +47,7 @@ function makeContext() {
 }
 
 function makeWorktree(example: string): { dir: string; drop: () => void } {
-  const dir = mkdtempSync(join(tmpdir(), `backlot-wt-${example}-`));
+  const dir = mkdtempSync(join(tmpdir(), `runly-wt-${example}-`));
   cpSync(join(repo, 'examples', example), dir, { recursive: true });
   execFileSync('git', ['init', '-q'], { cwd: dir });
   execFileSync('git', ['add', '-A'], { cwd: dir });

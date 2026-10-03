@@ -2,7 +2,7 @@
  * Three failure modes reported from one long agent-fleet session (issues #40,
  * #41, #34). They looked unrelated and turned out to be a single chain.
  *
- * 1. `BACKLOT_HOLDER_PID=$$ backlot up` is the documented way to hold a lease,
+ * 1. `BACKLOT_HOLDER_PID=$$ runly up` is the documented way to hold a lease,
  *    and it CANNOT work from an agent harness: every command runs in a fresh
  *    shell, so `$$` names a shell that has already exited. The lease was created
  *    already dead — `holderAlive: false` on the very next command — and the
@@ -38,8 +38,8 @@ afterAll(() => {
 });
 
 function ctx(extraEnv: Record<string, string> = {}) {
-  const stateDir = mkdtempSync(join(tmpdir(), 'backlot-agentlease-'));
-  const wt = mkdtempSync(join(tmpdir(), 'backlot-agentlease-wt-'));
+  const stateDir = mkdtempSync(join(tmpdir(), 'runly-agentlease-'));
+  const wt = mkdtempSync(join(tmpdir(), 'runly-agentlease-wt-'));
   writeFileSync(
     join(wt, 'srv.mjs'),
     `import{createServer}from'node:http';console.log('ready');createServer((q,s)=>s.end('ok')).listen(Number(process.env.PORT), '127.0.0.1');\n`,
@@ -323,14 +323,14 @@ describe('token --raw prints what an Authorization header wants (#41, #39)', () 
     // carries its {{role}} placeholder and signs with the wrong key outside the
     // environment.
     const c = await cli(['ctx', '--json']);
-    expect(c.json?.tokenVia).toBe('backlot token --role <role> --raw');
+    expect(c.json?.tokenVia).toBe('runly token --role <role> --raw');
   }, 120_000);
 });
 
 describe.runIf(procScanSupported())('teardown and quiesce reap what escaped the group kill (#34)', () => {
   /**
    * The reported leak: ~548 orphaned processes holding ~15 GiB, many of them
-   * backlot service children still running out of an environment tree that had
+   * runly service children still running out of an environment tree that had
    * been deleted a day earlier. A tagged escapee is the shape the field hit —
    * `ng serve`'s detached esbuild workers inherit the tag but not the process
    * group, so the -pgid SIGKILL misses them.
@@ -411,7 +411,7 @@ describe.runIf(procScanSupported())('teardown and quiesce reap what escaped the 
     // it, so the CHILD holds a controlling terminal while `script` itself does
     // not. `script` stays OUTSIDE the tree and the child cd's in — which is the
     // real topology: a developer's pty master is their terminal emulator, living
-    // well away from backlot's state, and only the shell sits in the directory.
+    // well away from runly's state, and only the shell sits in the directory.
     // (Put the master inside the tree instead and reaping it — correctly, it has
     // no terminal — SIGHUPs the child through the pty, which no real teardown
     // could do.)

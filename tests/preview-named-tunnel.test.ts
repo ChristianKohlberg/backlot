@@ -84,7 +84,7 @@ function ctx(stackExtra: string, extraEnv: Record<string, string> = {}) {
   execFileSync('git', ['init', '-q'], { cwd: wt });
 
   // The publisher refuses without an origin certificate. Its CONTENT is never
-  // read by backlot — only cloudflared would care — so an empty file is a
+  // read by runly — only cloudflared would care — so an empty file is a
   // faithful stand-in for "the operator has logged in".
   const cert = join(stateDir, 'cert.pem');
   writeFileSync(cert, '');
@@ -170,7 +170,7 @@ describe('the cloudflare-named preview publisher', () => {
     expect(cfg).toBeTruthy();
     const text = readFileSync(cfg as string, 'utf8');
     expect(text).toMatch(/hostname: web-probe\.example\.dev/);
-    expect(text).toMatch(/service: http:\/\/127\.0\.0\.1:\d+/);
+    expect(text).toMatch(/service: http:\/\/localhost:\d+/);
     // cloudflared refuses to start without one, so its absence is not cosmetic.
     expect(text).toMatch(/service: http_status:404/);
   });

@@ -89,7 +89,7 @@ export class EnvSupervisor {
     const cmd = watchMode && spec.watch_run ? spec.watch_run : spec.run;
     // A repo can already run arbitrary shell here, so this is not a privilege
     // boundary — it makes an ACCIDENT loud. `cwd: ../sibling` silently ran the
-    // service outside its environment tree, against files backlot never synced.
+    // service outside its environment tree, against files runly never synced.
     const cwd = spec.cwd ? safeJoin(this.envTree, spec.cwd, `service '${name}' cwd`) : this.envTree;
     const running: Running = { proc: null as unknown as ChildProcess, buf: '', probeBuf: '', restarts: 0, expectedExit: false, restartTimer: null, startedAt: now() };
     const launch = () => {
@@ -163,7 +163,7 @@ export class EnvSupervisor {
       proc.on('exit', (code) => {
         if (running.expectedExit) return;
         // A service that DAEMONIZES (forks and returns 0 immediately) is not a
-        // supervised service: backlot restarts it, each restart forks another
+        // supervised service: runly restarts it, each restart forks another
         // background copy, and those copies escape both the group kill and, if
         // they detach far enough, the tag scan. Refuse it rather than
         // multiplying processes nobody can reclaim.

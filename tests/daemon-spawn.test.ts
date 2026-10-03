@@ -45,8 +45,8 @@ const cli = (args: string[], cwd: string, env: Record<string, string>) =>
 
 describe('daemon.log stays signal on spawn', () => {
   it('carries no node:sqlite ExperimentalWarning', async () => {
-    const stateDir = mkdtempSync(join(tmpdir(), 'backlot-warn-'));
-    const wt = mkdtempSync(join(tmpdir(), 'backlot-warn-wt-'));
+    const stateDir = mkdtempSync(join(tmpdir(), 'runly-warn-'));
+    const wt = mkdtempSync(join(tmpdir(), 'runly-warn-wt-'));
     dirs.push(stateDir, wt);
 
     // A real spawn through the real CLI: exit 0 proves the daemon came up,
@@ -63,8 +63,8 @@ describe('daemon.log stays signal on spawn', () => {
 
 describe('a client whose spawned daemon loses the cold-start race', () => {
   it('falls through to the winner instead of failing its ping window', async () => {
-    const stateDir = mkdtempSync(join(tmpdir(), 'backlot-lostrace-'));
-    const wt = mkdtempSync(join(tmpdir(), 'backlot-lostrace-wt-'));
+    const stateDir = mkdtempSync(join(tmpdir(), 'runly-lostrace-'));
+    const wt = mkdtempSync(join(tmpdir(), 'runly-lostrace-wt-'));
     dirs.push(stateDir, wt);
 
     // Make "our daemon lost the election" deterministic: the lock names US, a

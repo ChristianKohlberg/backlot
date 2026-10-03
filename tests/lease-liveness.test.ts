@@ -30,8 +30,8 @@ afterAll(() => {
 });
 
 function ctx(extraEnv: Record<string, string> = {}) {
-  const stateDir = mkdtempSync(join(tmpdir(), 'backlot-lease-'));
-  const wt = mkdtempSync(join(tmpdir(), 'backlot-lease-wt-'));
+  const stateDir = mkdtempSync(join(tmpdir(), 'runly-lease-'));
+  const wt = mkdtempSync(join(tmpdir(), 'runly-lease-wt-'));
   dirs.push(stateDir, wt);
   writeFileSync(join(wt, 'srv.mjs'), `import{createServer}from'node:http';console.log('ready');createServer((q,s)=>s.end('ok')).listen(Number(process.env.PORT), '127.0.0.1');\n`);
   writeFileSync(

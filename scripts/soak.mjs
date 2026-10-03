@@ -95,7 +95,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 // SOAK_DIR pins it — useful for reproducing, and for fault injection.
 const baseDir = process.env.SOAK_DIR
   ? (mkdirSync(process.env.SOAK_DIR, { recursive: true }), resolve(process.env.SOAK_DIR))
-  : mkdtempSync(join(tmpdir(), 'backlot-soak-'));
+  : mkdtempSync(join(tmpdir(), 'runly-soak-'));
 const stateDir = join(baseDir, 'state');
 const stacksDir = join(baseDir, 'stacks');
 mkdirSync(stateDir, { recursive: true });
@@ -196,7 +196,7 @@ function cli(args, { cwd, timeoutMs = 180_000, quiet = false } = {}) {
   const verb = args[0];
   // --json goes right AFTER the verb: `exec` treats everything from its first
   // non-flag token as the passthrough command, so a trailing --json would be
-  // handed to the executed command instead of to backlot.
+  // handed to the executed command instead of to runly.
   const argv = args.includes('--json') ? args : [args[0], '--json', ...args.slice(1)];
   const rec = stats.verbs.get(verb) ?? { n: 0, failed: 0 };
   rec.n++;
@@ -283,7 +283,7 @@ async function fetchJson(url, timeoutMs = 3000) {
  */
 function writeStackA(dir) {
   mkdirSync(join(dir, 'src'), { recursive: true });
-  writeFileSync(join(dir, 'backlot.yml'), `name: soak-a
+  writeFileSync(join(dir, 'runly.yml'), `name: soak-a
 
 services:
   web:
@@ -378,7 +378,7 @@ console.log('upkeep ran');
 /** Stack B/C: the smallest bindable stack — capacity churn needs cheap binds. */
 function writeStackMin(dir, name) {
   mkdirSync(dir, { recursive: true });
-  writeFileSync(join(dir, 'backlot.yml'), `name: ${name}
+  writeFileSync(join(dir, 'runly.yml'), `name: ${name}
 services:
   web:
     run: node srv.mjs

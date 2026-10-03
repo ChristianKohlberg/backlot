@@ -4,8 +4,8 @@
  *
  * The contract is ENSURE, NOT OWN (decision 0018). An appliance's identity is
  * its probe address: whoever answers `host:port` IS the appliance, no matter
- * who started it — a compose file yesterday, a teammate's shell, or backlot a
- * minute ago. backlot never supervises the process (the `start:` command is
+ * who started it — a compose file yesterday, a teammate's shell, or runly a
+ * minute ago. runly never supervises the process (the `start:` command is
  * expected to daemonize, e.g. `docker run -d`), never stops one automatically,
  * and blames nobody's code when one is missing: every failure here is an
  * infra-error by construction.
@@ -190,7 +190,7 @@ export async function ensureAppliance(
   }
 }
 
-/** Explicit stop verb only — backlot never stops an appliance on its own. */
+/** Explicit stop verb only — runly never stops an appliance on its own. */
 export async function stopAppliance(name: string, spec: ApplianceSpec, root: string): Promise<void> {
   if (!spec.stop) {
     throw new BrokerError('work-error', `appliance '${name}' declares no stop: command`, 'appliance');

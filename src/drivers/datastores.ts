@@ -4,7 +4,7 @@
  * Two families:
  *  - sqlite: fully engine-native — the ns IS a file; template restore is a copy.
  *  - command (postgres/mssql/mysql/redis): ALL mechanics are repo-declared
- *    commands ({{ns}}/{{preset}}/{{template}} resolved by the engine). backlot
+ *    commands ({{ns}}/{{preset}}/{{template}} resolved by the engine). runly
  *    embeds no database clients — the anti-scope ("orchestrate, don't
  *    reimplement") applied to data.
  *
@@ -223,7 +223,7 @@ export async function retireBakedTemplates(dir: string, cwd: string, force = fal
           attempts,
           nextAttemptAt: Date.now() + Math.min(3600000, 60000 * 2 ** Math.min(attempts - 1, 6)),
           state: attempts >= 3 ? 'needs-attention' : 'retry-pending',
-          message: 'Drop unconfirmed; marker retained. Check the appliance and retry with backlot pool gc.',
+          message: 'Drop unconfirmed; marker retained. Check the appliance and retry with runly pool gc.',
         }));
         deferred++;
         continue;

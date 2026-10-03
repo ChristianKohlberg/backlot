@@ -1,6 +1,6 @@
 # Driver spec
 
-backlot has three extension seams. Thinness is deliberate — it is what "never own
+runly has three extension seams. Thinness is deliberate — it is what "never own
 compute" looks like in code.
 
 **Status (v0.4):** the **datastore** seam is live, and its authoritative shape is
@@ -61,7 +61,7 @@ manifest author's responsibility (the general trust model, README §Security).
 
 ## Preview publisher
 
-How one leased service is published to the internet by `backlot preview` — a seam so
+How one leased service is published to the internet by `runly preview` — a seam so
 future adapters (named tunnels, an authenticated provider) drop in without touching the
 verb. The real interface is `PreviewPublisher` (`src/drivers/preview.ts`); the shipped
 adapter is `cloudflare-quick` (a `cloudflared` quick tunnel), selected by the manifest's

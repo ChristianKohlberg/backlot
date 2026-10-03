@@ -54,8 +54,8 @@ describe('client-side error classification', () => {
 
 describe('a wedged daemon must not hang the caller forever', () => {
   it('destroys the request at the deadline and exits 3', async () => {
-    const stateDir = mkdtempSync(join(tmpdir(), 'backlot-wedge-'));
-    const wt = mkdtempSync(join(tmpdir(), 'backlot-wedge-wt-'));
+    const stateDir = mkdtempSync(join(tmpdir(), 'runly-wedge-'));
+    const wt = mkdtempSync(join(tmpdir(), 'runly-wedge-wt-'));
     dirs.push(stateDir, wt);
     writeFileSync(join(wt, 'stack.yaml'), `name: wedge\nservices: {}\nchecks:\n  ok: { run: "true" }\n`);
 
@@ -105,12 +105,12 @@ describe('a wedged daemon must not hang the caller forever', () => {
 
 describe('an over-limit socket path is refused as infra, not silently truncated', () => {
   it('exits 3 naming the sun_path limit instead of running against a truncated socket', async () => {
-    const base = mkdtempSync(join(tmpdir(), 'backlot-sun-cli-'));
+    const base = mkdtempSync(join(tmpdir(), 'runly-sun-cli-'));
     // Deep enough that stateDir/daemon.sock exceeds AF_UNIX sun_path (104 on
     // macOS). Unguarded, BOTH client and daemon truncate identically, so this
     // would "work" — against a socket that collides across state dirs.
     const stateDir = join(base, 'x'.repeat(120));
-    const wt = mkdtempSync(join(tmpdir(), 'backlot-sun-cli-wt-'));
+    const wt = mkdtempSync(join(tmpdir(), 'runly-sun-cli-wt-'));
     dirs.push(base, stateDir, wt);
     writeFileSync(join(wt, 'stack.yaml'), `name: sun\nservices: {}\nchecks:\n  ok: { run: "true" }\n`);
 
@@ -133,8 +133,8 @@ describe('an over-limit socket path is refused as infra, not silently truncated'
 
 describe('exec preserves argument boundaries', () => {
   it('keeps a quoted argument containing spaces as ONE argument', async () => {
-    const stateDir = mkdtempSync(join(tmpdir(), 'backlot-exec-'));
-    const wt = mkdtempSync(join(tmpdir(), 'backlot-exec-wt-'));
+    const stateDir = mkdtempSync(join(tmpdir(), 'runly-exec-'));
+    const wt = mkdtempSync(join(tmpdir(), 'runly-exec-wt-'));
     dirs.push(stateDir, wt);
     writeFileSync(join(wt, 'stack.yaml'), `name: ex\nservices:\n  idle: { run: "echo ready; sleep 300", ready: { log: "ready", timeout: 20 } }\nchecks:\n  ok: { run: "true" }\n`);
     execFileSync('git', ['init', '-q'], { cwd: wt });
@@ -154,8 +154,8 @@ describe('exec preserves argument boundaries', () => {
   }, 60_000);
 
   it('still treats a single token as a shell string, keeping redirection', async () => {
-    const stateDir = mkdtempSync(join(tmpdir(), 'backlot-exec2-'));
-    const wt = mkdtempSync(join(tmpdir(), 'backlot-exec2-wt-'));
+    const stateDir = mkdtempSync(join(tmpdir(), 'runly-exec2-'));
+    const wt = mkdtempSync(join(tmpdir(), 'runly-exec2-wt-'));
     dirs.push(stateDir, wt);
     writeFileSync(join(wt, 'stack.yaml'), `name: ex2\nservices:\n  idle: { run: "echo ready; sleep 300", ready: { log: "ready", timeout: 20 } }\nchecks:\n  ok: { run: "true" }\n`);
     execFileSync('git', ['init', '-q'], { cwd: wt });
@@ -174,8 +174,8 @@ describe('exec preserves argument boundaries', () => {
 
 describe('bounded flags are validated, not silently coerced', () => {
   it('rejects a non-numeric --lines instead of returning the whole log', async () => {
-    const stateDir = mkdtempSync(join(tmpdir(), 'backlot-lines-'));
-    const wt = mkdtempSync(join(tmpdir(), 'backlot-lines-wt-'));
+    const stateDir = mkdtempSync(join(tmpdir(), 'runly-lines-'));
+    const wt = mkdtempSync(join(tmpdir(), 'runly-lines-wt-'));
     dirs.push(stateDir, wt);
     writeFileSync(join(wt, 'stack.yaml'), `name: ln\nservices: {}\nchecks:\n  ok: { run: "true" }\n`);
     execFileSync('git', ['init', '-q'], { cwd: wt });

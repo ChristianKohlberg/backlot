@@ -8,7 +8,7 @@
  * driving. One path serves both installs — the npm tarball ships package.json
  * beside `dist/`, and a git checkout has it at the same relative position.
  */
-import { readFileSync } from 'node:fs';
+import { readFileSync, statSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -35,6 +35,37 @@ function readVersion(): string {
 }
 
 export const VERSION: string = readVersion();
+
+/**
+ * Which BUILD of this version is running — the modification time of this very
+ * module, as the process saw it when it loaded.
+ *
+ * The version alone cannot tell a rebuilt checkout from the build it replaced:
+ * `git pull && npm run build` on a checkout install keeps package.json at the
+ * same version while every file under dist/ changes, so `runly update` used to
+ * report "already runly 0.12.0 — nothing to do" and leave the old code serving.
+ * The daemon reads this once at start and keeps it; the CLI reads it fresh, so
+ * any rebuild or reinstall since the daemon started shows up as a difference.
+ * `unknown` (unreadable) never counts as a difference, for the same reason an
+ * unknown version never counts as skew.
+ */
+function readBuild(): string {
+  const fake = process.env.BACKLOT_FAKE_BUILD;
+  if (fake) return fake;
+  try {
+    return String(Math.trunc(statSync(fileURLToPath(import.meta.url)).mtimeMs));
+  } catch {
+    return 'unknown';
+  }
+}
+
+export const BUILD: string = readBuild();
+
+/** True only when both builds are known and differ — a same-version rebuild or reinstall. */
+export function rebuiltSince(cliBuild: string, daemonBuild: string | undefined): boolean {
+  if (daemonBuild === undefined || daemonBuild === 'unknown' || cliBuild === 'unknown') return false;
+  return cliBuild !== daemonBuild;
+}
 
 /**
  * Order two versions, or return undefined when they cannot be ordered.
@@ -97,9 +128,9 @@ export function versionSkew(cli: string, daemon: string | undefined): VersionSke
       daemon: 'pre-0.9.0',
       direction: 'daemon-unversioned',
       message:
-        `the running daemon predates version reporting (backlot <= 0.8.0) while this CLI is ${cli} — ` +
+        `the running daemon predates version reporting (runly <= 0.8.0) while this CLI is ${cli} — ` +
         `it would serve your request with the old code, silently ignoring anything this version added. ` +
-        `Run 'backlot update' to restart the daemon onto the installed version.`,
+        `Run 'runly update' to restart the daemon onto the installed version.`,
     };
   }
   if (daemon === cli) return null;
@@ -107,13 +138,13 @@ export function versionSkew(cli: string, daemon: string | undefined): VersionSke
   const direction: SkewDirection = order === undefined ? 'unordered' : order < 0 ? 'daemon-older' : 'daemon-newer';
   const tail =
     direction === 'daemon-newer'
-      ? `You are running an OLDER CLI than the daemon; 'backlot update' would DOWNGRADE it, so it refuses without --force. ` +
+      ? `You are running an OLDER CLI than the daemon; 'runly update' would DOWNGRADE it, so it refuses without --force. ` +
         `Prefer invoking the newer CLI, or upgrade this one.`
-      : `Run 'backlot update' to restart the daemon onto the installed version.`;
+      : `Run 'runly update' to restart the daemon onto the installed version.`;
   return {
     cli,
     daemon,
     direction,
-    message: `the running daemon is backlot ${daemon} but this CLI is ${cli} — it would serve your request with the other build's code. ${tail}`,
+    message: `the running daemon is runly ${daemon} but this CLI is ${cli} — it would serve your request with the other build's code. ${tail}`,
   };
 }

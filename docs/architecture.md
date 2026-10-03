@@ -1,6 +1,6 @@
-# backlot — architecture
+# runly — architecture
 
-> **Thesis:** backlot puts a working instance of a web application *in front of* a coding
+> **Thesis:** runly puts a working instance of a web application *in front of* a coding
 > agent (or a human) — running, seeded, authenticated, provable — as a cheap, repeatable
 > act. It brokers environments; it never provides them.
 
@@ -19,7 +19,7 @@ process whose identity is verified.
 Failed teardown preserves a warm, retryable environment with its ownership and
 capacity charge; deletion waits for confirmed reclamation, including the final
 cwd scan. `pool recycle`, including `--force`, reports unreaped survivors
-separately from a busy or leased environment. Run `backlot doctor` to inspect
+separately from a busy or leased environment. Run `runly doctor` to inspect
 them, then retry recycling once they can be reclaimed; force does not bypass
 unresolved ownership.
 
@@ -52,14 +52,14 @@ is not a discipline failure; it is the rational response to expensive provisioni
 
 ## 2. Non-goals (hard boundaries)
 
-These are where tools like this die of scope creep. backlot:
+These are where tools like this die of scope creep. runly:
 
 - **Never owns compute.** Local processes and BYO cloud sandboxes (Morph, Sprites, E2B,
   plain SSH) via drivers. No fleet, no billing, no scheduler.
 - **Is never a build system.** It *invokes* the repo's commands; it never understands
   them. There is no plugin that knows what Angular is.
-- **Is never CI.** CI may call backlot; never the reverse.
-- **Is never the agent.** No LLM calls, no browser driving, no test authoring. backlot
+- **Is never CI.** CI may call runly; never the reverse.
+- **Is never the agent.** No LLM calls, no browser driving, no test authoring. runly
   guarantees URLs, credentials, data states, and verdicts; what the consumer does with
   them is its business.
 
@@ -71,7 +71,7 @@ Kubernetes, Windows, secrets management, and dashboards are not.
 
 | Noun | What it is |
 | --- | --- |
-| **Stack** | What a repo declares in `backlot.yml`: services, datastores, seed presets, upkeep rules, checks. The only repo-specific artifact. |
+| **Stack** | What a repo declares in `runly.yml`: services, datastores, seed presets, upkeep rules, checks. The only repo-specific artifact. |
 | **Substrate** | Where environments physically live, behind a driver: `local` (supervised processes in a directory), later `docker`, `morph`, `sprites`, `ssh`. |
 | **Environment** | A pooled slot on a substrate: its own copy of the tree, warm caches, running services, allocated ports, a datastore namespace. Durable; belongs to the pool, never to a person or task. A lease may cover a **subset** of it — a service slice (`up <service>`), or the datastores alone (`up --data-only`, [decision 0023](decisions/0023-data-only-leases.md)) for a test lane that needs a seeded database rather than an application. |
 | **Binding** | A source state (ref + dirty diff) plus a data state (preset, at a hygiene level) attached to an environment. An immutable snapshot. |
@@ -112,8 +112,8 @@ that resolves to the caller (including a symlinked subdirectory on an already
 canonical stack), or whose mapping cannot be resolved, blocks the default request
 with the exact `--holder` needed to inspect or release it. If aliases converge on
 several leases for the same holder, Backlot refuses ambiguity and names the
-environments. Recovery requires inspecting `backlot status` and explicitly choosing
-`backlot pool recycle <envId> --force`: this destroys the selected environment and
+environments. Recovery requires inspecting `runly status` and explicitly choosing
+`runly pool recycle <envId> --force`: this destroys the selected environment and
 its data and ends its lease.
 
 Proven obsolete template directories move atomically under the bake lock into
@@ -125,11 +125,11 @@ both template roots preserve shared or ambiguous server templates, including
 truncated-name collisions; ordinary retention respects those owners too.
 
 Recovery performs no external retirement drops. Each sweep or explicit
-`backlot pool gc` retirement batch attempts at most one external drop, capped at
+`runly pool gc` retirement batch attempts at most one external drop, capped at
 two seconds or the shorter configured command timeout. Unconfirmed drops retain
 their markers and `.retirement.json` records with durable backoff; automatic
 attempts stop after three failures. After repairing the appliance, run
-`backlot pool gc` to retry retained records despite backoff or the attempt limit;
+`runly pool gc` to retry retained records despite backoff or the attempt limit;
 repeat for additional pending markers. This still preserves shared or ambiguous
 ownership. Ordinary retention never prunes retirement descriptors or failure
 records.
@@ -144,9 +144,9 @@ worktree-hosted harnesses, where teardown must agonize over unlanded work.)
 
 ## 4. Convergence, not checkpointing
 
-backlot gets the checkpointing dividend **by convergence rather than restoration**. A
+runly gets the checkpointing dividend **by convergence rather than restoration**. A
 checkpoint (Morph, Sprites, CRIU) freezes opaque bytes and gives back *that exact
-moment*. backlot keeps live environments plus layered, individually-keyed caches — the
+moment*. runly keeps live environments plus layered, individually-keyed caches — the
 fingerprint ledger, machine-global package stores, baked DB templates, the compiler's
 own incremental state — and on each bind *converges* what's there to what was asked for.
 
@@ -178,7 +178,7 @@ Local pools are convergence all the way down. Same verbs above the driver line.
   quiesce idle environments while no CLI is running. Verbs fired in parallel on a
   cold machine all race to spawn it; the singleton election keeps that safe (one
   wins, losers concede, their clients fall through to the winner), but fleets
-  should still warm the daemon with a cheap `backlot status` before parallelizing.
+  should still warm the daemon with a cheap `runly status` before parallelizing.
 - **Concurrency lives at the environment boundary**: a short pool lock serializes
   claim/release bookkeeping; one lock per environment serializes bind/exec/reset on it.
   Different environments (and different stacks) bind in parallel — with the caveat
@@ -210,7 +210,7 @@ That made a cold environment permanently expensive: idle reclamation quiesces *h
 not the environment, so the row survived and the machine-wide budget stayed full
 forever. A host with as many worktrees as the heuristic allows locked out every new
 stack indefinitely while nothing was running (#46). So when the machine-wide cap is
-what binds, backlot **evicts the least-recently-used cold environment** — unleased, not
+what binds, runly **evicts the least-recently-used cold environment** — unleased, not
 busy, idle past `idleTtlMs` — and takes its slot. Never a leased or busy one, and never
 one released recently enough to still be doing the warm pool's job; the victim pays one
 cold provision on its next bind, and the eviction is logged as `pool-evict`. "Cold" here
@@ -253,7 +253,7 @@ local/remote abstraction; the local substrate is enumerate-and-copy.)
 - **Bindings are immutable snapshots.** A running check executes against the revision
   synced at start; edits mid-run cannot contaminate the verdict. New sync = new binding
   revision.
-- `backlot sync` takes the same source-only projection as a watch save — services
+- `runly sync` takes the same source-only projection as a watch save — services
   kept, the dev servers' own watchers reload — when EVERY service declares
   `hot_reload: true` (its `run:` watches its own tree), the parsed manifest matches
   the last successful full bind, and the save fires no upkeep rule. The memory-only
@@ -290,7 +290,7 @@ local/remote abstraction; the local substrate is enumerate-and-copy.)
 Some artifacts are produced env-side but owned worktree-side (a regenerated lockfile, a
 generated API client). Default remains "never touch the worktree"; the exception is
 explicit: manifest-declared `outputs:` are reported in the verdict
-(`outputs_changed: [...]`) and copied back **only** by `backlot pull` (or `--pull`).
+(`outputs_changed: [...]`) and copied back **only** by `runly pull` (or `--pull`).
 The environment may *offer* artifacts; it never silently writes.
 
 ## 7. Upkeep — the fingerprint ledger
@@ -311,11 +311,11 @@ before build/start:
 - **Data templates are keyed by the `create:` command string, not by seed *content***
   (v1's honest limitation): editing a seed script does not auto-invalidate the template.
   Declare an `@rebake-template <datastore>` upkeep rule triggered on the seed files to
-  invalidate it (see `examples/hello-multi/backlot.yml`). Content-hash keying is planned;
+  invalidate it (see `examples/hello-multi/runly.yml`). Content-hash keying is planned;
   until then that upkeep rule is the mechanism.
 - Toolchain-level bumps (global.json, .nvmrc) are env-recycle events, not upkeep —
   unless the repo manages toolchains declaratively (mise/asdf) via its own rule.
-  backlot never installs SDKs on its own initiative.
+  runly never installs SDKs on its own initiative.
 
 ## 8. Data — presets, templates, hygiene
 
@@ -358,7 +358,7 @@ Every failure is classified — the field an agent branches on mechanically:
 | Class | Meaning | Who acts |
 | --- | --- | --- |
 | `work-error` | the synced code is at fault (compile error, failing upkeep triggered by your change, test failure) | the consumer fixes and re-syncs |
-| `env-error` | the environment is at fault (stale cache, missing toolchain, flapping service) | backlot auto-remediates by recycling |
+| `env-error` | the environment is at fault (stale cache, missing toolchain, flapping service) | runly auto-remediates by recycling |
 | `infra-error` | something external (backing DB down, registry unreachable) | actionable message; nobody's code is blamed |
 
 ## 10. Laptop reality
@@ -382,7 +382,7 @@ Every failure is classified — the field an agent branches on mechanically:
   lease is released by the next sweep: the environment would go back in the pool while its
   caller was still using it, and the next bind — a `run` defaulting to the `empty` preset, or
   another agent — would hand that caller a different, unseeded store through the same URL.
-  The pattern that produced this in the field was `BACKLOT_HOLDER_PID=$$ backlot up` from an
+  The pattern that produced this in the field was `BACKLOT_HOLDER_PID=$$ runly up` from an
   agent harness, where every command gets a fresh shell, so `$$` is already gone. It presented
   as a stale seed template and cost hours in the wrong subsystem; refusing at bind time is
   the whole fix.
@@ -420,25 +420,25 @@ Every failure is classified — the field an agent branches on mechanically:
 The CLI **is** the API: every verb takes `--json`; stdout is data, stderr is human.
 
 ```
-backlot up [--watch] [--reset-data|--pristine] [--ttl <minutes>]  # session lease
-backlot run <check> [--pristine] [--pull] [--detach]   # run lease → verdict → release
-backlot job <id> | job ls                        # poll / list detached runs
-backlot ctx                                      # the context blob (below)
-backlot sync | bind --ref <sha>                  # project worktree | a committed ref
-backlot exec <cmd...>                            # run anything inside the leased env
-backlot logs <service> [--lines N]               # supervised service logs
-backlot token --role <r>                         # mint a token via auth.token
-backlot reset-data | pull | release
-backlot preview <service> [--ttl <minutes>] | preview stop   # publish one service publicly (below)
-backlot status | doctor                          # pool state | active health check
-backlot pool ls|recycle [--all]|reconcile|gc|doctor
-backlot daemon stop                              # waits until the daemon and its services are gone (README)
-backlot update [--check] [--force]               # run the INSTALLED build (below)
-backlot --version
+runly up [--watch] [--reset-data|--pristine] [--ttl <minutes>]  # session lease
+runly run <check> [--pristine] [--pull] [--detach]   # run lease → verdict → release
+runly job <id> | job ls                        # poll / list detached runs
+runly ctx                                      # the context blob (below)
+runly sync | bind --ref <sha>                  # project worktree | a committed ref
+runly exec <cmd...>                            # run anything inside the leased env
+runly logs <service> [--lines N]               # supervised service logs
+runly token --role <r>                         # mint a token via auth.token
+runly reset-data | pull | release
+runly preview <service> [--ttl <minutes>] | preview stop   # publish one service publicly (below)
+runly status | doctor                          # pool state | active health check
+runly pool ls|recycle [--all]|reconcile|gc|doctor
+runly daemon stop                              # waits until the daemon and its services are gone (README)
+runly update [--check] [--force]               # run the INSTALLED build (below)
+runly --version
 ```
 
 **Version skew, and `update` (decision 0024).** The CLI spawns the daemon from its
-own `dist/`, so installing a new backlot does not replace a daemon that is already
+own `dist/`, so installing a new runly does not replace a daemon that is already
 running — it serves the old code for the rest of its life. The daemon therefore
 reports its version on `ping` (which the CLI already issues on every invocation),
 and a mismatch **refuses** every verb except `update`, `doctor` and `daemon stop`
@@ -447,13 +447,13 @@ arguments it does not know instead of rejecting them: `up --data-only` against a
 pre-0.9.0 daemon boots the whole application and reports success, which is issue
 #41's shape — a wrong result that names the wrong subsystem.
 
-`backlot update` restarts the daemon; the autospawn then brings up the installed
+`runly update` restarts the daemon; the autospawn then brings up the installed
 build. **Leases survive**: services stop, environments go `warm`, and each holder's
 next verb rebinds — the same transition the idle quiesce already performs (decision
 0021), which is why a live lease is reported rather than refused. What *is* refused
 is an in-flight operation (`busy` — the caller is waiting on a verdict over this
 socket) and a downgrade (an older CLI restarting a newer daemon, the direction that
-can strand journal state); `--force` overrides either. backlot never installs
+can strand journal state); `--force` overrides either. runly never installs
 itself — it prints the upgrade command for the detected install.
 
 The journal stamps `PRAGMA user_version`, and a daemon **refuses to open a state
@@ -478,12 +478,12 @@ bind" in the README for `bindDiagnostics`.
 `ctx` returns one blob with everything a consumer needs: service URLs (stable per
 environment), login credentials, a token-mint hook, datastore connection strings,
 artifact directory, hygiene state, and recent service events. An agent holding this
-blob needs nothing else from backlot.
+blob needs nothing else from runly.
 
-**Public preview (decision 0027).** `backlot preview <service>` publishes one leased
+**Public preview (decision 0027).** `runly preview <service>` publishes one leased
 service through a preview **publisher** adapter (default: a Cloudflare quick tunnel via
 `cloudflared`, an env-error when absent) and reports the URL in `ctx.previewUrls`;
-`backlot preview stop` ends it. It is opt-in per invocation and **scoped to the lease,
+`runly preview stop` ends it. It is opt-in per invocation and **scoped to the lease,
 not to the service incarnation** — a `sync`, a rebind or an idle quiesce leaves the
 tunnel up, while `release`, TTL lapse, teardown, `shutdown` and crash recovery all reap
 it. Exceptions and `previewNotice` reporting are defined by
@@ -492,7 +492,7 @@ The URL is **public and unauthenticated** —
 see README §Security model.
 
 **Division of labor** (the bug-fix loop): the agent thinks, edits, greps, and commits
-in its own worktree with its own harness — backlot is where the code *runs*, never
+in its own worktree with its own harness — runly is where the code *runs*, never
 where the agent *works*. Fast unit tests that need no system don't pay the broker tax
 at all. See the [README](../README.md#quickstart) for the agent interface and migration
 from the former adapter, and [decision 0029](decisions/0029-cli-only-agent-interface.md)
@@ -536,17 +536,17 @@ surfaced by `status` and `doctor`.
 
 ## 12. The manifest
 
-One file, `backlot.yml`, at the repo root, validated by a published JSON Schema
-([`../schema/backlot.schema.json`](../schema/backlot.schema.json)). Everything `{{…}}` is
+One file, `runly.yml`, at the repo root, validated by a published JSON Schema
+([`../schema/runly.schema.json`](../schema/runly.schema.json)). Everything `{{…}}` is
 injected by the engine — symbolic ports, datastore URLs, service URLs — which is what
 makes environments relocatable across substrates. Services are **commands, not
 containers**; backing infrastructure (a DB server) is externally run and probed.
 
 Every command in the manifest — service `run:`/`build:`, check `run:`, upkeep,
 datastore hooks — executes under `sh`, which is **dash on Ubuntu and
-bash-running-as-sh on macOS**, the two platforms backlot tests. Write POSIX sh
+bash-running-as-sh on macOS**, the two platforms runly tests. Write POSIX sh
 only: a bashism (`[[`, arrays, `set -o pipefail`) can pass on one leg and fail
-on the other with the same backlot.yml.
+on the other with the same runly.yml.
 
 ```yaml
 name: myapp
@@ -600,7 +600,7 @@ checks:
     env: { API_PORT: "{{ports.api}}", SPA_PORT: "{{ports.web}}" }
     artifacts: [test-results/**]
 preview:
-  publisher: cloudflare-quick             # which adapter `backlot preview` publishes through
+  publisher: cloudflare-quick             # which adapter `runly preview` publishes through
   # forbidden: true                       # ...or refuse public preview outright (work-error)
 ```
 
@@ -636,7 +636,7 @@ By 2026 the wave consolidated: Gitpod rebranded to Ona and was acquired by OpenA
 agent, git as sync) but is per-task-ephemeral, local-only, and has no data/verdict
 layer.
 
-backlot is the unowned layer between them: **the repo-aware environment broker** —
+runly is the unowned layer between them: **the repo-aware environment broker** —
 buy the substrate, declare the stack, broker the environments.
 
 ## 15. Milestones
@@ -652,10 +652,10 @@ buy the substrate, declare the stack, broker the environments.
    (native `createdb -T` restore) AND against the founding monorepo: a full .NET +
    MSSQL vertical (seeded per-env database on the shared server, built host, real
    login, real seeded domain data over an authenticated API) came up through
-   `backlot up` in ~50 s; `backlot run` provisioned a second full environment in
-   ~48 s. The consumer's Playwright system-e2e suite now runs as an backlot check
-   (`backlot run e2e`, ~58 s incl. provisioning via PLAYWRIGHT_REUSE against the
-   backlot-provisioned servers) with verdict parity against the incumbent harness —
+   `runly up` in ~50 s; `runly run` provisioned a second full environment in
+   ~48 s. The consumer's Playwright system-e2e suite now runs as an runly check
+   (`runly run e2e`, ~58 s incl. provisioning via PLAYWRIGHT_REUSE against the
+   runly-provisioned servers) with verdict parity against the incumbent harness —
    identical pass/fail results on the same suite.
 3. **0.3 — remote. ◐ PARTIAL.** Detached submit-and-poll runs shipped (`run
    --detach` → jobId; the verdict outlives the client, journaled). Driver spec

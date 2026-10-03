@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * The backlot daemon: HTTP over a unix socket, auto-spawned by the CLI
+ * The runly daemon: HTTP over a unix socket, auto-spawned by the CLI
  * (decision 0009). One RPC endpoint; the CLI is a thin client. Serializes
  * requests through a simple queue — policy code stays race-free.
  */
@@ -11,7 +11,7 @@ import { existsSync, rmSync, writeFileSync, chmodSync } from 'node:fs';
 import { socketPath, pidPath, stateRoot } from '../core/paths.js';
 import { electSelf, releaseSelf } from './election.js';
 import { BrokerError } from '../core/util.js';
-import { VERSION } from '../core/version.js';
+import { BUILD, VERSION } from '../core/version.js';
 import { JOURNAL_SCHEMA_VERSION } from '../core/journal.js';
 import { Engine } from './engine.js';
 import { logEvent } from '../core/events.js';
@@ -31,7 +31,7 @@ async function dispatch(verb: string, args: Record<string, unknown>, emit: (phas
     case 'ping':
       // The version rides on ping because the CLI already pings on EVERY
       // invocation (ensureDaemon), so skew detection costs no extra round trip.
-      return { pid: process.pid, version: VERSION, journalSchema: JOURNAL_SCHEMA_VERSION };
+      return { pid: process.pid, version: VERSION, build: BUILD, journalSchema: JOURNAL_SCHEMA_VERSION };
     case 'up':
       return engine.up({
         cwd, holder, holderPid, callerEnv: args.callerEnv, presets: args.presets,
@@ -58,7 +58,7 @@ async function dispatch(verb: string, args: Record<string, unknown>, emit: (phas
       void engine
         .executeJob(jobId, { cwd, holder, pull: Boolean(args.pull), callerEnv: args.callerEnv, presets: args.presets, check: String(args.check), hygiene: (args.hygiene as never) ?? undefined })
         .catch((err) => logEvent({ level: 'error', kind: 'job', detail: `job ${jobId} failed outside the verdict path: ${String((err as Error).message ?? err)}` }));
-      return { jobId, poll: `backlot job ${jobId}` };
+      return { jobId, poll: `runly job ${jobId}` };
     }
     case 'job':
       return engine.jobStatus(String(args.jobId));
@@ -83,7 +83,13 @@ async function dispatch(verb: string, args: Record<string, unknown>, emit: (phas
     case 'release':
       return engine.release(cwd, holder);
     case 'preview':
-      return engine.previewStart(cwd, String(args.service), holder, args.ttlMs ? Number(args.ttlMs) : undefined);
+      return engine.previewStart(
+        cwd,
+        String(args.service),
+        holder,
+        args.ttlMs ? Number(args.ttlMs) : undefined,
+        args.httpsPort !== undefined ? Number(args.httpsPort) : undefined,
+      );
     case 'preview-stop':
       return engine.previewStop(cwd, holder);
     case 'appliance-ls':
@@ -139,7 +145,7 @@ let ownsLock = false;
  *
  * The 50ms delay is what lets the result frame reach the client before the
  * process goes: exiting inside the handler leaves the CLI reading a socket that
- * closed without a result. `backlot update` and `daemon stop` share this path
+ * closed without a result. `runly update` and `daemon stop` share this path
  * on purpose — a restart is a stop plus the next verb's autospawn (decision
  * 0009), so there is no second teardown implementation to keep in step.
  */
@@ -306,7 +312,7 @@ async function start(): Promise<void> {
 void start().catch((err) => {
   // Nothing has been established yet, so there is no graceful path — but dying
   // silently left the client waiting on a daemon that would never answer.
-  console.error(`backlot daemon failed to start: ${String((err as Error).stack ?? err)}`);
+  console.error(`runly daemon failed to start: ${String((err as Error).stack ?? err)}`);
   process.exit(1);
 });
 

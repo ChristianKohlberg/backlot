@@ -14,7 +14,7 @@ import { BrokerError } from '../src/core/util.js';
 import { tempDir, freePort } from './helpers.js';
 
 const root = join(import.meta.dirname, '..');
-const schema = JSON.parse(readFileSync(join(root, 'schema/backlot.schema.json'), 'utf8'));
+const schema = JSON.parse(readFileSync(join(root, 'schema/runly.schema.json'), 'utf8'));
 const ajv = new Ajv2020({ allErrors: true });
 const validateSchema = ajv.compile(schema);
 
@@ -145,7 +145,7 @@ describe('ensureAppliance', () => {
     // before ready: "by design". That contradicts decision 0018, which states
     // ready: exists precisely "because servers like Postgres accept connections
     // before they serve them". An open port is the condition ready: is there to
-    // disambiguate, so honouring it only when backlot happened to run start:
+    // disambiguate, so honouring it only when runly happened to run start:
     // made the gate meaningless for the common case: a long-lived appliance
     // that is already up.
     const err = await ensureAppliance(

@@ -22,18 +22,18 @@ afterAll(() => {
 });
 
 function handle(envId = 'ds-e1'): DsHandle {
-  const root = mk('backlot-ds-');
+  const root = mk('runly-ds-');
   return { envId, envTree: root, dataDir: join(root, 'data') };
 }
 
 describe('sqlite: WAL sidecars must not survive a template restore', () => {
   it("does not replay a previous lease's WAL onto a restored database", async () => {
-    process.env.BACKLOT_STATE_DIR = mk('backlot-ds-state-');
+    process.env.BACKLOT_STATE_DIR = mk('runly-ds-state-');
     const h = handle();
     // template: true is the path the finding describes — restore is a file
     // copy over the .db, which leaves any sidecar untouched. The create
     // command seeds a marker row so template content is identifiable.
-    const seed = join(mk('backlot-ds-seed-'), 'seed.mjs');
+    const seed = join(mk('runly-ds-seed-'), 'seed.mjs');
     writeFileSync(
       seed,
       `import { DatabaseSync } from 'node:sqlite';
@@ -121,7 +121,7 @@ describe('command family: namespaces must not collide', () => {
 
 describe('repo-declared commands are bounded', () => {
   it('kills a hung command and its whole process group', async () => {
-    const cwd = mk('backlot-ds-hang-');
+    const cwd = mk('runly-ds-hang-');
     const marker = join(cwd, 'child-alive');
     const started = Date.now();
 
@@ -145,14 +145,14 @@ describe('repo-declared commands are bounded', () => {
 
   it('reports a normal failure without waiting for the timeout', async () => {
     const started = Date.now();
-    const r = await runBounded('exit 3', mk('backlot-ds-fail-'), 30);
+    const r = await runBounded('exit 3', mk('runly-ds-fail-'), 30);
     expect(r.code).toBe(3);
     expect(r.timedOut).toBe(false);
     expect(Date.now() - started).toBeLessThan(5000);
   });
 
   it('captures output from a successful command', async () => {
-    const r = await runBounded('echo hello-from-cmd', mk('backlot-ds-ok-'), 30);
+    const r = await runBounded('echo hello-from-cmd', mk('runly-ds-ok-'), 30);
     expect(r.code).toBe(0);
     expect(r.output).toContain('hello-from-cmd');
   });
@@ -160,7 +160,7 @@ describe('repo-declared commands are bounded', () => {
   it('settles even when the command cannot be spawned', async () => {
     // A cwd that does not exist makes spawn emit 'error' with no 'exit'. The
     // promise must still settle, or the caller's lock wedges forever.
-    const r = await runBounded('true', join(tmpdir(), 'backlot-does-not-exist-xyz'), 5);
+    const r = await runBounded('true', join(tmpdir(), 'runly-does-not-exist-xyz'), 5);
     expect(r.code).toBe(1);
   });
 });
@@ -170,8 +170,8 @@ describe('baked template markers self-heal when the server loses the template', 
     // A file-backed stand-in for a server: "databases" are files in a dir, so
     // wiping the appliance (docker rm -f, volume prune) is an rm -rf. No real
     // postgres needed to drive the exact failure.
-    const server = mk('backlot-ds-server-');
-    process.env.BACKLOT_STATE_DIR = mk('backlot-ds-state2-');
+    const server = mk('runly-ds-server-');
+    process.env.BACKLOT_STATE_DIR = mk('runly-ds-state2-');
     const h = handle('bake-e1');
 
     const spec = {
@@ -205,8 +205,8 @@ describe('baked template markers self-heal when the server loses the template', 
   }, 30_000);
 
   it('still surfaces a genuinely broken restore command after rebaking', async () => {
-    const server = mk('backlot-ds-server2-');
-    process.env.BACKLOT_STATE_DIR = mk('backlot-ds-state3-');
+    const server = mk('runly-ds-server2-');
+    process.env.BACKLOT_STATE_DIR = mk('runly-ds-state3-');
     const h = handle('bake-e2');
     const ds = makeDatastore(
       'app',
@@ -251,7 +251,7 @@ describe('template identifiers survive Postgres truncation', () => {
 
 describe('an ephemeral flush failure is reported, not swallowed', () => {
   it('fails the reset instead of claiming a store was cleared', async () => {
-    process.env.BACKLOT_STATE_DIR = mk('backlot-ds-eph-');
+    process.env.BACKLOT_STATE_DIR = mk('runly-ds-eph-');
     const h = handle('eph-e1');
     const ds = makeDatastore(
       'cache',
@@ -297,9 +297,9 @@ describe('rebake serializes with an in-flight bake/restore', () => {
     // be inside ensure(): unserialized, the rm of the template dir landed
     // between a sibling's bake and its restore copy, failing an innocent bind
     // with a spurious infra-error (and bumping its failStreak).
-    process.env.BACKLOT_STATE_DIR = mk('backlot-ds-rebake-');
+    process.env.BACKLOT_STATE_DIR = mk('runly-ds-rebake-');
     const h = handle('rb-e1');
-    const seed = join(mk('backlot-ds-rbseed-'), 'seed.mjs');
+    const seed = join(mk('runly-ds-rbseed-'), 'seed.mjs');
     writeFileSync(
       seed,
       `import { DatabaseSync } from 'node:sqlite';

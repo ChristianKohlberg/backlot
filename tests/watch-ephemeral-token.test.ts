@@ -12,7 +12,7 @@ const repo = join(import.meta.dirname, '..');
 const CLI = join(repo, 'dist', 'cli', 'index.js');
 
 function makeContext() {
-  const stateDir = mkdtempSync(join(tmpdir(), 'backlot-wet-'));
+  const stateDir = mkdtempSync(join(tmpdir(), 'runly-wet-'));
   const env = { ...process.env, BACKLOT_STATE_DIR: stateDir, BACKLOT_SWEEP_MS: '500' };
   const cli = (args: string[], cwd: string): Promise<{ exitCode: number; json?: Record<string, unknown>; out: string }> =>
     new Promise((resolve) => {
@@ -50,7 +50,7 @@ createServer((q, s) => s.end(readFileSync('./message.txt', 'utf8'))).listen(Numb
 
 describe('--watch: save in the worktree, served without calling sync', () => {
   const ctx = makeContext();
-  const wt = mkdtempSync(join(tmpdir(), 'backlot-watch-'));
+  const wt = mkdtempSync(join(tmpdir(), 'runly-watch-'));
   afterAll(() => {
     ctx.cleanup();
     rmSync(wt, { recursive: true, force: true });
@@ -95,7 +95,7 @@ createServer((q, s) => s.end(process.pid + ':' + readFileSync('./message.txt', '
 
 describe('--watch two-stage reload: an ordinary save must not bounce services', () => {
   const ctx = makeContext();
-  const wt = mkdtempSync(join(tmpdir(), 'backlot-watch2-'));
+  const wt = mkdtempSync(join(tmpdir(), 'runly-watch2-'));
   afterAll(() => {
     ctx.cleanup();
     rmSync(wt, { recursive: true, force: true });
@@ -137,7 +137,7 @@ services:
 
 describe('--watch fallback: a save that trips an upkeep rule restarts services', () => {
   const ctx = makeContext();
-  const wt = mkdtempSync(join(tmpdir(), 'backlot-watchup-'));
+  const wt = mkdtempSync(join(tmpdir(), 'runly-watchup-'));
   afterAll(() => {
     ctx.cleanup();
     rmSync(wt, { recursive: true, force: true });
@@ -186,7 +186,7 @@ upkeep:
 
 describe('ephemeral datastores: reset = flush, create once', () => {
   const ctx = makeContext();
-  const wt = mkdtempSync(join(tmpdir(), 'backlot-eph-'));
+  const wt = mkdtempSync(join(tmpdir(), 'runly-eph-'));
   afterAll(() => {
     ctx.cleanup();
     rmSync(wt, { recursive: true, force: true });
@@ -224,7 +224,7 @@ datastores:
 
 describe('the token verb', () => {
   const ctx = makeContext();
-  const wt = mkdtempSync(join(tmpdir(), 'backlot-tok-'));
+  const wt = mkdtempSync(join(tmpdir(), 'runly-tok-'));
   afterAll(() => {
     ctx.cleanup();
     rmSync(wt, { recursive: true, force: true });
@@ -251,7 +251,7 @@ auth:
 
 describe('the sync VERB takes the projection path too (2026-07-19 dogfood P1)', () => {
   const ctx = makeContext();
-  const wt = mkdtempSync(join(tmpdir(), 'backlot-syncproj-'));
+  const wt = mkdtempSync(join(tmpdir(), 'runly-syncproj-'));
   afterAll(() => {
     ctx.cleanup();
     rmSync(wt, { recursive: true, force: true });

@@ -33,7 +33,7 @@ export function requireCallerEnv(manifest: Manifest, active: Iterable<string>, v
   for (const service of active) {
     for (const [name, mode] of Object.entries(manifest.services[service]!.env_from ?? {})) {
       if (mode === 'required' && values[name] === undefined) {
-        throw new BrokerError('work-error', `service '${service}' requires caller environment '${name}'; export it and run 'backlot up' again (inputs are not retained across daemon restarts)`, 'env_from');
+        throw new BrokerError('work-error', `service '${service}' requires caller environment '${name}'; export it and run 'runly up' again (inputs are not retained across daemon restarts)`, 'env_from');
       }
     }
   }

@@ -1,7 +1,7 @@
 /**
  * Process identity and orphan discovery.
  *
- * Backlot spawns each service detached (its own process group) and kills the
+ * Runly spawns each service detached (its own process group) and kills the
  * group on teardown — but a daemon that dies ungracefully leaves those groups
  * running with nothing tracking them. Recorded pids alone are not enough to
  * clean up afterwards: by the time a new daemon reads them they may have been
@@ -13,7 +13,7 @@
  * that pid. Together they answer the two questions cleanup needs:
  *
  *   - "is pid N still the process I recorded?"        -> `sameProcess`
- *   - "which backlot processes has everyone lost?"    -> `scanTagged`
+ *   - "which runly processes has everyone lost?"    -> `scanTagged`
  *
  * Identity works on every platform: /proc where it exists, `ps -o lstart=`
  * otherwise, so a recycled pid is never mistaken for the process we recorded.
@@ -69,7 +69,7 @@ export function startTime(pid: number): number | undefined {
  *
  * Without this, non-Linux recovery fell back to a bare liveness check, which is
  * exactly the pid-reuse hazard the start time exists to close — and macOS is
- * the platform backlot's primary users are on. `ps -o lstart=` reports a
+ * the platform runly's primary users are on. `ps -o lstart=` reports a
  * process's start wall-clock to the second, which is enough to distinguish a
  * recycled pid from the process we recorded.
  *
@@ -95,7 +95,7 @@ function darwinStartTime(pid: number): number | undefined {
  * Field 5 of /proc/<pid>/stat: the process group id.
  *
  * `sh -c <cmd>` does NOT reliably exec: dash forks for anything non-trivial,
- * so the pid backlot records is often only the wrapper, and the real server is
+ * so the pid runly records is often only the wrapper, and the real server is
  * a sibling in the same group. Killing "the leader" and then checking the
  * leader's liveness therefore reports success while the server keeps running —
  * group membership is the only honest liveness question.
@@ -149,7 +149,7 @@ export function isAlive(pid: number): boolean {
 /**
  * Is pid N still the same process that was recorded with `recordedStart`?
  *
- * With no recorded start time (a journal written by an older backlot, or a
+ * With no recorded start time (a journal written by an older runly, or a
  * non-Linux host) this can only fall back to liveness, which is exactly the
  * pid-reuse hazard this exists to close — so callers should treat an
  * un-verifiable pid as un-signallable where a mistake would be costly.
@@ -182,7 +182,7 @@ function readEnviron(pid: number): Record<string, string> | undefined {
  * Every live process tagged as belonging to this state root.
  *
  * Note this finds *descendants* too — an `ng serve` inherits the tag from the
- * `sh -c` wrapper backlot spawned, which is the whole point: after the wrapper
+ * `sh -c` wrapper runly spawned, which is the whole point: after the wrapper
  * dies the child is still identifiable.
  */
 export function scanTagged(stateRoot: string): TaggedProc[] {
@@ -212,7 +212,7 @@ export function scanTagged(stateRoot: string): TaggedProc[] {
 /**
  * Field 7 of /proc/<pid>/stat: the controlling terminal, 0 for none.
  *
- * Backlot spawns every service with `stdio: ['ignore', 'pipe', 'pipe']` and
+ * Runly spawns every service with `stdio: ['ignore', 'pipe', 'pipe']` and
  * detached, so it and all its descendants have NO controlling terminal. A human's
  * interactive shell always has one. That difference is the only cheap evidence
  * available for "is a person sitting in front of this process".
@@ -235,7 +235,7 @@ function hasControllingTty(pid: number): boolean {
  * The tag scan above misses a descendant that scrubbed its environment (a
  * process launched through `env -i`, a re-exec that rebuilds environ, some
  * language runtimes' worker pools). Those still have to live SOMEWHERE, and for
- * a service backlot started that somewhere is the environment tree.
+ * a service runly started that somewhere is the environment tree.
  *
  * Linux keeps the cwd link readable after the directory is unlinked, appending
  * " (deleted)" to the target — which is precisely the shape of the leak this
@@ -248,7 +248,7 @@ function hasControllingTty(pid: number): boolean {
  * signal a matched process's whole GROUP, so without the exclusion a teardown
  * would kill that person's shell and every job in it. That is the one outcome
  * this module exists to prevent (see the header): skipping a sweep is safe,
- * signalling a stranger's process is not. A backlot service can never be
+ * signalling a stranger's process is not. A runly service can never be
  * excluded by it, because it never has a terminal to begin with.
  *
  * Even so, deliberately NOT used on the quiesce path: a warm environment's tree

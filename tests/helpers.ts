@@ -1,5 +1,5 @@
 /**
- * Helpers for exercising the example FIXTURES raw — no daemon, no backlot.
+ * Helpers for exercising the example FIXTURES raw — no daemon, no runly.
  *
  * They spawn a service directly and probe readiness the way the engine does
  * (env injection, http/log readiness, fail-fast on fatal markers), which is
@@ -24,7 +24,7 @@ export interface Service {
 }
 
 export function tempDir(prefix: string): { dir: string; cleanup: () => void } {
-  const dir = mkdtempSync(join(tmpdir(), `backlot-${prefix}-`));
+  const dir = mkdtempSync(join(tmpdir(), `runly-${prefix}-`));
   return { dir, cleanup: () => rmSync(dir, { recursive: true, force: true }) };
 }
 

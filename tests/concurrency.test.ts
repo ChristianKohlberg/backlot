@@ -12,11 +12,11 @@ import { join } from 'node:path';
 const repo = join(import.meta.dirname, '..');
 const CLI = join(repo, 'dist', 'cli', 'index.js');
 
-const stateDir = mkdtempSync(join(tmpdir(), 'backlot-conc-'));
+const stateDir = mkdtempSync(join(tmpdir(), 'runly-conc-'));
 const env = { ...process.env, BACKLOT_STATE_DIR: stateDir, BACKLOT_SWEEP_MS: '500' };
 
 function makeSlowWorktree(name: string): string {
-  const dir = mkdtempSync(join(tmpdir(), `backlot-conc-${name}-`));
+  const dir = mkdtempSync(join(tmpdir(), `runly-conc-${name}-`));
   // A service that takes ~1.5s to become ready — long enough that two
   // serialized binds (>3s) are clearly distinguishable from two parallel ones.
   // It records its own boot window (process start -> listening) to an absolute

@@ -2,7 +2,7 @@
  * The daemonization detector (supervisor.ts): a service whose run command
  * forks and exits 0 immediately is NOT a supervisable service.
  *
- * Without the detector, backlot restarts the "crashed" service up to three
+ * Without the detector, runly restarts the "crashed" service up to three
  * times — each restart forking ANOTHER background copy that escapes the group
  * kill — then polls a dead readiness probe for the full ready timeout and
  * finally blames the ENVIRONMENT (env-error). That is a process leak plus a
@@ -54,8 +54,8 @@ afterAll(async () => {
 
 describe('a service that daemonizes is refused, fast and with the blame on the repo', () => {
   it('up fails as work-error naming FOREGROUND, well before the ready timeout, and degrades the env', async () => {
-    const stateDir = mkdtempSync(join(tmpdir(), 'backlot-dmz-'));
-    const wt = mkdtempSync(join(tmpdir(), 'backlot-dmz-wt-'));
+    const stateDir = mkdtempSync(join(tmpdir(), 'runly-dmz-'));
+    const wt = mkdtempSync(join(tmpdir(), 'runly-dmz-wt-'));
     dirs.push(stateDir, wt);
     // The classic accident: the run command backgrounds the real process and
     // returns 0 at once. The declared ready gate would wait 30s if polled.

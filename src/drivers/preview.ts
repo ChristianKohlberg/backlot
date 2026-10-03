@@ -7,7 +7,8 @@
  */
 import { spawn, type ChildProcess } from 'node:child_process';
 import { appendFileSync, mkdirSync, existsSync, writeFileSync } from 'node:fs';
-import { homedir } from 'node:os';
+import { homedir, userInfo } from 'node:os';
+import { createHash } from 'node:crypto';
 import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { BrokerError, now } from '../core/util.js';
@@ -20,6 +21,8 @@ import type { ServicePid } from '../core/types.js';
 export interface PreviewSettings {
   domain?: string;
   prefix?: string;
+  /** `tailscale` only: the HTTPS port on the tailnet name (decision 0031). */
+  https_port?: number;
 }
 
 export interface PreviewPublisher {
@@ -28,7 +31,7 @@ export interface PreviewPublisher {
   checkPrerequisite(): void;
   /**
    * Start a supervised tunnel to `localUrl`. The process is spawned detached with
-   * backlot tags so `pool gc` and lease teardown can reap it.
+   * runly tags so `pool gc` and lease teardown can reap it.
    *
    * An adapter OWNS the process it spawned until it hands back a pid: if it
    * throws, it must already have killed it. Nothing downstream can clean up a
@@ -109,8 +112,8 @@ async function abandon(proc: ChildProcess, spawnedStart: number | undefined): Pr
 function withSurvivor(err: unknown, pid: number | undefined): unknown {
   if (pid === undefined || !(err instanceof BrokerError)) return err;
   const warning =
-    `the cloudflared process (pid ${pid}) could NOT be confirmed dead and was never recorded anywhere —` +
-    ` it may still be serving a PUBLIC, unauthenticated URL; kill it by hand`;
+    `the preview process (pid ${pid}) could NOT be confirmed dead and was never recorded anywhere —` +
+    ` it may still be serving the preview URL; kill it by hand`;
   return new BrokerError(err.klass, err.message, err.source, `${err.logExcerpt ? `${err.logExcerpt}\n` : ''}${warning}`);
 }
 
@@ -399,9 +402,262 @@ class CloudflareNamedPublisher implements PreviewPublisher {
   }
 }
 
+
+/**
+ * `tailscale serve` prints this once the tailnet listener stands. Foreground
+ * serve has no other readiness signal, and the mapping it announces is live the
+ * moment the line is out.
+ */
+const TS_READY_RE = /Available within your tailnet|Available on the internet/;
+
+/** Auto-derived tailnet ports land here unless `preview.https_port` pins one. */
+const TS_PORT_BASE = 21000;
+const TS_PORT_SPAN = 1000;
+
+function tailscaleBin(): string {
+  const override = process.env.BACKLOT_TAILSCALE?.trim();
+  if (override) return override;
+  try {
+    return execFileSync('which', ['tailscale'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
+  } catch {
+    return 'tailscale';
+  }
+}
+
+function ts(bin: string, args: string[], what: string): string {
+  try {
+    return execFileSync(bin, args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 15_000 });
+  } catch (err) {
+    const detail = err && typeof err === 'object' && 'stderr' in err ? String((err as { stderr?: unknown }).stderr ?? '') : '';
+    throw new BrokerError('env-error', `${what} failed`, 'preview', detail.slice(-2000));
+  }
+}
+
+function tsJson(bin: string, args: string[], what: string): Record<string, unknown> {
+  const raw = ts(bin, args, what);
+  try {
+    const parsed: unknown = JSON.parse(raw || '{}');
+    return parsed && typeof parsed === 'object' ? (parsed as Record<string, unknown>) : {};
+  } catch {
+    throw new BrokerError('env-error', `${what} returned something that is not JSON`, 'preview', raw.slice(-2000));
+  }
+}
+
+/**
+ * Every HTTPS port this machine already serves on its tailnet name — the
+ * persistent (`--bg`) config and every live foreground session alike. A port
+ * taken by anyone, runly or a human with `tailscale serve`, is not ours to
+ * take over: tailscale would refuse the listener anyway, but only after the
+ * process had started, which reads as a broken tool rather than a busy port.
+ */
+export function tailnetPortsInUse(serveStatus: Record<string, unknown>): Set<number> {
+  const used = new Set<number>();
+  const addTcp = (cfg: unknown) => {
+    const tcp = cfg && typeof cfg === 'object' ? (cfg as { TCP?: unknown }).TCP : undefined;
+    if (!tcp || typeof tcp !== 'object') return;
+    for (const k of Object.keys(tcp)) {
+      const n = Number(k);
+      if (Number.isInteger(n) && n > 0) used.add(n);
+    }
+  };
+  addTcp(serveStatus);
+  const fg = serveStatus.Foreground;
+  if (fg && typeof fg === 'object') for (const session of Object.values(fg)) addTcp(session);
+  return used;
+}
+
+/**
+ * The tailnet port for an environment's service when the manifest pins none.
+ *
+ * Derived, not allocated: the same environment and service land on the same
+ * port every time, so a re-publish after a rebind — or after `preview stop` —
+ * hands the reviewer the address they already have, which is what makes a
+ * tailnet name worth having. Ports are stable for an environment's lifetime
+ * (decision 0004), and so is this. A collision walks forward to the next free
+ * port inside the span; a full span is an env-error, not a silent reuse.
+ */
+export function deriveTailnetPort(envId: string, service: string, inUse: Set<number>): number {
+  const h = createHash('sha256').update(`${envId}\0${service}`).digest().readUInt32BE(0);
+  const start = h % TS_PORT_SPAN;
+  for (let i = 0; i < TS_PORT_SPAN; i++) {
+    const port = TS_PORT_BASE + ((start + i) % TS_PORT_SPAN);
+    if (!inUse.has(port)) return port;
+  }
+  throw new BrokerError(
+    'env-error',
+    `every tailnet port in ${TS_PORT_BASE}-${TS_PORT_BASE + TS_PORT_SPAN - 1} is already served on this machine — free some ('tailscale serve status') or pin preview.https_port`,
+    'preview',
+  );
+}
+
+/**
+ * Publishes on this machine's tailnet name through `tailscale serve`, in the
+ * FOREGROUND (decision 0031).
+ *
+ * Foreground is the whole design. A foreground serve config is a session of
+ * the `tailscale serve` process: tailscaled drops it the moment that process
+ * exits, however it exits — SIGTERM and SIGKILL alike (measured on tailscale
+ * 1.102). So the mapping lives exactly as long as a supervised, tagged child of
+ * the lease, and every reap path 0027 built for a tunnel process reaps the URL
+ * with it. `--bg` would write a persistent config that survives the process,
+ * the lease and a daemon crash, with nothing in the journal able to name it.
+ *
+ * It runs as the daemon's user, never through sudo. sudo with `use_pty` puts
+ * the command in its own process group, out of reach of the group kill, and
+ * `env_reset` strips the runly tags `pool gc` finds orphans by — a SIGKILLed
+ * sudo then leaves a live `tailscale serve` that nothing will ever reap. The
+ * operator therefore has to be allowed to drive serve: `tailscale set
+ * --operator=<user>`, once per machine.
+ */
+class TailscalePublisher implements PreviewPublisher {
+  readonly name = 'tailscale';
+
+  checkPrerequisite(): void {
+    const bin = tailscaleBin();
+    if (!cloudflaredAvailable(bin)) {
+      throw new BrokerError(
+        'env-error',
+        `the '${this.name}' preview publisher requires the tailscale CLI — install it and ensure it is on PATH, or set BACKLOT_TAILSCALE to its path`,
+        'preview',
+      );
+    }
+    this.self(bin);
+    const user = userInfo();
+    if (user.uid !== 0) {
+      const prefs = tsJson(bin, ['debug', 'prefs'], 'reading tailscale prefs');
+      const operator = typeof prefs.OperatorUser === 'string' ? prefs.OperatorUser : '';
+      if (operator !== user.username) {
+        throw new BrokerError(
+          'env-error',
+          `the '${this.name}' publisher runs 'tailscale serve' as '${user.username}', which is not this machine's tailscale operator` +
+            `${operator ? ` ('${operator}' is)` : ''} — run 'sudo tailscale set --operator=${user.username}' once. ` +
+            `sudo per publish is not an option: it moves serve out of the process group and environment runly reaps by.`,
+          'preview',
+        );
+      }
+    }
+  }
+
+  /** This machine's tailnet name, refusing a tailscaled that could not serve HTTPS on it. */
+  private self(bin: string): string {
+    const status = tsJson(bin, ['status', '--json'], 'reading tailscale status');
+    const backend = typeof status.BackendState === 'string' ? status.BackendState : '';
+    if (backend !== 'Running') {
+      throw new BrokerError(
+        'env-error',
+        `tailscale is not connected on this machine (state '${backend || 'unknown'}') — run 'tailscale up'`,
+        'preview',
+      );
+    }
+    const certDomains = Array.isArray(status.CertDomains) ? status.CertDomains.filter((d): d is string => typeof d === 'string') : [];
+    const selfDns = (status.Self as { DNSName?: unknown } | undefined)?.DNSName;
+    const dns = typeof selfDns === 'string' ? selfDns.replace(/\.$/, '') : '';
+    if (!dns || certDomains.length === 0) {
+      throw new BrokerError(
+        'env-error',
+        `this tailnet cannot issue HTTPS certificates for '${dns || 'this machine'}' — enable MagicDNS and HTTPS Certificates in the tailscale admin console (DNS page)`,
+        'preview',
+      );
+    }
+    return certDomains.includes(dns) ? dns : (certDomains[0] as string);
+  }
+
+  async start(opts: {
+    envId: string;
+    service: string;
+    localUrl: string;
+    logDir: string;
+    settings?: PreviewSettings;
+  }): Promise<{ url: string; pid: ServicePid }> {
+    this.checkPrerequisite();
+    const bin = tailscaleBin();
+    const host = this.self(bin);
+    const inUse = tailnetPortsInUse(tsJson(bin, ['serve', 'status', '--json'], 'reading tailscale serve status'));
+    const pinned = opts.settings?.https_port;
+    if (pinned !== undefined && inUse.has(pinned)) {
+      // work-error, not env-error: nothing on this machine is broken — the
+      // manifest pinned a port another publication (or a human) already holds,
+      // and taking it over would silently repoint someone else's address.
+      throw new BrokerError(
+        'work-error',
+        `tailnet port ${pinned} (preview.https_port) is already served on this machine — 'tailscale serve status' shows by what; unpin it to get a derived port, or free it`,
+        'preview',
+      );
+    }
+    const port = pinned ?? deriveTailnetPort(opts.envId, opts.service, inUse);
+    const url = `https://${host}${port === 443 ? '' : `:${port}`}`;
+
+    mkdirSync(opts.logDir, { recursive: true });
+    const logPath = join(opts.logDir, `preview-${opts.service}.log`);
+    const tagName = `preview:${opts.service}`;
+    const proc = spawn(bin, ['serve', `--https=${port}`, opts.localUrl], {
+      env: { ...process.env, ...serviceTag(opts.envId, tagName, stateRoot()) },
+      stdio: ['ignore', 'pipe', 'pipe'],
+      detached: true,
+    });
+    const spawnedStart = proc.pid === undefined ? undefined : startTime(proc.pid);
+    let buf = '';
+    const sink = (d: Buffer) => {
+      const s = d.toString();
+      buf = (buf + s).slice(-16_000);
+      try {
+        appendFileSync(logPath, s);
+      } catch {
+        /* log dir gone */
+      }
+    };
+    proc.stdout?.on('data', sink);
+    proc.stderr?.on('data', sink);
+
+    try {
+      await new Promise<void>((resolve, reject) => {
+        const deadline = now() + startTimeoutMs();
+        const poll = () => {
+          if (TS_READY_RE.test(buf)) return resolve();
+          if (proc.exitCode !== null) {
+            const denied = /access denied|permission denied/i.test(buf);
+            return reject(
+              new BrokerError(
+                'env-error',
+                denied
+                  ? `tailscale refused to change the serve config for '${userInfo().username}' — run 'sudo tailscale set --operator=${userInfo().username}' once`
+                  : `tailscale serve exited before the tailnet listener stood (exit ${proc.exitCode})`,
+                'preview',
+                buf.slice(-2000),
+              ),
+            );
+          }
+          if (now() > deadline) {
+            return reject(new BrokerError('env-error', `timed out waiting for tailscale to serve ${url}`, 'preview', buf.slice(-2000)));
+          }
+          setTimeout(poll, 100).unref();
+        };
+        proc.on('error', (err) => reject(new BrokerError('env-error', `failed to start tailscale serve: ${err.message}`, 'preview')));
+        poll();
+      });
+    } catch (err) {
+      // As for the tunnels: a serve that was merely slow stands a second after
+      // the timeout, and with no pid returned nothing could ever name it.
+      throw withSurvivor(err, await abandon(proc, spawnedStart));
+    }
+
+    const pid = proc.pid;
+    if (!pid) {
+      throw withSurvivor(new BrokerError('env-error', 'tailscale serve started without a pid', 'preview'), await abandon(proc, spawnedStart));
+    }
+    return { url, pid: { pid, startTime: spawnedStart } };
+  }
+
+  /** The foreground session dies with the process, and the tailnet mapping with it. */
+  async stop(rec: ServicePid): Promise<boolean> {
+    return killGroupVerified(rec.pid, rec.startTime);
+  }
+}
+
 const publishers: Record<string, PreviewPublisher> = {
   'cloudflare-quick': new CloudflareQuickPublisher(),
   'cloudflare-named': new CloudflareNamedPublisher(),
+  tailscale: new TailscalePublisher(),
 };
 
 export function resolvePreviewPublisher(name: string): PreviewPublisher {

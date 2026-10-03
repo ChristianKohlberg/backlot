@@ -1,7 +1,7 @@
 /**
- * Where this backlot came from, and therefore what command upgrades it.
+ * Where this runly came from, and therefore what command upgrades it.
  *
- * backlot does not install itself. It brokers environments and refuses to own
+ * runly does not install itself. It brokers environments and refuses to own
  * what it did not create — the same rule that makes appliances "ensured, not
  * owned" (decision 0018) and services commands rather than containers
  * (decision 0012). Applied to its own binary: a self-updater that shelled out
@@ -22,7 +22,7 @@ export interface InstallInfo {
   kind: InstallKind;
   /** The package root: the directory holding package.json and dist/. */
   root: string;
-  /** What a human should run to get the newest release. Never run by backlot. */
+  /** What a human should run to get the newest release. Never run by runly. */
   upgradeHint: string;
 }
 
@@ -35,7 +35,7 @@ export function installKind(): InstallInfo {
     // pnpm materialises packages under a `.pnpm` store and links them, so the
     // real path names it even when the link does not.
     if (parts.some((p) => p === '.pnpm')) {
-      return { kind: 'pnpm', root, upgradeHint: 'pnpm add -g backlot@latest' };
+      return { kind: 'pnpm', root, upgradeHint: 'pnpm add -g runly@latest' };
     }
     // A global npm root is a node_modules with no package.json ABOVE it; a
     // project-local install always has the consuming project's manifest there.
@@ -44,10 +44,10 @@ export function installKind(): InstallInfo {
       return {
         kind: 'node_modules',
         root,
-        upgradeHint: 'npm install backlot@latest (this is a project-local install; update the dependency)',
+        upgradeHint: 'npm install runly@latest (this is a project-local install; update the dependency)',
       };
     }
-    return { kind: 'npm-global', root, upgradeHint: 'npm install -g backlot@latest' };
+    return { kind: 'npm-global', root, upgradeHint: 'npm install -g runly@latest' };
   }
   // A checkout: dist/ is built from src/ in place, so the upgrade is a pull and
   // a rebuild. Never suggest npm here — it would install a second copy over the
@@ -55,5 +55,5 @@ export function installKind(): InstallInfo {
   if (existsSync(join(root, 'src')) && existsSync(join(root, 'tsconfig.json'))) {
     return { kind: 'checkout', root, upgradeHint: 'git pull && npm ci && npm run build' };
   }
-  return { kind: 'unknown', root, upgradeHint: 'update backlot however it was installed, then run: backlot update' };
+  return { kind: 'unknown', root, upgradeHint: 'update runly however it was installed, then run: runly update' };
 }

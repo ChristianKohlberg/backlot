@@ -50,9 +50,21 @@ one tunnel, which forces one shared cloudflared process for every previewed
 service — and a shared process cannot honour 0027's `stop()` contract, because
 the pid another publication still references may not be killed.
 
+## `tailscale` serves in the foreground, as the operator — never `--bg`, never sudo
+
+The `tailscale` publisher runs `tailscale serve --https=<port> <url>` WITHOUT
+`--bg`. A foreground serve config dies with the process (SIGTERM and SIGKILL
+alike, measured on 1.102), which is what lets the lease-scoped preview machinery
+reap the URL by reaping a pid. Do not "fix" it to `--bg`: that writes persistent
+config nothing in the journal can name again. Do not wrap it in sudo either —
+`use_pty` moves the command out of the process group and `env_reset` strips the
+runly tags, so a SIGKILLed sudo leaves an unreapable live serve. The machine's
+tailscale operator must be the daemon's user (`tailscale set --operator=…`);
+`checkPrerequisite` says so ([decision 0031](docs/decisions/0031-tailscale-preview-publisher.md)).
+
 ## The preview tunnel is scoped to the lease, not to the services it publishes
 
-`backlot preview` journals its tunnel on the **lease row** (`preview_*`), not in
+`runly preview` journals its tunnel on the **lease row** (`preview_*`), not in
 `env.servicePids` — so none of the service-reap machinery above owns it, and the
 lifetime rule is deliberately different ([decision 0027](docs/decisions/0027-lease-scoped-public-preview.md)).
 A rebind, a `sync` or an idle quiesce restarts or stops services while the lease
@@ -129,11 +141,11 @@ The data-only ceiling and shape-conversion accounting are defined in
 ## Version skew is a first-class failure, and the daemon outlives the install
 
 The CLI spawns the daemon from **its own `dist/`** (`ensureDaemon`), so installing a
-new backlot never replaces a daemon that is already running — it serves old code for
+new runly never replaces a daemon that is already running — it serves old code for
 the rest of its life, and an old daemon *ignores* arguments it does not know rather
 than rejecting them. `ping` therefore carries the daemon's version, and a mismatch
 **refuses** every verb except `update`, `doctor` and `daemon stop` with
-`infra-error`. `backlot update` is the remedy: it restarts the daemon (shared code
+`infra-error`. `runly update` is the remedy: it restarts the daemon (shared code
 path with `daemon stop`), and the next verb's autospawn is what makes the new daemon
 the installed build. Leases survive; an in-flight (`busy`) operation and a downgrade
 are the only refusals. See
@@ -150,7 +162,7 @@ before the behaviour under test ever runs (this broke `cli-contract` and
 
 Skew reaches the **manifest** too, as of the `auth.logins` list form
 ([0026](docs/decisions/0026-a-stack-may-advertise-several-logins.md)): a stack using it
-fails validation on a pre-0.10.0 backlot with `the backlot manifest is invalid`, which
+fails validation on a pre-0.10.0 runly with `the runly manifest is invalid`, which
 reads as a broken manifest rather than an old install. Hence the singular
 `{user, password}` form must keep validating indefinitely, and `ctx.logins` must stay a
 single object (the primary, manifest entry 0) — `allLogins` is where the set lives.
@@ -212,14 +224,14 @@ a green integration suite alone does not verify the published artifact.
 The repo doubles as its own Claude Code plugin marketplace (docs/config only — it
 does not touch the CLI build). Layout:
 - `.claude-plugin/marketplace.json` — marketplace manifest at repo root.
-- `plugins/backlot/.claude-plugin/plugin.json` — the plugin manifest; **bump its
+- `plugins/runly/.claude-plugin/plugin.json` — the plugin manifest; **bump its
   `version` when the skill changes** (independent of `package.json`'s CLI version).
-- `plugins/backlot/skills/backlot/SKILL.md` — the **upstream canonical** backlot
+- `plugins/runly/skills/runly/SKILL.md` — the **upstream canonical** runly
   skill. Keep it generic/stack-agnostic; never hardcode a consuming repo's
   services or presets. `README.md` is the source of truth for its content.
 
-backlot is CLI-only: the plugin ships **only the skill — no `.mcp.json`.** Install
-is `/plugin marketplace add ChristianKohlberg/backlot && /plugin install backlot`.
+runly is CLI-only: the plugin ships **only the skill — no `.mcp.json`.** Install
+is `/plugin marketplace add ChristianKohlberg/runly && /plugin install runly`.
 
 ## Maintaining this file
 

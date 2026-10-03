@@ -107,7 +107,7 @@ function enumerate(stackRoot: string, manifest: Manifest): string[] {
     if (gitlinks.length > 0) {
       throw new BrokerError(
         'work-error',
-        `this repository uses git submodules (${gitlinks.slice(0, 3).join(', ')}${gitlinks.length > 3 ? ', …' : ''}), which backlot does not project into an environment — their contents would be silently missing. Vendor them, or declare the paths you need under sync.include.`,
+        `this repository uses git submodules (${gitlinks.slice(0, 3).join(', ')}${gitlinks.length > 3 ? ', …' : ''}), which runly does not project into an environment — their contents would be silently missing. Vendor them, or declare the paths you need under sync.include.`,
         'sync',
       );
     }
@@ -360,7 +360,7 @@ export function syncIntoEnv(
       if (!contentDiffers) copied++; // a real change was propagated
     }
     // The env copy was written (or verified) moments ago, so a missing stat
-    // here means something OUTSIDE backlot is deleting the env tree under a
+    // here means something OUTSIDE runly is deleting the env tree under a
     // live sync. Carrying on would record a cache entry for a file that is not
     // there; crashing on the undefined was an unclassified TypeError.
     const newDstStat = statOf(dst);
@@ -438,7 +438,7 @@ export function syncIntoEnv(
  * Which declared outputs did the ENVIRONMENT change?
  *
  * Comparing the env copy against the LIVE worktree answered a different
- * question: a worktree file edited after the bind also differs, so backlot
+ * question: a worktree file edited after the bind also differs, so runly
  * reported it as an env-side change and a subsequent pull copied the stale
  * bind-time copy over the newer worktree content. The bind-time hash recorded
  * in the sync cache is the correct baseline.

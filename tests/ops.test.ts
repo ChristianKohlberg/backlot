@@ -12,7 +12,7 @@ const repo = join(import.meta.dirname, '..');
 const CLI = join(repo, 'dist', 'cli', 'index.js');
 
 function makeContext() {
-  const stateDir = mkdtempSync(join(tmpdir(), 'backlot-ops-'));
+  const stateDir = mkdtempSync(join(tmpdir(), 'runly-ops-'));
   const env = { ...process.env, BACKLOT_STATE_DIR: stateDir, BACKLOT_SWEEP_MS: '500' };
   const cli = (args: string[], cwd: string): Promise<{ exitCode: number; json?: Record<string, unknown> }> =>
     new Promise((resolve) => {
@@ -52,7 +52,7 @@ checks:
 
 describe('check timeouts and job ls', () => {
   const ctx = makeContext();
-  const wt = mkdtempSync(join(tmpdir(), 'backlot-ops-wt-'));
+  const wt = mkdtempSync(join(tmpdir(), 'runly-ops-wt-'));
   afterAll(() => {
     ctx.cleanup();
     rmSync(wt, { recursive: true, force: true });
@@ -131,7 +131,7 @@ describe('check timeouts and job ls', () => {
 });
 
 describe('pool policy precedence (unit)', () => {
-  const dir = mkdtempSync(join(tmpdir(), 'backlot-pol-'));
+  const dir = mkdtempSync(join(tmpdir(), 'runly-pol-'));
   const saved = { state: process.env.BACKLOT_STATE_DIR, pool: process.env.BACKLOT_POOL_MAX };
   afterEach(() => {
     process.env.BACKLOT_STATE_DIR = saved.state;
@@ -163,7 +163,7 @@ describe('pool policy precedence (unit)', () => {
     // a user raising idleTtlMs to 2h had LEASED envs quiesce before ABANDONED
     // ones — a leased environment reclaimed more aggressively than a forgotten
     // one inverts the lease-liveness design.
-    process.env.BACKLOT_STATE_DIR = mkdtempSync(join(tmpdir(), 'backlot-pol2-'));
+    process.env.BACKLOT_STATE_DIR = mkdtempSync(join(tmpdir(), 'runly-pol2-'));
     const savedEnv = { idle: process.env.BACKLOT_IDLE_TTL_MS, leased: process.env.BACKLOT_LEASED_IDLE_TTL_MS };
     try {
       delete process.env.BACKLOT_LEASED_IDLE_TTL_MS;
@@ -188,7 +188,7 @@ describe('pool policy precedence (unit)', () => {
 
 describe('retention sweep (unit)', () => {
   it('prunes old artifacts, truncates fat logs, keeps newest templates', async () => {
-    const dir = mkdtempSync(join(tmpdir(), 'backlot-ret-'));
+    const dir = mkdtempSync(join(tmpdir(), 'runly-ret-'));
     process.env.BACKLOT_STATE_DIR = dir;
     const { pruneArtifacts, truncateLogs, pruneTemplates } = await import('../src/core/retention.js');
     const { policy } = await import('../src/core/policy.js');
@@ -227,7 +227,7 @@ describe('template pruning honors the bake lock', () => {
     // pruneTemplates was the one remaining writer that mutated a stack's
     // template dir OUTSIDE the stack-scoped bake lock — reopening the exact
     // deleted-mid-restore race the lock was introduced to close.
-    const dir = mkdtempSync(join(tmpdir(), 'backlot-ret-lock-'));
+    const dir = mkdtempSync(join(tmpdir(), 'runly-ret-lock-'));
     process.env.BACKLOT_STATE_DIR = dir;
     const { pruneTemplates } = await import('../src/core/retention.js');
     const { withBakeLock } = await import('../src/drivers/datastores.js');

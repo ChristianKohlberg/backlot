@@ -59,7 +59,7 @@ afterAll(() => {
  * `heat: 'cold'` — without waiting out the real 30 minutes.
  */
 function ctx(opts: { total: number; idleTtlMs?: number; sweepMs?: number; stubbornService?: boolean }) {
-  const stateDir = mkdtempSync(join(tmpdir(), 'backlot-mcap-'));
+  const stateDir = mkdtempSync(join(tmpdir(), 'runly-mcap-'));
   dirs.push(stateDir);
   const env = {
     ...process.env,
@@ -72,7 +72,7 @@ function ctx(opts: { total: number; idleTtlMs?: number; sweepMs?: number; stubbo
     BACKLOT_SWEEP_MS: String(opts.sweepMs ?? 300),
   };
   const stack = (name: string) => {
-    const wt = mkdtempSync(join(tmpdir(), `backlot-mcap-${name}-`));
+    const wt = mkdtempSync(join(tmpdir(), `runly-mcap-${name}-`));
     dirs.push(wt);
     writeFileSync(
       join(wt, 'stack.yaml'),

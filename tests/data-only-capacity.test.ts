@@ -49,7 +49,7 @@ afterAll(() => {
 });
 
 function ctx(opts: { total?: number; dataOnly?: number; idleTtlMs?: number } = {}) {
-  const stateDir = mkdtempSync(join(tmpdir(), 'backlot-docap-'));
+  const stateDir = mkdtempSync(join(tmpdir(), 'runly-docap-'));
   dirs.push(stateDir);
   const env = {
     ...process.env,
@@ -63,7 +63,7 @@ function ctx(opts: { total?: number; dataOnly?: number; idleTtlMs?: number } = {
   };
   /** A stack with one cheap service AND a datastore, so both shapes are bindable. */
   const stack = (name: string) => {
-    const wt = mkdtempSync(join(tmpdir(), `backlot-docap-${name}-`));
+    const wt = mkdtempSync(join(tmpdir(), `runly-docap-${name}-`));
     dirs.push(wt);
     writeFileSync(
       join(wt, 'seed.mjs'),

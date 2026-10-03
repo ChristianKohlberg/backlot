@@ -22,8 +22,8 @@ afterAll(() => {
 const manifest = { name: 'racy', services: {}, checks: {} } as never;
 
 function repo() {
-  const src = mkdtempSync(join(tmpdir(), 'backlot-racy-src-'));
-  const env = mkdtempSync(join(tmpdir(), 'backlot-racy-env-'));
+  const src = mkdtempSync(join(tmpdir(), 'runly-racy-src-'));
+  const env = mkdtempSync(join(tmpdir(), 'runly-racy-env-'));
   dirs.push(src, env);
   execFileSync('git', ['init', '-q'], { cwd: src });
   return { src, env };
@@ -287,7 +287,7 @@ describe('outputs write-back respects the worktree as source of truth', () => {
 describe('submodules are refused, not silently omitted', () => {
   it('fails with an actionable error naming the submodule', () => {
     const { src, env } = repo();
-    const inner = mkdtempSync(join(tmpdir(), 'backlot-sub-'));
+    const inner = mkdtempSync(join(tmpdir(), 'runly-sub-'));
     dirs.push(inner);
     execFileSync('git', ['init', '-q'], { cwd: inner });
     writeFileSync(join(inner, 'lib.txt'), 'from submodule');

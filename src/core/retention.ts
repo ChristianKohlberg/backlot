@@ -1,5 +1,5 @@
 /**
- * Disk retention: nothing backlot writes may grow forever. Called from the
+ * Disk retention: nothing runly writes may grow forever. Called from the
  * daemon sweeper (~10 min cadence); every function is idempotent, best-effort,
  * and unit-testable in isolation.
  */
@@ -65,7 +65,7 @@ export function truncateLogs(p: Policy, root = envsRoot()): number {
           } finally {
             closeSync(fd);
           }
-          writeFileSync(full, Buffer.concat([Buffer.from('[backlot: truncated by retention sweep]\n'), tail]));
+          writeFileSync(full, Buffer.concat([Buffer.from('[runly: truncated by retention sweep]\n'), tail]));
           truncated++;
         }
       } catch {

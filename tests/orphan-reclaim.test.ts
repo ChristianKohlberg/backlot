@@ -18,7 +18,7 @@ const repo = join(import.meta.dirname, '..');
 const CLI = join(repo, 'dist', 'cli', 'index.js');
 
 function makeContext(extra: Record<string, string> = {}) {
-  const stateDir = mkdtempSync(join(tmpdir(), 'backlot-orph-'));
+  const stateDir = mkdtempSync(join(tmpdir(), 'runly-orph-'));
   const env = { ...process.env, BACKLOT_STATE_DIR: stateDir, BACKLOT_SWEEP_MS: '300', ...extra };
   const cli = (args: string[], cwd: string): Promise<{ exitCode: number; json?: Record<string, unknown> }> =>
     new Promise((resolve) => {
@@ -69,7 +69,7 @@ createServer((q, s) => s.end('ok')).listen(Number(process.env.PORT), '127.0.0.1'
 `;
 
 function makeWt(name: string, body: string): string {
-  const dir = mkdtempSync(join(tmpdir(), `backlot-orph-${name}-`));
+  const dir = mkdtempSync(join(tmpdir(), `runly-orph-${name}-`));
   writeFileSync(join(dir, 'server.mjs'), body);
   writeFileSync(
     join(dir, 'stack.yaml'),
@@ -96,7 +96,7 @@ const alive = (pid: number): boolean => {
 /**
  * The pids that actually matter.
  *
- * `sh -c node server.mjs` FORKS on this platform, so the pid backlot records
+ * `sh -c node server.mjs` FORKS on this platform, so the pid runly records
  * is only the wrapper — it dies obediently on SIGTERM while the real server
  * survives holding the memory. Asserting on the recorded pid alone passes
  * against the un-fixed code, so every leak assertion here counts the real
@@ -153,7 +153,7 @@ describe('process identity', () => {
 
 describe('reap safety: pid reuse must never hit a bystander', () => {
   it('refuses to signal a group whose leader pid is no longer the recorded process', async () => {
-    // A live group that backlot never spawned, standing in for whatever
+    // A live group that runly never spawned, standing in for whatever
     // inherited a recycled pid. Its recorded start time is deliberately wrong.
     const victim = spawn('sh', ['-c', 'sleep 30'], { detached: true, stdio: 'ignore' });
     victim.unref();
@@ -221,7 +221,7 @@ describe('orphan reclaim (issue #5)', () => {
     const tagged = scanTagged(ctx.stateDir);
     expect(tagged.length).toBeGreaterThan(0);
     expect(tagged.some((p) => p.service === 'web')).toBe(true);
-    // The tag is scoped to THIS state root, so a parallel backlot install
+    // The tag is scoped to THIS state root, so a parallel runly install
     // (or another test's daemon) can never be swept by this one.
     expect(tagged.every((p) => p.envId.startsWith('tagged'))).toBe(true);
   });
@@ -343,7 +343,7 @@ describe('orphan reclaim (issue #5)', () => {
 
 describe('journal compatibility', () => {
   it('reads the legacy bare-number service_pids shape', () => {
-    const dir = mkdtempSync(join(tmpdir(), 'backlot-orph-jrn-'));
+    const dir = mkdtempSync(join(tmpdir(), 'runly-orph-jrn-'));
     dirs.push(dir);
     const journal = new Journal(join(dir, 'journal.db'));
     journal.saveEnv({
@@ -351,7 +351,7 @@ describe('journal compatibility', () => {
       ports: {}, datastoreNs: {}, fingerprints: {}, presets: {},
       bindCount: 0, createdAt: 1, lastUsedAt: 1, servicePids: { web: { pid: 4242 } }, failStreak: 0,
     });
-    // Rewrite the blob the way backlot <= 0.5.0 wrote it: a bare number.
+    // Rewrite the blob the way runly <= 0.5.0 wrote it: a bare number.
     const db = new DatabaseSync(join(dir, 'journal.db'));
     db.prepare('UPDATE envs SET service_pids = ? WHERE id = ?').run('{"web":4242}', 'legacy-e1');
     db.close();

@@ -330,7 +330,7 @@ describe('preview tunnels', () => {
     const again = await cli(['up', '--json']);
     expect(again.code).toBe(0);
     expect(again.json?.previewUrls).toEqual({});
-    expect(String(again.json?.previewNotice)).toMatch(/work-error: backlot.yml now sets preview.forbidden/);
+    expect(String(again.json?.previewNotice)).toMatch(/work-error: runly.yml now sets preview.forbidden/);
     expect(await goneWithin(pid, 10_000)).toBe(true);
   });
 
@@ -379,7 +379,7 @@ describe('preview tunnels', () => {
     const synced = await cli(['sync', '--json']);
     expect(synced.code).toBe(0);
     expect(synced.json?.previewUrls).toEqual({});
-    expect(String(synced.json?.previewNotice)).toMatch(/work-error: backlot.yml now sets preview.forbidden/);
+    expect(String(synced.json?.previewNotice)).toMatch(/work-error: runly.yml now sets preview.forbidden/);
     expect(await goneWithin(pid, 10_000)).toBe(true);
   });
 

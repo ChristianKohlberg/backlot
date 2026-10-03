@@ -39,7 +39,7 @@ jobs:
       - run: npm test
         env:
           BACKLOT_POOL_MAX: '2'
-      # The fixture must stay runnable raw (no backlot) — it doubles as the docs.
+      # The fixture must stay runnable raw (no runly) — it doubles as the docs.
       - name: hello-web boots and serves seeded data
         working-directory: examples/hello-web
         run: |

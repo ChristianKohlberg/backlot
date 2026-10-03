@@ -37,7 +37,7 @@ afterAll(() => {
 
 describe('election primitive', () => {
   it('grants the lock to exactly one caller', () => {
-    const lock = join(mkdir('backlot-elect-'), 'daemon.lock');
+    const lock = join(mkdir('runly-elect-'), 'daemon.lock');
     expect(electSelf(lock)).toBe(true);
     // A second call from THIS process must not double-grant. The holder is us,
     // which claimIsLive treats as not-live so the lock is breakable — and we
@@ -48,7 +48,7 @@ describe('election primitive', () => {
   });
 
   it('concedes to a live holder', () => {
-    const lock = join(mkdir('backlot-elect-'), 'daemon.lock');
+    const lock = join(mkdir('runly-elect-'), 'daemon.lock');
     // A holder that is genuinely running: the test runner's own parent, or any
     // live pid that is not us. Use pid 1, which always exists.
     writeFileSync(lock, JSON.stringify({ pid: 1, startTime: startTime(1) }));
@@ -56,7 +56,7 @@ describe('election primitive', () => {
   });
 
   it('breaks a lock whose holder is dead', () => {
-    const lock = join(mkdir('backlot-elect-'), 'daemon.lock');
+    const lock = join(mkdir('runly-elect-'), 'daemon.lock');
     let dead = 4_194_300;
     const alive = (p: number) => {
       try {
@@ -72,7 +72,7 @@ describe('election primitive', () => {
   });
 
   it('breaks a lock left by a REUSED pid rather than trusting the number', () => {
-    const lock = join(mkdir('backlot-elect-'), 'daemon.lock');
+    const lock = join(mkdir('runly-elect-'), 'daemon.lock');
     // pid 1 is alive, but the recorded start time is wrong — so this claim
     // belongs to a process that no longer exists, not to init.
     writeFileSync(lock, JSON.stringify({ pid: 1, startTime: (startTime(1) ?? 0) + 999 }));
@@ -80,7 +80,7 @@ describe('election primitive', () => {
   });
 
   it('breaks a corrupt lock instead of wedging forever', () => {
-    const lock = join(mkdir('backlot-elect-'), 'daemon.lock');
+    const lock = join(mkdir('runly-elect-'), 'daemon.lock');
     writeFileSync(lock, 'not json at all');
     expect(electSelf(lock)).toBe(true);
   });
@@ -88,8 +88,8 @@ describe('election primitive', () => {
 
 describe('daemon singleton under a real race', () => {
   it('leaves exactly one daemon when many clients start at once', async () => {
-    const stateDir = mkdir('backlot-race-');
-    const wt = mkdir('backlot-race-wt-');
+    const stateDir = mkdir('runly-race-');
+    const wt = mkdir('runly-race-wt-');
     writeFileSync(join(wt, 'srv.mjs'), `import{createServer}from'node:http';console.log('up');createServer((q,s)=>s.end('ok')).listen(Number(process.env.PORT), '127.0.0.1');\n`);
     writeFileSync(
       join(wt, 'stack.yaml'),
@@ -148,7 +148,7 @@ describe('daemon singleton under a real race', () => {
 
 describe('election under a slow claim', () => {
   it('does not steal a lock that exists but is still being written', () => {
-    const dir = mkdir('backlot-elect-slow-');
+    const dir = mkdir('runly-elect-slow-');
     const lock = join(dir, 'daemon.lock');
     // The exact state macOS exposed in CI: the winner has CREATED the lock but
     // not finished writing it, because assembling the claim runs `ps`. A racing
