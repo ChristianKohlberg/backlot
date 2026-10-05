@@ -10,6 +10,7 @@ import { existsSync, mkdirSync, mkdtempSync, readdirSync, realpathSync, rmSync, 
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { pruneTemplates } from '../src/core/retention.js';
+import { procScanSupported } from '../src/core/procscan.js';
 import { autoTether, isAncestor } from '../src/cli/tether.js';
 import { makeCtx, SERVER, sleep, waitFor, type Ctx } from './support/context.js';
 import { disposeStateSync } from './support/leaks.js';
@@ -136,7 +137,8 @@ describe('runly pool doctor (decision 0037)', () => {
       `env-dir:${env.stack}-e99`,
       'foreign-namespace:backlot_someoneelse_e1_main',
       `namespace:backlot_${sid}_e99_main`,
-      `process:pid ${orphan.pid}`,
+      // Tagged processes are found by a /proc scan: Linux only.
+      ...(procScanSupported() ? [`process:pid ${orphan.pid}`] : []),
     ].sort());
     // A dry run changed nothing.
     expect(existsSync(join(server, `backlot_${sid}_e99_main`))).toBe(true);
@@ -149,14 +151,18 @@ describe('runly pool doctor (decision 0037)', () => {
     for (const f of fix.json.findings as Array<{ kind: string; fixed?: boolean }>) {
       expect(f.fixed ?? false, f.kind).toBe(f.kind !== 'foreign-namespace');
     }
-    expect(await waitFor(() => {
-      try {
-        process.kill(orphan.pid!, 0);
-        return false;
-      } catch {
-        return true;
-      }
-    }, 10_000)).toBe(true);
+    if (procScanSupported()) {
+      expect(await waitFor(() => {
+        try {
+          process.kill(orphan.pid!, 0);
+          return false;
+        } catch {
+          return true;
+        }
+      }, 10_000)).toBe(true);
+    } else {
+      process.kill(orphan.pid!, 'SIGKILL');
+    }
     expect(new Set(readdirSync(server))).toEqual(new Set([...live, 'backlot_someoneelse_e1_main', 'customer_db']));
     // The live environment was not touched.
     expect((await fetch(up.json.urls.web)).ok).toBe(true);
