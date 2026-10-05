@@ -693,15 +693,19 @@ async function phaseCapacity() {
     if (must(q.body?.state === 'hot', 'capacity', 'idle-probe holder failed to bind', q.stdout.slice(0, 200))) {
       const envId = q.body.envId;
       const url = q.body.urls.web;
+      // Watched through `status`, which is server-wide and touches no
+      // environment: `ps` here is a runly verb on stack B, and every verb is
+      // activity — polling it would keep the service alive (decision 0035).
       const idle = await until(40_000, 1000, async () => {
-        const ps = await cli(['ps'], { cwd: stackB, quiet: true });
-        const web = ps.body?.services?.find((x) => x.env === envId && x.service === 'web');
-        return web?.state === 'idle' ? web : false;
+        const e = (await statusEnvs()).find((x) => x.id === envId);
+        return e && e.state === 'warm' ? e : false;
       });
       must(idle, 'capacity', 'stack B web (idle: 8s) was never idle-stopped');
       if (idle) {
-        const e = (await statusEnvs()).find((x) => x.id === envId);
-        must(e?.lease, 'capacity', 'an idle stop must keep the lease', JSON.stringify(e ?? null).slice(0, 300));
+        must(idle.lease, 'capacity', 'an idle stop must keep the lease', JSON.stringify(idle).slice(0, 300));
+        const ps0 = await cli(['ps'], { cwd: stackB, quiet: true });
+        must(ps0.body?.services?.find((x) => x.env === envId && x.service === 'web')?.state === 'idle', 'capacity',
+          'ps must report an idle-stopped service as idle', JSON.stringify(ps0.body?.services ?? null).slice(0, 300));
         let answered = false;
         try {
           const r = await fetch(url, { signal: AbortSignal.timeout(60_000) });

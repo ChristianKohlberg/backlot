@@ -15,7 +15,9 @@ import { join } from 'node:path';
 import { killUnder } from './leaks.js';
 
 export default function setup() {
-  const dir = mkdtempSync(join(tmpdir(), 'runly-suite-'));
+  // Short: every state root below it must still fit a unix socket path (103
+  // bytes, 104 on macOS), and macOS's own tmpdir is already ~50 of them.
+  const dir = mkdtempSync(join(process.platform === 'darwin' ? '/tmp' : tmpdir(), 'rs-'));
   const previous = process.env.TMPDIR;
   process.env.TMPDIR = dir;
   return async () => {

@@ -13,22 +13,32 @@
  * BACKLOT_TETHER=off opts out (the environment then lives by its TTL).
  * --holder-pid / BACKLOT_HOLDER_PID always win.
  */
+import { execFileSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import { isAlive } from '../core/procscan.js';
 
 function parentOf(pid: number): number | undefined {
+  if (process.platform === 'linux') {
+    try {
+      const stat = readFileSync(`/proc/${pid}/stat`, 'utf8');
+      // Field 4, after the parenthesised command (which may contain spaces).
+      const rest = stat.slice(stat.lastIndexOf(')') + 2).split(' ');
+      const ppid = Number(rest[1]);
+      return Number.isInteger(ppid) && ppid > 0 ? ppid : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+  // macOS and other platforms without /proc: ask ps.
   try {
-    const stat = readFileSync(`/proc/${pid}/stat`, 'utf8');
-    // Field 4, after the parenthesised command (which may contain spaces).
-    const rest = stat.slice(stat.lastIndexOf(')') + 2).split(' ');
-    const ppid = Number(rest[1]);
+    const ppid = Number(execFileSync('ps', ['-o', 'ppid=', '-p', String(pid)], { encoding: 'utf8', timeout: 2000 }).trim());
     return Number.isInteger(ppid) && ppid > 0 ? ppid : undefined;
   } catch {
     return undefined;
   }
 }
 
-/** Is `ancestor` this process or one of its ancestors? Linux only (/proc). */
+/** Is `ancestor` this process or one of its ancestors? (/proc on Linux, ps elsewhere.) */
 export function isAncestor(ancestor: number, of = process.pid): boolean {
   let pid: number | undefined = of;
   for (let i = 0; pid !== undefined && i < 64; i++) {
