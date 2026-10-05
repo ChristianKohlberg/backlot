@@ -37,10 +37,23 @@ function daemonCtx(extra: Record<string, string> = {}) {
       });
     });
   const cleanup = () => {
+    let pid = 0;
     try {
-      process.kill(Number(readFileSync(join(stateDir, 'daemon.pid'), 'utf8')));
+      pid = Number(readFileSync(join(stateDir, 'daemon.pid'), 'utf8'));
+      process.kill(pid);
     } catch {
       /* gone */
+    }
+    // A stopping daemon still writes logs while it stops services; removing the
+    // state dir under it races (ENOTEMPTY). Wait for it, bounded.
+    const deadline = Date.now() + 5000;
+    while (pid > 0 && Date.now() < deadline) {
+      try {
+        process.kill(pid, 0);
+      } catch {
+        break;
+      }
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 50);
     }
     for (const p of scanTagged(stateDir)) {
       try {
@@ -49,7 +62,7 @@ function daemonCtx(extra: Record<string, string> = {}) {
         /* gone */
       }
     }
-    rmSync(stateDir, { recursive: true, force: true });
+    rmSync(stateDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
   };
   return { stateDir, cli, cleanup };
 }
