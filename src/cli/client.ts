@@ -166,6 +166,12 @@ export async function daemonInfo(): Promise<DaemonInfo | null> {
  */
 export const DAEMON_STOP_TIMEOUT_MS = 60_000;
 
+/** The stop window, overridable (BACKLOT_DAEMON_STOP_TIMEOUT_MS) so a test of the timeout need not sit through a minute. */
+export const daemonStopTimeoutMs = (): number => {
+  const v = Number(process.env.BACKLOT_DAEMON_STOP_TIMEOUT_MS);
+  return Number.isFinite(v) && v > 0 ? v : DAEMON_STOP_TIMEOUT_MS;
+};
+
 /**
  * Wait for the daemon to be really gone — not answering AND not running.
  *

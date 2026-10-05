@@ -3,15 +3,12 @@
  * Persisted in the per-machine SQLite journal; the daemon's memory is a cache.
  */
 
-import type { Login } from './manifest.js';
-import type { BindDiagnostics } from './diagnostics.js';
-
 export type EnvState = 'provisioning' | 'hot' | 'warm' | 'degraded' | 'recycling';
 
 export type Hygiene = 'reuse' | 'reset-data' | 'pristine';
 
-/** Every lease is a session lease; `run` survives only in journals from before 0.13 (decision 0032). */
-export type LeaseKind = 'session' | 'run';
+/** Every lease is a session lease (decision 0032); a `run` row from a pre-0.13 journal is read as one. */
+export type LeaseKind = 'session';
 
 /** The field an agent branches on mechanically (decision 0010). */
 export type ErrorClass = 'work-error' | 'env-error' | 'infra-error';
@@ -26,94 +23,4 @@ export interface ServicePid {
   startTime?: number;
   pgid?: number;
   pgids?: number[];
-}
-
-export interface Environment {
-  id: string;
-  stack: string;
-  substrate: string;
-  state: EnvState;
-  root: string;
-  /** Symbolic name -> allocated port. Stable for the environment's lifetime. */
-  ports: Record<string, number>;
-  datastoreNs: Record<string, string>;
-  /** Per-upkeep-rule trigger hash as last applied IN THIS ENV (decision 0008). */
-  fingerprints: Record<string, string>;
-  bindCount: number;
-  createdAt: number;
-  lastUsedAt: number;
-}
-
-/** An immutable snapshot of source + data state (decision 0005). */
-export interface Binding {
-  envId: string;
-  revision: number;
-  ref: string;
-  dirtyPatchHash: string | null;
-  preset: string;
-  hygiene: Hygiene;
-  syncedAt: number;
-}
-
-export interface Lease {
-  id: string;
-  envId: string;
-  kind: LeaseKind;
-  /** Refreshed by any CLI touch; expiry releases the env WARM (decision 0003). */
-  expiresAt: number;
-  holder: string;
-}
-
-export interface Failure {
-  class: ErrorClass;
-  message: string;
-  /** e.g. the upkeep rule or service that failed. */
-  source?: string;
-  logExcerpt?: string;
-}
-
-/** What `runly ctx --json` returns — the consumer's entire interface. */
-export interface Context {
-  /** Present on bind responses only; ctx never replays another request's timings. */
-  bindDiagnostics?: BindDiagnostics;
-  stack: string;
-  envId: string;
-  lease: Lease;
-  urls: Record<string, string>;
-  /** Allocated ports by manifest key. */
-  ports?: Record<string, number>;
-  /**
-   * Public preview URLs for services explicitly published via `runly preview`.
-   * Each URL is world-readable and unauthenticated — anyone with the link reaches
-   * the service. Empty when no preview is active on this lease.
-   */
-  previewUrls?: Record<string, string>;
-  /**
-   * What a bind did to a live preview, returned on that bind's OWN response
-   * (`up`, `reset-data`) — never on a plain `ctx` read, which cannot
-   * know which bind a notice belongs to. Set when the bind tore the tunnel down
-   * (the manifest now forbids preview, the previewed service left the running
-   * set, or its local port moved) or when `--reset-data`/`--pristine` left the
-   * same public URL serving new content.
-   */
-  previewNotice?: string;
-  /**
-   * The PRIMARY login — the first one the manifest declares. Kept singular so a
-   * consumer written against the one-login form keeps reading `logins.user`
-   * unchanged when a stack grows a list; `allLogins` is where the rest live.
-   */
-  logins?: Login;
-  /**
-   * Every login the stack declares, in manifest order, `logins` first. Present
-   * whenever any login is declared — a single-login stack reports one entry, so a
-   * consumer that wants to enumerate never branches on the manifest form.
-   */
-  allLogins?: Login[];
-  /** The manifest's internal auth.token hook, still templated — informational. */
-  tokenCommand?: string;
-  /** How a CONSUMER actually mints a token: `runly token --role <role> --raw`. */
-  tokenVia?: string;
-  datastores: Record<string, { url: string }>;
-  hygiene: Hygiene;
-  events: Array<{ at: number; service: string; event: string }>;
 }

@@ -27,23 +27,25 @@ function failingServer(code: string) {
   return srv;
 }
 
-describe('freePort under allocation failure', () => {
-  it('rejects rather than crashing the process on EMFILE', async () => {
+describe('port probing under allocation failure', () => {
+  it('reports the port busy rather than crashing the process on EMFILE', async () => {
     vi.doMock('node:net', () => ({ createServer: () => failingServer('EMFILE') }));
-    const { freePort } = await import('../src/core/ports.js');
+    const { probeFree, allocateInBlock } = await import('../src/core/ports.js');
 
-    // The failure must arrive as a rejected promise the caller can classify.
-    // Before the fix there was no 'error' listener, so Node rethrew this as an
-    // uncaught exception and the daemon died with the pool mid-flight.
-    await expect(freePort()).rejects.toThrow(/EMFILE/);
+    // The failure must arrive as an answer the caller can act on. With no
+    // 'error' listener Node would rethrow it as an uncaught exception and the
+    // daemon would die with the pool mid-flight.
+    await expect(probeFree(30123)).resolves.toBe(false);
+    await expect(allocateInBlock({ lo: 30123, hi: 30125 }, new Set())).resolves.toBeUndefined();
   });
 
   it('still allocates a real port when the OS cooperates', async () => {
-    const { freePort } = await import('../src/core/ports.js');
-    const a = await freePort();
-    const b = await freePort();
+    const { allocateInBlock } = await import('../src/core/ports.js');
+    const a = await allocateInBlock({ lo: 30500, hi: 30999 }, new Set());
     expect(a).toBeGreaterThan(0);
+    const b = await allocateInBlock({ lo: 30500, hi: 30999 }, new Set([a!]));
     expect(b).toBeGreaterThan(0);
+    expect(b).not.toBe(a);
   });
 });
 

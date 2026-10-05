@@ -16,34 +16,51 @@
  * under the stack root, plus sync.include and checked-out submodules, minus
  * declared `caches:`).
  */
-import { execFileSync } from 'node:child_process';
-import { existsSync, lstatSync, readdirSync, readFileSync } from 'node:fs';
+import { execFile } from 'node:child_process';
+import { createReadStream, existsSync, lstatSync, readdirSync } from 'node:fs';
 import { createHash } from 'node:crypto';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
+import { promisify } from 'node:util';
 import { isFile, matchesAny, safeJoin } from './util.js';
 import type { Manifest } from './manifest.js';
 
-function gitFiles(root: string): string[] | null {
+const execFileP = promisify(execFile);
+
+/**
+ * git's file list under `root`, restricted to `pathspecs` when given (literal
+ * directory or file paths relative to `root`). Asynchronous: on a large
+ * worktree the listing takes long enough that a synchronous call stalled every
+ * proxied connection of every environment while it ran.
+ */
+async function gitFiles(root: string, pathspecs: string[] = ['.']): Promise<string[] | null> {
   try {
-    const out = execFileSync(
+    const { stdout } = await execFileP(
       'git',
-      ['-C', root, 'ls-files', '-z', '--cached', '--others', '--exclude-standard', '--', '.'],
-      { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 },
+      ['-C', root, 'ls-files', '-z', '--cached', '--others', '--exclude-standard', '--', ...pathspecs],
+      { encoding: 'utf8', maxBuffer: 256 * 1024 * 1024, env: { ...process.env, GIT_LITERAL_PATHSPECS: '1' } },
     );
-    return out.split('\0').filter(Boolean);
+    return stdout.split('\0').filter(Boolean);
   } catch {
     return null;
   }
 }
 
+/** Does the repository `root` belongs to declare submodules at all? (No .gitmodules, no gitlinks to look for.) */
+function declaresSubmodules(root: string): boolean {
+  for (let dir = root; ; dir = dirname(dir)) {
+    if (existsSync(join(dir, '.gitmodules'))) return true;
+    if (existsSync(join(dir, '.git')) || dirname(dir) === dir) return false;
+  }
+}
+
 /** Gitlink (submodule) paths under `root`, as `git ls-files -s` reports them. */
-function gitlinks(root: string): string[] {
+async function gitlinks(root: string): Promise<string[]> {
   try {
-    const staged = execFileSync('git', ['-C', root, 'ls-files', '-s', '-z', '--', '.'], {
+    const { stdout } = await execFileP('git', ['-C', root, 'ls-files', '-s', '-z', '--', '.'], {
       encoding: 'utf8',
-      maxBuffer: 64 * 1024 * 1024,
+      maxBuffer: 256 * 1024 * 1024,
     });
-    return staged
+    return stdout
       .split('\0')
       .filter((l) => l.startsWith('160000 '))
       .map((l) => l.split('\t')[1] ?? '')
@@ -54,37 +71,61 @@ function gitlinks(root: string): string[] {
 }
 
 /**
+ * The literal directory (or file) each glob can only match under, as git
+ * pathspecs — or null when one of them can match anywhere (a bare name, a
+ * leading `**`), so the whole worktree has to be listed.
+ */
+export function globPathspecs(globs: string[]): string[] | null {
+  const specs = new Set<string>();
+  for (const g of globs) {
+    const p = g.replace(/^glob\((.*)\)$/, '$1').replace(/^\.\//, '');
+    const parts = p.split('/');
+    if (parts.length === 1 && !/[*?[]/.test(p)) return null; // a bare name matches a segment anywhere
+    const stop = parts.findIndex((seg) => /[*?[]/.test(seg));
+    const prefix = (stop === -1 ? parts : parts.slice(0, stop)).filter(Boolean).join('/');
+    if (!prefix || prefix.split('/').includes('..')) return null;
+    specs.add(prefix);
+  }
+  return [...specs];
+}
+
+/**
  * The worktree's files that match `only` (globs relative to the stack root),
  * or all of them when `only` is omitted.
  *
- * The listing is git's (one `ls-files`); the globs are applied BEFORE anything
- * is stat'ed, so a bind whose upkeep rules name a lockfile and a migrations
- * folder touches those files and nothing else of a 35k-file worktree.
+ * The listing is git's (one `ls-files`, limited to the globs' literal
+ * prefixes); the globs are applied BEFORE anything is stat'ed, so a bind
+ * whose upkeep rules name a lockfile and a migrations folder touches those
+ * files and nothing else of a 35k-file worktree.
  *
  * A submodule appears in ls-files only as its gitlink path, which stats as a
  * directory, so a CHECKED-OUT submodule is enumerated recursively — a trigger
  * inside it must fire like any other. An uninitialised submodule is an empty
- * directory and contributes nothing.
+ * directory and contributes nothing. A repository without a .gitmodules has
+ * no gitlinks, and the second listing is skipped.
  */
-export function enumerateSource(stackRoot: string, manifest: Manifest, only?: string[]): string[] {
-  const listed = gitFiles(stackRoot) ?? walkAll(stackRoot);
+export async function enumerateSource(stackRoot: string, manifest: Manifest, only?: string[]): Promise<string[]> {
+  const pathspecs = only === undefined ? null : globPathspecs(only);
+  const narrowed = pathspecs !== null && pathspecs.length > 0;
+  const listed = (await gitFiles(stackRoot, narrowed ? pathspecs : undefined)) ?? walkAll(stackRoot);
   const seen = new Set(listed);
-  const nested = (root: string, prefix: string, depth: number) => {
+  const nested = async (root: string, prefix: string, depth: number): Promise<void> => {
     if (depth > 8) return; // a submodule cycle
-    for (const gl of gitlinks(root)) {
+    if (!declaresSubmodules(root)) return;
+    for (const gl of await gitlinks(root)) {
       const sub = join(root, gl);
       if (!existsSync(join(sub, '.git'))) continue;
-      for (const f of gitFiles(sub) ?? []) {
+      for (const f of (await gitFiles(sub)) ?? []) {
         const rel = `${prefix}${gl}/${f}`;
         if (!seen.has(rel)) {
           seen.add(rel);
           listed.push(rel);
         }
       }
-      nested(sub, `${prefix}${gl}/`, depth + 1);
+      await nested(sub, `${prefix}${gl}/`, depth + 1);
     }
   };
-  nested(stackRoot, '', 0);
+  await nested(stackRoot, '', 0);
   // sync.include: git-ignored files that still count as source (an .env.local
   // an upkeep rule may name as its trigger).
   for (const inc of manifest.sync?.include ?? []) {
@@ -148,19 +189,8 @@ function walkAll(root: string, prefix = ''): string[] {
  * never walks the rest of the worktree. A glob that escapes the worktree is
  * ignored.
  */
-export function snapshotOutputs(stackRoot: string, globs: string[], compare: 'stat' | 'content' = 'stat'): string {
-  const seen = new Map<string, string>();
-  // `content` (decision 0038): a build tool that rewrites identical files
-  // (the Angular CLI does) moves every mtime and would restart the service
-  // for nothing; hashing what is IN the files ignores that.
-  const fingerprint = (full: string, st: { size: number; mtimeMs: number }): string => {
-    if (compare === 'stat') return `${st.size}:${st.mtimeMs}`;
-    try {
-      return `${st.size}:${createHash('sha256').update(readFileSync(full)).digest('hex')}`;
-    } catch {
-      return `${st.size}:unreadable`;
-    }
-  };
+export async function snapshotOutputs(stackRoot: string, globs: string[], compare: 'stat' | 'content' = 'stat'): Promise<string> {
+  const seen = new Map<string, { full: string; size: number; mtimeMs: number }>();
   const walk = (dir: string, rel: string, all = false) => {
     let names: string[];
     try {
@@ -179,7 +209,7 @@ export function snapshotOutputs(stackRoot: string, globs: string[], compare: 'st
         continue; // vanished mid-walk
       }
       if (st.isDirectory()) walk(full, childRel, all);
-      else if (all || matchesAny(childRel, globs)) seen.set(childRel, fingerprint(full, st));
+      else if (all || matchesAny(childRel, globs)) seen.set(childRel, { full, size: st.size, mtimeMs: st.mtimeMs });
     }
   };
   for (const glob of globs) {
@@ -197,7 +227,7 @@ export function snapshotOutputs(stackRoot: string, globs: string[], compare: 'st
       try {
         const literal = safeJoin(stackRoot, parts.join('/'), 'outputs');
         const st = lstatSync(literal);
-        if (st.isFile()) seen.set(parts.join('/'), fingerprint(literal, st));
+        if (st.isFile()) seen.set(parts.join('/'), { full: literal, size: st.size, mtimeMs: st.mtimeMs });
         else if (st.isDirectory()) walk(join(stackRoot, parts.join('/')), parts.join('/'), true); // a directory: everything under it
       } catch {
         /* absent */
@@ -206,5 +236,37 @@ export function snapshotOutputs(stackRoot: string, globs: string[], compare: 'st
     }
     walk(start, base);
   }
-  return [...seen].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)).map(([f, v]) => `${f}:${v}`).join('\n');
+  const entries = [...seen].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+  // `content` (decision 0038): a build tool that rewrites identical files
+  // (the Angular CLI does) moves every mtime and would restart the service
+  // for nothing; hashing what is IN the files ignores that. Streamed, a few
+  // at a time, so a large bundle never blocks the daemon's event loop.
+  const prints = compare === 'stat'
+    ? entries.map(([, st]) => `${st.size}:${st.mtimeMs}`)
+    : await mapLimit(entries, 8, async ([, st]) => `${st.size}:${(await hashFile(st.full)) ?? 'unreadable'}`);
+  return entries.map(([f], i) => `${f}:${prints[i]}`).join('\n');
+}
+
+/** sha256 of a file, streamed; null when it cannot be read. */
+export function hashFile(path: string): Promise<string | null> {
+  return new Promise((resolve) => {
+    const hash = createHash('sha256');
+    const stream = createReadStream(path);
+    stream.on('data', (chunk) => hash.update(chunk));
+    stream.on('end', () => resolve(hash.digest('hex')));
+    stream.on('error', () => resolve(null));
+  });
+}
+
+async function mapLimit<T, R>(items: T[], limit: number, fn: (item: T) => Promise<R>): Promise<R[]> {
+  const out = new Array<R>(items.length);
+  let next = 0;
+  const worker = async () => {
+    while (next < items.length) {
+      const i = next++;
+      out[i] = await fn(items[i] as T);
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
+  return out;
 }

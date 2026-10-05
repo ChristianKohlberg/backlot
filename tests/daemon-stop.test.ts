@@ -8,6 +8,9 @@ import { awaitDaemonGone, DAEMON_STOP_TIMEOUT_MS } from '../src/cli/client.js';
 import { VERSION } from '../src/core/version.js';
 import { disposeStateSync } from './support/leaks.js';
 
+/** The stop window the timeout test runs with (BACKLOT_DAEMON_STOP_TIMEOUT_MS), instead of a full minute. */
+const STOP_WINDOW_MS = 3_000;
+
 const CLI = join(import.meta.dirname, '../dist/cli/index.js');
 function alive(pid: number) { try { process.kill(pid, 0); return true; } catch { return false; } }
 function fixture() {
@@ -83,9 +86,9 @@ it('reports infra-error when an acknowledged shutdown never completes', async ()
   await new Promise<void>((resolve) => server.listen(join(f.state, 'daemon.sock'), resolve));
   try {
     const started = performance.now();
-    const stop = await f.cli(['daemon', 'stop']);
+    const stop = await f.cli(['daemon', 'stop'], { BACKLOT_DAEMON_STOP_TIMEOUT_MS: String(STOP_WINDOW_MS) });
     expect(stop.code, JSON.stringify(stop)).toBe(3);
-    expect(performance.now() - started).toBeGreaterThanOrEqual(DAEMON_STOP_TIMEOUT_MS);
+    expect(performance.now() - started).toBeGreaterThanOrEqual(STOP_WINDOW_MS);
     const error = JSON.parse(stop.stdout).error;
     expect(error).toMatchObject({ class: 'infra-error', source: 'daemon' });
     expect(error.message).toContain('still shutting down');
@@ -94,7 +97,7 @@ it('reports infra-error when an acknowledged shutdown never completes', async ()
     await new Promise<void>((resolve) => server.close(() => resolve()));
     await f.cleanup();
   }
-}, DAEMON_STOP_TIMEOUT_MS + 30_000);
+}, STOP_WINDOW_MS + 30_000);
 
 
 it('keeps shutdown polling bounded even when ping stops responding', async () => {

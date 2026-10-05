@@ -21,7 +21,7 @@ const engine = new Engine();
 // one lock per environment. Requests for different environments overlap; two
 // operations on one environment never do.
 
-async function dispatch(verb: string, args: Record<string, unknown>, emit: (phase: string) => void): Promise<unknown> {
+async function dispatch(verb: string, args: Record<string, unknown>, emit: (phase: string) => void, signal?: AbortSignal): Promise<unknown> {
   const cwd = String(args.cwd ?? process.cwd());
   const holder = args.holder ? String(args.holder) : undefined;
   const holderPid = args.holderPid !== undefined ? Number(args.holderPid) : undefined;
@@ -43,6 +43,7 @@ async function dispatch(verb: string, args: Record<string, unknown>, emit: (phas
         dataOnly: Boolean(args.dataOnly),
         rebuild: Boolean(args.rebuild),
         onProgress: emit,
+        signal,
       });
     case 'down':
       return engine.down({
@@ -153,6 +154,7 @@ let ownsLock = false;
  * 0009), so there is no second teardown implementation to keep in step.
  */
 function stopDaemon(): void {
+  stopSweeper();
   setTimeout(async () => {
     await engine.shutdown();
     // Clean up what we own, exactly as the signal path does — a stale lock
@@ -193,9 +195,23 @@ function pingExisting(): Promise<boolean> {
  */
 let recovered: Promise<void> = Promise.resolve();
 
+/** The sweeper's timer; cleared the moment a shutdown begins. */
+let sweepTimer: NodeJS.Timeout | undefined;
+function stopSweeper(): void {
+  if (sweepTimer) clearInterval(sweepTimer);
+  sweepTimer = undefined;
+}
+
 const server = createServer((req, res) => {
   let body = '';
   req.on('data', (d) => (body += d));
+  // A client that hangs up (Ctrl-C, a killed agent) aborts what it asked for
+  // where that is still possible: a queued `up` leaves the queue instead of
+  // binding later for nobody.
+  const aborter = new AbortController();
+  res.on('close', () => {
+    if (!res.writableFinished) aborter.abort();
+  });
   req.on('end', () => {
     void (async () => {
       // Response is newline-delimited JSON: zero or more {type:'progress'}
@@ -214,7 +230,7 @@ const server = createServer((req, res) => {
         const { verb, args } = JSON.parse(body || '{}');
         verbForLog = String(verb ?? '?');
         if (verb !== 'ping') await recovered;
-        const data = await dispatch(verb, args ?? {}, emit);
+        const data = await dispatch(verb, args ?? {}, emit, aborter.signal);
         res.end(JSON.stringify({ type: 'result', ok: true, data }) + '\n');
       } catch (err) {
         // An unclassified throw is a DAEMON bug, not a bad environment.
@@ -272,8 +288,13 @@ async function start(): Promise<void> {
   // callback, by which point the socket exists and can accept connections, so
   // a permissive umask left a window where it was world-reachable. The socket
   // has no RPC auth and exposes arbitrary-shell verbs, so the window matters.
-  process.umask(0o077);
+  const callerUmask = process.umask(0o077);
   server.listen(sock, () => {
+    // …and only the socket. Everything the daemon spawns — services, builds,
+    // upkeep, exec — inherited 077 and wrote owner-only files into the
+    // caller's worktree (a build output nobody else could read). The state
+    // root is 0700 itself, so restoring the caller's umask keeps it private.
+    process.umask(callerUmask);
     ownsSocket = true;
     // The socket has no RPC auth and exposes arbitrary-shell verbs (exec/token),
     // so it must be owner-only. On macOS the socket-file mode is what actually
@@ -301,11 +322,13 @@ async function start(): Promise<void> {
     // rejection, which takes the daemon down on any transient journal or FS
     // write failure.
     void recovered.then(() => {
-      setInterval(() => {
+      if (engine.stopping) return;
+      sweepTimer = setInterval(() => {
         void engine.sweep().catch((err) => {
           logEvent({ level: 'error', kind: 'sweep', detail: `sweep failed: ${String((err as Error).message ?? err)}` });
         });
-      }, sweepMs).unref();
+      }, sweepMs);
+      sweepTimer.unref();
     }).catch((err) => logEvent({ level: 'error', kind: 'recover', detail: `sweeper never armed: ${String((err as Error).message ?? err)}` }));
     // Detach from the spawning CLI's lifetime.
     if (process.send) process.send('ready');
@@ -368,6 +391,7 @@ for (const sig of ['SIGINT', 'SIGTERM'] as const) {
     // engine.shutdown() stops services and rewrites env rows, which would let a
     // conceding process tear down the winner's environments.
     if (!ownsLock && !ownsSocket) process.exit(0);
+    stopSweeper();
     void engine.shutdown().then(() => {
       // Only remove the socket if WE own it — a losing/duplicate daemon must
       // never delete the healthy daemon's socket.

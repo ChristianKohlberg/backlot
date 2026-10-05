@@ -8,10 +8,11 @@
  *
  * Several services interleave by time with a `service | ` prefix; one named
  * service prints bare lines (the pre-0.16 output). `--until` follows until a
- * line matches (exit 0) or `--timeout` runs out (exit 124, like timeout(1)).
+ * line of the CURRENT process matches (exit 0) or `--timeout` runs out (exit
+ * 124, like timeout(1)).
  */
 import { closeSync, openSync, readSync, statSync } from 'node:fs';
-import { interleave, readLog, sinceLastStart, type LogLine } from '../core/logs.js';
+import { interleave, markPrior, readLastLines, readLog, sinceLastStart, type LogLine } from '../core/logs.js';
 import { parseDuration } from '../core/units.js';
 
 export interface LogsSpec {
@@ -53,32 +54,61 @@ function render(l: LogLine, o: LogsOptions): string {
   return o.prefix ? `${l.service} | ${l.text}` : l.text;
 }
 
-/** The backlog: what is on disk now, filtered. */
-export function backlog(spec: LogsSpec, o: LogsOptions): LogLine[] {
+/** Where a follower stands in one log: the live file's inode and the offset read up to. */
+interface Cursor {
+  ino: number;
+  pos: number;
+}
+
+function cursorOf(file: string): Cursor {
+  try {
+    const st = statSync(file);
+    return { ino: st.ino, pos: st.size };
+  } catch {
+    return { ino: 0, pos: 0 };
+  }
+}
+
+/**
+ * The backlog: what is on disk now, filtered. With `ends`, each live file is
+ * read only up to that offset — where a follower then takes over, so a line
+ * written while the backlog is parsed is printed once.
+ *
+ * Lines before a service's last start marker belong to an earlier process and
+ * are marked `prior`: shown, but never what `--until` matches.
+ */
+export function backlog(spec: LogsSpec, o: LogsOptions, ends?: Map<string, number>): LogLine[] {
   const since = o.since === undefined ? undefined : parseSince(o.since)!;
+  // --lines bounds the backlog; with --since and no --lines, the whole window.
+  const limit = o.lines ?? (o.since !== undefined ? Infinity : 40);
+  // The plain `--lines N` read: only the end of each file, read backwards.
+  const tailOnly = since === undefined && o.grep === undefined && Number.isFinite(limit);
   const groups = spec.files.map(({ service, file }) => {
-    let lines = readLog(file, service);
+    const end = ends?.get(file);
+    let lines = tailOnly ? readLastLines(file, service, limit, end) : readLog(file, service, undefined, end);
     if (since?.kind === 'up') lines = sinceLastStart(lines);
     else if (since?.kind === 'age') {
       const from = Date.now() - since.ms;
       lines = lines.filter((l) => !Number.isNaN(l.at) && l.at >= from);
     }
-    return lines;
+    return markPrior(lines);
   });
   let all = select(interleave(groups), o);
-  // --lines bounds the backlog; with --since and no --lines, the whole window.
-  const limit = o.lines ?? (o.since !== undefined ? Infinity : 40);
   if (Number.isFinite(limit)) all = all.slice(-limit);
   return all;
 }
 
 /**
  * Print the backlog and, with `follow`, every new line until interrupted,
- * `until` matches or `timeoutMs` passes. Returns the exit code.
+ * `until` matches or `timeoutMs` passes (exit 124, like timeout(1) —
+ * decision 0038 — whether or not `--until` was given). Returns the exit code.
  */
 export async function showLogs(spec: LogsSpec, o: LogsOptions, write: (s: string) => void = (s) => process.stdout.write(s)): Promise<number> {
   const start = Date.now();
-  const lines = backlog(spec, o);
+  // Where the follower starts is taken BEFORE the backlog is read: a line
+  // written in between is then the follower's, not lost between the two.
+  const cursors = new Map<string, Cursor>(spec.files.map(({ file }) => [file, cursorOf(file)]));
+  const lines = backlog(spec, o, new Map([...cursors].map(([f, c]) => [f, c.pos])));
   if (!o.follow && o.json) {
     // `lines` keeps its pre-0.16 meaning (the text, newline-joined); `entries` is the structured form.
     const service = spec.files.length === 1 ? spec.files[0]!.service : undefined;
@@ -87,33 +117,52 @@ export async function showLogs(spec: LogsSpec, o: LogsOptions, write: (s: string
   }
   for (const l of lines) {
     write(`${render(l, o)}\n`);
-    if (o.until?.test(l.text)) return 0;
+    if (!l.prior && o.until?.test(l.text)) return 0;
   }
   if (!o.follow) return 0;
 
-  // Follow: remember where each file ends now, then poll for what is appended.
-  // A file that shrank (rotated, or the environment was rebuilt) is read from
-  // its start again.
-  const pos = new Map<string, number>();
+  // Follow: poll each file for what is appended past its cursor. A rotation
+  // renames the live file to `.1` (same inode) and starts a new one: the rest
+  // of the old file is drained from `.1` first, then the new one is read from
+  // its start. A file that shrank in place (truncated) is read from its start.
   const partial = new Map<string, string>();
-  for (const { file } of spec.files) pos.set(file, sizeOf(file));
+  const take = (file: string, service: string, text: string, into: LogLine[][]) => {
+    const chunk = (partial.get(file) ?? '') + text;
+    const nl = chunk.lastIndexOf('\n');
+    partial.set(file, nl < 0 ? chunk : chunk.slice(nl + 1));
+    if (nl >= 0) into.push(parseChunk(chunk.slice(0, nl), service));
+  };
   for (;;) {
-    if (o.timeoutMs !== undefined && Date.now() - start >= o.timeoutMs) return o.until ? 124 : 0;
+    if (o.timeoutMs !== undefined && Date.now() - start >= o.timeoutMs) return 124;
     const fresh: LogLine[][] = [];
     for (const { service, file } of spec.files) {
-      const size = sizeOf(file);
-      let from = pos.get(file) ?? 0;
-      if (size < from) {
-        from = 0;
+      const cur = cursors.get(file) ?? { ino: 0, pos: 0 };
+      let st: { ino: number; size: number };
+      try {
+        st = statSync(file);
+      } catch {
+        continue; // not there (yet), or mid-rotation
+      }
+      if (cur.ino !== 0 && st.ino !== cur.ino) {
+        // Rotated: whatever the old file got after our cursor is in `.1` now.
+        try {
+          const old = statSync(`${file}.1`);
+          if (old.ino === cur.ino && old.size > cur.pos) take(file, service, readRange(`${file}.1`, cur.pos, old.size), fresh);
+        } catch {
+          /* rotated away twice, or removed */
+        }
+        cursors.set(file, { ino: st.ino, pos: 0 });
+      } else if (cur.ino === 0) {
+        cursors.set(file, { ino: st.ino, pos: cur.pos });
+      }
+      const now = cursors.get(file)!;
+      if (st.size < now.pos) {
+        now.pos = 0;
         partial.delete(file);
       }
-      if (size === from) continue;
-      const chunk = (partial.get(file) ?? '') + readRange(file, from, size);
-      pos.set(file, size);
-      const nl = chunk.lastIndexOf('\n');
-      partial.set(file, nl < 0 ? chunk : chunk.slice(nl + 1));
-      if (nl < 0) continue;
-      fresh.push(parseChunk(chunk.slice(0, nl), service));
+      if (st.size === now.pos) continue;
+      take(file, service, readRange(file, now.pos, st.size), fresh);
+      now.pos = st.size;
     }
     for (const l of select(interleave(fresh), o)) {
       write(`${render(l, o)}\n`);
@@ -132,14 +181,6 @@ function parseChunk(text: string, service: string): LogLine[] {
       ? { service, at: Date.parse(m[1]!), text: m[2]!, marker: m[2]!.startsWith('-- runly:') }
       : { service, at: Date.now(), text: raw, marker: false };
   });
-}
-
-function sizeOf(file: string): number {
-  try {
-    return statSync(file).size;
-  } catch {
-    return 0;
-  }
 }
 
 function readRange(file: string, from: number, to: number): string {

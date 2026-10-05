@@ -128,6 +128,8 @@ export interface EnvRow {
 export interface DropRecipe {
   cmd?: string;
   cwd?: string;
+  /** The server-side namespace the drop removes (0.16.1+), referenced from before it is created. */
+  ns?: string;
   /** A file (sqlite) to delete instead, with its -wal/-shm/-journal sidecars. */
   path?: string;
 }
@@ -576,7 +578,7 @@ export class Journal {
       id: r.id as string,
       envId: r.env_id as string,
       presets: r.presets == null ? undefined : JSON.parse(r.presets as string),
-      kind: r.kind as LeaseKind,
+      kind: 'session' as LeaseKind,
       holder: r.holder as string,
       hygiene: r.hygiene as Hygiene,
       expiresAt: r.expires_at as number,

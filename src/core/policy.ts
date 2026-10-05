@@ -13,8 +13,6 @@ export interface Policy {
   poolMaxTotal: number;
   sessionTtlMs: number;
   idleTtlMs: number;
-  /** How long a LEASED but untouched environment keeps its services running. */
-  leasedIdleTtlMs: number;
   waitMs: number;
   /** Retention knobs (task: disk sweep). */
   logCapBytes: number;
@@ -42,7 +40,13 @@ export interface Budget {
   cpu: number;
   /** Linux: MemAvailable must stay above this after a start (headroom for non-runly work). */
   reserveBytes: number;
-  /** A start waits while the 1-minute load average exceeds this many times the core count. */
+  /**
+   * Linux with PSI: a start waits while runnable work stalled on the CPU at
+   * least this percent of the time over both the last 10 s and the last 60 s
+   * (`/proc/pressure/cpu` "some"). 100 or more switches the gate off.
+   */
+  cpuPressure: number;
+  /** Without PSI (macOS, old kernels): a start waits while the 1-minute load average exceeds this many times the core count. */
   loadPerCore: number;
   /** How long an `up` waits in the queue before it fails. */
   waitMs: number;
@@ -61,7 +65,6 @@ interface ConfigFile {
   poolMaxTotal?: number;
   sessionTtlMs?: number;
   idleTtlMs?: number;
-  leasedIdleTtlMs?: number;
   waitMs?: number;
   logCapBytes?: number;
   templatesKeep?: number;
@@ -129,7 +132,12 @@ export function budgetPolicy(f: ConfigFile = configFile()): Budget {
     memoryBytes: size('BACKLOT_BUDGET_MEMORY', b.memory ?? b.memoryBytes, Math.floor(total * 0.7)),
     cpu: num('BACKLOT_BUDGET_CPU', b.cpu, cores * 1.5),
     reserveBytes: size('BACKLOT_BUDGET_RESERVE', b.reserve ?? b.reserveBytes, Math.max(2 * 1024 ** 3, Math.floor(total * 0.1))),
-    loadPerCore: num('BACKLOT_BUDGET_LOAD_PER_CORE', b.loadPerCore, 2),
+    // Calibrated on a 16-core box shared by ~10 agents: a load of 25-43 (the
+    // old 2 x cores gate) held no-op ups for minutes while PSI "some" sat at
+    // 20-40%, i.e. the CPUs still had room. 70% over 10 s AND 60 s is a box
+    // that is genuinely saturated now and has been for a minute.
+    cpuPressure: num('BACKLOT_BUDGET_CPU_PRESSURE', b.cpuPressure, 70),
+    loadPerCore: num('BACKLOT_BUDGET_LOAD_PER_CORE', b.loadPerCore, 4),
     waitMs: num('BACKLOT_BUDGET_WAIT_MS', b.waitMs, 10 * 60_000),
     maxQueue: num('BACKLOT_BUDGET_MAX_QUEUE', b.maxQueue, 64),
     defaultRun: { memoryBytes: 512 * 1024 ** 2, cpu: 0.5 },
@@ -152,15 +160,6 @@ export function policy(): Policy {
     // `poolMaxDataOnly` are ignored.
     sessionTtlMs: num('BACKLOT_LEASE_TTL_MS', f.sessionTtlMs, 30 * 60_000),
     idleTtlMs,
-    // A LEASE used to exempt an environment from idle reclamation entirely, so
-    // heat (services, and their memory) was held for as long as the lease
-    // lasted — which for a crashed agent meant the full TTL. Leased
-    // environments now quiesce too, just later: the lease survives, only the
-    // heat is reclaimed, and the next verb rebinds. The default derives from
-    // the RESOLVED idleTtlMs (architecture §11: "2 x idleTtlMs") — a constant
-    // here made leased envs quiesce BEFORE abandoned ones once idleTtlMs was
-    // raised past 30 minutes.
-    leasedIdleTtlMs: num('BACKLOT_LEASED_IDLE_TTL_MS', f.leasedIdleTtlMs, 2 * idleTtlMs),
     waitMs: num('BACKLOT_WAIT_MS', f.waitMs, 60_000),
     // One rotation per file (decision 0038): a service keeps up to twice this.
     logCapBytes: num('BACKLOT_LOG_CAP_BYTES', f.logCapBytes, 20 * 1024 * 1024),

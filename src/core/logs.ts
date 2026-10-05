@@ -13,12 +13,14 @@
  * Build and upkeep output of the last `up` are kept apart, in
  * `<service>.build.log` and `upkeep.build.log`, replaced by each new build.
  */
-import { appendFileSync, closeSync, existsSync, openSync, readFileSync, readSync, renameSync, statSync, writeFileSync } from 'node:fs';
+import { appendFileSync, closeSync, existsSync, openSync, readSync, renameSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { policy } from './policy.js';
 
 export const START_MARKER = '-- runly:';
 const STAMP = /^(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d+)?Z) (.*)$/;
+/** A stamped start marker line, as it is on disk. */
+const MARKER_LINE = /^\S+Z -- runly:/;
 
 export const logFileOf = (dir: string, service: string): string => join(dir, `${service}.log`);
 export const buildLogOf = (dir: string, service: string): string => join(dir, `${service}.build.log`);
@@ -110,12 +112,18 @@ export interface LogLine {
   text: string;
   /** A start marker. */
   marker: boolean;
+  /** Written by an earlier process than the last start marker's (`--until` never matches it). */
+  prior?: boolean;
 }
 
-/** Read the tail of a file (bounded), so a 20 MB log is never one string twice. */
-function readTail(file: string, maxBytes: number): string {
+/**
+ * Read the tail of a file (bounded), so a 20 MB log is never one string
+ * twice. `end` stops at that offset (what a follower will read from), so a
+ * line appended meanwhile is read once, by the follower.
+ */
+function readTail(file: string, maxBytes: number, end?: number): string {
   try {
-    const size = statSync(file).size;
+    const size = Math.min(statSync(file).size, end ?? Infinity);
     const len = Math.min(size, maxBytes);
     const fd = openSync(file, 'r');
     try {
@@ -132,25 +140,98 @@ function readTail(file: string, maxBytes: number): string {
   }
 }
 
-/** Parse one log (its rotation first, then the live file) into lines. */
-export function readLog(file: string, service: string, maxBytes = 64 * 1024 * 1024): LogLine[] {
+function parseInto(out: LogLine[], text: string, service: string, last: number): number {
+  for (const raw of text.split('\n')) {
+    if (raw === '') continue;
+    const m = STAMP.exec(raw);
+    if (m) {
+      last = Date.parse(m[1]!);
+      out.push({ service, at: last, text: m[2]!, marker: m[2]!.startsWith(START_MARKER) });
+    } else {
+      out.push({ service, at: last, text: raw, marker: false });
+    }
+  }
+  return last;
+}
+
+/** Parse one log (its rotation first, then the live file up to `end`) into lines. */
+export function readLog(file: string, service: string, maxBytes = 64 * 1024 * 1024, end?: number): LogLine[] {
   const out: LogLine[] = [];
   let last = NaN;
   for (const f of [`${file}.1`, file]) {
-    const text = readTail(f, maxBytes);
-    if (!text) continue;
-    for (const raw of text.split('\n')) {
-      if (raw === '') continue;
-      const m = STAMP.exec(raw);
-      if (m) {
-        last = Date.parse(m[1]!);
-        out.push({ service, at: last, text: m[2]!, marker: m[2]!.startsWith(START_MARKER) });
-      } else {
-        out.push({ service, at: last, text: raw, marker: false });
-      }
-    }
+    const text = readTail(f, maxBytes, f === file ? end : undefined);
+    if (text) last = parseInto(out, text, service, last);
   }
   return out;
+}
+
+/**
+ * The last lines of one log — at least `want` that are not start markers, or
+ * all there are — read BACKWARDS from `end` in growing chunks, into the
+ * rotation only when the live file runs out. `logs --lines 40` on a 20 MB log
+ * used to parse both whole files to print 40 lines.
+ */
+export function readLastLines(file: string, service: string, want: number, end?: number): LogLine[] {
+  const content = (text: string) => text.split('\n').filter((l) => l !== '' && !MARKER_LINE.test(l)).length;
+  const chunks: string[] = [];
+  let have = 0;
+  for (const f of [file, `${file}.1`]) {
+    if (have >= want) break;
+    let fd: number;
+    let size: number;
+    try {
+      size = Math.min(statSync(f).size, f === file ? (end ?? Infinity) : Infinity);
+      fd = openSync(f, 'r');
+    } catch {
+      continue;
+    }
+    try {
+      let pos = size;
+      let held = Buffer.alloc(0);
+      let step = 64 * 1024;
+      let text = '';
+      while (pos > 0) {
+        const len = Math.min(step, pos);
+        pos -= len;
+        const buf = Buffer.alloc(len);
+        readSync(fd, buf, 0, len, pos);
+        held = Buffer.concat([buf, held]);
+        step *= 2;
+        if (pos === 0) {
+          text = held.toString('utf8');
+          break;
+        }
+        // Whole lines only: what follows the first newline of what is held.
+        const nl = held.indexOf(0x0a);
+        if (nl < 0) continue;
+        const whole = held.subarray(nl + 1).toString('utf8');
+        if (have + content(whole) >= want) {
+          text = whole;
+          break;
+        }
+      }
+      have += content(text);
+      chunks.unshift(text);
+    } finally {
+      closeSync(fd);
+    }
+  }
+  const out: LogLine[] = [];
+  let last = NaN;
+  for (const text of chunks) last = parseInto(out, text, service, last);
+  return out;
+}
+
+/** Mark every line before the last start marker as `prior` (an earlier process's). */
+export function markPrior(lines: LogLine[]): LogLine[] {
+  let lastMarker = -1;
+  for (let i = lines.length - 1; i >= 0; i--) {
+    if (lines[i]!.marker) {
+      lastMarker = i;
+      break;
+    }
+  }
+  return lines.map((l, i) => (i < lastMarker ? { ...l, prior: true } : l));
 }
 
 /** Only the lines of the CURRENT process: from the last start marker on. */
@@ -178,11 +259,3 @@ export function beginBuildLog(file: string, header: string): void {
     /* no log dir (warm without an environment) */
   }
 }
-
-export const readFileIfAny = (file: string): string => {
-  try {
-    return readFileSync(file, 'utf8');
-  } catch {
-    return '';
-  }
-};

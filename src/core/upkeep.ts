@@ -57,7 +57,7 @@ export const ruleKey = (rule: { when: string; run: string }): string => `${rule.
  * bind reads to decide what upkeep is due. Empty, without asking git, when the
  * manifest declares no rules.
  */
-export function triggerFiles(root: string, manifest: Manifest): string[] {
+export async function triggerFiles(root: string, manifest: Manifest): Promise<string[]> {
   const whens = (manifest.upkeep ?? []).map((rule) => rule.when);
   return whens.length === 0 ? [] : enumerateSource(root, manifest, whens);
 }
@@ -85,8 +85,8 @@ export interface TriggerSet {
 interface TriggerCacheEntry { hash: string; size: number; mtime: number }
 const RACY_WINDOW_MS = 2000;
 
-export function triggerSet(root: string, manifest: Manifest, cacheDir?: string): TriggerSet {
-  const files = triggerFiles(root, manifest);
+export async function triggerSet(root: string, manifest: Manifest, cacheDir?: string): Promise<TriggerSet> {
+  const files = await triggerFiles(root, manifest);
   let cache: { writtenAt?: number; entries: Record<string, TriggerCacheEntry> } = { entries: {} };
   if (cacheDir) {
     try {

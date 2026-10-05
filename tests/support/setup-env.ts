@@ -13,3 +13,4 @@ process.env.BACKLOT_TETHER = 'off';
 // budget tests set them explicitly.
 process.env.BACKLOT_BUDGET_LOAD_PER_CORE ??= '1000000';
 process.env.BACKLOT_BUDGET_RESERVE ??= '0';
+process.env.BACKLOT_BUDGET_CPU_PRESSURE ??= '1000';
