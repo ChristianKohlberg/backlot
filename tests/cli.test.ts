@@ -99,7 +99,7 @@ describe('the local loop (hello-web)', () => {
     const lines = res.stdout.trim().split('\n');
     const vars = Object.fromEntries(lines.map((l) => [l.slice(0, l.indexOf('=')), l.slice(l.indexOf('=') + 1)]));
     expect(Object.keys(vars).sort()).toEqual(
-      ['RUNLY_DATASTORE_MAIN_URL', 'RUNLY_ENV_ID', 'RUNLY_PORT_WEB', 'RUNLY_URL_WEB'].sort(),
+      ['RUNLY_DATASTORE_MAIN_PRESET', 'RUNLY_DATASTORE_MAIN_URL', 'RUNLY_ENV_ID', 'RUNLY_PORT_WEB', 'RUNLY_URL_WEB'].sort(),
     );
     expect(vars.RUNLY_URL_WEB).toBe(url);
     expect(url).toContain(`:${vars.RUNLY_PORT_WEB}`);
@@ -251,23 +251,29 @@ describe('the multi-service topology (hello-multi)', () => {
     expect(logs.stdout).toContain('worker ready');
   });
 
-  it('up <service> starts only its slice and genuinely stops what it excludes', async () => {
+  it('up <service> adds its closure and stops nothing; down stops just what it names (decision 0034)', async () => {
     // Full app first: capture web's URL and confirm it actually serves.
     let res = await ctx.cli(['up', '--json'], wt.dir);
     expect(res.exitCode, `stdout: ${res.stdout ?? ''}\nstderr: ${res.stderr ?? ''}`).toBe(0);
     const webUrl = (res.json!.urls as Record<string, string>).web!;
     expect((await fetch(webUrl)).ok).toBe(true);
 
-    // `up api` — api's closure excludes web, so web must genuinely STOP (its
-    // stable port stops answering), not merely vanish from the ctx blob.
+    // `up api` is ADDITIVE: web keeps running.
     res = await ctx.cli(['up', 'api', '--json'], wt.dir);
+    expect(res.exitCode, `stdout: ${res.stdout ?? ''}\nstderr: ${res.stderr ?? ''}`).toBe(0);
+    expect((res.json!.urls as Record<string, string>).web).toBe(webUrl);
+    expect((await fetch(webUrl)).ok).toBe(true);
+
+    // `down web` genuinely STOPS it (its stable port stops answering), not
+    // merely drops it from the ctx blob.
+    res = await ctx.cli(['down', 'web', '--json'], wt.dir);
     expect(res.exitCode, `stdout: ${res.stdout ?? ''}\nstderr: ${res.stderr ?? ''}`).toBe(0);
     let urls = res.json!.urls as Record<string, string>;
     expect(urls.api).toBeDefined();
     expect(urls.web).toBeUndefined(); // filtered from ctx
     await expect(fetch(webUrl)).rejects.toThrow(); // AND the process is down
 
-    // A rebind preserves the slice: reset-data must not resurrect web.
+    // A rebind keeps what the lease wants: reset-data must not resurrect web.
     res = await ctx.cli(['reset-data', '--json'], wt.dir);
     expect(res.exitCode, `stdout: ${res.stdout ?? ''}\nstderr: ${res.stderr ?? ''}`).toBe(0);
     await expect(fetch(webUrl)).rejects.toThrow();
@@ -278,10 +284,11 @@ describe('the multi-service topology (hello-multi)', () => {
     urls = res.json!.urls as Record<string, string>;
     expect(urls.api).toBeDefined();
     expect((await fetch(urls.web!)).ok).toBe(true);
+    await ctx.cli(['down', 'worker', '--json'], wt.dir);
 
-    // Plain `up` on this SAME live lease re-expands to the whole app: the []
-    // request overrides the preserved slice, so the excluded worker restarts.
-    // (Guards the []-vs-undefined RPC distinction the design hinges on.)
+    // Plain `up` on this SAME live lease adds the default set — every service —
+    // so the downed worker starts again. (Guards the []-vs-undefined RPC
+    // distinction the design hinges on: [] adds everything, undefined nothing.)
     res = await ctx.cli(['up', '--json'], wt.dir);
     expect(res.exitCode, `stdout: ${res.stdout ?? ''}\nstderr: ${res.stderr ?? ''}`).toBe(0);
     const workerLogs = await ctx.cli(['logs', 'worker', '--lines', '5'], wt.dir);
@@ -339,7 +346,10 @@ describe('a slice does not leak across a pool handoff (hello-multi)', () => {
   });
 
   it('re-claiming a released slice via the fast path reports only the slice, not the whole app', async () => {
-    // sliceA runs api only, then releases — the env stays hot with just api up.
+    // sliceA runs api only (down everything, then up api — `up` is additive,
+    // decision 0034), then releases — the env stays hot with just api up.
+    await ctx.cli(['up', '--holder', 'sliceA', '--json'], wt.dir);
+    await ctx.cli(['down', '--holder', 'sliceA', '--json'], wt.dir);
     await ctx.cli(['up', 'api', '--holder', 'sliceA', '--json'], wt.dir);
     await ctx.cli(['release', '--holder', 'sliceA', '--json'], wt.dir);
     // sliceB re-claims with the SAME slice: the fast path reuses the hot env

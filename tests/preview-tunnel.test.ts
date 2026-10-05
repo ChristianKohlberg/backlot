@@ -307,12 +307,12 @@ describe('preview tunnels', () => {
 
   // Nothing brings the service back this lease, so the URL would publish a port
   // with nothing behind it — the same rule `preview <out-of-slice>` is refused by.
-  it('tears the tunnel down when a bind drops the previewed service from the slice', async () => {
+  it('tears the tunnel down when `down` stops the previewed service', async () => {
     const { cli, stateDir } = ctx();
     await cli(['up', '--json']);
     await cli(['preview', 'web', '--json']);
     const pid = tunnelPid(stateDir);
-    const narrowed = await cli(['up', 'api', '--json']);
+    const narrowed = await cli(['down', 'web', '--json']);
     expect(narrowed.code).toBe(0);
     expect(narrowed.json?.previewUrls).toEqual({});
     expect(String(narrowed.json?.previewNotice)).toMatch(/env-error: service 'web' is not in this bind's running set/);
@@ -440,7 +440,7 @@ describe('preview tunnels', () => {
   // The teardown's own justification ("not in this bind's running set") is only
   // true once the bind commits that set — a bind that fails leaves the old shape
   // in the journal, so the next `up` brings the service back to a killed tunnel.
-  it('keeps the tunnel when the bind that would have narrowed the slice fails', async () => {
+  it('keeps the tunnel when a bind fails', async () => {
     const { cli, wt, stateDir } = ctx();
     await cli(['up', '--json']);
     await cli(['preview', 'web', '--json']);
@@ -575,10 +575,11 @@ it('retains the forbidden preview notice through a preset refresh fallback', asy
     expect(synced.code, synced.stdout + synced.stderr).toBe(0);
     expect(synced.json?.previewUrls).toEqual({});
     expect(String(synced.json?.previewNotice)).toMatch(/preview.forbidden.*torn down/);
-    expect((synced.json?.bindDiagnostics as {reasons: string[]}).reasons).toContain('datastore-preset-changed');
+    expect((synced.json?.bindDiagnostics as {reasons: string[]}).reasons).toContain('manifest-changed');
+    // No preset keeps the data (decision 0034), even one the catalog dropped.
     const stores = synced.json!.datastores as Record<string, {url: string; preset: string}>;
-    expect(stores.main!.preset).toBe('dev');
-    expect(f.marker(stores.main!.url)).toBe('dev');
+    expect(stores.main!.preset).toBe('alternate');
+    expect(f.marker(stores.main!.url)).toBe('alternate');
     expect(await goneWithin(pid, 5000)).toBe(true);
     expect((await f.cli(['ctx', '--json'])).json?.previewNotice).toBeUndefined();
   } finally {

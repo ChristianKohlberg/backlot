@@ -213,17 +213,17 @@ describe('caller environment inputs', () => {
     expect(explicit.json.error.message).toContain("no service 'worker'");
   }, 30_000);
 
-  it('validates required inputs before converting a data-only lease to an application', async () => {
+  it('validates required inputs before starting services on a lease that runs none', async () => {
     const f = fixture('required');
-    writeFileSync(join(f.tree, 'seed.mjs'), `import {DatabaseSync} from 'node:sqlite'; const db=new DatabaseSync(process.argv[2]); db.exec('CREATE TABLE IF NOT EXISTS t(x)');db.close();`);
-    writeFileSync(join(f.tree, 'backlot.yml'), readFileSync(join(f.tree, 'backlot.yml'), 'utf8') + `datastores:\n  main: { driver: sqlite, create: 'node seed.mjs {{ns}}' }\n`);
-    const data = await f.cli(['up', '--data-only']);
-    expect(data.code, data.stdout + data.stderr).toBe(0);
+    const first = await f.cli(['up'], { TEST_CALLER_KEY: 'first-key' });
+    expect(first.code, first.stdout + first.stderr).toBe(0);
+    const down = await f.cli(['down']);
+    expect(down.code, down.stdout + down.stderr).toBe(0);
     const missing = await f.cli(['up']);
     expect(missing.code).toBe(1);
-    expect((await f.cli(['ctx'])).json.dataOnly).toBe(true);
+    expect(Object.values((await f.cli(['ctx'])).json.services)).toEqual(['down']);
     const app = await f.cli(['up'], { TEST_CALLER_KEY: 'application-key' });
-    expect(app.json.envId).toBe(data.json.envId);
+    expect(app.json.envId).toBe(first.json.envId);
     expect((await f.response(app.json)).value).toBe('application-key');
   });
 

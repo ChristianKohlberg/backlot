@@ -35,13 +35,33 @@ async function dispatch(verb: string, args: Record<string, unknown>, emit: (phas
         cwd, holder, holderPid, callerEnv: args.callerEnv, presets: args.presets,
         hygiene: (args.hygiene as never) ?? undefined,
         ttlMs: args.ttlMs ? Number(args.ttlMs) : undefined,
-        // [] (not undefined) so the `up` verb always means the whole app unless
-        // a slice is named — undefined is reserved for internal shape-preserving
-        // rebinds (reset-data), which never come through this RPC.
+        // [] (not undefined) so a bare `up` adds the default set — every
+        // service; undefined is reserved for the internal reset-data rebind,
+        // which adds nothing and never comes through this RPC.
         services: Array.isArray(args.services) ? (args.services as unknown[]).map(String) : [],
+        // Removed by decision 0034; refused by the engine if a client sends it.
         dataOnly: Boolean(args.dataOnly),
         onProgress: emit,
       });
+    case 'down':
+      return engine.down({
+        cwd, holder,
+        services: Array.isArray(args.services) ? (args.services as unknown[]).map(String) : [],
+        onProgress: emit,
+      });
+    case 'db-new':
+      return engine.dbNew({
+        cwd, holder, holderPid,
+        datastore: String(args.datastore ?? ''),
+        preset: args.preset === undefined ? undefined : String(args.preset),
+        onProgress: emit,
+      });
+    case 'db-drop':
+      return engine.dbDrop(String(args.name ?? ''));
+    case 'db-ls':
+      return engine.dbLs(cwd, Boolean(args.all));
+    case 'ps':
+      return engine.ps(cwd, Boolean(args.all));
     case 'ctx':
       return engine.ctx(cwd, holder);
     case 'reset-data':
@@ -84,7 +104,7 @@ async function dispatch(verb: string, args: Record<string, unknown>, emit: (phas
     case 'daemon-restart':
       // The refusal lives in the ENGINE, not the CLI, so any
       // other RPC caller cannot restart past an in-flight operation just by
-      // not implementing the check (the same reason the three --data-only
+      // not implementing the check (the same reason the old --data-only
       // contradictions were moved out of the CLI in 0.8.0).
       engine.assertRestartable({
         force: Boolean(args.force),

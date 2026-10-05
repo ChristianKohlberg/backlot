@@ -27,9 +27,9 @@ supersedes it and update this index — never edit a decision in place.
 | [0020](0020-rewrite-in-go-considered-and-declined.md) | A rewrite in Go was considered and declined — the defects were design and POSIX, not language |
 | [0021](0021-quiesce-is-not-a-teardown.md) | A quiesce runs under the environment lock, not as a borrowed teardown — disk is truth, so a borrowed state is a borrowed crash contract |
 | [0022](0022-data-state-mechanisms-deferred.md) | Data-state mechanisms are deferred until a consumer forces them — 0016's doctrine stands, its unbuilt features stop pretending to be pending |
-| [0023](0023-data-only-leases.md) | A lease may cover the datastores alone (`up --data-only`) — the environment is unbundled downward, not split into a second pool |
+| [0023](0023-data-only-leases.md) | A lease may cover the datastores alone (`up --data-only`) — the environment is unbundled downward, not split into a second pool (superseded by 0034) |
 | [0024](0024-updating-the-running-daemon.md) | `backlot update` reconciles the running daemon to the installed build — version skew is refused, and backlot never installs itself |
-| [0025](0025-data-only-environments-are-priced-separately.md) | A data-only environment answers to its own ceiling, and changing an environment's shape is a metered capacity event |
+| [0025](0025-data-only-environments-are-priced-separately.md) | A data-only environment answers to its own ceiling, and changing an environment's shape is a metered capacity event (superseded by 0034) |
 | [0026](0026-a-stack-may-advertise-several-logins.md) | A stack may advertise several logins — `ctx.logins` stays the primary, `allLogins` carries the set |
 | [0027](0027-lease-scoped-public-preview.md) | Lease-scoped public preview is explicit, supervised, and separate from `expose` |
 | [0028](0028-named-preview-hostnames.md) | A preview may publish under a hostname we own, and the publisher is where that lives |
@@ -38,3 +38,4 @@ supersedes it and update this index — never edit a decision in place.
 | [0031](0031-tailscale-preview-publisher.md) | A preview may publish on the tailnet, through a foreground `tailscale serve` |
 | [0032](0032-environments-run-in-the-callers-worktree.md) | Environments run in the caller's worktree, one per worktree; `up` is the only bind verb and restarts only services whose build output changed; runly runs no checks (`ctx --env` instead of `run`/`job`/`checks:`); no per-stack ceiling; runly caches no builds; `runly warm` prepares an idle worktree |
 | [0033](0033-the-daemon-holds-public-ports-behind-an-l4-proxy.md) | The daemon holds every public port behind an L4 proxy for the environment's life; services listen on a fresh internal port; connections are held while a service starts and client bytes are counted; ports come from three disjoint blocks (public 20000–29999, internal 30000–31999, tunnel 32000–32767) below the ephemeral range |
+| [0034](0034-additive-up-database-copies-and-ps.md) | `up` is additive and `down` stops what it names; a `--preset` reloads one datastore and restarts its users, no preset keeps the data, `ctx` reports each datastore's preset; `--data-only` is removed — a database alone is a `runly db new\|with` copy, reaped like an environment (holder or worktree gone), no TTL; `runly ps` shows services and copies |

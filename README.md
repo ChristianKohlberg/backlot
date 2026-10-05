@@ -12,7 +12,7 @@ The `backlot` command and `backlot.yml` manifests remain accepted. `runly.yml` t
 It brokers environments; it never provides them. Local processes today, your own cloud
 sandboxes (Morph, Sprites, SSH) tomorrow — same verbs, same model.
 
-> **Status: 0.13.** The local loop — pool, leases, in-place binds, data states —
+> **Status: 0.15.** The local loop — pool, leases, in-place binds, data states —
 > is complete, hardened by two full review cycles, and proven end to end against
 > a real .NET + Angular + MSSQL monorepo (its Playwright e2e suite runs against a
 > runly environment, and each release is verified by driving a real session
@@ -53,6 +53,11 @@ runly up --json          # lease an env: upkeep, seed, build and start in THIS w
 runly ctx --json         # re-read that same blob later, read-only — no re-bind (up already returned it)
 eval "$(runly ctx --env)" && node smoke.test.mjs   # your own tests, fed RUNLY_URL_WEB etc.
 runly up                 # after editing: due upkeep + builds, restarts what the builds changed
+runly up api             # ADD a service (and its depends_on) — up never stops what runs
+runly down web           # stop one service; lease, data and ports stay
+runly up --preset main=empty   # reload ONE datastore; the others keep their data
+runly ps                 # what runs for this worktree: services and database copies
+runly db with main -- npm test # a fresh database copy for one command, dropped after it
 runly warm               # due upkeep + builds in this worktree, no lease, no services (prepare an idle worktree)
 runly exec <cmd>         # run a command in the worktree with your lease's URLs/ports/conn strings (raw exit, not a verdict)
 runly preview <service>  # publish one service (public tunnel via cloudflared, or the tailnet via tailscale)
@@ -70,12 +75,15 @@ names, and your own test command reads them:
 | `RUNLY_PORT_<PORT>` | each public port, by its manifest key |
 | `RUNLY_URL_<SERVICE>` | each running service's URL |
 | `RUNLY_DATASTORE_<NAME>_URL` | each datastore's connection string |
+| `RUNLY_DATASTORE_<NAME>_PRESET` | the preset that datastore holds now |
 | `RUNLY_LOGIN_USER`, `RUNLY_LOGIN_PASSWORD` | the primary login, when the stack declares one |
 
 Names are upper-cased, every other character becomes `_` (`web-audit` →
 `RUNLY_URL_WEB_AUDIT`), and a value is single-quoted only when a shell needs it.
 `ctx --json` carries the same and more for programs. Want known data first?
-`runly up --reset-data` (or `reset-data --preset NAME`) before the tests.
+`runly up --preset <store>=<preset>` reloads one store, `runly up --reset-data`
+all of them. A test lane that wants a database and not the application uses
+`runly db with <store> -- <cmd>` instead.
 `exec <cmd>` is the other way in: it runs a command in your worktree with the
 lease's environment in its variables (`BACKLOT_URL_*`, `BACKLOT_DS_*`,
 `BACKLOT_PORT_*`) and hands back its raw stdout and exit code.
@@ -86,8 +94,10 @@ your shell tools, for example `runly up --json` and `runly ctx --env`.
 The CLI, daemon RPC and Claude Code skill remain supported.
 
 **Every `up` applies the worktree as it is — and restarts only what changed.** It
-runs the due upkeep rules and the `build:` of every service it starts (your build
-tool decides what is current; runly keeps no build cache). Then:
+runs the due upkeep rules and the `build:` of every service it runs (your build
+tool decides what is current; runly keeps no build cache). It is **additive**: it
+starts the services you name next to the running ones and never stops one
+([decision 0034](docs/decisions/0034-additive-up-database-copies-and-ps.md)). Then:
 
 - a running service whose build **output** changed is restarted. A service says
   what its build produces with `outputs:` globs (`bin/**`, `dist/web`); runly
@@ -96,11 +106,14 @@ tool decides what is current; runly keeps no build cache). Then:
 - a service with **no** `build:` keeps running (a dev server reads the worktree
   itself). To restart one on every `up`, give it `build: "true"`;
 - a service that is not running is started; dependents of a restarted service
-  are not restarted (its port did not move).
+  are not restarted (its port did not move);
+- a datastore named with `--preset` is reloaded, and the running services that
+  use it restart around the reload.
 
-A changed manifest, changed caller inputs or presets, an upkeep rule that ran,
-`--reset-data`/`--pristine`, or an unhealthy environment take the full bind
-instead: everything stops, data is prepared, everything is built and started.
+A changed manifest, changed caller inputs, an upkeep rule that ran, a moved public
+port, `--reset-data`/`--pristine`, an unhealthy environment or one with nothing
+running take the full bind instead: everything stops, data is prepared,
+everything is built and started. Adding a service and choosing a preset do not.
 Comments and whitespace alone do not change the parsed manifest. See
 [the in-place rules](docs/architecture.md#6-in-place--verbs-converge-watch-observes) and
 [preview reconciliation](docs/decisions/0027-lease-scoped-public-preview.md).
@@ -145,6 +158,29 @@ knowing:
 - **One environment per worktree.** A second holder (`--holder`) of the same
   worktree waits for its environment — and is refused at once, naming the holder,
   when that lease outlasts the wait. Parallel lanes need separate worktrees.
+
+### Upgrading to 0.15 — additive `up`, `runly db` ([decision 0034](docs/decisions/0034-additive-up-database-copies-and-ps.md))
+
+- **`up <service>` no longer stops the services you did not name.** It adds.
+  To stop one, `runly down <service>`; to stop all and keep the environment,
+  `runly down`. A script that relied on `up api` taking `web` down needs a
+  `down web`.
+- **No `--preset` keeps the data**, also for a new holder (0.14 reseeded a fresh
+  holder's stores to their defaults). A lane that needs known data says so:
+  `--preset <store>=<preset>` for one store, `--reset-data` for all.
+- **`--preset` reloads only the store it names** and restarts only the services
+  that use it, instead of restarting the environment. Naming the preset a store
+  already holds now reloads it too.
+- **`up --data-only` is gone** (exit 64). Use `runly db with <store> -- <cmd>`
+  (or `runly db new <store>`). `BACKLOT_POOL_MAX_DATA_ONLY` is ignored. On its
+  first start the 0.15 daemon turns a **leased** data-only environment into an
+  environment with no services wanted (lease and data kept) and **recycles** an
+  unleased one.
+- `ctx.dataOnly` is gone; `ctx.services` reports what runs, and
+  `.datastores.<name>.preset` is now always the preset the store holds.
+  `ctx --env` adds `RUNLY_DATASTORE_<NAME>_PRESET`.
+- The journal schema is 4: an older daemon refuses it. Run `runly update` after
+  installing.
 
 ### Upgrading to 0.14 — ports ([decision 0033](docs/decisions/0033-the-daemon-holds-public-ports-behind-an-l4-proxy.md))
 
@@ -229,7 +265,7 @@ Skip the second step and runly tells you, rather than quietly serving you the
 old behaviour: every verb except `update`, `doctor` and `daemon stop` fails with
 `infra-error` (exit 3) naming both versions. That refusal is deliberate — an old
 daemon does not reject a flag it has never heard of, it *ignores* it, so
-`up --data-only` against a pre-0.9.0 daemon would boot the whole application into
+`up --data-only` against a pre-0.9.0 daemon would have booted the whole application into
 what you asked to be a database-only lease and report success.
 
 ```bash
@@ -252,12 +288,14 @@ before acting. It refuses only two things: an **in-flight operation** (a bind
 or `exec` whose caller is waiting on it) and a **downgrade** (an older CLI restarting
 a newer daemon). `--force` overrides either.
 
-### Partial `up`: lease one slice, not the whole app
+### Additive `up`, and `down`
 
-`runly up` with **no service** brings up the whole app. Name one or more
-services and runly starts **only that slice plus its transitive `depends_on`
-closure** — nothing else boots. This is how you lease a single vertical or a lone
-SPA without paying for the rest of the stack.
+`up` **adds** ([decision 0034](docs/decisions/0034-additive-up-database-copies-and-ps.md)).
+Name one or more services and runly starts **those plus their transitive
+`depends_on` closure**, next to whatever already runs; it never stops a running
+service. `up` with no service adds every service. `down` stops just the services
+it names — or, with no names, all of them — and keeps the lease, the data and
+the public ports.
 
 Take [`examples/hello-multi`](examples/hello-multi/runly.yml): `web`
 `depends_on: [api]`, and `worker` stands alone.
@@ -265,95 +303,102 @@ Take [`examples/hello-multi`](examples/hello-multi/runly.yml): `web`
 ```bash
 cd examples/hello-multi
 runly up web       # starts web + api (its depends_on closure) — worker stays down
-runly up worker    # starts worker alone — no api, no web
-runly up           # the whole app: api + web + worker
+runly up worker    # adds worker; web and api keep running, same pids
+runly down web     # stops web alone; api and worker keep running, web's port stays reserved
+runly up           # adds everything not running yet (here: web)
+runly down         # stops every service; the lease, data and ports stay
 ```
 
-Because the closure is transitive, naming a leaf pulls in everything it needs to
-run and nothing it doesn't — ideal for iterating on one frontend while its single
-backing service comes along for the ride. An unknown service name is a manifest
-work-error. All the usual flags (`--reset-data`/`--pristine`,
-`--ttl`, `--json`) apply to the partial form too.
+Only services are named — never a datastore or an appliance: datastores exist
+for the environment's whole life, and appliances are shared (decision 0018). A
+service whose dependency you take down keeps running and is named in the `down`
+answer, because it now reaches a port with nothing behind it. What the lease
+wants survives a quiesce and a daemon restart: the next `up` brings it back. An
+unknown service name is a manifest work-error. `ctx.services` reports each
+service as `running`, `stopped` (wanted, not running) or `down`, and `ctx.urls`
+lists the wanted ones. A fresh holder starts from what is running, never from
+the previous holder's wishes.
 
-### `--data-only`: lease a database, not an application
+### Datastore presets: reload one, keep the rest
 
-A test lane usually needs one thing from an environment — a warm, seeded database
-of its own — and paying for services it never calls is what pushes people back to
-Testcontainers, where every lane starts its own container and restores a full
-backup per test collection.
-
-```bash
-runly up --data-only --ttl 30      # seeded store, leased; no services, no builds
-runly ctx --json                   # .datastores.main.url — point your fixture at it
-runly reset-data                   # back to the baseline between runs
-runly release
-```
-
-Everything else about the lease is unchanged: it is pooled, restored from the same
-template, and dropped on recycle. A worktree has one environment, so two lanes in
-two worktrees get two namespaces and neither sees the other's writes; two lanes in
-one worktree take turns. `ctx` reports `dataOnly: true` so a
-fixture can tell "no services by design" from "a service failed to start", and the
-environment sits at `warm` because nothing is meant to be running.
-
-It refuses what it cannot mean: naming a service alongside it, and a manifest
-that declares no datastore.
-
-**It is priced like a catalog, not like a stack.** `POOL_MAX_TOTAL` comes from `min(cores/2, memGB/4)` because they bound *running
-services* — so data-only environments are counted against their own machine-wide
-ceiling, `BACKLOT_POOL_MAX_DATA_ONLY` (default `max(4, 2 × the heuristic)`,
-disk-shaped), and against neither application cap. A test lane on every
-integration run therefore no longer competes with the interactive leases people
-use to look at the app, which was the whole point of the feature.
-
-Two consequences worth knowing. A host can hold `POOL_MAX_TOTAL` applications
-*plus* `POOL_MAX_DATA_ONLY` lanes. And switching your own lease between the two
-shapes still works in both directions, but now needs room in the shape you are
-switching *into* — otherwise the cheap ceiling would just be application capacity
-by another name ([decision 0025](docs/decisions/0025-data-only-environments-are-priced-separately.md)).
-
-During conversion to data-only, the old application slot stays reserved until
-its services have stopped. If preparation fails before teardown, the running
-application still counts against the application caps; retrying the conversion
-or returning to the application shape remains supported. A shape change waits
-for an operation already using the environment. For failed teardown and recycle
-retries, see [survivor ownership](docs/architecture.md#journal-upgrade-barrier).
-
-### Choosing datastore presets
-
-`up` and `reset-data` accept `--preset NAME` when
-the stack has one datastore. For multiple stores, name each target explicitly:
+Every datastore keeps its data unless you ask otherwise — on every `up`, for a
+new holder, after a daemon restart. runly never resets a store to its default
+behind your back. To reload a store, name its preset:
 
 ```bash
+runly up --preset main=empty                   # reload main only; restart the services that use it
 runly up --preset main=dev --preset audit=empty
-runly reset-data --preset main=empty
+runly up --preset empty                        # the short form, for a stack with one datastore
+runly reset-data                               # restore every store, each with the preset it holds
+runly reset-data --preset main=empty           # …with main switched to empty
 ```
+
+A named preset reloads that datastore from its template — even when it already
+holds that preset, which is how you reset one store — and restarts only the
+running services that **use** it: those whose `run:`, `build:` or `env:` templates
+`{{datastores.<name>.…}}`. When no service references the store, runly cannot
+tell who reads it, so every running service restarts. Other stores and services
+are untouched.
+
+`ctx --json` reports `.datastores.<name>.preset`, the preset the store **holds**
+(null before its first restore), and `ctx --env` exports it as
+`RUNLY_DATASTORE_<NAME>_PRESET`. Bind diagnostics list what was reloaded
+(`reloaded`) and restarted (`restarted`).
 
 Names must appear in that datastore's `presets` catalog, and so must the names a
 `default_preset` declares: a declared default outside the catalog fails every
 bind, with or without `--preset`. Without a catalog (omitted or empty), the
 implicit `default` and any manifest-declared `default_preset` names remain valid.
 Unknown stores, unknown presets, duplicate targets and ambiguous bare names are
-refused before acquiring an environment or changing data. Changing a preset
-restores that store even with ordinary reuse hygiene. Under reuse, unmentioned
-stores keep their data unless their inherited preset was removed or upkeep
-requires a template rebake. `reset-data` and `--pristine` restore every store.
+refused before acquiring an environment or changing data. A store is created
+with its default (`default_preset.session`, then the first catalog entry, then
+`default`). A store whose held preset left the catalog keeps its data; the next
+reset restores the default. A `--preset` whose bind fails is not remembered —
+run it again. RPC accepts the same choices as a `presets` object mapping
+datastore names to preset names. Other CLI verbs reject `--preset` with exit 64.
 
-A continuing lease keeps its selections across `up`, `reset-data`,
-`--pristine`, failed-bind retries and daemon restart unless explicitly overridden.
-If a manifest removes the selected preset, the next bind selects the
-current default: `default_preset.session` (`default_preset.run` is ignored since
-`runly run` was removed), then
-the first catalog entry, then `default`. A new lease uses the manifest
-defaults and never inherits the previous holder's choices. In `ctx --json`,
-`.datastores.<name>.preset` reports the last completed restore, including earlier
-stores that succeeded when a later store failed; it is absent after a pristine
-wipe until that store is restored. A selection that differs from the one the
-environment last recorded appears as `datastore-preset-changed` in bind
-diagnostics (a first bind or a newly added store has none to differ from).
-RPC accepts the same choices as a `presets` object mapping datastore names
-to preset names. Other CLI verbs reject `--preset` with exit 64 and a message
-on stderr.
+### Database copies: `runly db`
+
+A test lane wants a seeded database of its own — often several at once — and not
+the application. `runly db` makes **copies** of a datastore outside any
+environment: no lease, no ports, no services, as many in parallel as you like.
+Each is restored from the same template the environments use (baked first if it
+is missing):
+
+```bash
+runly db with main -- dotnet test            # a fresh copy for one command; dropped when it exits
+runly db with main --preset empty -- npm test
+runly db new main --json                     # {name, url, preset, …}: keep it until you drop it
+runly db ls                                  # this worktree's copies (--all: every one)
+runly db drop main-k3j9x2
+```
+
+`db with` runs the command with `RUNLY_DB_URL` (the connection string) and
+`RUNLY_DB_NAME` set, drops the copy when the command exits — also when it fails,
+and after Ctrl-C, which it passes on — and exits with the command's exit code.
+`db new` prints `name=`, `url=` and `preset=` lines (`--json` for the object).
+
+Every copy is recorded in the journal with its holder — this worktree, and the
+agent's process when you pass `--holder-pid` (or `BACKLOT_HOLDER_PID`); `db with`
+tethers the copy to its own process — and with the drop command it needs. It is
+reaped exactly like an environment: when the holder process is gone, when the
+worktree is removed, after a daemon restart too. There is no TTL: a copy made
+with no tether lives until its worktree goes or you drop it. A command-family
+datastore needs a `drop:` command to be copied at all. `db new` does not run
+upkeep; a template that needs an install first wants `runly warm`.
+
+### What runs: `runly ps`
+
+```bash
+runly ps            # this worktree: services and database copies
+runly ps --all      # the whole server
+runly ps --json
+```
+
+One row per service — environment, service, state (`running`, `starting`,
+`stopped`, `down`), public and internal port, pid, idle time since the last
+client byte through the proxy, resident memory (Linux) — and one per database
+copy — name, datastore, preset, state, holder, age.
 
 ### How long you hold it: `--ttl` for agents, `--holder-pid` for shells
 

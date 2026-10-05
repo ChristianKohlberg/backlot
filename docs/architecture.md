@@ -28,6 +28,14 @@ so they must refuse a schema 3 journal. Upgrade the running daemon before using
 it; do not lower `PRAGMA user_version` to bypass the barrier. Schema 3 retains
 schema 2's lease preset intent and the additive physical-path identity migration.
 
+Schema 4 ([decision 0034](decisions/0034-additive-up-database-copies-and-ps.md))
+records `activeServices: []` for an environment whose lease wants no services
+(a schema 3 reader would boot the whole app) and adds the `db_copies` table (a
+schema 3 reader would never reap a copy), so a schema 3 daemon refuses it. Lease
+preset intent is no longer read: a datastore keeps what it holds unless a bind
+names a preset. The first schema 4 recovery migrates data-only rows: a leased
+one becomes an environment with no services wanted, an unleased one is recycled.
+
 ---
 
 ## 1. The problem
@@ -68,17 +76,18 @@ These are where tools like this die of scope creep. runly:
 as the primary consumer. Portless workers and multi-datastore stacks are in scope;
 Kubernetes, Windows, secrets management, and dashboards are not.
 
-## 3. The model — five nouns
+## 3. The model — the nouns
 
 | Noun | What it is |
 | --- | --- |
 | **Stack** | What a repo declares in `runly.yml`: services, datastores, seed presets, upkeep rules. The only repo-specific artifact. |
 | **Substrate** | Where environments physically live, behind a driver: `local` (supervised processes in a directory), later `docker`, `morph`, `sprites`, `ssh`. |
-| **Environment** | A pooled slot on a substrate: running services, allocated ports, a datastore namespace, its logs — running **in the caller's worktree**, whose caches it shares ([decision 0032](decisions/0032-environments-run-in-the-callers-worktree.md)). Durable; belongs to the pool, never to a person or task. A lease may cover a **subset** of it — a service slice (`up <service>`), or the datastores alone (`up --data-only`, [decision 0023](decisions/0023-data-only-leases.md)) for a test lane that needs a seeded database rather than an application. |
+| **Environment** | A pooled slot on a substrate: running services, allocated ports, a datastore namespace, its logs — running **in the caller's worktree**, whose caches it shares ([decision 0032](decisions/0032-environments-run-in-the-callers-worktree.md)). Durable; belongs to the pool, never to a person or task. Its lease says which services it wants up — `up` adds, `down` takes away — and every datastore exists for its whole life ([decision 0034](decisions/0034-additive-up-database-copies-and-ps.md)). |
+| **Database copy** | A fresh copy of one datastore, restored from the environments' template, outside any environment: no lease, no ports, no services (`runly db new|with`, decision 0034). Journalled with its holder and its drop command; reaped like an environment when the holder or the worktree is gone. |
 | **Binding** | A source state (the caller's worktree, as it is) plus a data state (preset, at a hygiene level) attached to the worktree's one environment. Since decision 0032 it is not a frozen snapshot: the services read the live worktree, and runly records no identity of it. |
 | **Lease** | Temporary ownership of an environment; see [lease deadlines and renewal](../README.md#how-long-you-hold-it---ttl-for-agents---holder-pid-for-shells). Expiry returns the environment to the pool **warm** — nothing is torn down. |
 
-There used to be a sixth, verb-noun: a **Run**, a named check executed against a
+There used to be another, verb-noun: a **Run**, a named check executed against a
 binding with a JSON verdict. Decision 0032 removed it: a repo runs its own tests
 against `runly ctx --env`.
 
@@ -241,21 +250,10 @@ Waiting can never clear a machine-wide block — the count is of rows, and relea
 lease leaves the row behind — so if nothing is evictable the refusal is immediate, and
 names the cap that actually bound plus `BACKLOT_POOL_MAX_TOTAL` (#47).
 
-**A third ceiling, for data-only environments.** `poolMax`/`poolMaxTotal` bound
-*application* environments, because the heuristic behind them measures cores and
-memory — running services. A data-only environment (`up --data-only`) starts none, so
-it is counted against `poolMaxDataOnly` instead: disk-shaped, machine-wide, and
-charged against neither application cap. Otherwise a test lane invoked on every
-integration run competes with the interactive leases people use to look at the app,
-which is the contention `--data-only` existed to remove (#48).
-
-The shape therefore lives on the environment row, and **changing it is a capacity
-event**: a claim may still convert an environment between shapes — a holder switching
-its own lease both ways stays supported — but only when the destination ceiling has
-room, and the move is logged as `pool-shape`. Unmetered, the conversion would make the
-cheap ceiling into application capacity, since reuse is never capacity-checked
-(decision 0025). Eviction is bucketed for the same reason: a data-only request can
-only give up a cold data-only environment.
+**There is no data-only ceiling** ([decision 0034](decisions/0034-additive-up-database-copies-and-ps.md),
+superseding 0023/0025). A database without the application is a `runly db` copy,
+which is not an environment and answers to no pool cap; `BACKLOT_POOL_MAX_DATA_ONLY`
+is ignored. Every environment counts against `poolMaxTotal`.
 
 ## 6. In place — "verbs converge, watch observes"
 
@@ -272,26 +270,35 @@ incrementality to the build tool.
   environment; a second holder waits for it (refused at once, naming the holder, when
   the lease outlasts the wait). The sweep recycles surplus environments an older
   journal left for one worktree.
-- **`up` is the only bind verb, and restarts what a build changed.** Every `up` runs
-  the due upkeep rules and the `build:` of every service it starts. The full
-  stop/data/build/start path is taken when the parsed manifest differs from the last
-  successful full bind (the memory-only `appliedManifests` ledger in `engine.ts`;
-  missing entries count as different), caller inputs or presets changed, an upkeep
-  rule ran, the hygiene is `reset-data`/`pristine`, the environment is not hot and
-  healthy, or the requested shape differs from what runs. Otherwise each active
-  service's build runs between two snapshots of its declared `outputs:` (path, size,
-  mtime — `snapshotOutputs` in `worktree.ts`), and only the services whose snapshot
-  differs — or that declare no outputs — are stopped and started again
-  (`stopServicesForRestart`, then `startSlice` over just those, with the rest counted
-  as already started for `depends_on`). A service with no `build:` keeps running.
-  Dependents of a restarted service are not restarted: its port is stable. See
-  `tests/in-place.test.ts`, `tests/bind-diagnostics.test.ts` and
+- **`up` is the only bind verb; it is additive and restarts what a build changed**
+  ([decision 0034](decisions/0034-additive-up-database-copies-and-ps.md)). The services
+  a bind runs are what runs now, plus (for a continuing lease) what the lease wants —
+  `EnvRow.activeServices`, undefined for every service, `[]` for none — plus the
+  request's `depends_on` closure. Every `up` runs the due upkeep rules and the
+  `build:` of every service it runs. The full stop/data/build/start path is taken
+  when the parsed manifest differs from the last successful full bind (the
+  memory-only `appliedManifests` ledger in `engine.ts`; missing entries count as
+  different), caller inputs changed, an upkeep rule ran, a public port moved, the
+  hygiene is `reset-data`/`pristine`, or the environment is not hot and healthy.
+  Otherwise each running service's build runs between two snapshots of its declared
+  `outputs:` (path, size, mtime — `snapshotOutputs` in `worktree.ts`), and only the
+  services whose snapshot differs — or that declare no outputs — are stopped and
+  started again (`stopServicesForRestart`, then `startSlice` over just those, with
+  the rest counted as already started for `depends_on`); the services the request
+  adds are built and started with them. A datastore named with `--preset` is
+  reloaded while the running services that template `{{datastores.<name>.…}}` (all
+  of them, when none does) are stopped. A service with no `build:` keeps running.
+  Dependents of a restarted service are not restarted: its port is stable. `down`
+  stops the named services (or all) under the env lock and records the smaller
+  wanted set; the proxy keeps their public ports. See `tests/in-place.test.ts`,
+  `tests/additive-up-and-db.test.ts`, `tests/bind-diagnostics.test.ts` and
   `tests/startup-config.test.ts`.
 - **Tests see the live worktree.** There is no frozen snapshot any more: an edit made
   while the repo's tests run is visible to the services. runly runs no checks; the
   tests read the environment from `runly ctx --env` (`RUNLY_PORT_<PORT>`,
-  `RUNLY_URL_<SERVICE>`, `RUNLY_DATASTORE_<NAME>_URL`, `RUNLY_LOGIN_USER`,
-  `RUNLY_LOGIN_PASSWORD`, `RUNLY_ENV_ID`).
+  `RUNLY_URL_<SERVICE>`, `RUNLY_DATASTORE_<NAME>_URL`,
+  `RUNLY_DATASTORE_<NAME>_PRESET`, `RUNLY_LOGIN_USER`, `RUNLY_LOGIN_PASSWORD`,
+  `RUNLY_ENV_ID`), or take a database copy of their own with `runly db with`.
 - `sync`, `bind`, `--watch`, `run`, `--detach` and `job` are removed; the CLI answers
   each with a usage error naming 0032. `watch_run` and `hot_reload` are accepted and
   ignored.
@@ -362,8 +369,8 @@ first bind; no presets or templates).
 
 | Level | Meaning | Typical consumer |
 | --- | --- | --- |
-| `reuse` | retain compatible state; see [preset selection](../README.md#choosing-datastore-presets) | human inspect loop |
-| `reset-data` | restore data template, keep all build caches | agent verify loops (`up --reset-data` before the tests) |
+| `reuse` | keep every datastore's data; a store named with `--preset` is reloaded alone (see [presets](../README.md#datastore-presets-reload-one-keep-the-rest)) | human inspect loop |
+| `reset-data` | restore every datastore from its template, each with the preset it holds (or the one named), keep all build caches | agent verify loops (`up --reset-data` before the tests) |
 | `pristine` | fresh private state; every upkeep rule re-runs in the worktree (nothing there is deleted; builds run on every `up` anyway) | merge-grade proofs; auto-escalation |
 
 Two consecutive bind failures on the same warm environment auto-escalate the next bind
@@ -452,8 +459,13 @@ Every failure is classified — the field an agent branches on mechanically:
 The CLI **is** the API: every verb takes `--json`; stdout is data, stderr is human.
 
 ```
-runly up [--reset-data|--pristine] [--ttl <minutes>]  # lease; upkeep + builds, restart what changed
+runly up [service...] [--preset [ds=]p]... [--reset-data|--pristine] [--ttl <minutes>]
+                                               # lease; ADD services; upkeep + builds, restart what changed
+runly down [service...]                        # stop just these (none = all); lease, data, ports stay
 runly ctx [--env]                              # the context blob (below); --env: RUNLY_* lines
+runly ps [--all]                               # services and database copies (this worktree | server)
+runly db new <ds> [--preset p] | db with <ds> [--preset p] -- <cmd...> | db ls [--all] | db drop <name>
+                                               # database copies outside any environment (decision 0034)
 runly warm                                     # due upkeep + builds in this worktree, no lease
 runly exec <cmd...>                            # run anything in the worktree, with the lease's env
 runly logs <service> [--lines N]               # supervised service logs
@@ -474,7 +486,7 @@ reports its version on `ping` (which the CLI already issues on every invocation)
 and a mismatch **refuses** every verb except `update`, `doctor` and `daemon stop`
 with `infra-error`. It refuses rather than warns because an old daemon ignores
 arguments it does not know instead of rejecting them: `up --data-only` against a
-pre-0.9.0 daemon boots the whole application and reports success, which is issue
+pre-0.9.0 daemon booted the whole application and reported success, which is issue
 #41's shape — a wrong result that names the wrong subsystem.
 
 `runly update` restarts the daemon; the autospawn then brings up the installed
@@ -494,7 +506,8 @@ Every verb accepts `--json`. Exit codes: `0` ok · `1` work-error ·
 `2` env-error · `3` infra-error · `64` usage. On a failure the `--json` body is
 `{ok:false, error:{class,message,…}}`. The verbs and flags decision 0032 removed
 (`sync`, `bind`, `pull`, `run`, `job`, `--watch`, `--detach`, `--pull`, `--ref`) exit
-64 naming it, before the daemon is contacted.
+64 naming it, before the daemon is contacted; so does `--data-only`, naming
+decision 0034 and `runly db`.
 
 **Progress.** The long verbs (`up`, `warm`, `reset-data`) stream bind
 phases (acquire → upkeep → datastore → build → start-and-ready, with an elapsed
@@ -508,12 +521,27 @@ bind" in the README for `bindDiagnostics`.
 
 `ctx` returns one blob with everything a consumer needs: service URLs (stable per
 environment), public ports and the proxy's per-port counters, login credentials, a token-mint hook, datastore
-connection strings, hygiene state, and recent service events. An agent holding this
+connection strings with the preset each datastore holds, each service's state
+(`running`, `stopped`, `down`), hygiene state, and recent service events. An agent holding this
 blob needs nothing else from runly. `ctx --env` prints the part a test command needs as
 shell-exportable lines with stable names: `RUNLY_ENV_ID`, `RUNLY_PORT_<PORT>`,
-`RUNLY_URL_<SERVICE>`, `RUNLY_DATASTORE_<NAME>_URL`, `RUNLY_LOGIN_USER`,
-`RUNLY_LOGIN_PASSWORD` (names upper-cased, other characters as `_`; a value is
+`RUNLY_URL_<SERVICE>`, `RUNLY_DATASTORE_<NAME>_URL`, `RUNLY_DATASTORE_<NAME>_PRESET`,
+`RUNLY_LOGIN_USER`, `RUNLY_LOGIN_PASSWORD` (names upper-cased, other characters as `_`; a value is
 single-quoted only when a shell needs it) — `eval "$(runly ctx --env)" && pnpm e2e`.
+
+**Database copies (decision 0034).** `runly db new <datastore>` restores a fresh
+copy from the environments' template (baking it if missing) and prints its name,
+url and preset; `runly db with <datastore> -- <cmd>` hands one to a command as
+`RUNLY_DB_URL`/`RUNLY_DB_NAME` and drops it when the command exits, with its exit
+code. A copy is a `db_copies` row — written as `creating` before the restore — that
+carries its holder (worktree; `--holder-pid`, or `db with`'s own CLI process) and
+its drop (the templated command and where to run it, or its directory under
+`<state>/dbs`). The sweeper (and recovery) drops a copy whose holder process is
+gone (the same `holderGone` check a lease gets), whose worktree is gone or now
+another stack, or whose creation or drop never finished; a failed drop stays on
+record with a backoff. No TTL, no pool cap. `runly ps` lists services (state,
+public and internal port, pid, proxy idle, RSS from the tagged processes) and
+copies, for the caller's worktree or `--all`.
 
 **Public preview (decision 0027).** `runly preview <service>` publishes one leased
 service through a preview **publisher** adapter (default: a Cloudflare quick tunnel via
@@ -538,17 +566,17 @@ for the removal decision.
 Policy lives in the engine, never the manifest. Precedence per knob: environment
 variable > `$STATE_DIR/config.json` > built-in default. The per-stack ceiling
 (`BACKLOT_POOL_MAX` / `poolMax`) and the run, artifact and job knobs were removed by
-decision 0032; a leftover setting is ignored.
+decision 0032, the data-only ceiling (`BACKLOT_POOL_MAX_DATA_ONLY` /
+`poolMaxDataOnly`) by decision 0034; a leftover setting is ignored.
 
 | Env var | config.json key | Default |
 | --- | --- | --- |
 | `BACKLOT_STATE_DIR` | — | `$XDG_STATE_HOME/backlot` (the per-machine root; 0700) |
 | `BACKLOT_LEASED_IDLE_TTL_MS` | `leasedIdleTtlMs` | `2 x idleTtlMs` — a LEASED but untouched env stops its services (keeps the lease) |
-| `BACKLOT_POOL_MAX_TOTAL` | `poolMaxTotal` | `min(cores/2, memGB/4)`, clamped **[2,8]**, **machine-wide across every stack**, application envs only. When this is what binds, a cold unleased env is evicted rather than the caller refused |
-| `BACKLOT_POOL_MAX_DATA_ONLY` | `poolMaxDataOnly` | `max(4, 2 x heuristic)` — data-only envs, machine-wide, counted against neither application cap (decision 0025) |
+| `BACKLOT_POOL_MAX_TOTAL` | `poolMaxTotal` | `min(cores/2, memGB/4)`, clamped **[2,8]**, **machine-wide across every stack**, every environment. When this is what binds, a cold unleased env is evicted rather than the caller refused |
 | `BACKLOT_LEASE_TTL_MS` | `sessionTtlMs` | 30 min |
 | `BACKLOT_IDLE_TTL_MS` | `idleTtlMs` | 30 min |
-| `BACKLOT_WAIT_MS` | `waitMs` | 60 s (queue-at-capacity timeout; also bounds a shape change waiting on an operation in flight on the holder's own environment) |
+| `BACKLOT_WAIT_MS` | `waitMs` | 60 s (queue-at-capacity timeout) |
 | `BACKLOT_LOG_CAP_BYTES` | `logCapBytes` | 5 MB |
 | `BACKLOT_TEMPLATES_KEEP` | `templatesKeep` | 4 per stack |
 | `BACKLOT_SWEEP_MS` | — | 15 s (lease/idle sweep cadence) |

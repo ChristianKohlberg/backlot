@@ -10,19 +10,6 @@ import { stateRoot } from './paths.js';
 export interface Policy {
   /** Machine-wide ceiling across ALL stacks (the memory heuristic is per host). */
   poolMaxTotal: number;
-  /**
-   * Machine-wide ceiling for DATA-ONLY environments, counted separately.
-   *
-   * poolMaxTotal is derived from cores and memory because it bounds
-   * running services. A data-only environment starts none, opens no port and
-   * builds nothing — where the datastore is an appliance, its marginal cost is a
-   * database catalog plus a synced tree. Charging it a stack-sized slot made a
-   * test lane compete with the interactive leases people use to LOOK at the app,
-   * which is the contention `up --data-only` existed to remove (#48). This cap
-   * is therefore disk-shaped, not CPU-shaped, and there is no per-stack variant:
-   * one lane per agent on one stack is the normal case.
-   */
-  poolMaxDataOnly: number;
   sessionTtlMs: number;
   idleTtlMs: number;
   /** How long a LEASED but untouched environment keeps its services running. */
@@ -35,7 +22,6 @@ export interface Policy {
 
 interface ConfigFile {
   poolMaxTotal?: number;
-  poolMaxDataOnly?: number;
   sessionTtlMs?: number;
   idleTtlMs?: number;
   leasedIdleTtlMs?: number;
@@ -81,11 +67,10 @@ export function policy(): Policy {
     // per-stack ceiling: a worktree has exactly one environment, decision 0032.)
     // Raise it deliberately if the host can take it.
     poolMaxTotal: num('BACKLOT_POOL_MAX_TOTAL', f.poolMaxTotal, poolMaxHeuristic()),
-    // Deliberately NOT the cores/memory heuristic: a data-only environment runs
-    // nothing, so what bounds it is disk, not CPU or RAM. Twice the heuristic
-    // with a floor of 4 leaves room for a lane per agent without letting the
-    // trees grow without limit.
-    poolMaxDataOnly: num('BACKLOT_POOL_MAX_DATA_ONLY', f.poolMaxDataOnly, Math.max(4, 2 * poolMaxHeuristic())),
+    // There is no data-only ceiling any more (decision 0034): a database
+    // without an application is a `runly db` copy, which is not an
+    // environment and answers to no pool cap. BACKLOT_POOL_MAX_DATA_ONLY and
+    // `poolMaxDataOnly` are ignored.
     sessionTtlMs: num('BACKLOT_LEASE_TTL_MS', f.sessionTtlMs, 30 * 60_000),
     idleTtlMs,
     // A LEASE used to exempt an environment from idle reclamation entirely, so

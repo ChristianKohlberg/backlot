@@ -28,6 +28,9 @@
  *   (c) env export — `ctx --env` must parse as KEY=value lines, and the
  *       stack's own check run with them must pass (decision 0032: runly no
  *       longer runs checks)
+ *   (c2) down/db — `down web` keeps the lease and URL, `up web` restores it;
+ *       two parallel `db new` copies are distinct and dropped; `db with`
+ *       propagates its command's exit code and drops its copy (decision 0034)
  *   (d) capacity churn — a second stack whose one environment (decision
  *       0032) is held by a short-TTL holder while another queues on its
  *       expiry, lease expiries, and a quiesce/rebind cycle under a
@@ -159,6 +162,9 @@ const stats = {
   heldRequests: 0,
   heldRequestFailures: 0,
   envChecks: 0,
+  downUps: 0,
+  dbCopies: 0,
+  dbWithRuns: 0,
   queuedAcquires: 0,
   leaseExpiries: 0,
   quiesceRebinds: 0,
@@ -542,6 +548,57 @@ async function phaseEnvExport() {
   if (must(check.code === 0, 'env', "the stack's own check failed against ctx --env", check.out.slice(0, 400))) stats.envChecks++;
 }
 
+/**
+ * (c2) Additive up / down and database copies (decision 0034), on the session
+ * lease phase (b) left up: `down web` keeps the lease and the public URL, `up
+ * web` brings it back; two `db new` copies are distinct and dropped; `db with`
+ * hands its command RUNLY_DB_URL, propagates the exit code and drops the copy.
+ */
+async function phaseDownAndDb() {
+  log(`phase down/db (cycle ${cycle})`);
+  const before = await cli(['ctx'], { cwd: stackA });
+  if (!must(before.body?.services?.web === 'running', 'down/db', 'ctx does not report web as running before down', before.stdout.slice(0, 300))) return;
+  const d = await cli(['down', 'web'], { cwd: stackA });
+  must(Array.isArray(d.body?.stopped) && d.body.stopped.includes('web'), 'down/db', 'down web did not report web stopped', d.stdout.slice(0, 300));
+  const mid = await cli(['ctx'], { cwd: stackA });
+  // `urls` lists the services the lease wants; a downed one keeps its public
+  // port (decision 0033), which `ports` still reports.
+  must(mid.body?.envId === before.body.envId && mid.body?.services?.web === 'down' && mid.body?.urls?.web === undefined &&
+    mid.body?.ports?.web === before.body.ports.web,
+    'down/db', 'after down the lease, the public port or the down state was lost', mid.stdout.slice(0, 300));
+  const back = await cli(['up', 'web'], { cwd: stackA });
+  if (must(back.body?.state === 'hot' && back.body?.envId === before.body.envId && back.body?.urls?.web === before.body.urls.web,
+    'down/db', 'up web after down did not bring the same environment back on the same URL', back.stdout.slice(0, 300))) {
+    const alive = await until(5000, 250, () => fetchJson(back.body.urls.web + '/health'));
+    if (must(alive && alive.ok === true, 'down/db', 'web does not answer after down + up', back.body.urls.web)) stats.downUps++;
+  }
+
+  const [c1, c2] = await Promise.all([cli(['db', 'new', 'main'], { cwd: stackA }), cli(['db', 'new', 'main'], { cwd: stackA })]);
+  const names = [c1.body?.name, c2.body?.name];
+  if (must(names.every(Boolean) && names[0] !== names[1] && c1.body?.url !== c2.body?.url, 'down/db', 'two db new calls did not yield two distinct copies', `${c1.stdout.slice(0, 200)} | ${c2.stdout.slice(0, 200)}`)) {
+    stats.dbCopies += 2;
+  }
+  const ls = await cli(['db', 'ls'], { cwd: stackA });
+  must(names.every((n) => ls.body?.copies?.some((c) => c.name === n)), 'down/db', 'db ls does not list the new copies', ls.stdout.slice(0, 300));
+  for (const n of names.filter(Boolean)) {
+    const dr = await cli(['db', 'drop', n], { cwd: stackA });
+    must(dr.body?.dropped === n, 'down/db', `db drop ${n} did not confirm`, dr.stdout.slice(0, 200));
+  }
+
+  const want = randInt(0, 3);
+  const w = await new Promise((resolveW) => {
+    execFile(process.execPath, [CLI, 'db', 'with', 'main', '--', process.execPath, '-e',
+      `const u=process.env.RUNLY_DB_URL;process.exit(u&&process.env.RUNLY_DB_NAME?${want}:9)`],
+    { cwd: stackA, env: daemonEnv, timeout: 120_000 }, (err, stdout, stderr) =>
+      resolveW({ code: err ? (typeof err.code === 'number' ? err.code : -1) : 0, out: String(stdout) + String(stderr) }));
+  });
+  const after = await cli(['db', 'ls'], { cwd: stackA, quiet: true });
+  if (must(w.code === want && (after.body?.copies ?? []).length === 0, 'down/db',
+    'db with did not propagate the exit code or did not drop its copy', `exit ${w.code} (wanted ${want}); left: ${JSON.stringify(after.body?.copies ?? null).slice(0, 200)} ${w.out.slice(0, 200)}`)) {
+    stats.dbWithRuns++;
+  }
+}
+
 async function statusEnvs() {
   const s = await cli(['status'], { cwd: stackA, quiet: true });
   return s.body?.envs ?? [];
@@ -819,6 +876,9 @@ async function convergence() {
     // which a read-only handle refuses to perform. We only SELECT.
     const db = new DatabaseSync(join(stateDir, 'journal.db'));
     envRows = db.prepare('SELECT id, state, root, service_pids FROM envs').all();
+    for (const c of db.prepare('SELECT name, state FROM db_copies').all()) {
+      fail('error', 'convergence', `database copy ${c.name} (${c.state}) is still journalled after shutdown — a dropped copy must leave no row`);
+    }
     const leaseRows = db.prepare('SELECT id, env_id, holder FROM leases').all();
     const envIds = new Set(envRows.map((e) => e.id));
     for (const l of leaseRows) {
@@ -882,6 +942,9 @@ function printStats() {
   lines.push(`  full-bind restarts     ${stats.fallbackRestarts}`);
   lines.push(`  requests held/failed   ${stats.heldRequests}/${stats.heldRequestFailures}`);
   lines.push(`  env-export checks      ${stats.envChecks}`);
+  lines.push(`  down+up round trips    ${stats.downUps}`);
+  lines.push(`  db copies (new+drop)   ${stats.dbCopies}`);
+  lines.push(`  db with runs           ${stats.dbWithRuns}`);
   lines.push(`  queued acquires        ${stats.queuedAcquires}`);
   lines.push(`  lease expiries swept   ${stats.leaseExpiries}`);
   lines.push(`  quiesce -> rebind      ${stats.quiesceRebinds}`);
@@ -953,6 +1016,8 @@ async function main() {
       await maybeChaos();
       if (timeLeft() < 30_000) break;
       await phaseEnvExport(); // reads that session's environment
+      if (timeLeft() < 45_000) break;
+      await phaseDownAndDb(); // additive up / down + db copies on that lease
       if (timeLeft() < 45_000) break;
       await phaseCapacity();
       await cli(['release'], { cwd: stackA, quiet: true });

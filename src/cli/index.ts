@@ -18,27 +18,47 @@ import { BrokerError } from '../core/util.js';
 const USAGE = `runly — puts a working instance of a web application in front of you.
 
 Usage:
-  runly up [service...] [--reset-data|--pristine] [--ttl <minutes>] [--holder-pid <pid>]
-                          (no service = whole app; named services start only that
-                           slice plus its depends_on closure)
-                          session lease on THIS worktree's one environment. Every
-                          up applies the worktree as it is now: the due upkeep
-                          rules, then every build: of the services it starts.
+  runly up [service...] [--preset [DATASTORE=]NAME]... [--reset-data|--pristine]
+           [--ttl <minutes>] [--holder-pid <pid>]
+                          session lease on THIS worktree's one environment.
+                          ADDITIVE: starts the named services plus their
+                          depends_on closure (none named = every service) and
+                          never stops one that is already running. Every up
+                          applies the worktree as it is now: the due upkeep
+                          rules, then every build: of the services it runs.
                           A running service whose build OUTPUT changed (its
                           outputs: globs; none declared = always) is restarted;
                           one whose output is unchanged, or that has no build:,
                           keeps running. Dependents are not restarted.
-  runly up --data-only  lease the DATASTORES alone — a seeded database, no
-                          services, no builds. For test lanes that need a
-                          database per run rather than a whole application.
-                          Connection strings arrive in the same ctx blob.
-  runly ctx [--env]     the consumer context blob (URLs, logins, conn strings).
+                          Every datastore exists for the environment's life and
+                          keeps its data; --preset reloads ONLY that datastore
+                          from its template and restarts the running services
+                          that use it.
+  runly down [service...] stop just these services (none named = all of them).
+                          The lease, the data and the public ports stay.
+  runly ctx [--env]     the consumer context blob (URLs, services, logins,
+                          conn strings and the preset each datastore holds).
                           --env prints shell-exportable KEY=value lines instead:
                           RUNLY_ENV_ID, RUNLY_PORT_<PORT>, RUNLY_URL_<SERVICE>,
-                          RUNLY_DATASTORE_<NAME>_URL, RUNLY_LOGIN_USER and
-                          RUNLY_LOGIN_PASSWORD (names uppercased, any other
-                          character as _). Run your checks with them:
-                          eval "$(runly ctx --env)" && npm test
+                          RUNLY_DATASTORE_<NAME>_URL, RUNLY_DATASTORE_<NAME>_PRESET,
+                          RUNLY_LOGIN_USER and RUNLY_LOGIN_PASSWORD (names
+                          uppercased, any other character as _). Run your checks
+                          with them: eval "$(runly ctx --env)" && npm test
+  runly ps [--all]      what runs for this worktree: each service (state, public
+                          and internal port, pid, idle time, memory) and each
+                          database copy. --all for the whole server
+  runly db new <datastore> [--preset NAME] [--holder-pid <pid>]
+                          a fresh copy of a datastore from the same template the
+                          environments use — no lease, no ports, no services.
+                          Prints its name, url and preset. It is dropped when
+                          the holder process (--holder-pid / BACKLOT_HOLDER_PID)
+                          exits or this worktree goes away, or by 'db drop'
+  runly db with <datastore> [--preset NAME] -- <cmd...>
+                          run a command against a fresh copy (RUNLY_DB_URL,
+                          RUNLY_DB_NAME), drop the copy when it exits, and exit
+                          with its exit code
+  runly db ls [--all]   this worktree's database copies (--all: every one)
+  runly db drop <name>  drop one copy now
   runly warm            run this worktree's due upkeep rules and its service
                           builds now — no lease, no services. For an idle worktree
                           just moved to a new commit
@@ -98,14 +118,17 @@ environment would be handed to the next caller while you were still using it —
 runly refuses the bind instead. Use --ttl.
 
 up and reset-data accept --preset NAME (one datastore), or repeatable
---preset DATASTORE=NAME. ctx reports each datastore's selected preset.
+--preset DATASTORE=NAME; a named datastore is reloaded from its template, every
+other one keeps its data. ctx reports the preset each datastore holds. db new and
+db with take --preset NAME for their one datastore.
 
 Every verb accepts --json. Long verbs (up/warm/reset-data) show live progress
 on a terminal (stderr); force with --progress, silence with --quiet. stdout stays clean.
 Exit codes: 0 ok · 1 work-error · 2 env-error · 3 infra-error · 64 usage.
 
 Removed in 0.13 (decision 0032; each now exits 64 naming its replacement):
-sync, bind, pull, run, job, --watch, --detach, --pull, --ref.`;
+sync, bind, pull, run, job, --watch, --detach, --pull, --ref.
+Removed in 0.15 (decision 0034): up --data-only — use 'runly db new|with'.`;
 
 const rawArgv = process.argv.slice(2);
 const verb = rawArgv[0];
@@ -216,8 +239,8 @@ function hygiene(): string | undefined {
 }
 
 async function main(): Promise<void> {
-  if (presetArgs.length > 0 && !['up', 'reset-data'].includes(verb ?? '')) {
-    console.error('runly: --preset is supported by up and reset-data');
+  if (presetArgs.length > 0 && !['up', 'reset-data', 'db'].includes(verb ?? '')) {
+    console.error('runly: --preset is supported by up, reset-data and db');
     process.exit(64);
   }
   if (!verb || verb === 'help' || verb === '--help' || verb === '-h') {
@@ -256,6 +279,12 @@ async function main(): Promise<void> {
     '--watch': `--watch was removed ${D}: re-run 'runly up' after a change; it runs the due upkeep and the builds, and restarts what changed`,
     '--ref': `--ref was removed ${D}: environments run in your worktree; check the ref out ('git checkout <ref>', or a separate worktree) and run 'runly up'`,
   };
+  // Removed by decision 0034: datastores are no longer leased through an
+  // environment of their own.
+  removedFlags['--data-only'] =
+    `--data-only was removed (decision 0034): a database without an environment is 'runly db new <datastore>' ` +
+    `(prints its url; dropped when its holder or worktree goes, or by 'runly db drop'), or 'runly db with <datastore> -- <cmd>', ` +
+    `which drops it when the command exits. To keep the environment but stop its services: 'runly down'`;
   for (const [flag, msg] of Object.entries(removedFlags)) {
     if (flags.has(flag)) {
       console.error(`runly: ${msg}`);
@@ -263,7 +292,7 @@ async function main(): Promise<void> {
     }
   }
 
-  const known = ['up', 'ctx', 'warm', 'exec', 'logs', 'token', 'reset-data', 'release', 'preview', 'status', 'doctor', 'appliance', 'pool', 'daemon', 'update'];
+  const known = ['up', 'down', 'ctx', 'ps', 'db', 'warm', 'exec', 'logs', 'token', 'reset-data', 'release', 'preview', 'status', 'doctor', 'appliance', 'pool', 'daemon', 'update'];
   if (!known.includes(verb)) {
     console.error(`runly: unknown verb '${verb}'\n\n${USAGE}`);
     process.exit(64);
@@ -281,8 +310,42 @@ async function main(): Promise<void> {
       /* no manifest here, or an invalid one — the verb itself reports that */
     }
   }
+  // `db` names its one datastore positionally, so its --preset is a bare name.
+  let dbPreset: string | undefined;
+  if (verb === 'db') {
+    if (presetArgs.length > 1) {
+      console.error('runly db: --preset is given once — a copy is of one datastore');
+      process.exit(64);
+    }
+    const raw = presetArgs[0];
+    if (raw !== undefined) {
+      const at = raw.indexOf('=');
+      if (at >= 0 && raw.slice(0, at) !== positional[1]) {
+        console.error(`runly db: --preset ${raw} names another datastore than '${positional[1] ?? ''}'`);
+        process.exit(64);
+      }
+      dbPreset = at >= 0 ? raw.slice(at + 1) : raw;
+    }
+    const sub = positional[0];
+    if (!['new', 'with', 'ls', 'drop'].includes(sub ?? '')) {
+      console.error(`runly db: ${sub ? `unknown subcommand '${sub}'` : 'which subcommand?'} (new <datastore> | with <datastore> -- <cmd...> | ls | drop <name>)`);
+      process.exit(64);
+    }
+    if ((sub === 'new' || sub === 'with') && !positional[1]) {
+      console.error(`runly db ${sub}: which datastore? (runly db ${sub} <datastore>${sub === 'with' ? ' -- <cmd...>' : ''})`);
+      process.exit(64);
+    }
+    if (sub === 'with' && (passthrough === null || passthrough.length === 0)) {
+      console.error('runly db with: no command given (runly db with <datastore> -- <cmd...>)');
+      process.exit(64);
+    }
+    if (sub === 'drop' && !positional[1]) {
+      console.error('runly db drop: which copy? (the name from db new or db ls)');
+      process.exit(64);
+    }
+  }
   let presets: Record<string, string> | undefined;
-  if (presetArgs.length > 0) {
+  if (presetArgs.length > 0 && verb !== 'db') {
     const manifest = loadStack(process.cwd()).manifest;
     presets = parsePresetArgs(manifest, presetArgs);
   }
@@ -358,13 +421,70 @@ async function main(): Promise<void> {
           process.exit(64);
         }
       }
-      const dataOnly = flags.has('--data-only');
       res = await rpc(
         'up',
-        { cwd, holder, holderPid, hygiene: hygiene(), ttlMs, services: positional, dataOnly, callerEnv, presets },
+        { cwd, holder, holderPid, hygiene: hygiene(), ttlMs, services: positional, callerEnv, presets },
         progress,
       );
       endProgress();
+      break;
+    }
+    case 'down':
+      res = await rpc('down', { cwd, holder, services: positional }, progress);
+      endProgress();
+      if (res.ok && !json) {
+        const d = res.data as { down: string[]; stopped: string[]; dependentsStillRunning: string[]; previewNotice?: string };
+        console.log(d.stopped.length ? `stopped ${d.stopped.join(', ')}` : 'nothing was running');
+        if (d.dependentsStillRunning.length) {
+          console.error(`runly: note: ${d.dependentsStillRunning.join(', ')} still run${d.dependentsStillRunning.length === 1 ? 's' : ''} and depend${d.dependentsStillRunning.length === 1 ? 's' : ''} on what is now down`);
+        }
+        if (d.previewNotice) console.error(`runly: ${d.previewNotice}`);
+        return;
+      }
+      break;
+    case 'ps':
+      res = await rpc('ps', { cwd, all: flags.has('--all') });
+      if (res.ok && !json) {
+        for (const line of psLines(res.data as PsData)) console.log(line);
+        return;
+      }
+      break;
+    case 'db': {
+      const sub = positional[0]!;
+      if (sub === 'new') {
+        res = await rpc('db-new', { cwd, holder, holderPid, datastore: positional[1], preset: dbPreset }, progress);
+        endProgress();
+        if (res.ok && !json) {
+          const d = res.data as DbCopy;
+          console.log(`name=${shellValue(d.name)}\nurl=${shellValue(d.url)}\npreset=${shellValue(d.preset)}`);
+          return;
+        }
+        break;
+      }
+      if (sub === 'with') {
+        // The copy is tethered to THIS process: the CLI outlives the command,
+        // so if it is killed the daemon's reaper drops the copy.
+        const created = await rpc('db-new', { cwd, holder, holderPid: process.pid, datastore: positional[1], preset: dbPreset }, progress);
+        endProgress();
+        if (!created.ok) {
+          errExit(created.error);
+          return;
+        }
+        const copy = created.data as DbCopy;
+        const code = await runWithCopy(passthrough!, copy);
+        const dropped = await rpc('db-drop', { name: copy.name });
+        if (!dropped.ok) console.error(`runly db with: dropping ${copy.name} failed (${dropped.error.message}) — the sweeper retries it`);
+        process.exit(code);
+      }
+      if (sub === 'ls') {
+        res = await rpc('db-ls', { cwd, all: flags.has('--all') });
+        if (res.ok && !json) {
+          for (const line of dbLines((res.data as { copies: DbCopy[] }).copies)) console.log(line);
+          return;
+        }
+        break;
+      }
+      res = await rpc('db-drop', { name: positional[1] });
       break;
     }
     case 'ctx':
@@ -727,8 +847,91 @@ interface CtxForEnv {
   envId: string;
   ports?: Record<string, number>;
   urls?: Record<string, string>;
-  datastores?: Record<string, { url: string }>;
+  datastores?: Record<string, { url: string; preset?: string | null }>;
   logins?: { user: string; password: string } | null;
+}
+
+interface DbCopy {
+  name: string;
+  datastore: string;
+  preset: string;
+  url: string;
+  state: string;
+  worktree: string;
+  holder: string;
+  holderPid: number | null;
+  holderAlive: boolean | null;
+  createdAt: number;
+}
+
+interface PsData {
+  scope: string;
+  services: Array<{ env: string; service: string; state: string; publicPort: number | null; internalPort: number | null; pid: number | null; idleMs: number | null; rssBytes: number | null }>;
+  databases: DbCopy[];
+}
+
+/**
+ * Run `db with`'s command against the copy, its exit code as ours. One token
+ * is a shell string (as for exec); several keep the caller's own word splits.
+ * SIGINT/SIGTERM are passed on, so the copy is dropped after the command stops.
+ */
+async function runWithCopy(parts: string[], copy: DbCopy): Promise<number> {
+  const { spawn } = await import('node:child_process');
+  const { constants } = await import('node:os');
+  const env = { ...process.env, RUNLY_DB_URL: copy.url, RUNLY_DB_NAME: copy.name };
+  const child = parts.length === 1
+    ? spawn(parts[0]!, { stdio: 'inherit', env, shell: true })
+    : spawn(parts[0]!, parts.slice(1), { stdio: 'inherit', env });
+  const forward = (sig: NodeJS.Signals) => () => {
+    try { child.kill(sig); } catch { /* already gone */ }
+  };
+  const onInt = forward('SIGINT');
+  const onTerm = forward('SIGTERM');
+  process.on('SIGINT', onInt);
+  process.on('SIGTERM', onTerm);
+  return new Promise((resolve) => {
+    child.on('error', (err) => {
+      console.error(`runly db with: could not start '${parts[0]}': ${err.message}`);
+      resolve(127);
+    });
+    child.on('exit', (code, signal) => {
+      process.off('SIGINT', onInt);
+      process.off('SIGTERM', onTerm);
+      resolve(code ?? (signal ? 128 + (constants.signals[signal] ?? 0) : 1));
+    });
+  });
+}
+
+/** A plain, aligned table; `-` for an empty cell. */
+function table(header: string[], rows: string[][]): string[] {
+  const widths = header.map((h, i) => Math.max(h.length, ...rows.map((r) => (r[i] ?? '').length)));
+  const line = (cells: string[]) => cells.map((c, i) => (c || '-').padEnd(widths[i]!)).join('  ').trimEnd();
+  return [line(header), ...rows.map(line)];
+}
+
+const ago = (ms: number | null): string => (ms === null ? '' : ms < 60_000 ? `${Math.round(ms / 1000)}s` : ms < 3_600_000 ? `${Math.round(ms / 60_000)}m` : `${(ms / 3_600_000).toFixed(1)}h`);
+const mb = (bytes: number | null): string => (bytes === null ? '' : `${Math.round(bytes / (1024 * 1024))}M`);
+
+function dbLines(copies: DbCopy[]): string[] {
+  if (copies.length === 0) return ['no database copies'];
+  return table(['NAME', 'DATASTORE', 'PRESET', 'STATE', 'HOLDER', 'CREATED'], copies.map((c) => [
+    c.name, c.datastore, c.preset, c.state,
+    `${c.holder}${c.holderPid !== null ? ` (pid ${c.holderPid}${c.holderAlive === false ? ', gone' : ''})` : ''}`,
+    `${ago(Date.now() - c.createdAt)} ago`,
+  ]));
+}
+
+function psLines(d: PsData): string[] {
+  const out: string[] = [];
+  out.push(...(d.services.length === 0
+    ? ['no environment for this worktree']
+    : table(['ENV', 'SERVICE', 'STATE', 'PORT', 'INTERNAL', 'PID', 'IDLE', 'RSS'], d.services.map((s) => [
+      s.env, s.service, s.state, s.publicPort === null ? '' : String(s.publicPort), s.internalPort === null ? '' : String(s.internalPort),
+      s.pid === null ? '' : String(s.pid), ago(s.idleMs), mb(s.rssBytes),
+    ]))));
+  out.push('');
+  out.push(...dbLines(d.databases));
+  return out;
 }
 
 /** `web-audit` -> `WEB_AUDIT`: a valid, stable shell variable suffix. */
@@ -739,13 +942,18 @@ const shellValue = (v: string): string => (/^[A-Za-z0-9_./:@%+,=-]*$/.test(v) ? 
 /**
  * `runly ctx --env` (decision 0032). Names are stable and documented:
  * RUNLY_ENV_ID, RUNLY_PORT_<PORT>, RUNLY_URL_<SERVICE>,
- * RUNLY_DATASTORE_<NAME>_URL, RUNLY_LOGIN_USER, RUNLY_LOGIN_PASSWORD.
+ * RUNLY_DATASTORE_<NAME>_URL, RUNLY_DATASTORE_<NAME>_PRESET (decision 0034),
+ * RUNLY_LOGIN_USER, RUNLY_LOGIN_PASSWORD.
  */
 function envLines(c: CtxForEnv): string[] {
   const lines = [`RUNLY_ENV_ID=${shellValue(c.envId)}`];
   for (const [k, v] of Object.entries(c.ports ?? {}).sort()) lines.push(`RUNLY_PORT_${envName(k)}=${v}`);
   for (const [k, v] of Object.entries(c.urls ?? {}).sort()) lines.push(`RUNLY_URL_${envName(k)}=${shellValue(v)}`);
-  for (const [k, v] of Object.entries(c.datastores ?? {}).sort()) lines.push(`RUNLY_DATASTORE_${envName(k)}_URL=${shellValue(v.url)}`);
+  for (const [k, v] of Object.entries(c.datastores ?? {}).sort()) {
+    lines.push(`RUNLY_DATASTORE_${envName(k)}_URL=${shellValue(v.url)}`);
+    // What the datastore holds right now (decision 0034); absent before its first restore.
+    if (v.preset) lines.push(`RUNLY_DATASTORE_${envName(k)}_PRESET=${shellValue(v.preset)}`);
+  }
   if (c.logins) {
     lines.push(`RUNLY_LOGIN_USER=${shellValue(c.logins.user)}`);
     lines.push(`RUNLY_LOGIN_PASSWORD=${shellValue(c.logins.password)}`);

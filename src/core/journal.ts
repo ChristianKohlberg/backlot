@@ -23,6 +23,11 @@ import type { EnvState, Hygiene, LeaseKind, ServicePid } from './types.js';
  * Schema 3's survivor-group compatibility barrier is documented in
  * docs/architecture.md#journal-upgrade-barrier.
  *
+ * Schema 4 (decision 0034): `active_services = '[]'` means "no services are
+ * wanted" (an older daemon reads an empty list as the whole app and would boot
+ * it), the `db_copies` table holds database copies an older daemon would never
+ * reap, and data-only environments are migrated away at the first recovery.
+ *
  * What this exists to stop is the DOWNGRADE, which has already cost once. The
  * sha256 env-id migration stranded pre-upgrade rows that then counted against
  * POOL_MAX_TOTAL and held their ports forever (BACKLOG.md), because nothing on
@@ -32,7 +37,7 @@ import type { EnvState, Hygiene, LeaseKind, ServicePid } from './types.js';
  * test lane's database. Disk is truth (decision 0009), so the truth has to say
  * what wrote it.
  */
-export const JOURNAL_SCHEMA_VERSION = 3;
+export const JOURNAL_SCHEMA_VERSION = 4;
 
 /**
  * service_pids was once `{"web": 1234}` and is now
@@ -78,21 +83,19 @@ export interface EnvRow {
   /** Consecutive bind failures — >= 2 auto-escalates the next bind to pristine (decision 0007). */
   failStreak: number;
   /**
-   * The services this environment currently has up, when that is a SUBSET of
-   * the manifest — `runly up sherlock` starts only that slice plus its
-   * transitive depends_on closure. Undefined means the whole app is up (the
-   * default). reset-data/watch rebinds read this to preserve the lease's shape;
-   * a fresh `up` re-declares it.
+   * The services this environment's lease WANTS up (decision 0034): `up`
+   * adds to it, `down` takes away. Undefined means every service the
+   * manifest declares (so a service added to the manifest later is included);
+   * `[]` means none — the shape `down` with no names leaves. The running set
+   * is the supervisor's; this is the intent a quiesce or a daemon restart
+   * keeps, and the next `up` restores.
    */
   activeServices?: string[];
   /**
-   * This environment was bound for its DATASTORES ONLY — no services, by design.
-   *
-   * `activeServices: []` cannot express this: an empty selection has always meant
-   * "the whole app" (see `resolveServiceClosure`), so without a separate flag a
-   * shape-preserving rebind — `reset-data` on a data lease is the one that
-   * matters — would read the empty shape and boot the entire stack. A fresh claim
-   * never inherits it; only the request sets it.
+   * Read only to migrate it away: an older runly bound environments for their
+   * datastores alone (`up --data-only`, decisions 0023/0025, removed by 0034).
+   * Recovery turns a leased one into an environment with no services wanted
+   * and recycles an unleased one; nothing else reads it.
    */
   dataOnly?: boolean;
 }
@@ -122,6 +125,39 @@ export interface LeaseRow {
   previewStart?: number;
   /** Local port the tunnel was published against, so a rebind can spot drift. */
   previewPort?: number;
+}
+
+/**
+ * A database copy made by `runly db new|with` (decision 0034): a fresh restore
+ * from the same template an environment's datastore uses, with no lease, ports
+ * or services. Everything needed to DROP it is on the row — the command, where
+ * to run it, the files to remove — so it can be reaped after the worktree that
+ * made it is gone.
+ */
+export interface DbCopyRow {
+  name: string;
+  stack: string;
+  stackRoot: string;
+  datastore: string;
+  preset: string;
+  ns: string;
+  url: string;
+  /** `creating` until the restore finished; `dropping` once a drop started (or failed). */
+  state: 'creating' | 'ready' | 'dropping';
+  /** The caller's worktree, the same holder name `up` uses. */
+  holder: string;
+  /** The agent tether, when the caller named one (`--holder-pid`, BACKLOT_HOLDER_PID, or `db with`'s own CLI). */
+  holderPid?: number;
+  holderStart?: number;
+  /** The already-templated drop command (command-family drivers). */
+  dropCmd?: string;
+  /** Where it runs: the worktree, or the state root when that is gone. */
+  dropCwd?: string;
+  /** What to delete instead (sqlite): the copy's own directory under the state root. */
+  dropPath?: string;
+  createdAt: number;
+  dropAttempts: number;
+  nextDropAt: number;
 }
 
 export class Journal {
@@ -169,6 +205,14 @@ export class Journal {
       );
       CREATE TABLE IF NOT EXISTS counters (
         stack TEXT PRIMARY KEY, next_env INTEGER NOT NULL DEFAULT 1
+      );
+      CREATE TABLE IF NOT EXISTS db_copies (
+        name TEXT PRIMARY KEY, stack TEXT NOT NULL, stack_root TEXT NOT NULL,
+        datastore TEXT NOT NULL, preset TEXT NOT NULL, ns TEXT NOT NULL, url TEXT NOT NULL,
+        state TEXT NOT NULL, holder TEXT NOT NULL, holder_pid INTEGER, holder_start INTEGER,
+        drop_cmd TEXT, drop_cwd TEXT, drop_path TEXT,
+        created_at INTEGER NOT NULL, drop_attempts INTEGER NOT NULL DEFAULT 0,
+        next_drop_at INTEGER NOT NULL DEFAULT 0
       );
     `);
     // Migrations for journals created before holder identity existed.
@@ -324,6 +368,59 @@ export class Journal {
         stack_root = ? WHERE id = ?`);
       for (const change of changes) update.run(change.stack, change.root, change.root, change.id);
     });
+  }
+
+  private rowToDbCopy(r: Record<string, unknown>): DbCopyRow {
+    return {
+      name: r.name as string,
+      stack: r.stack as string,
+      stackRoot: r.stack_root as string,
+      datastore: r.datastore as string,
+      preset: r.preset as string,
+      ns: r.ns as string,
+      url: r.url as string,
+      state: r.state as DbCopyRow['state'],
+      holder: r.holder as string,
+      holderPid: (r.holder_pid as number | null) ?? undefined,
+      holderStart: (r.holder_start as number | null) ?? undefined,
+      dropCmd: (r.drop_cmd as string | null) ?? undefined,
+      dropCwd: (r.drop_cwd as string | null) ?? undefined,
+      dropPath: (r.drop_path as string | null) ?? undefined,
+      createdAt: r.created_at as number,
+      dropAttempts: (r.drop_attempts as number) ?? 0,
+      nextDropAt: (r.next_drop_at as number) ?? 0,
+    };
+  }
+
+  saveDbCopy(c: DbCopyRow): void {
+    this.db
+      .prepare(
+        `INSERT INTO db_copies (name, stack, stack_root, datastore, preset, ns, url, state, holder, holder_pid, holder_start,
+           drop_cmd, drop_cwd, drop_path, created_at, drop_attempts, next_drop_at)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+         ON CONFLICT(name) DO UPDATE SET state=excluded.state, drop_attempts=excluded.drop_attempts,
+           next_drop_at=excluded.next_drop_at`,
+      )
+      .run(
+        c.name, c.stack, c.stackRoot, c.datastore, c.preset, c.ns, c.url, c.state, c.holder,
+        c.holderPid ?? null, c.holderStart ?? null, c.dropCmd ?? null, c.dropCwd ?? null, c.dropPath ?? null,
+        c.createdAt, c.dropAttempts, c.nextDropAt,
+      );
+  }
+
+  getDbCopy(name: string): DbCopyRow | undefined {
+    const r = this.db.prepare('SELECT * FROM db_copies WHERE name = ?').get(name);
+    return r ? this.rowToDbCopy(r as Record<string, unknown>) : undefined;
+  }
+
+  allDbCopies(): DbCopyRow[] {
+    return (this.db.prepare('SELECT * FROM db_copies ORDER BY created_at, name').all() as Record<string, unknown>[]).map((r) =>
+      this.rowToDbCopy(r),
+    );
+  }
+
+  deleteDbCopy(name: string): void {
+    this.db.prepare('DELETE FROM db_copies WHERE name = ?').run(name);
   }
 
   deleteEnv(id: string): void {

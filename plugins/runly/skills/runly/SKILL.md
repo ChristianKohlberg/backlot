@@ -1,6 +1,6 @@
 ---
 name: runly
-description: Use runly to put a running, seeded, authenticated instance of the web app in front of you before inspecting behaviour, proving a change, or reproducing a bug. Use when the consuming repo has a runly.yml at its root and the `runly` CLI is installed; covers leasing a warm env that runs in your worktree, partial/per-service up, re-running up after edits, running your own tests against `ctx --env`, warming an idle worktree, and reading context.
+description: Use runly to put a running, seeded, authenticated instance of the web app in front of you before inspecting behaviour, proving a change, or reproducing a bug. Use when the consuming repo has a runly.yml at its root and the `runly` CLI is installed; covers leasing a warm env that runs in your worktree, additive per-service up/down, re-running up after edits, throwaway database copies (runly db), runly ps, running your own tests against `ctx --env`, warming an idle worktree, and reading context.
 ---
 
 # runly
@@ -35,12 +35,15 @@ not just to read or edit code.
   `up` again after edits, `exec`/`ctx`/`logs` against it, and `release` when done.
 - **runly runs no checks.** Run the repo's own tests yourself against the
   environment: `eval "$(runly ctx --env)" && <test command>`. Want known data
-  first? `runly up --reset-data` (or `reset-data --preset NAME`) before it.
+  first? `runly up --reset-data` (all datastores) or `runly up --preset <ds>=<preset>`
+  (that one datastore) before it. Without `--preset`, data is kept as it is.
 - **Releasing is a non-event.** `release` (or just letting the lease's TTL lapse)
   returns the env to the pool with its heat intact.
-- **You can lease just a database.** `up --data-only` gives you a seeded, isolated
-  datastore with no services and no builds — the right unit for an integration
-  test lane. Don't stand up your own container for that.
+- **Need just a database? `runly db with <datastore> -- <cmd>`.** It makes a
+  fresh seeded copy from the same template, runs your command with
+  `RUNLY_DB_URL`/`RUNLY_DB_NAME`, and drops the copy when it exits — as many in
+  parallel as you like, no lease, your running app untouched. Don't stand up your
+  own container for that. (`up --data-only` was removed in 0.15: exit 64.)
 - **How long you hold it: use `--ttl <minutes>`.** That is the form for you.
   There is a second form, `--holder-pid <pid>` / `BACKLOT_HOLDER_PID`, which ties
   the lease to a process so it frees the instant that process exits — it is for
@@ -58,10 +61,12 @@ stderr is human progress. Exit codes are contractual: `0` ok · `1` work-error �
 
 | Verb | What it does |
 | --- | --- |
-| `up [service...]` | Session lease: upkeep, build and start services in this worktree, print context. **No service = the whole app. Named services start only that slice plus its transitive `depends_on` closure** (see below). **Every `up` applies your edits:** it runs the due upkeep and the builds, then restarts only the services whose build output changed (see below). Flags: `--reset-data`\|`--pristine`, `--ttl <minutes>` (**the lease form for agents**), `--holder-pid <pid>` (interactive shells only — see above), `--data-only` (see below). |
-| `up --data-only` | Lease the **datastores alone** — a seeded database, no services, no builds. For a test lane that needs a database per run rather than a whole application: read `.datastores.<name>.url` from `ctx` and point your fixture at it, `reset-data` between runs. `ctx` reports `dataOnly: true`, and the env sits at `warm` because nothing is meant to run. Cannot be combined with a service name. Counted against its own machine-wide ceiling, not the application pool caps — a test lane does not compete with interactive leases. |
+| `up [service...]` | Session lease: upkeep, build and start services in this worktree, print context. **Additive: named services (plus their `depends_on` closure) start next to what already runs; nothing running is stopped. No service = add every service.** **Every `up` applies your edits:** it runs the due upkeep and the builds, then restarts only the services whose build output changed (see below). Flags: `--preset <ds>=<preset>` (reload that one datastore, restart the services that use it), `--reset-data`\|`--pristine`, `--ttl <minutes>` (**the lease form for agents**), `--holder-pid <pid>` (interactive shells only — see above). |
+| `down [service...]` | Stop just the named services (no name = all). The lease, the data and the public ports stay; `up` brings them back. Dependents keep running and are named in the answer. |
+| `db new\|with\|ls\|drop` | Database copies outside any environment, from the same templates: `db new <ds> [--preset p]` prints `name`/`url`/`preset`; `db with <ds> [--preset p] -- <cmd>` runs the command with `RUNLY_DB_URL`/`RUNLY_DB_NAME`, drops the copy on exit and returns the command's exit code; `db ls [--all]`; `db drop <name>`. A copy is reaped when its holder exits or its worktree goes. No TTL. |
+| `ps [--all]` | What runs for this worktree (`--all`: the whole box): services (state, public/internal port, pid, idle, rss) and database copies (name, datastore, preset, holder, created). |
 | `ctx` | Re-read the consumer **context blob** (service URLs, login creds, connection strings, recent events) for the env your lease holds — read-only, no re-bind. `up` already returned this once. **A stack may advertise several logins: `logins` is the primary one, `allLogins` is the whole set** — see below. |
-| `ctx --env` | The same environment as shell-exportable `KEY=value` lines for your own tests: `RUNLY_ENV_ID`, `RUNLY_PORT_<PORT>`, `RUNLY_URL_<SERVICE>`, `RUNLY_DATASTORE_<NAME>_URL`, `RUNLY_LOGIN_USER`, `RUNLY_LOGIN_PASSWORD` (names upper-cased, other characters as `_`: `web-audit` → `RUNLY_URL_WEB_AUDIT`). Use `eval "$(runly ctx --env)" && <tests>`. |
+| `ctx --env` | The same environment as shell-exportable `KEY=value` lines for your own tests: `RUNLY_ENV_ID`, `RUNLY_PORT_<PORT>`, `RUNLY_URL_<SERVICE>`, `RUNLY_DATASTORE_<NAME>_URL`, `RUNLY_DATASTORE_<NAME>_PRESET` (the preset it holds), `RUNLY_LOGIN_USER`, `RUNLY_LOGIN_PASSWORD` (names upper-cased, other characters as `_`: `web-audit` → `RUNLY_URL_WEB_AUDIT`). Use `eval "$(runly ctx --env)" && <tests>`. |
 | `release` | Release the current lease; the environment stays warm in the pool. On `{"released": false}` read the `reason` — a lease is keyed by the directory that bound it, so releasing from elsewhere matches nothing. |
 | `warm` | Run this worktree's due upkeep rules and its service builds **now, with no lease and no services**, and print each step with its duration. For an idle worktree just moved to a new commit (`git checkout <sha> && runly warm`), so the next bind finds the installs done and the build tools' caches current. |
 | `exec <cmd...>` | Run an arbitrary command in your worktree with the lease's ports, URLs and connection strings in its environment (`BACKLOT_URL_*`, `BACKLOT_DS_*`); hands back raw stdout + exit code. Needs an `up` first. |
@@ -107,28 +112,31 @@ upkeep rules and every `build:` of the services it starts, then:
 - a service whose build changed its declared `outputs:` is restarted;
 - a service with a `build:` and no `outputs:` is restarted after every build;
 - a service with **no** `build:` keeps running (a dev server that reloads itself);
+- `--preset <ds>=<p>` reloads that datastore and restarts only the running
+  services whose templates reference it (all of them if none does);
 - a changed manifest, an upkeep rule that ran or `--reset-data`/`--pristine`
   restart everything.
 
 `bindDiagnostics.reuse` says which happened (`reused`, `restarted` with the
 `restarted` list, or `rebound`), and `builds[].reason` says why per service.
 
-### Partial / per-service `up`
+### Additive `up` and `down`
 
-`runly up` with no argument brings up the whole app. **Name one or more
-services and runly starts only that slice plus its transitive `depends_on`
-closure** — nothing else boots. This is the way to lease a single vertical or a
-lone SPA without booting the rest of the stack.
+`up` only ever adds. **Name one or more services and runly starts them plus
+their transitive `depends_on` closure, next to whatever already runs.** On a
+fresh worktree that is exactly the slice you named; `runly up` with no argument
+adds the rest. `down` takes services away again without giving up the lease.
 
 ```bash
-runly up web            # start `web` + everything in its depends_on closure; leave the rest down
-runly up api worker     # start these two slices (and their closures) only
-runly up                # whole app
+runly up web            # start `web` + its depends_on closure; nothing else boots
+runly up api            # add `api` next to `web`; `web` keeps its pid
+runly down web          # stop `web` only; lease, data, ports stay
+runly up                # add everything
+runly ps                # what runs here, with ports, pids, idle time and memory
 ```
 
-Naming a leaf service transitively pulls in exactly what it needs and nothing it
-doesn't. An unknown service name is a manifest work-error. All the usual `up`
-flags apply to the partial form.
+Datastores always exist with the environment; only services are named. An
+unknown service name is a manifest work-error.
 
 ### Logins: read `allLogins`, don't default to the admin
 
@@ -165,8 +173,8 @@ empty `allLogins` means the manifest declares none, not that the seed failed.
 
 1. Run your tests against `ctx --env`; don't hand-roll port or URL discovery.
    `up --reset-data` first when they need the seeded state.
-2. Use partial `up` to lease just the slice you're working on; don't boot the
-   whole app to iterate on one frontend.
+2. `up` just the services you're working on; don't boot the whole app to
+   iterate on one frontend. For a database-only test lane use `runly db with`.
 3. `release` when you stop, and size `--ttl` to the work — holding a lease keeps a
    pooled env out of circulation. Never `--holder-pid $$`; see the lease model above.
 4. Branch on the **class** of a failure, not just the exit code: `work-error` is
