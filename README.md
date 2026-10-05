@@ -12,7 +12,7 @@ The `backlot` command and `backlot.yml` manifests remain accepted. `runly.yml` t
 It brokers environments; it never provides them. Local processes today, your own cloud
 sandboxes (Morph, Sprites, SSH) tomorrow — same verbs, same model.
 
-> **Status: 0.10.** The local loop — pool, leases, bind-by-sync, data states,
+> **Status: 0.10.** The local loop — pool, leases, in-place binds, data states,
 > verdicts — is complete, hardened by two full review cycles, and proven end to
 > end against a real .NET + Angular + MSSQL monorepo (its Playwright e2e suite
 > runs as a runly check, and each release is verified by driving a real session
@@ -30,9 +30,11 @@ on the same machinery in every repo (port allocation, DB namespacing, capacity g
 zombie reaping) and stay welded to that repo. runly is that machinery, extracted,
 with the repo-specific knowledge moved into one declarative file.
 
-The core trick: **environments are pooled, durable, and warm; work visits them.**
-Binding your worktree to a warm environment is a git sync + fingerprint-gated upkeep —
-seconds, not minutes. Abandoning an environment is a non-event: your lease lapses and
+The core trick: **environments are pooled, durable, and warm, and they run in your
+worktree.** Binding is fingerprint-gated upkeep and builds in the worktree you call
+from, whose caches are already warm — seconds, not minutes; no copy of your source is
+made ([decision 0032](docs/decisions/0032-environments-run-in-the-callers-worktree.md)).
+What an environment keeps to itself is its ports, its datastore namespace and its logs. Abandoning an environment is a non-event: your lease lapses and
 the environment returns to the pool with its heat intact. ([Why not checkpointing?](docs/decisions/0006-convergence-over-checkpointing.md))
 
 ## Quickstart
@@ -45,11 +47,12 @@ the fastest first contact is a checkout:
 git clone https://github.com/ChristianKohlberg/runly runly && cd runly
 npm install && npm run build && npm link   # (or, for your own repos: npm i -g runly)
 cd examples/hello-web
-runly up --json          # lease a warm env: sync, seed, start — returns the full context blob (URLs + creds)
+runly up --json          # lease an env: upkeep, seed, build and start in THIS worktree — returns the full context blob (URLs + creds)
 runly run smoke --json   # bind -> run the check -> JSON verdict -> release
 runly ctx --json         # re-read that same blob later, read-only — no re-bind (up already returned it)
-runly sync               # source-only edits project in; startup configuration changes rebind
-runly exec <cmd>         # run an arbitrary command in the env your lease holds (raw exit, not a verdict)
+runly sync               # re-converge to the worktree: hot-reload services kept, others rebuild/restart
+runly warm               # upkeep + builds in this worktree, no lease, no services (warm an idle worktree)
+runly exec <cmd>         # run a command in the worktree with your lease's URLs/ports/conn strings (raw exit, not a verdict)
 runly preview <service>  # publish one service (public tunnel via cloudflared, or the tailnet via tailscale)
 runly preview stop       # stop the preview tunnel on your lease
 runly release            # environment returns to the pool, warm
@@ -59,8 +62,9 @@ runly release            # environment returns to the pool, warm
 environment, executes a check declared in `runly.yml`, returns a classified
 verdict (`work` / `env` / `infra` — a dead dev-server is never reported as your
 test failing) with artifacts, then releases — **no prior `up` needed**. `exec
-<cmd>` runs an arbitrary command inside the environment your `up` lease is
-already holding and hands back its raw stdout and exit code, so it **needs an
+<cmd>` runs an arbitrary command in your worktree with the environment your `up`
+lease is holding in its environment variables (`BACKLOT_URL_*`, `BACKLOT_DS_*`,
+`BACKLOT_PORT_*`) and hands back its raw stdout and exit code, so it **needs an
 `up` first**. Rule of thumb: **`run` to prove a change, `exec` to poke at the
 live environment.**
 
@@ -69,16 +73,52 @@ MCP launch entries from your agent configuration and invoke CLI commands through
 your shell tools, for example `runly up --json` and `runly run smoke --json`.
 The CLI, daemon RPC and Claude Code skill remain supported.
 
-Source-only saves can keep `hot_reload` services running. Any change to the parsed
-manifest takes the full bind path so startup environment and commands are applied;
-comments and whitespace alone do not change the parsed configuration. See
-[projection eligibility](docs/architecture.md#6-sync--verbs-sync-watch-streams) and
+Source-only saves can keep `hot_reload` services running: they already read the
+worktree, so `sync` only records the new source. Any change to the parsed manifest
+takes the full bind path so startup environment and commands are applied; comments
+and whitespace alone do not change the parsed configuration. See
+[the in-place rules](docs/architecture.md#6-in-place--verbs-converge-watch-observes) and
 [preview reconciliation](docs/decisions/0027-lease-scoped-public-preview.md) for the
 full conditions.
 
-`runly run CHECK --detach --pull` copies declared outputs back to the worktree
-before the completed job verdict is recorded. Without `--pull`, detached checks
-leave worktree outputs untouched, just like foreground checks.
+A check runs in your **live** worktree: an edit you make while it runs is visible
+to it. The verdict's `outputsChanged` names the declared `outputs:` it rewrote —
+they are already in place; `runly pull`, `run --pull` and `bind --ref` were removed
+with the source copy (decision 0032).
+
+### Warming an idle worktree
+
+`runly warm` runs the stack's upkeep rules and services' `build:` steps in the
+current worktree **without a lease and without starting services**, printing each
+step and how long it took (`--json` for the structured form). It writes the same
+record a bind reads, so whatever it ran the next `up` or `run` skips. The intended
+use is a pooled worktree moved to a new commit between tasks:
+
+```bash
+git checkout <sha> && runly warm
+```
+
+It waits for any operation in flight on the worktree's environments. Build lines
+that template an environment's ports or datastores, and `@` built-ins (they act
+on an environment's data), are reported as skipped — the next bind does them.
+
+### What runs in your worktree
+
+Since environments run in place, the repo's own commands write into the worktree:
+upkeep installs, builds, service-generated files, check results. Two consequences
+worth knowing:
+
+- **Ignore your output.** Anything a build or service writes that git does not
+  ignore — and `caches:` does not declare — counts as source, so the next bind sees
+  a change and restarts. Declare build output under `caches:` (it is then neither
+  fingerprinted nor watched) or git-ignore it.
+- **Wiped a cache by hand? Bind `--pristine`.** runly records what it installed and
+  built; it cannot see you deleting `node_modules` or `obj/`. A pristine bind
+  forgets that record and re-runs every upkeep rule and build — it never deletes
+  anything in the worktree. Two consecutive bind failures escalate to it
+  automatically.
+- Environments of the same worktree (a session `up` and a `run`) share its build
+  output: a rebuild by one is visible to the other's running services.
 
 ### Moving from Backlot to Runly
 
@@ -252,8 +292,7 @@ BACKLOT_HOLDER_PID=$$ runly up          # an interactive shell: hold it until TH
 Explicit `up` renews the lease. Content operations (`sync`, `bind`, watch saves,
 and `reset-data`) preserve a continuing lease's absolute deadline, including
 when sync falls back to a full bind. Use `up --ttl <minutes>` to extend it;
-`bind --ref <ref> --ttl <minutes>` and `preview <service> --ttl <minutes>` also
-renew explicitly. Read-only polling does not extend ownership. A fresh or
+`preview <service> --ttl <minutes>` also renews explicitly. Read-only polling does not extend ownership. A fresh or
 expired acquisition takes a normal new deadline; `reset-data` requires a live
 lease and refuses an expired one before changing data. `run` always takes its
 own independent lease.
@@ -295,7 +334,7 @@ services:
     run: pnpm exec ng serve --port {{ports.web}}
     port: web
     ready: { http: / }
-    hot_reload: true      # see projection eligibility above
+    hot_reload: true      # sync keeps it running: see above
 datastores:
   main:
     driver: postgres
@@ -353,7 +392,7 @@ service and readiness-probe inputs, not build, upkeep, check-command, or `exec` 
 
 Each explicit `up` refreshes the lease's inputs, including clearing omitted optional
 values, and changed inputs restart services even when source files are unchanged.
-`sync`, `--watch`, `reset-data`, and `bind --ref` keep that lease's inputs. A new
+`sync`, `--watch` and `reset-data` keep that lease's inputs. A new
 holder never inherits them: reusing its warm environment restarts input-configured
 services with the new holder's values. Each `run` takes fresh caller inputs for
 its own isolated service processes.
@@ -469,22 +508,26 @@ say — pin the port on the command instead of in the shared manifest:
 
 ### Understanding a slow bind
 
-`up --json`, `sync --json`, `reset-data --json`, and `bind --ref --json` return
+`up --json`, `sync --json` and `reset-data --json` return
 `bindDiagnostics` for that operation; a `run` verdict includes its setup
 diagnostics too. `ctx` does not replay timings from earlier calls. The report
 includes:
 
 - `durationMs`: elapsed daemon-side operation time, excluding CLI startup.
 - `phasesMs`: time spent acquiring/waiting (`queue`), preparing, ensuring
-  appliances, syncing, upkeep, stopping services, data preparation, builds,
+  appliances, fingerprinting the worktree, upkeep, stopping services, data preparation, builds,
   readiness, and finalization. Skipped phases are zero.
 - `reuse`: `reused` for an unchanged running environment, `rebound` for the
-  ordinary preparation/start path, or `projected` when hot-reload services kept
-  running. `reasons` explains why reuse was unavailable or projection was used.
-- `sync`: file counts; `upkeep`: numbers of rules run and skipped; `builds`:
+  ordinary preparation/start path, or `refreshed` when hot-reload services kept
+  running and only the new source was recorded. `reasons` explains why reuse was
+  unavailable or a refresh fell back.
+- `source`: files in the worktree's source state and how many had to be re-read;
+  `upkeep`: numbers of rules run and skipped; `builds`:
   each selected build's cache hit/miss and reason (`source-unchanged`,
-  `source-changed`, or `no-build-record`). A build skipped because a running
-  hot-reload service already handles the projected source reports `skipped`
+  `source-changed`, or `no-build-record`). Build records belong to the worktree,
+  so a build done by `runly warm` or another environment of the same worktree is a
+  hit. A build skipped because a running hot-reload service already handles the
+  changed source reports `skipped`
   with `running-service-reused`. These describe Backlot's build-command
   decisions; Cargo or another build tool may still reuse its own cache.
 
@@ -497,14 +540,14 @@ still running, use `--progress`, including alongside `--json`.
 | runly is | runly is not |
 | --- | --- |
 | a warm pool of leased, isolated environments | a compute provider (bring your own, local or cloud) |
-| bind-by-sync: your dirty worktree, in front, in seconds | a build system (it invokes your commands, never understands them) |
+| in-place binds: your dirty worktree, running, in seconds | a build system (it invokes your commands, never understands them) |
 | seeded, template-restored data states | CI (CI may call runly; never the reverse) |
 | machine verdicts with a work/env/infra error taxonomy | an agent (no LLM calls, no browser driving) |
 
 ## Learn more
 
 - [docs/overview.md](docs/overview.md) — the two-page tour, with diagrams. Start here.
-- [docs/objections.md](docs/objections.md) — "why the copy?", "my agent can just run the dev servers", "compose does this" — taken seriously, with receipts.
+- [docs/objections.md](docs/objections.md) — "my agent can just run the dev servers", "compose does this" — taken seriously, with receipts. (Its "why the copy?" answer predates [decision 0032](docs/decisions/0032-environments-run-in-the-callers-worktree.md), which removed the copy.)
 - [docs/architecture.md](docs/architecture.md) — the full design; it *is* the product.
 - [docs/decisions/](docs/decisions/) — why it is the way it is.
 
@@ -520,9 +563,10 @@ Be clear-eyed about what running runly means:
   per-user state dir (filesystem permissions are the auth) — no TCP, no remote
   callers. Future remote substrates run the same model *on the remote box*, reached
   over your own SSH/provider credentials.
-- **Environments are projections, not sandboxes.** Isolation between environments
-  is namespacing (ports, directories, database namespaces), not a security
-  boundary — code in an environment runs as you, on your machine. For untrusted
+- **Environments are not sandboxes.** They run in your worktree, and isolation
+  between them is namespacing (ports, database namespaces, private log/data
+  directories), not a security boundary — code in an environment runs as you, on
+  your machine, and writes into your worktree. For untrusted
   code, put the *substrate* in a sandbox (a VM, a cloud box), not your laptop.
 - **Public preview URLs are world-readable.** `runly preview` publishes the
   chosen service through a quick tunnel (Cloudflare by default; the `tailscale`

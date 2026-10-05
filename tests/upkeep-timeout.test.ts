@@ -68,4 +68,30 @@ describe('per-rule upkeep deadlines and live progress', () => {
     await runUpkeep(dir, ['input'], manifest, result.fingerprints, (phase) => progress.push(phase));
     expect(progress).toEqual([]);
   });
+
+  it('drops a rule from the ledger BEFORE it runs, so a half-applied rule is never vouched for', async () => {
+    vi.stubEnv('BACKLOT_CMD_TIMEOUT_S', '');
+    const dir = tree();
+    // Succeeds for the first trigger content, fails for the second.
+    const manifest: Manifest = { name: 'commit', upkeep: [{ when: 'input', run: 'test "$(cat input)" = one' }] };
+    const commits: Array<Record<string, string>> = [];
+    const ok = await runUpkeep(dir, ['input'], manifest, {}, undefined, { commit: (fps) => commits.push({ ...fps }) });
+    expect(commits).toEqual([{}, ok.fingerprints]);
+    // The trigger moves, and the install fails half-way: the old hash must not
+    // survive, or a revert to the old trigger would skip the repair.
+    writeFileSync(join(dir, 'input'), 'two');
+    commits.length = 0;
+    await expect(runUpkeep(dir, ['input'], manifest, ok.fingerprints, undefined, { commit: (fps) => commits.push({ ...fps }) })).rejects.toThrow(/upkeep rule failed/);
+    expect(commits).toEqual([{}]);
+  });
+
+  it('skips @ built-ins when asked, and reports each rule\'s outcome', async () => {
+    const dir = tree();
+    const manifest: Manifest = { name: 'warm', upkeep: [{ when: 'input', run: 'true' }, { when: 'input', run: '@rebake-template main' }] };
+    const first = await runUpkeep(dir, ['input'], manifest, {}, undefined, { builtins: false });
+    expect(first.steps.map((s) => s.status)).toEqual(['ran', 'skipped']);
+    expect(first.rebakeTemplates).toEqual([]);
+    const second = await runUpkeep(dir, ['input'], manifest, first.fingerprints, undefined, { builtins: false });
+    expect(second.steps.map((s) => s.status)).toEqual(['fresh', 'skipped']);
+  });
 });

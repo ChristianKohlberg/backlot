@@ -57,7 +57,7 @@ describe('content operations preserve the lease deadline', () => {
             await expect.poll(async () => {
               if (mode === 'watch projection') {
                 const status = await f.cli(['status']);
-                return status.events.some((e) => e.kind === 'watch' && e.detail?.startsWith('projected '));
+                return status.events.some((e) => e.kind === 'watch' && e.detail?.startsWith('worktree source changed'));
               }
               const context = await f.cli(['ctx']);
               return context.events.some((e) => e.event === 'started' && e.at > first.events[0].at);
@@ -65,7 +65,7 @@ describe('content operations preserve the lease deadline', () => {
             result = await f.cli(['ctx']);
           } else {
             result = await f.cli([mode === 'reset-data' ? 'reset-data' : 'sync']);
-            if (mode === 'projection') expect(result.bindDiagnostics.reuse).toBe('projected');
+            if (mode === 'projection') expect(result.bindDiagnostics.reuse).toBe('refreshed');
           }
           expect(result.lease.id).toBe(first.lease.id);
           expect(result.lease.expiresAt).toBe(first.lease.expiresAt);

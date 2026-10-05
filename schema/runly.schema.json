@@ -41,7 +41,7 @@
       "items": {
         "type": "string"
       },
-      "description": "Paths (globs allowed) preserved by the bind-time reset: node_modules, **/obj, .angular, ..."
+      "description": "Build and install output inside the worktree (node_modules, **/obj, .angular, ...). Environments run in the worktree (decision 0032), so this is what is NOT source: it is left out of the source identity (a build writing there does not make the next bind restart) and `--watch` ignores writes there."
     },
     "sync": {
       "type": "object",
@@ -52,14 +52,14 @@
           "items": {
             "type": "string"
           },
-          "description": "Generated files preserved across binds even though tracked/derived."
+          "description": "Accepted for compatibility and ignored: since decision 0032 there is no environment-side reset for it to protect files from."
         },
         "include": {
           "type": "array",
           "items": {
             "type": "string"
           },
-          "description": "Git-ignored files that must ride along with a binding (.env.local)."
+          "description": "Git-ignored files that are part of the source state (.env.local): an edit to one changes the source identity, so the next bind restarts what reads it."
         }
       }
     },
@@ -68,7 +68,7 @@
       "items": {
         "type": "string"
       },
-      "description": "Artifacts produced env-side but owned worktree-side (lockfiles, generated clients). Reported as outputs_changed; copied back only by explicit `runly pull`."
+      "description": "Files a check may regenerate (lockfiles, generated clients). Checks run in the worktree (decision 0032), so they are written in place; a run reports which ones it changed as outputsChanged."
     },
     "upkeep": {
       "type": "array",
@@ -227,7 +227,7 @@
         },
         "hot_reload": {
           "type": "boolean",
-          "description": "This service's run: command watches its own tree and reloads changed files itself (ng serve, dotnet watch, vite). When EVERY service declares it, `runly sync` projects changed files without restarting services; any service without it forces the full rebind, because projecting under a non-watching process silently serves stale code."
+          "description": "This service's run: command watches the worktree and reloads changed files itself (ng serve, dotnet watch, vite). When EVERY service declares it, `runly sync` records the new source without restarting services; any service without it forces the full rebind, because a non-watching process silently serves stale code."
         }
       }
     },

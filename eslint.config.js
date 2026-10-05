@@ -3,7 +3,8 @@
  * they are what catches real defects (unused symbols, unsafe truthiness); the
  * one deliberate addition is banning non-null `!` in the two files where the
  * fleet review found `!` suppressing contract violations the type system had
- * correctly flagged (sync.ts, engine.ts — the getEnv(...)! cluster).
+ * correctly flagged (engine.ts — the getEnv(...)! cluster — and the worktree
+ * fingerprint, which inherited sync.ts's rule when the projection was removed).
  */
 import eslint from '@eslint/js';
 import tseslint from 'typescript-eslint';
@@ -19,7 +20,7 @@ export default tseslint.config(
     },
   },
   {
-    files: ['src/core/sync.ts', 'src/daemon/engine.ts'],
+    files: ['src/core/worktree.ts', 'src/daemon/engine.ts'],
     rules: {
       '@typescript-eslint/no-non-null-assertion': 'error',
     },

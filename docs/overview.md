@@ -22,9 +22,9 @@ and make *ownership* — not the environment — the disposable thing.
 
 One `runly.yml` at your repo root declares services, datastores, seed presets, and
 checks. A per-machine daemon (auto-spawned by the CLI, nothing to deploy) supervises a
-pool of environments, each with its own copy of the tree, its own ports, and its own
-datastore namespace. Verbs *lease* an environment, *sync* your worktree into it, and hand
-you URLs, credentials, and verdicts.
+pool of environments, each with its own ports, its own datastore namespace and its own
+logs, all running **in your worktree** — no copy of your source is made. Verbs *lease* an
+environment, converge it to your worktree, and hand you URLs, credentials, and verdicts.
 
 ```mermaid
 flowchart LR
@@ -39,7 +39,7 @@ flowchart LR
             E3["env 3 · warm<br/>(services stopped, caches kept)"]
         end
     end
-    WT -- "sync: hash-gated copy<br/>(worktree is never touched back)" --> E1
+    E1 -- "runs in place: builds, services,<br/>checks (no copy)" --> WT
     CLI -- "lease + bind" --> E1
     E1 -- "URLs · credentials · logs" --> WT
     E1 -- "run &lt;check&gt; → verdict<br/>ok / work-error / env-error / infra-error" --> WT
@@ -52,16 +52,15 @@ Two inversions carry the whole design:
   When an agent crashes or a
   human forgets, the lease lapses and the environment returns to the pool **warm**, heat
   intact. Abandonment costs nothing, so nothing gets hoarded.
-- **Watchers never move; bindings move.** An environment's dev servers watch the
-  environment's *own* tree forever. Pointing them at new work means syncing that work in
-  — so caches survive rebinds, ports and URLs stay stable, and your worktree is never
-  written to (the sole exception: manifest-declared `outputs:`, copied back only by an
-  explicit `runly pull`).
+- **Environments run in your worktree; ports never move.** Services build and run where
+  you work, so your warm caches are theirs and no source is copied
+  ([decision 0032](decisions/0032-environments-run-in-the-callers-worktree.md)). What an
+  environment keeps to itself — ports (and so URLs), database namespace, logs — is
+  stable for its lifetime.
 
-The safety invariant underneath both: **an environment never holds the only copy of
-anything.** Your worktree stays the source of truth; the environment's tree is a
-disposable projection. That makes every reclaim — lease expiry, recycle, even losing the
-machine — safe by construction.
+The safety invariant underneath both: **an environment's private state never holds the
+only copy of anything, and runly never deletes your worktree.** That makes every
+reclaim — lease expiry, recycle, even losing the machine — safe by construction.
 
 ## An environment's life
 
@@ -69,7 +68,7 @@ machine — safe by construction.
 stateDiagram-v2
     [*] --> pristine : provision (templates + shared caches)
     pristine --> hot : bind + start (seconds; minutes on first build)
-    hot --> hot : rebind (sync + upkeep, seconds)
+    hot --> hot : rebind (fingerprint + upkeep, seconds)
     hot --> warm : idle TTL — services stop, caches stay
     warm --> hot : next verb (start + ready-wait)
     hot --> degraded : service flaps past its restart budget
@@ -81,20 +80,22 @@ Binding converges an environment to what you asked for instead of restoring a sn
 a fingerprint ledger replays only the upkeep rules whose triggers changed (lockfile →
 install, migrations → migrate), and data states restore from baked templates in seconds.
 Hygiene is per-bind: `reuse` keeps everything (inspection), `reset-data` restores the
-data template and keeps *declared* `caches:` while sweeping undeclared droppings (the
-default for runs), `--pristine` rebuilds from scratch (merge-grade verdicts). Two consecutive bind failures on the same environment
+data template and nothing else (the default for runs), `--pristine` re-runs every
+upkeep rule and build in place (merge-grade verdicts; it never deletes anything in your
+worktree). `runly warm` does the upkeep and builds ahead of time, with no lease, for an
+idle worktree moved to a new commit. Two consecutive bind failures on the same environment
 auto-escalate the next bind to pristine — the standard defense against stale-cache
 heisenbugs.
 
 ## A session, concretely
 
 ```bash
-runly up                  # lease an env, sync your worktree, start services
+runly up                  # lease an env; upkeep, build, start — in your worktree
                             # (name services — `runly up web` — to start only
                             #  that slice plus its depends_on closure)
 runly ctx --json          # URLs, login creds, DB strings, recent events — all an agent needs
 # …edit code in your worktree…
-runly sync                # project the edits in; watchers/caches do the rest
+runly sync                # dev servers already see the edits; this rebuilds what doesn't
 runly run e2e --json      # second env from the pool, fresh data, JSON verdict
 runly release             # or just walk away — the lease lapses harmlessly
 ```

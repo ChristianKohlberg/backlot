@@ -546,8 +546,6 @@ it.each([
     expect(published.code, published.stdout + published.stderr).toBe(0);
     const pid = tunnelPid(f.stateDir);
     expect(alive(pid)).toBe(true);
-    const projectedManifest = join(f.stateDir, 'envs', String(up.json!.envId), 'tree', 'stack.yaml');
-    const before = readFileSync(projectedManifest, 'utf8');
     f.manifest.preview = { forbidden: true };
     f.manifest.datastores.main.default_preset.session = 'missing';
     writeFileSync(f.manifestPath, stringify(f.manifest));
@@ -557,19 +555,18 @@ it.each([
     expect(await goneWithin(pid, 5000)).toBe(true);
     expect((await f.cli(['ctx', '--json'])).json?.previewUrls).toEqual({});
     expect(f.marker(url)).toBe('dev');
-    expect(readFileSync(projectedManifest, 'utf8')).toBe(before);
   } finally {
     await f.cli(['daemon', 'stop', '--json']);
   }
 }, 30000);
 
-it('retains the forbidden preview notice through preset projection fallback', async () => {
+it('retains the forbidden preview notice through a preset refresh fallback', async () => {
   const f = presetPreview(true);
   try {
     const up = await f.cli(['up', '--preset', 'alternate', '--json']);
     expect(up.code, up.stdout + up.stderr).toBe(0);
     const projected = await f.cli(['sync', '--json']);
-    expect((projected.json?.bindDiagnostics as {reuse: string}).reuse).toBe('projected');
+    expect((projected.json?.bindDiagnostics as {reuse: string}).reuse).toBe('refreshed');
     const published = await f.cli(['preview', 'web', '--json']);
     expect(published.code, published.stdout + published.stderr).toBe(0);
     const pid = tunnelPid(f.stateDir);

@@ -5,7 +5,7 @@
  */
 import { readdirSync, statSync, rmSync, readFileSync, writeFileSync, existsSync, openSync, readSync, closeSync } from 'node:fs';
 import { join } from 'node:path';
-import { artifactsRoot, templatesRoot, envsRoot } from './paths.js';
+import { artifactsRoot, templatesRoot, envsRoot, worktreesRoot } from './paths.js';
 import { logEvent } from './events.js';
 import { runQuiet } from './util.js';
 import { hasOtherTemplateOwner, parseBakedMarker, withBakeLock } from '../drivers/datastores.js';
@@ -139,12 +139,45 @@ export async function pruneTemplates(p: Policy, root = templatesRoot(), protecte
   return pruned;
 }
 
+/**
+ * Per-worktree state (decision 0032 — the source-hash cache and the worktree
+ * ledger) for a worktree that no longer exists. It must outlive every
+ * environment, because `runly warm` writes it for a worktree with none; so it
+ * goes only when its recorded root is gone AND no environment still names the
+ * stack. A missing or unreadable record is left alone: it proves nothing.
+ */
+export function pruneWorktreeState(journal: Journal, root = worktreesRoot()): number {
+  let pruned = 0;
+  for (const stackId of entriesOf(root)) {
+    const dir = join(root, stackId);
+    try {
+      const recordedRoot = ['ledger.json', 'hashes.json']
+        .map((f) => {
+          try {
+            return (JSON.parse(readFileSync(join(dir, f), 'utf8')) as { root?: unknown }).root;
+          } catch {
+            return undefined;
+          }
+        })
+        .find((r): r is string => typeof r === 'string');
+      if (recordedRoot === undefined || existsSync(recordedRoot)) continue;
+      if (journal.envsForStack(stackId).length > 0) continue;
+      rmSync(dir, { recursive: true, force: true });
+      pruned++;
+    } catch {
+      /* no readable ledger — leave it */
+    }
+  }
+  return pruned;
+}
+
 export async function retentionSweep(
   journal: Journal,
   p: Policy,
   protectedStacks: ReadonlySet<string> = new Set(),
-): Promise<{ artifacts: number; logs: number; jobs: number; templates: number }> {
+): Promise<{ artifacts: number; logs: number; jobs: number; templates: number; worktrees: number }> {
   return {
+    worktrees: pruneWorktreeState(journal),
     artifacts: pruneArtifacts(p),
     logs: truncateLogs(p),
     jobs: pruneJobs(journal, p),

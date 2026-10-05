@@ -21,25 +21,30 @@ Usage:
   runly up [service...] [--watch] [--reset-data|--pristine] [--ttl <minutes>] [--holder-pid <pid>]
                           (no service = whole app; named services start only that
                            slice plus its depends_on closure)
-                          session lease: sync, upkeep, start services, print context
+                          session lease: upkeep, build and start services IN this
+                          worktree, print context
   runly up --data-only  lease the DATASTORES alone — a seeded database, no
                           services, no builds. For test lanes that need a
                           database per run rather than a whole application.
                           Connection strings arrive in the same ctx blob.
-  runly run <check> [--pristine] [--pull] [--detach]
+  runly run <check> [--pristine] [--detach]
                           run lease: bind -> execute the check -> verdict -> release
                           --detach: submit-and-poll — returns a jobId immediately
   runly job <jobId>     poll a detached run (pending|running|done + verdict)
   runly ctx             the consumer context blob (URLs, logins, conn strings)
-  runly sync            project the worktree state into the current lease
-  runly exec <cmd...>   run a command inside the leased environment
+  runly sync            re-converge the lease to the worktree as it is now
+                          (hot-reload services are kept; others rebuild/restart)
+  runly warm            run this worktree's upkeep rules and service builds now —
+                          no lease, no services. For an idle worktree just moved
+                          to a new commit, so the next bind finds warm caches
+  runly exec <cmd...>   run a command in the worktree with the lease's ports,
+                          URLs and connection strings in its environment
   runly logs <service> [--lines N]
   runly reset-data      restore the data template on the current lease
   runly token --role <r> [--raw]
                           mint an auth token via the stack's auth.token hook.
                           Default output is JSON ({token, role}); --raw prints the
                           bare token, which is what an Authorization header wants
-  runly pull            copy declared outputs back into the worktree
   runly release         release the current lease (environment stays warm)
   runly preview <service> [--ttl ...] [--https-port N]
                           publish a service from your lease on a public quick
@@ -90,7 +95,7 @@ runly refuses the bind instead. Use --ttl.
 up, run and reset-data accept --preset NAME (one datastore), or repeatable
 --preset DATASTORE=NAME. ctx reports each datastore's selected preset.
 
-Every verb accepts --json. Long verbs (up/run/sync/bind/reset-data) show live progress
+Every verb accepts --json. Long verbs (up/run/sync/warm/reset-data) show live progress
 on a terminal (stderr); force with --progress, silence with --quiet. stdout stays clean.
 Exit codes: 0 ok · 1 work-error · 2 env-error · 3 infra-error · 64 usage.`;
 
@@ -223,7 +228,26 @@ async function main(): Promise<void> {
     return;
   }
 
-  const known = ['up', 'run', 'job', 'ctx', 'sync', 'bind', 'exec', 'logs', 'token', 'reset-data', 'pull', 'release', 'preview', 'status', 'doctor', 'appliance', 'pool', 'daemon', 'update'];
+  // Removed by decision 0032 (environments run in the worktree): there is no
+  // copy to pull from and no second tree to bind a ref into. Named, not merely
+  // unknown, so a script that used them learns what replaced them.
+  const removed: Record<string, string> = {
+    pull: `'runly pull' was removed: environments run in your worktree now (decision 0032), so declared outputs are already there — a run reports which ones it changed as outputsChanged`,
+  };
+  if (removed[verb]) {
+    console.error(`runly: ${removed[verb]}`);
+    process.exit(64);
+  }
+  if (flags.has('--pull')) {
+    console.error(`runly: --pull was removed: environments run in your worktree now (decision 0032), so a check writes its outputs in place`);
+    process.exit(64);
+  }
+  if (verb === 'bind' && flagValue('--ref') !== undefined) {
+    console.error(`runly: 'bind --ref' was removed: environments run in your worktree now (decision 0032), so a ref is bound by checking it out there ('git checkout <ref>', or a separate worktree) and running 'runly up'`);
+    process.exit(64);
+  }
+
+  const known = ['up', 'run', 'job', 'ctx', 'sync', 'bind', 'warm', 'exec', 'logs', 'token', 'reset-data', 'release', 'preview', 'status', 'doctor', 'appliance', 'pool', 'daemon', 'update'];
   if (!known.includes(verb)) {
     console.error(`runly: unknown verb '${verb}'\n\n${USAGE}`);
     process.exit(64);
@@ -330,13 +354,13 @@ async function main(): Promise<void> {
         process.exit(64);
       }
       if (flags.has('--detach')) {
-        res = await rpc('run-detach', { cwd, holder, check, hygiene: hygiene(), pull: flags.has('--pull'), callerEnv, presets });
+        res = await rpc('run-detach', { cwd, holder, check, hygiene: hygiene(), callerEnv, presets });
         if (res.ok) {
           out(res.data);
           return;
         }
       } else {
-        res = await rpc('run', { cwd, holder, check, hygiene: hygiene(), pull: flags.has('--pull'), callerEnv, presets }, progress);
+        res = await rpc('run', { cwd, holder, check, hygiene: hygiene(), callerEnv, presets }, progress);
         endProgress();
 
       }
@@ -369,26 +393,49 @@ async function main(): Promise<void> {
       endProgress();
       break;
     case 'bind': {
-      const ref = flagValue('--ref');
-      const ttl = flagValue('--ttl');
-      let ttlMs: number | undefined;
-      if (ttl !== undefined) {
-        ttlMs = parseTtlMinutes(ttl);
-        if (ttlMs === undefined) {
-          console.error(`runly: --ttl expects minutes (a positive number), got '${ttl}'`);
-          process.exit(64);
-        }
-        if (!ref) {
-          // Plain `bind` (sync) has no ttl to set — accepting --ttl here would
-          // silently drop it and mislead the caller into thinking the lease was
-          // extended.
-          console.error('runly: --ttl requires --ref (plain `bind` projects the worktree and keeps the current lease clock)');
-          process.exit(64);
-        }
+      // Plain `bind` is `sync`'s older spelling. It has no ttl to set —
+      // accepting --ttl would silently drop it and mislead the caller into
+      // thinking the lease was extended.
+      if (flagValue('--ttl') !== undefined) {
+        console.error('runly: bind takes no --ttl (it re-converges the lease and keeps its clock); use `runly up --ttl <minutes>`');
+        process.exit(64);
       }
-      res = ref ? await rpc('bind-ref', { cwd, holder, ref, ttlMs }, progress) : await rpc('sync', { cwd, holder }, progress);
+      res = await rpc('sync', { cwd, holder }, progress);
       endProgress();
       break;
+    }
+    case 'warm': {
+      res = await rpc('warm', { cwd }, progress);
+      endProgress();
+      if (!res.ok) break;
+      const w = res.data as {
+        ok: boolean;
+        root: string;
+        sourceFiles: number;
+        fingerprintMs: number;
+        durationMs: number;
+        steps: Array<{ kind: string; index?: number; when?: string; service?: string; status: string; durationMs: number; reason?: string }>;
+        failure: RpcError | null;
+      };
+      if (json) console.log(JSON.stringify(w));
+      else {
+        // One line per step: what it was, what happened, how long it took. The
+        // upkeep COMMAND is never printed — commands may carry credentials —
+        // only the rule's position and its trigger glob.
+        const secs = (ms: number) => `${(ms / 1000).toFixed(1)}s`;
+        console.log(`warming ${w.root} (${w.sourceFiles} source files fingerprinted in ${secs(w.fingerprintMs)})`);
+        for (const st of w.steps) {
+          const what = st.kind === 'upkeep' ? `upkeep rule ${st.index} (${st.when})` : `build '${st.service}'`;
+          console.log(`  ${what}: ${st.status}${st.status === 'ran' || st.status === 'failed' ? ` in ${secs(st.durationMs)}` : ''}${st.reason ? ` — ${st.reason}` : ''}`);
+        }
+        console.log(`${w.ok ? 'warm' : 'failed'} after ${secs(w.durationMs)}`);
+        if (w.failure) {
+          console.error(`runly: [${w.failure.class}] ${w.failure.message}${w.failure.source ? ` (${w.failure.source})` : ''}`);
+          if (w.failure.logExcerpt) console.error(`--- log excerpt ---\n${w.failure.logExcerpt}`);
+        }
+      }
+      process.exitCode = w.ok ? 0 : 1;
+      return;
     }
     case 'exec': {
       // The whole passthrough is the command, verbatim — its own --flags intact.
@@ -454,9 +501,6 @@ async function main(): Promise<void> {
       }
       break;
     }
-    case 'pull':
-      res = await rpc('pull', { cwd, holder });
-      break;
     case 'release':
       res = await rpc('release', { cwd, holder });
       break;

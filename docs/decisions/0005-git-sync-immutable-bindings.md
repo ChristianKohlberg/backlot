@@ -1,6 +1,6 @@
 # 0005. Git is the sync transport; bindings are immutable; verbs sync, watch streams
 
-- Status: Accepted
+- Status: Superseded by [0032](0032-environments-run-in-the-callers-worktree.md) — no projection, no immutable snapshot, no bind-time reset; `sync` and `--watch` keep their verb shape
 
 ## Decision
 

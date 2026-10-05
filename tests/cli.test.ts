@@ -142,38 +142,22 @@ describe('the local loop (hello-web)', () => {
 
 // ---------------------------------------------------------------------------
 
-describe('bind --ref preserves the lease clock (hello-web)', () => {
+describe('verbs removed with the projection say what replaced them (decision 0032)', () => {
   const ctx = makeContext();
   const wt = makeWorktree('hello-web');
-  beforeAll(() => {
-    // bind --ref resolves a COMMIT, so the fixture needs one.
-    execFileSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-q', '-m', 'init'], { cwd: wt.dir });
-  });
   afterAll(async () => {
     await ctx.cleanup();
     wt.drop();
   });
 
-  it('re-pointing a ref keeps the existing TTL; --ttl overrides it', async () => {
-    const remainingMin = (r: CliResult) => ((r.json!.lease as { expiresAt: number }).expiresAt - Date.now()) / 60_000;
-
-    let res = await ctx.cli(['up', '--ttl', '480', '--json'], wt.dir);
-    expect(res.exitCode, `stdout: ${res.stdout}\nstderr: ${res.stderr}`).toBe(0);
-    expect(remainingMin(res)).toBeGreaterThan(470); // ~480
-    expect(remainingMin(res)).toBeLessThan(481);
-
-    // The bug: bind --ref used to reset the lease to the ~30-min default. Bounds
-    // are pinned both sides so a wrong impl that extends (not just shortens) fails.
-    res = await ctx.cli(['bind', '--ref', 'HEAD', '--json'], wt.dir);
-    expect(res.exitCode, `stdout: ${res.stdout}\nstderr: ${res.stderr}`).toBe(0);
-    expect(remainingMin(res)).toBeGreaterThan(470); // still ~480, not shortened
-    expect(remainingMin(res)).toBeLessThan(481);
-
-    // Explicit --ttl on bind sets the clock in one operation.
-    res = await ctx.cli(['bind', '--ref', 'HEAD', '--ttl', '600', '--json'], wt.dir);
-    expect(res.exitCode, `stdout: ${res.stdout}\nstderr: ${res.stderr}`).toBe(0);
-    expect(remainingMin(res)).toBeGreaterThan(590); // ~600
-    expect(remainingMin(res)).toBeLessThan(601);
+  it('pull, run --pull and bind --ref are usage errors naming the decision', async () => {
+    for (const args of [['pull'], ['run', 'smoke', '--pull'], ['bind', '--ref', 'HEAD']]) {
+      const res = await ctx.cli([...args, '--json'], wt.dir);
+      expect(res.exitCode, `${args.join(' ')}: ${res.stderr}`).toBe(64);
+      expect(res.stderr).toContain('decision 0032');
+    }
+    // Refused before a daemon is ever needed.
+    expect(existsSync(join(ctx.stateDir, 'daemon.sock'))).toBe(false);
   });
 });
 
@@ -206,14 +190,16 @@ describe('verdicts, outputs, and the error taxonomy', () => {
     expect((res.json!.error as { message: string }).message).toContain('smoke');
   });
 
-  it('outputs contract: env-produced files are reported, pulled only explicitly', async () => {
-    appendFileSync(join(wt.dir, 'runly.yml'), `outputs: [generated.txt]\n`);
-    await ctx.cli(['up'], wt.dir);
-    await ctx.cli(['exec', 'echo produced-in-env > generated.txt'], wt.dir);
-    expect(existsSync(join(wt.dir, 'generated.txt'))).toBe(false); // never written silently
-    const pull = await ctx.cli(['pull', '--json'], wt.dir);
-    expect(pull.json!.pulled).toEqual(['generated.txt']);
-    expect(readFileSync(join(wt.dir, 'generated.txt'), 'utf8')).toContain('produced-in-env');
+  it('outputs contract: a check writes in place and its run reports which declared outputs it changed', async () => {
+    // `checks:` is the manifest's last block, so the check entry goes first.
+    appendFileSync(join(wt.dir, 'runly.yml'), `  regen:\n    run: echo produced-by-check > generated.txt\n`);
+    appendFileSync(join(wt.dir, 'runly.yml'), `outputs: [generated.txt, untouched.txt]\n`);
+    writeFileSync(join(wt.dir, 'untouched.txt'), 'same');
+    const res = await ctx.cli(['run', 'regen', '--json'], wt.dir);
+    expect(res.exitCode, `stdout: ${res.stdout}\nstderr: ${res.stderr}`).toBe(0);
+    // There is no copy to pull from any more: the check ran in the worktree.
+    expect(readFileSync(join(wt.dir, 'generated.txt'), 'utf8')).toContain('produced-by-check');
+    expect(res.json!.outputsChanged).toEqual(['generated.txt']);
   });
 
   it('ctx without a lease is an env-error telling you the fix', async () => {

@@ -107,7 +107,7 @@ describe('path-escape guards (sec 2/3/4)', () => {
   const ctx = makeContext();
   afterAll(() => ctx.cleanup());
 
-  it('sync.include with .. is rejected, not projected/deleted', async () => {
+  it('sync.include with .. is rejected, never read', async () => {
     const wt = makeWt(stackWith('sync:\n  include: ["../../../etc/hosts"]'));
     const res = await ctx.cli(['up', '--json'], wt);
     expect(res.exitCode, `stdout: ${res.stdout ?? ''}\nstderr: ${res.stderr ?? ''}`).toBe(1);

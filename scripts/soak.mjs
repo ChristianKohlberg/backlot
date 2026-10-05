@@ -413,7 +413,9 @@ writeStackMin(stackB, 'soak-b');
 gitInit(stackA);
 gitInit(stackB);
 
-const envTreeOf = (envId) => join(stateDir, 'envs', envId, 'tree');
+// Environments run in the worktree (decision 0032): what an environment
+// "sees" is the worktree itself, so the convergence checks read it there.
+const envTreeOf = (_envId) => stackA;
 let srcRev = 0;
 function churnFiles(n) {
   // Keyed by path — the same file can be drawn twice in one batch, and any
@@ -466,11 +468,11 @@ async function phaseSession() {
     await sleep(randInt(100, 500));
     const s = await cli(['sync'], { cwd: stackA });
     must(s.body?.state === 'hot', 'session', 'sync did not return a hot context', s.stdout);
-    // The projection must be REAL: read a changed file back from inside the env.
+    // The environment must see the worktree: read a changed file back through exec.
     const probe = pick(changed);
     const ex = await cli(['exec', `cat ${probe.rel}`], { cwd: stackA });
     must(ex.body?.exitCode === 0 && ex.body?.stdout === probe.content, 'session',
-      'exec read back different content than sync projected', `wanted:\n${probe.content}\ngot:\n${ex.body?.stdout}`);
+      'exec read back different content than the worktree holds', `wanted:\n${probe.content}\ngot:\n${ex.body?.stdout}`);
     const lg = await cli(['logs', 'web', '--lines', '20'], { cwd: stackA });
     must(typeof lg.body?.lines === 'string', 'session', 'logs returned no lines field', lg.stdout);
     await sleep(randInt(100, 600));
@@ -481,7 +483,7 @@ async function phaseSession() {
   must(rel.body?.released === true, 'session', 'release reported nothing released', rel.stdout);
 }
 
-/** Wait for one file's env-tree copy to converge to `content` (null = deleted). */
+/** Wait for one file, as the environment sees it, to converge to `content` (null = deleted). */
 function converged(envId, rel, content) {
   return until(12_000, 200, () => {
     const p = join(envTreeOf(envId), rel);

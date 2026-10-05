@@ -17,7 +17,7 @@ export interface ServiceSpec {
   run: string;
   build?: string;
   watch_run?: string;
-  /** run: self-reloads on file changes — lets `sync` project without a restart. */
+  /** run: self-reloads on worktree changes — lets `sync` keep it running. */
   hot_reload?: boolean;
   cwd?: string;
   port?: string;
@@ -148,8 +148,11 @@ export interface Manifest {
   preview?: PreviewSpec;
   appliances?: Record<string, ApplianceSpec>;
   datastores?: Record<string, DatastoreSpec>;
+  /** Build/install output in the worktree: not part of the source identity, ignored by `--watch` (decision 0032). */
   caches?: string[];
+  /** `include`: git-ignored files that are part of the source identity. `keep` is accepted and ignored (decision 0032). */
   sync?: { keep?: string[]; include?: string[] };
+  /** Files a check may regenerate; a run reports which ones changed. */
   outputs?: string[];
   upkeep?: UpkeepRule[];
   auth?: { logins?: LoginsSpec; token?: string };
@@ -158,7 +161,7 @@ export interface Manifest {
 
 export interface Stack {
   manifest: Manifest;
-  /** Directory containing the manifest — the sync source root. */
+  /** Directory containing the manifest — the worktree environments run in (decision 0032). */
   root: string;
   /** Stable identity: pools are keyed by this. */
   id: string;

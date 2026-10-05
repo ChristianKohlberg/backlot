@@ -1,7 +1,7 @@
 /**
  * The daemon's event loop must survive a large bind (BACKLOG P2, decision
- * 0020's one open language-attributable item): syncIntoEnv's synchronous
- * hashing/copying blocked the loop, so every concurrent verb — even a
+ * 0020's one open language-attributable item): the bind's synchronous
+ * hashing (once copying too, before decision 0032) blocked the loop, so every concurrent verb — even a
  * read-only `status` — stalled behind the slowest bind in flight.
  */
 import { describe, it, expect, afterAll } from 'vitest';
@@ -26,7 +26,7 @@ afterAll(() => {
 });
 
 describe('a large bind does not block the daemon', () => {
-  it('status answers promptly while a many-file sync is in flight', async () => {
+  it('status answers promptly while a many-file fingerprint is in flight', async () => {
     const stateDir = mkdtempSync(join(tmpdir(), 'runly-loop-'));
     const wt = mkdtempSync(join(tmpdir(), 'runly-loop-wt-'));
     dirs.push(stateDir, wt);
@@ -34,7 +34,7 @@ describe('a large bind does not block the daemon', () => {
       join(wt, 'runly.yml'),
       `name: bigtree\nservices:\n  idle: { run: "echo ready; sleep 300", ready: { log: "ready", timeout: 60 } }\n`,
     );
-    // A tree big enough that enumerate+hash+copy occupies the sync phase for
+    // A tree big enough that enumerate+hash occupies the fingerprint phase for
     // several seconds on ANY machine — including tmpfs-backed /tmp, where 40k
     // files synced in ~2s: 2000 dirs x 80 files of ~1KB — 160k files, the
     // per-file syscall+hash cost dominates.
@@ -65,7 +65,7 @@ describe('a large bind does not block the daemon', () => {
 
     const upStart = Date.now();
     const up = cli(['up']);
-    await new Promise((r) => setTimeout(r, 700)); // inside the bind's sync phase
+    await new Promise((r) => setTimeout(r, 700)); // inside the bind's fingerprint phase
     const probe = await cli(['status']);
     const upRes = await up;
     const upMs = Date.now() - upStart;

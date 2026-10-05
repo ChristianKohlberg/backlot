@@ -5,43 +5,36 @@ gets the honest version: where the objection is *right*, and where it stops
 being right. runly was extracted from a hand-rolled harness that lived
 through every failure below — this page is that experience, not advocacy.
 
-## "Why copy the source at all? Repo, worktree, *and* an env tree?"
+## "Why not copy the source into each environment? Wasn't that the point?"
 
-Yes: three materializations — and only one of them is heavy.
+It was, until [decision 0032](decisions/0032-environments-run-in-the-callers-worktree.md).
+Each environment used to keep its own projected copy of the worktree and build and run
+there. Measured on the founding monorepo (35k tracked files, 1.07 GB of source), each
+environment tree weighed 2.0–2.6 GB: a full source copy (ext4 has no reflink, so
+copy-on-write fell back to a real copy) plus a second, cold set of caches — and those
+caches could never be borrowed from the worktree, because .NET (`project.assets.json`,
+`*.dgspec.json`, the CoreCompileInputs hash) and pnpm record the absolute path they
+were made at. Meanwhile the agent's own worktree, a persistent pool slot, already held
+warm caches from its earlier tasks. So environments now run **in** the worktree.
 
-```
-repo (.git object store)              history; shared by all worktrees
- └─ git worktree   /work/agent-1/app  SOURCE files; the agent edits here (truth)
-     └─ env tree   ~/.cache/runly/… SOURCE files again (projected copy)
-                                      + env-OWNED state: node_modules,
-                                        build output, the seeded database
-```
+What the copy bought, and what became of it:
 
-The projection copies only the source file set (`git ls-files` + declared
-includes) — megabytes, stat-gated, copy-on-write where the filesystem supports
-it. The heavy things (dependencies, build caches, data) are never copied from
-the worktree: the environment grows and keeps its own.
+- **Uncontaminated verdicts — given up.** A check ran against the snapshot synced at
+  its start; now it runs against the live worktree, and an edit made mid-run is
+  visible to it. An agent that wants a fixed input does not edit while its check runs,
+  or runs it from a second worktree.
+- **Two environments from one worktree — kept, with a caveat.** A session env and a
+  run env of one worktree still coexist (own ports, own databases), but they share its
+  build output: a rebuild by one is visible to the other's running services. Writes
+  into the worktree are serialized; their effect on running processes is not.
+- **Free abandonment — kept.** An environment's private directory (data, logs) still
+  never holds the only copy of anything, and runly never deletes the worktree, so a
+  reclaim needs no deliberation. Teardown checks the path before it deletes.
+- **Clean worktrees — given up.** Services and checks write where they run. Ignore
+  your output (or declare it under `caches:`), or it counts as a source change.
 
-What that one extra copy of the source buys:
-
-- **Uncontaminated verdicts.** A check runs against the snapshot synced at
-  start. This is [hermetic testing](https://testing.googleblog.com/2012/10/hermetic-servers.html)
-  applied to the agent loop: a test is only meaningful against fixed inputs,
-  and an agent — which does not pause while tests run — is a machine for
-  changing the inputs. The copy is what makes the inputs fixed.
-- **Two environments from one worktree.** The core loop is a session env (you
-  are clicking in it) plus a run env (the e2e proving your change), from the
-  same directory, simultaneously. There is no way to host both in the worktree.
-- **Free abandonment.** An environment never holds the only copy of anything,
-  so reclaiming one — lease lapsed, agent crashed, machine full — needs no
-  deliberation. This single property is what keeps a pooled fleet from
-  accumulating zombie stacks.
-- **Clean worktrees.** Services and checks write droppings (artifacts, tmp
-  files, generated output). Env-side they are swept on clean-slate binds;
-  worktree-side they would pollute the agent's `git status` and its commits.
-
-If none of those matter to you — one human, one checkout, pausing while tests
-run — you don't need the copy, or runly.
+If those trade-offs matter more to you than a warm cache — many concurrent verdicts
+from one checkout, editing while checks run — give each lane its own worktree.
 
 ## "My agent just runs `dotnet run` and `ng serve` itself — just as good."
 
@@ -94,8 +87,9 @@ overlap. The structural gaps:
    one worktree cannot back two differently-bound stacks), plus the
    well-documented macOS bind-mount I/O tax on exactly the watcher-heavy dev
    loops agents hammer, plus the `node_modules` inside-vs-outside volume
-   dance. runly's projection is neither: a real copy, cheap, with snapshot
-   semantics.
+   dance. runly runs commands in the worktree directly — no container, no
+   mount — and accepts the live-worktree semantics that come with that
+   ([decision 0032](decisions/0032-environments-run-in-the-callers-worktree.md)).
 2. **`up`/`down` is not a pool.** No leases, no reclaim, no warm reuse:
    nothing distinguishes an abandoned stack from a used one, and every fresh
    `up` pays start + seed again. Containers restart from the *image* — the

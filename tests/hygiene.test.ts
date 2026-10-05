@@ -5,7 +5,7 @@
  */
 import { describe, it, expect, afterAll } from 'vitest';
 import { execFile, execFileSync } from 'node:child_process';
-import { mkdtempSync, rmSync, writeFileSync, readFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, rmSync, writeFileSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Journal } from '../src/core/journal.js';
@@ -42,7 +42,7 @@ function makeContext(extraEnv: Record<string, string> = {}) {
 const envsOf = async (ctx: ReturnType<typeof makeContext>, cwd: string) =>
   ((await ctx.cli(['status', '--json'], cwd)).json!.envs ?? []) as Array<{ id: string; state: string; lease: unknown }>;
 
-describe('auto-escalation: two failures -> pristine bind heals a poisoned cache', () => {
+describe('auto-escalation: two failures -> pristine bind heals a cache the ledger vouched for', () => {
   const ctx = makeContext();
   const wt = mkdtempSync(join(tmpdir(), 'runly-esc-'));
   afterAll(() => {
@@ -51,16 +51,20 @@ describe('auto-escalation: two failures -> pristine bind heals a poisoned cache'
   });
 
   it('fail, fail, auto-pristine, green', async () => {
-    // The service crashes iff a POISON file exists. poison.txt is in caches:,
-    // so reuse/reset-data binds preserve it — only pristine wipes it.
+    // Environments run in the worktree (decision 0032), and pristine never
+    // deletes anything there. What it does is stop TRUSTING the worktree
+    // ledger: an upkeep output wiped behind runly's back (the ledger still says
+    // "applied") breaks the service until a pristine bind re-runs the rule.
     writeFileSync(
       join(wt, 'server.mjs'),
       `import { createServer } from 'node:http';
 import { existsSync } from 'node:fs';
-if (existsSync('./poison.txt')) { console.error('Error: poisoned cache'); process.exit(1); }
+if (!existsSync('./cache/dep')) { console.error('Error: cache missing'); process.exit(1); }
 createServer((q, s) => s.end('clean')).listen(Number(process.env.PORT), '127.0.0.1');
 `,
     );
+    writeFileSync(join(wt, 'dep.txt'), 'v1\n');
+    writeFileSync(join(wt, '.gitignore'), 'cache/\n');
     writeFileSync(
       join(wt, 'stack.yaml'),
       `name: escalate
@@ -71,13 +75,15 @@ services:
     env: { PORT: "{{ports.web}}" }
     ready: { http: /, timeout: 20 }
     fatal_logs: "Error:"
-caches: [poison.txt]
+upkeep:
+  - { when: dep.txt, run: "mkdir -p cache && cp dep.txt cache/dep" }
+caches: [cache]
 `,
     );
     execFileSync('git', ['init', '-q'], { cwd: wt });
 
     expect((await ctx.cli(['up', '--json'], wt)).exitCode).toBe(0); // healthy first
-    await ctx.cli(['exec', 'touch poison.txt'], wt); // a check poisons a cache path
+    rmSync(join(wt, 'cache'), { recursive: true, force: true }); // wiped by hand; the ledger still vouches
     // Nudge the source so the next bind actually restarts (the fast path
     // correctly reuses a healthy env when nothing changed).
     writeFileSync(join(wt, 'nudge.txt'), 'restart me');
@@ -88,6 +94,8 @@ caches: [poison.txt]
     const third = await ctx.cli(['sync', '--json'], wt); // auto-escalated to pristine
     expect(third.exitCode, `stdout: ${third.stdout ?? ''}\nstderr: ${third.stderr ?? ''}`).toBe(0);
     expect(third.json!.state).toBe('hot');
+    expect(existsSync(join(wt, 'cache', 'dep'))).toBe(true); // the rule ran again, in place
+    expect(existsSync(join(wt, 'nudge.txt'))).toBe(true); // and nothing of the worktree was deleted
   }, 60_000);
 });
 
@@ -190,38 +198,43 @@ describe('sleep pardon (journal level)', () => {
   });
 });
 
-describe('the clean-slate sweep cannot outrun the fingerprint ledger', () => {
-  const ctx = makeContext();
+describe('the upkeep ledger belongs to the worktree, not to an environment (decision 0032)', () => {
+  const ctx = makeContext({ BACKLOT_POOL_MAX: '2' });
   const wt = mkdtempSync(join(tmpdir(), 'runly-ledger-'));
   afterAll(() => {
     ctx.cleanup();
     rmSync(wt, { recursive: true, force: true });
   });
 
-  it('upkeep output swept by reset-data is rebuilt, not assumed present', async () => {
-    // An upkeep rule installs into an UNDECLARED dir (no caches: entry). The
-    // reset-data sweep removes it; the ledger's unchanged trigger hash used to
-    // skip the rule anyway — so the check ran against a tree missing exactly
-    // what upkeep exists to provide.
+  it('a second environment of the same worktree trusts the install the first one did; pristine re-runs it', async () => {
     writeFileSync(join(wt, 'dep.txt'), 'v1\n');
+    writeFileSync(join(wt, '.gitignore'), 'node_modules/\nupkeep.log\n');
     writeFileSync(
       join(wt, 'stack.yaml'),
       `name: ledger
 services:
   idle: { run: "echo ready; sleep 300", ready: { log: "ready", timeout: 20 } }
 upkeep:
-  - { when: dep.txt, run: "mkdir -p node_modules && echo installed > node_modules/marker" }
+  - { when: dep.txt, run: "mkdir -p node_modules && echo installed > node_modules/marker && echo ran >> upkeep.log" }
 checks:
   deps: { run: "test -f node_modules/marker" }
 `,
     );
     execFileSync('git', ['init', '-q'], { cwd: wt });
+    const runs = () => readFileSync(join(wt, 'upkeep.log'), 'utf8').trim().split('\n').length;
 
-    const first = await ctx.cli(['run', 'deps', '--json'], wt);
-    expect(first.exitCode, JSON.stringify(first.json)).toBe(0); // upkeep ran, marker exists
+    const up = await ctx.cli(['up', '--json'], wt); // environment 1 installs, in the worktree
+    expect(up.exitCode, JSON.stringify(up.json)).toBe(0);
+    expect(runs()).toBe(1);
 
-    const second = await ctx.cli(['run', 'deps', '--json'], wt);
-    expect(second.exitCode, JSON.stringify(second.json)).toBe(0); // swept -> upkeep must re-run
+    const run = await ctx.cli(['run', 'deps', '--json'], wt); // environment 2, same worktree
+    expect(run.exitCode, JSON.stringify(run.json)).toBe(0);
+    expect(run.json!.envId).not.toBe(up.json!.envId);
+    expect(runs()).toBe(1); // the install is a fact about the worktree: not repeated
+
+    const pristine = await ctx.cli(['run', 'deps', '--pristine', '--json'], wt);
+    expect(pristine.exitCode, JSON.stringify(pristine.json)).toBe(0);
+    expect(runs()).toBe(2); // pristine trusts nothing: the rule ran again
   }, 60_000);
 });
 

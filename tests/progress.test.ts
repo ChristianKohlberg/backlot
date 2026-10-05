@@ -65,9 +65,11 @@ describe('streaming progress', () => {
   }, 30_000);
 
   it('--progress emits phase lines to stderr', async () => {
-    const r = await run(['up', '--progress', '--json']);
+    // --pristine: the upkeep ledger belongs to the worktree (decision 0032) and
+    // survives the recycle above, so a plain `up` would find the rule fresh.
+    const r = await run(['up', '--pristine', '--progress', '--json']);
     const phases = r.stderr.replace(/\r/g, '\n');
-    expect(phases).toMatch(/syncing worktree/);
+    expect(phases).toMatch(/fingerprinting worktree/);
     expect(phases).toMatch(/starting 'web'/);
     expect(phases).toMatch(/upkeep rule 1: starting/);
     expect(phases).toMatch(/upkeep rule 1: finished/);

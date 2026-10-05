@@ -36,3 +36,4 @@ supersedes it and update this index — never edit a decision in place.
 | [0029](0029-cli-only-agent-interface.md) | Agents use the CLI; remove the MCP adapter |
 | [0030](0030-rename-backlot-to-runly.md) | Rename Backlot to Runly while preserving existing state, namespaces and the CLI alias |
 | [0031](0031-tailscale-preview-publisher.md) | A preview may publish on the tailnet, through a foreground `tailscale serve` |
+| [0032](0032-environments-run-in-the-callers-worktree.md) | Environments run in the caller's worktree; the projection copy is gone, and `runly warm` warms an idle worktree |

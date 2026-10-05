@@ -70,10 +70,10 @@ it('composes canonical ownership, selected preset, preview group and preserved d
     const published = await f.cli(['preview', 'web'], f.alias); expect(published.code, published.output).toBe(0);
     const members = f.pids(); expect(members.every(alive)).toBe(true);
     writeFileSync(join(f.tree, 'edit.txt'), 'projection');
-    const projected = await f.cli(['sync'], f.alias); check(projected); expect(projected.data.bindDiagnostics.reuse).toBe('projected');
+    const projected = await f.cli(['sync'], f.alias); check(projected); expect(projected.data.bindDiagnostics.reuse).toBe('refreshed');
     expect(members.every(alive)).toBe(true); expect(projected.data.previewUrls.web).toBe(publicUrl);
     f.manifest.services.web.hot_reload = false; f.save();
-    const full = await f.cli(['sync'], f.alias); check(full); expect(full.data.bindDiagnostics.reuse).not.toBe('projected');
+    const full = await f.cli(['sync'], f.alias); check(full); expect(full.data.bindDiagnostics.reuse).not.toBe('refreshed');
     expect(members.every(alive)).toBe(true);
     check(await f.cli(['reset-data'], f.alias)); expect(members.every(alive)).toBe(true);
     const stop = await f.cli(['daemon', 'stop']); expect(stop.code, stop.output).toBe(0); await stopped(members);

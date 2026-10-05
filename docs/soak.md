@@ -23,11 +23,11 @@ The harness drives the **real CLI** (`dist/cli/index.js`) against generated
 fixture stacks in a dedicated temp `BACKLOT_STATE_DIR`, cycling continuously:
 
 - **Session loop** — `up --watch`, sync with real file churn, `exec` reading the
-  projection back, `logs`, `ctx`, `release`.
+  worktree back, `logs`, `ctx`, `release`.
 - **Watch traffic** — plain saves, atomic-rename saves (`tmp` + `mv`, the way
   editors actually save), deletions, burst storms of 30–80 writes, and an
   upkeep-trigger touch (`deps.lock`) that must produce the documented fallback
-  restart: the upkeep marker appears in the env tree *and* the service comes
+  restart: the upkeep marker appears in the worktree *and* the service comes
   back on the same URL with a new pid.
 - **Run loop** — `run pass` / `run fail` / `run --detach` + `job` polling /
   unknown check, each with its verdict asserted exactly (a `fail` check must be

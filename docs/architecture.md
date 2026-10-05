@@ -73,8 +73,8 @@ Kubernetes, Windows, secrets management, and dashboards are not.
 | --- | --- |
 | **Stack** | What a repo declares in `runly.yml`: services, datastores, seed presets, upkeep rules, checks. The only repo-specific artifact. |
 | **Substrate** | Where environments physically live, behind a driver: `local` (supervised processes in a directory), later `docker`, `morph`, `sprites`, `ssh`. |
-| **Environment** | A pooled slot on a substrate: its own copy of the tree, warm caches, running services, allocated ports, a datastore namespace. Durable; belongs to the pool, never to a person or task. A lease may cover a **subset** of it — a service slice (`up <service>`), or the datastores alone (`up --data-only`, [decision 0023](decisions/0023-data-only-leases.md)) for a test lane that needs a seeded database rather than an application. |
-| **Binding** | A source state (ref + dirty diff) plus a data state (preset, at a hygiene level) attached to an environment. An immutable snapshot. |
+| **Environment** | A pooled slot on a substrate: running services, allocated ports, a datastore namespace, its logs — running **in the caller's worktree**, whose caches it shares ([decision 0032](decisions/0032-environments-run-in-the-callers-worktree.md)). Durable; belongs to the pool, never to a person or task. A lease may cover a **subset** of it — a service slice (`up <service>`), or the datastores alone (`up --data-only`, [decision 0023](decisions/0023-data-only-leases.md)) for a test lane that needs a seeded database rather than an application. |
+| **Binding** | A source state (the worktree's fingerprint) plus a data state (preset, at a hygiene level) attached to an environment. Since decision 0032 it is not a frozen snapshot: the services and checks read the live worktree. |
 | **Lease** | Temporary ownership of an environment; see [lease deadlines and renewal](../README.md#how-long-you-hold-it---ttl-for-agents---holder-pid-for-shells). Expiry returns the environment to the pool **warm** — nothing is torn down. |
 
 Plus one verb-noun: a **Run** — a named check executed against a binding, producing an
@@ -87,11 +87,16 @@ structurally, not by reaping harder: when a lease lapses (agent crashed, human f
 the environment returns to the pool with all its heat intact. There is never anything
 running *for nobody* — the pool is a fixed, intentional set.
 
-**Watchers never move; bindings move.** An environment's dev servers watch the
-*environment's own tree*, forever. Pointing them at different work means syncing
-different work into that tree. Source worktrees visit environments; environments never
-visit worktrees. Consequences: caches survive rebinds, ports (and therefore URLs) are
-stable for an environment's lifetime, and the consumer's worktree is never touched.
+**Environments run in the worktree; ports never move.** This used to read "watchers
+never move; bindings move": each environment kept its own projected copy of the
+worktree, and its dev servers watched that copy. Measured on the founding monorepo,
+the copy cost a full source copy plus a second, cold set of caches per environment
+(.NET and pnpm caches embed absolute paths, so they never transfer between
+paths) while the agent's persistent worktree already held warm ones. Since
+[decision 0032](decisions/0032-environments-run-in-the-callers-worktree.md) the
+services build and run in the caller's worktree; what stays the environment's
+own is its ports (and therefore URLs, stable for its lifetime), its datastore
+namespace and its logs.
 
 ### Physical stack identity
 
@@ -136,11 +141,13 @@ records.
 
 ### The safety invariant
 
-**An environment never holds the only copy of anything.** The consumer's worktree
-remains the sole source of truth; the environment's tree is a disposable projection;
-templates are rebuildable by definition. Every reclaim decision — lease expiry, recycle,
-teardown, even losing the machine — is therefore safe by construction. (Contrast with
-worktree-hosted harnesses, where teardown must agonize over unlanded work.)
+**An environment's private state never holds the only copy of anything, and runly
+never deletes the worktree.** The consumer's worktree remains the sole source of truth
+and is where the environment runs; the environment's own directory (data, logs) is
+disposable; templates are rebuildable by definition. Every reclaim decision — lease
+expiry, recycle, teardown, even losing the machine — deletes only that private
+directory, and teardown checks that it lies under the state root and does not contain
+the worktree before it does (decision 0032).
 
 ## 4. Convergence, not checkpointing
 
@@ -181,11 +188,11 @@ Local pools are convergence all the way down. Same verbs above the driver line.
   should still warm the daemon with a cheap `runly status` before parallelizing.
 - **Concurrency lives at the environment boundary**: a short pool lock serializes
   claim/release bookkeeping; one lock per environment serializes bind/exec/reset on it.
-  Different environments (and different stacks) bind in parallel — with the caveat
-  that sync hashing, file copying and the `git` calls are synchronous, so a very
-  large bind still blocks the daemon's event loop and delays others while it runs;
-  the sweeper never
-  expires or quiesces an environment with an operation in flight.
+  A third, per-worktree lock serializes what writes into a worktree (upkeep, builds)
+  across the environments of one stack; environment locks are always taken first.
+  Different environments (and different stacks) bind in parallel; the worktree
+  fingerprint runs on a worker thread so it does not block the daemon's event loop;
+  the sweeper never expires or quiesces an environment with an operation in flight.
 - **Local even when compute is remote.** A Morph environment is a pool entry whose
   driver executes over SSH. The consumer's machine is the brain; substrates are muscles.
 - **Disk is truth; daemon memory is a cache.** After a daemon crash or reboot, the next
@@ -239,75 +246,81 @@ cheap ceiling into application capacity, since reuse is never capacity-checked
 (decision 0025). Eviction is bucketed for the same reason: a data-only request can
 only give up a cold data-only environment.
 
-## 6. Sync — "verbs sync, watch streams"
+## 6. In place — "verbs converge, watch observes"
 
-Nothing observes the consumer's worktree by default. Every action verb (`run`, `up`,
-`sync`, `bind`) begins by capturing the worktree — the file set from `git ls-files`
-(tracked + untracked-unignored, plus `sync.include`) — and projecting it into the
-environment with **stat-gated, hash-verified copies**: a warm rebind stats instead of
-re-hashing, only changed files copy (CoW clone where the filesystem supports it), and
-deletions are mirrored from the previous binding. (The `git fetch` + patch transport is
-the planned *remote-substrate* path for 0.3, where the sync boundary becomes the
-local/remote abstraction; the local substrate is enumerate-and-copy.)
+Since [decision 0032](decisions/0032-environments-run-in-the-callers-worktree.md) an
+environment runs in the caller's worktree, so nothing is copied. Nothing observes the
+worktree by default either. Every action verb (`run`, `up`, `sync`) begins by
+**fingerprinting** the worktree — the file set from `git ls-files` (tracked +
+untracked-unignored, plus `sync.include` and checked-out submodules, minus declared
+`caches:`), hashed with a stat-gated, racily-clean cache kept in the state root — and
+compares that source identity with what the environment's services were started from
+(`@source`) and what the worktree's build output was built from (the `@built:*` stamps).
 
-- **Bindings are immutable snapshots.** A running check executes against the revision
-  synced at start; edits mid-run cannot contaminate the verdict. New sync = new binding
-  revision.
-- `runly sync` takes the same source-only projection as a watch save — services
-  kept, the dev servers' own watchers reload — when EVERY service declares
-  `hot_reload: true` (its `run:` watches its own tree), the parsed manifest matches
-  the last successful full bind, and the save fires no upkeep rule. The memory-only
-  `appliedManifests` ledger in `engine.ts` records that configuration only after a
-  successful full bind; both projection and ordinary reuse must match it even if
-  `@source` already advanced. Missing ledger entries require a full bind too. See
-  `tests/projection-config-and-detached-pull.test.ts` for regression coverage.
-  Any undeclared service forces the full rebind: projecting under
-  a non-watching process silently serves stale code, the failure class this
+- **A check sees the live worktree.** There is no frozen snapshot any more: an edit
+  made while a check runs is visible to it. Declared `outputs:` are hashed around the
+  check and reported as `outputsChanged`.
+- `runly sync` keeps the services — merely recording the new source — when EVERY
+  service declares `hot_reload: true` (its `run:` reloads changed files itself), the
+  parsed manifest matches the last successful full bind, and the change fires no
+  upkeep rule. The memory-only `appliedManifests` ledger in `engine.ts` records that
+  configuration only after a successful full bind; both this refresh and ordinary
+  reuse must match it even if `@source` already advanced. Missing ledger entries
+  require a full bind too. See `tests/sync-config-and-detached-outputs.test.ts` for
+  regression coverage. Any undeclared service forces the full rebind (rebuild,
+  restart): a non-watching process silently serves stale code, the failure class this
   broker exists to prevent (owner decision, 2026-07-20).
-- `--watch` sessions opt into a daemon-side debounced worktree watcher that auto-syncs
-  on save — the **two-stage reload**: stage 1 projects the changed files into the env
-  tree source-only (same sync implementation as every verb, under the env lock, never
-  sweeping untracked env files), updating the sync cache, the `@source` fingerprint and
-  `lastUsedAt`; stage 2 belongs to the services' own dev watchers (`watch_run`), which
-  pick the projected change up. Services are NOT stopped or restarted on an ordinary
-  save meeting the projection conditions above. **Caveat (deliberate):** a save
-  that changes what an upkeep rule or
-  `@rebake-template` fingerprints — a lockfile, a migration — falls back to the full
-  bind path, which runs the rule and restarts services; skipping the rule silently
-  would hand out an environment the manifest says is stale. Stopped on
+- `--watch` sessions opt into a daemon-side debounced watcher on the worktree. The dev
+  servers (`watch_run`) already see every save; the watcher exists for what they
+  cannot do. A save that changes what an upkeep rule or `@rebake-template`
+  fingerprints — a lockfile, a migration — takes the full bind path, which runs the
+  rule and restarts services; skipping the rule silently would hand out an
+  environment the manifest says is stale. An ordinary save records `@source` and the
+  activity, under the environment lock, without touching the services. Writes under
+  `caches:` are ignored (they are builds, not saves). Stopped on
   release/expiry/quiesce/recycle. See [lease renewal](../README.md#how-long-you-hold-it---ttl-for-agents---holder-pid-for-shells) for watch activity.
-- The environment-side reset restores tracked files hard on every bind. A **clean-slate**
-  bind (`--reset-data` or `--pristine`) additionally removes untracked env-side files —
-  droppings left by a check, service, or `exec` — **except** declared `caches:`
-  (node_modules, obj/, …) and `sync.keep` paths. A plain `reuse` bind keeps them, so an
-  undeclared build artifact is not destroyed on every bind; declare expensive output
-  under `caches:` and a poisoned env tree then self-heals on the next clean-slate bind.
-- Git-ignored-but-needed files (`.env.local`) are declarable via `sync.include`.
-- Oversized/binary diffs fall back to file copy past a threshold.
+- Nothing in the worktree is ever deleted by runly. `reset-data` restores data only;
+  `pristine` clears the worktree ledger so every upkeep rule and build re-runs in
+  place (§8).
+- Git-ignored-but-needed files (`.env.local`) are part of the source identity when
+  declared under `sync.include`, so an edit to one restarts what reads it.
+- `runly warm` brings an idle worktree's caches to its current source — command
+  upkeep rules and service builds, no lease, no services — writing the same ledger a
+  bind reads (§7).
 
-### Outputs — the one sanctioned write-back
+### Outputs — reported, never pulled
 
-Some artifacts are produced env-side but owned worktree-side (a regenerated lockfile, a
-generated API client). Default remains "never touch the worktree"; the exception is
-explicit: manifest-declared `outputs:` are reported in the verdict
-(`outputs_changed: [...]`) and copied back **only** by `runly pull` (or `--pull`).
-The environment may *offer* artifacts; it never silently writes.
+Some files are regenerated by a check but owned by the worktree (a lockfile, a
+generated API client). The check runs in the worktree, so it writes them where they
+belong; the run reports which declared `outputs:` it changed. The former explicit
+write-back (`runly pull`, `run --pull`) is gone with the copy it pulled from.
 
 ## 7. Upkeep — the fingerprint ledger
 
 Dependencies, generated code, and toolchain drift are handled by a **closed list** of
-`(fingerprint → action)` rules in the manifest, executed at bind time, after sync,
-before build/start:
+`(fingerprint → action)` rules in the manifest, executed at bind time, after
+fingerprinting, before build/start:
 
-- Each environment keeps a ledger: the hash of each trigger *as last applied in this
-  env*. The incoming binding's hashes are compared against **that environment's**
-  ledger — **direction-agnostic**, so binding *older* work also converges correctly.
-  Environments don't upgrade; they converge to the binding they serve.
-- **Pool divergence is normal and harmless.** Idle environments are never touched;
-  staleness is bounded by one upkeep pass at next use. Machine-global package stores
+- The ledger records the hash of each trigger *as last applied*. Since decision 0032
+  it is split by what it describes: command rules and per-service build stamps are
+  facts about the **worktree** (`worktrees/<stack>/ledger.json` in the state root,
+  shared by every environment of the stack and by `runly warm`, written under the
+  worktree lock); `@source` and `@` built-ins describe an **environment** and stay on
+  its row. Comparison stays **direction-agnostic**, so binding *older* work also
+  converges correctly. A rule or build drops its entry before it runs, so one that
+  fails half-way is never vouched for.
+- A build stamp is keyed by the source hash AND the resolved build command, so a
+  build line that templates an environment's ports is never shared across
+  environments.
+- The ledger cannot see what happens to the worktree outside runly: a `node_modules`
+  deleted by hand is still "applied". `--pristine` clears the worktree ledger.
+- **Pool divergence is normal and harmless.** Idle worktrees are never touched by
+  the daemon on its own initiative; staleness is bounded by one upkeep pass at next
+  use, or by an explicit `runly warm`. Machine-global package stores
   (pnpm store, NuGet cache) make the Nth environment's install mostly hard-linking.
 - **No background mutation of environments** (v1): lazy is predictable, and
-  predictability is what agents need.
+  predictability is what agents need. `runly warm` is the manual, explicit form;
+  scheduling it is deferred.
 - **Data templates are keyed by the `create:` command string, not by seed *content***
   (v1's honest limitation): editing a seed script does not auto-invalidate the template.
   Declare an `@rebake-template <datastore>` upkeep rule triggered on the seed files to
@@ -332,7 +345,7 @@ first bind; no presets or templates).
 | --- | --- | --- |
 | `reuse` | retain compatible state; see [preset selection](../README.md#choosing-datastore-presets) | human inspect loop |
 | `reset-data` | restore data template, keep all build caches | agent verify loops (default for runs) |
-| `pristine` | fresh environment | merge-grade verdicts; auto-escalation |
+| `pristine` | fresh private state; every upkeep rule and build re-runs in the worktree (nothing there is deleted) | merge-grade verdicts; auto-escalation |
 
 Two consecutive bind failures on the same warm environment auto-escalate the next bind
 to `pristine` (a per-env `failStreak` in the journal, cleared by any successful bind) —
@@ -390,7 +403,7 @@ Every failure is classified — the field an agent branches on mechanically:
   services (and their memory) alive for the full TTL even if nothing had touched the
   environment since the bind. Now a leased env that goes untouched past `leasedIdleTtlMs`
   quiesces to warm: the lease survives, only the services stop, and the next verb rebinds.
-  "Untouched" counts real use — `exec`, `ctx`, `logs`, `pull` — not just binds, so an actively
+  "Untouched" counts real use — `exec`, `ctx`, `logs` — not just binds, so an actively
   worked environment is never quiesced underneath its agent.
 - **Leases need no heartbeat daemon** because losing a lease is designed to be
   worthless: an explicit `up` refreshes the TTL (content and read-only verbs deliberately do not,
@@ -421,14 +434,15 @@ The CLI **is** the API: every verb takes `--json`; stdout is data, stderr is hum
 
 ```
 runly up [--watch] [--reset-data|--pristine] [--ttl <minutes>]  # session lease
-runly run <check> [--pristine] [--pull] [--detach]   # run lease → verdict → release
+runly run <check> [--pristine] [--detach]      # run lease → verdict → release
 runly job <id> | job ls                        # poll / list detached runs
 runly ctx                                      # the context blob (below)
-runly sync | bind --ref <sha>                  # project worktree | a committed ref
-runly exec <cmd...>                            # run anything inside the leased env
+runly sync                                     # re-converge the lease to the worktree
+runly warm                                     # upkeep + builds in this worktree, no lease
+runly exec <cmd...>                            # run anything in the worktree, with the lease's env
 runly logs <service> [--lines N]               # supervised service logs
 runly token --role <r>                         # mint a token via auth.token
-runly reset-data | pull | release
+runly reset-data | release
 runly preview <service> [--ttl <minutes>] | preview stop   # publish one service publicly (below)
 runly status | doctor                          # pool state | active health check
 runly pool ls|recycle [--all]|reconcile|gc|doctor
@@ -465,8 +479,8 @@ Every verb accepts `--json`. Exit codes: `0` ok · `1` work-error / failed check
 `{ok:false, error:{class,message,…}}`; a failed *check* under `run` is
 `{ok:false, exitCode, failure:{class,…}}`.
 
-**Progress.** The long verbs (`up`, `run`, `sync`, `bind`, `reset-data`) stream bind
-phases (acquire → sync → upkeep → datastore → build → start-and-ready, with an elapsed
+**Progress.** The long verbs (`up`, `run`, `sync`, `warm`, `reset-data`) stream bind
+phases (acquire → fingerprint → upkeep → datastore → build → start-and-ready, with an elapsed
 counter on upkeep rules, builds and readiness waits). The daemon sends these as
 newline-delimited `{type:"progress"}` frames ahead of the single `{type:"result"}` frame;
 the CLI renders them **to stderr**, so the `--json` stdout stays one clean object. Shown
@@ -564,7 +578,7 @@ services:
     build: pnpm exec ng build myapp
     run:   npx serve-dist dist/myapp --proxy /api={{services.api.url}}
     watch_run: pnpm exec ng serve myapp --port {{ports.web}}
-    hot_reload: true                      # projection eligibility: see §6
+    hot_reload: true                      # sync keeps it running: see §6
     port:  web
     ready: { http: / }
   worker:
@@ -581,11 +595,10 @@ datastores:
   cache:
     driver: redis
     ephemeral: true                       # reset-data = flush
-caches: [node_modules, "**/obj", .angular]
+caches: [node_modules, "**/obj", .angular]   # output, not source; --watch ignores it
 sync:
-  keep: [src/api-client.generated.ts]
-  include: [.env.local]
-outputs: [pnpm-lock.yaml, src/api-client.generated.ts]
+  include: [.env.local]                   # git-ignored, but part of the source identity
+outputs: [pnpm-lock.yaml, src/api-client.generated.ts]   # reported when a check changes them
 upkeep:
   - { when: pnpm-lock.yaml, run: pnpm install --frozen-lockfile }
   - { when: "glob(db/migrate/**)", run: bin/rails db:migrate }

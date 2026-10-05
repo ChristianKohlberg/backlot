@@ -1,6 +1,6 @@
 ---
 name: runly
-description: Use runly to put a running, seeded, authenticated instance of the web app in front of you before inspecting behaviour, proving a change, or reproducing a bug. Use when the consuming repo has a runly.yml at its root and the `runly` CLI is installed; covers leasing a warm env, bind-by-sync, partial/per-service up, running classified checks, and reading context.
+description: Use runly to put a running, seeded, authenticated instance of the web app in front of you before inspecting behaviour, proving a change, or reproducing a bug. Use when the consuming repo has a runly.yml at its root and the `runly` CLI is installed; covers leasing a warm env that runs in your worktree, partial/per-service up, running classified checks, warming an idle worktree, and reading context.
 ---
 
 # runly
@@ -19,9 +19,12 @@ not just to read or edit code.
 
 - **Warm pool.** Environments are pooled, durable, and kept warm; work *visits*
   them. You never create or destroy an environment — you lease one.
-- **Bind-by-sync.** Binding your worktree to a warm env is a git sync +
-  fingerprint-gated upkeep (replay only the upkeep rules whose triggers changed) —
-  **seconds, not minutes**. No checkpointing, no image rebuild.
+- **It runs in your worktree.** An environment's services build and run in the
+  worktree you call from — its caches (node_modules, obj/, …) are your caches.
+  What the environment keeps privately is its ports, its datastore namespace and
+  its logs. Binding is fingerprint-gated upkeep and builds (replay only what your
+  change invalidated) — **seconds, not minutes**. A check sees your live
+  worktree, edits made while it runs included.
 - **Two kinds of lease:**
   - a **session lease** (`up`) — you hold the env, its services stay running, you
     `sync`/`exec`/`ctx`/`logs` against it, and you `release` when done;
@@ -50,20 +53,21 @@ stderr is human progress. Exit codes are contractual: `0` ok · `1` work-error �
 
 | Verb | What it does |
 | --- | --- |
-| `up [service...]` | Session lease: sync, upkeep, start services, print context. **No service = the whole app. Named services start only that slice plus its transitive `depends_on` closure** (see below). Flags: `--watch`, `--reset-data`\|`--pristine`, `--ttl <minutes>` (**the lease form for agents**), `--holder-pid <pid>` (interactive shells only — see above), `--data-only` (see below). |
+| `up [service...]` | Session lease: upkeep, build and start services in this worktree, print context. **No service = the whole app. Named services start only that slice plus its transitive `depends_on` closure** (see below). Flags: `--watch`, `--reset-data`\|`--pristine`, `--ttl <minutes>` (**the lease form for agents**), `--holder-pid <pid>` (interactive shells only — see above), `--data-only` (see below). |
 | `up --data-only` | Lease the **datastores alone** — a seeded database, no services, no builds. For a test lane that needs a database per run rather than a whole application: read `.datastores.<name>.url` from `ctx` and point your fixture at it, `reset-data` between runs. `ctx` reports `dataOnly: true`, and the env sits at `warm` because nothing is meant to run. Cannot be combined with a service name or `--watch`. Counted against its own machine-wide ceiling, not the application pool caps — a test lane does not compete with interactive leases. |
-| `run <check>` | Run lease: bind → execute the check declared in `runly.yml` → classified verdict → release. `--pristine` rebuilds from scratch; `--pull` copies declared outputs back; `--detach` returns a `jobId` immediately (poll with `job <jobId>`). |
+| `run <check>` | Run lease: bind → execute the check declared in `runly.yml` → classified verdict → release. `--pristine` re-runs every upkeep rule and build (it never deletes anything in your worktree); the verdict's `outputsChanged` names declared outputs the check rewrote; `--detach` returns a `jobId` immediately (poll with `job <jobId>`). |
 | `ctx` | Re-read the consumer **context blob** (service URLs, login creds, connection strings, recent events) for the env your lease holds — read-only, no re-bind. `up` already returned this once. **A stack may advertise several logins: `logins` is the primary one, `allLogins` is the whole set** — see below. |
 | `release` | Release the current lease; the environment stays warm in the pool. On `{"released": false}` read the `reason` — a lease is keyed by the directory that bound it, so releasing from elsewhere matches nothing. |
-| `sync` | Sync the current worktree into the leased env; see [projection and rebind conditions](https://github.com/ChristianKohlberg/backlot#quickstart). |
-| `exec <cmd...>` | Run an arbitrary command inside the env your lease holds; hands back raw stdout + exit code (not a verdict). Needs an `up` first. |
+| `sync` | Re-converge the lease to the worktree as it is now: hot-reload services are kept, anything else rebuilds and restarts; see [the rebind conditions](https://github.com/ChristianKohlberg/backlot#quickstart). |
+| `warm` | Run this worktree's upkeep rules and service builds **now, with no lease and no services**, and print each step with its duration. For an idle worktree just moved to a new commit (`git checkout <sha> && runly warm`), so the next bind finds warm caches. |
+| `exec <cmd...>` | Run an arbitrary command in your worktree with the lease's ports, URLs and connection strings in its environment (`BACKLOT_URL_*`, `BACKLOT_DS_*`); hands back raw stdout + exit code (not a verdict). Needs an `up` first. |
 | `logs <service> [--lines N]` | Tail a service's logs from the leased env. |
-| `reset-data` | Restore the data template on the current lease (fresh seeded state, declared caches kept). |
+| `reset-data` | Restore the data template on the current lease (fresh seeded state; builds and caches untouched). |
 | `token --role <r>` | Mint an auth token via the stack's `auth.token` hook — for authenticating as a given role. Prints JSON (`{token, role}`); **add `--raw` for the bare token**, which is what an `Authorization` header wants. Piping the JSON into a header gets you a 401 that looks like a permissions problem. |
 | `preview <service>` | Publish **one** service from your lease on a public quick tunnel (needs `cloudflared`) so a human on another machine can look at it. The URL is **unauthenticated — anyone with the link reaches the app**, so only run it when you were asked to share, and end it with `preview stop` (releasing the lease also does). Opt-in per invocation; a stack may forbid it in `runly.yml` (work-error). It is scoped to the **lease**, not the services: a `sync` or a rebind leaves it up, and a bind that invalidated it says so in `previewNotice`. |
 | `status` | Daemon, pool, and lease overview. Per environment, `available` answers "will the next bind take this one?" — `heat: "cold"` just means quiesced, which is a **healthy free** pool entry, not a stuck one. |
 
-Adjacent: `pull` (copy declared outputs into the worktree), `appliance ls|start|stop`
+Adjacent: `appliance ls|start|stop`
 (shared backing servers), `pool ls|recycle|reconcile|gc|doctor`, `daemon stop`,
 `update` (see below), `--version`.
 

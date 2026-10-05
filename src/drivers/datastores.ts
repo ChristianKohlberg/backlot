@@ -32,7 +32,13 @@ import type { DatastoreSpec } from '../core/manifest.js';
 
 export interface DsHandle {
   envId: string;
-  envTree: string;
+  /**
+   * Where the datastore's repo commands (create/drop/template_restore) run:
+   * the caller's worktree, which is where the environment runs (decision
+   * 0032). Teardown falls back to the environment's own directory when the
+   * worktree is already gone.
+   */
+  cwd: string;
   dataDir: string;
 }
 
@@ -274,9 +280,9 @@ class SqliteDs implements DsDriver {
     return join(dir, `${this.name}-${preset}@${this.contentKey().slice(0, 12)}.db`);
   }
 
-  private async runCreate(envTree: string, ns: string, preset: string): Promise<void> {
+  private async runCreate(cwd: string, ns: string, preset: string): Promise<void> {
     if (!this.spec.create) throw new BrokerError('work-error', `datastore '${this.name}' has no create: command`, 'datastore');
-    await sh(template(this.spec.create, { ns, preset }), envTree, `seed failed for '${this.name}' preset '${preset}'`);
+    await sh(template(this.spec.create, { ns, preset }), cwd, `seed failed for '${this.name}' preset '${preset}'`);
   }
 
   async ensure(h: DsHandle, preset: string, force: boolean, exists: boolean): Promise<void> {
@@ -291,7 +297,7 @@ class SqliteDs implements DsDriver {
       // used to rm the dir between this bake and the copy below (vetbill-1i49
       // covered only the bake-vs-bake race).
       await withBakeLock(this.stackId, async () => {
-        if (!existsSync(tpl)) await this.runCreate(h.envTree, tpl, preset); // bake once
+        if (!existsSync(tpl)) await this.runCreate(h.cwd, tpl, preset); // bake once
         // The sidecars MUST go before the .db is replaced. SQLite in WAL mode
         // recovers `-wal` frames onto whatever database file it finds, so a
         // leftover WAL from the previous lease would be replayed over the fresh
@@ -302,7 +308,7 @@ class SqliteDs implements DsDriver {
       });
     } else {
       dropSidecars(dbPath);
-      await this.runCreate(h.envTree, dbPath, preset);
+      await this.runCreate(h.cwd, dbPath, preset);
     }
   }
 
@@ -424,10 +430,10 @@ class CommandDs implements DsDriver {
         // For an ephemeral store the drop command IS the reset. Swallowing its
         // failure handed the caller an environment that reported reset-data
         // hygiene while still holding the previous lease's keys.
-        await sh(template(this.spec.drop, { ns: nsE }), h.envTree, `flush failed for ephemeral '${this.name}' — the store was NOT reset`);
+        await sh(template(this.spec.drop, { ns: nsE }), h.cwd, `flush failed for ephemeral '${this.name}' — the store was NOT reset`);
       }
       if (!exists && this.spec.create) {
-        await sh(template(this.spec.create, { ns: nsE, preset }), h.envTree, `create failed for ephemeral '${this.name}'`);
+        await sh(template(this.spec.create, { ns: nsE, preset }), h.cwd, `create failed for ephemeral '${this.name}'`);
       }
       return;
     }
@@ -435,7 +441,7 @@ class CommandDs implements DsDriver {
     if (!this.spec.create) throw new BrokerError('work-error', `datastore '${this.name}' has no create: command`, 'datastore');
     const create = this.spec.create; // narrowed copy for the closure below
     const ns = this.ns(h);
-    if (this.spec.drop) await shQuiet(template(this.spec.drop, { ns }), h.envTree); // clean slate, best-effort
+    if (this.spec.drop) await shQuiet(template(this.spec.drop, { ns }), h.cwd); // clean slate, best-effort
     if (this.spec.template_restore) {
       const tpl = this.templateNs(preset);
       // Serialize bake-check + bake + mark on the STACK key (vetbill-1i49
@@ -443,8 +449,8 @@ class CommandDs implements DsDriver {
       // marker dir, so only a stack-scoped lock excludes it too).
       await withBakeLock(this.stackId, async () => {
         if (existsSync(this.bakedMarker(preset))) return;
-        await shQuiet(this.spec.drop ? template(this.spec.drop, { ns: tpl }) : 'true', h.envTree);
-        await sh(template(create, { ns: tpl, preset }), h.envTree, `template bake failed for '${this.name}' preset '${preset}'`);
+        await shQuiet(this.spec.drop ? template(this.spec.drop, { ns: tpl }) : 'true', h.cwd);
+        await sh(template(create, { ns: tpl, preset }), h.cwd, `template bake failed for '${this.name}' preset '${preset}'`);
         const marker: BakedMarker = {
           v: 1,
           ns: tpl,
@@ -453,7 +459,7 @@ class CommandDs implements DsDriver {
         writeFileSync(this.bakedMarker(preset), JSON.stringify(marker));
       });
       const restore = () =>
-        sh(template(this.spec.template_restore!, { template: tpl, ns }), h.envTree, `template restore failed for '${this.name}' preset '${preset}'`);
+        sh(template(this.spec.template_restore!, { template: tpl, ns }), h.cwd, `template restore failed for '${this.name}' preset '${preset}'`);
       try {
         await restore();
       } catch (err) {
@@ -465,8 +471,8 @@ class CommandDs implements DsDriver {
         rmSync(this.bakedMarker(preset), { force: true });
         await withBakeLock(this.stackId, async () => {
           if (existsSync(this.bakedMarker(preset))) return;
-          await shQuiet(this.spec.drop ? template(this.spec.drop, { ns: tpl }) : 'true', h.envTree);
-          await sh(template(create, { ns: tpl, preset }), h.envTree, `template rebake failed for '${this.name}' preset '${preset}' (after a failed restore: ${(err as Error).message})`);
+          await shQuiet(this.spec.drop ? template(this.spec.drop, { ns: tpl }) : 'true', h.cwd);
+          await sh(template(create, { ns: tpl, preset }), h.cwd, `template rebake failed for '${this.name}' preset '${preset}' (after a failed restore: ${(err as Error).message})`);
           const marker: BakedMarker = {
             v: 1,
             ns: tpl,
@@ -477,12 +483,12 @@ class CommandDs implements DsDriver {
         await restore(); // a second failure is genuinely the repo's problem
       }
     } else {
-      await sh(template(this.spec.create, { ns, preset }), h.envTree, `seed failed for '${this.name}' preset '${preset}'`);
+      await sh(template(this.spec.create, { ns, preset }), h.cwd, `seed failed for '${this.name}' preset '${preset}'`);
     }
   }
 
   async drop(h: DsHandle): Promise<void> {
-    if (this.spec.drop) await shQuiet(template(this.spec.drop, { ns: this.ns(h) }), h.envTree);
+    if (this.spec.drop) await shQuiet(template(this.spec.drop, { ns: this.ns(h) }), h.cwd);
   }
   async rebake(cwd?: string): Promise<void> {
     // Drop the server-side template DBs recorded in the markers before

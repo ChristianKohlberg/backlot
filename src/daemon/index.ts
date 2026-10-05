@@ -46,7 +46,7 @@ async function dispatch(verb: string, args: Record<string, unknown>, emit: (phas
         onProgress: emit,
       });
     case 'run':
-      return engine.run({ cwd, holder, callerEnv: args.callerEnv, presets: args.presets, check: String(args.check), hygiene: (args.hygiene as never) ?? undefined, pull: Boolean(args.pull), onProgress: emit });
+      return engine.run({ cwd, holder, callerEnv: args.callerEnv, presets: args.presets, check: String(args.check), hygiene: (args.hygiene as never) ?? undefined, onProgress: emit });
     case 'run-detach': {
       if (args.presets !== undefined) selectPresets(loadStack(cwd).manifest, 'run', args.presets);
       const jobId = engine.createJob(cwd, String(args.check));
@@ -56,7 +56,7 @@ async function dispatch(verb: string, args: Record<string, unknown>, emit: (phas
       // client) — but a REJECTION here is process-fatal without a catch, and
       // the job would be lost with no record of why.
       void engine
-        .executeJob(jobId, { cwd, holder, pull: Boolean(args.pull), callerEnv: args.callerEnv, presets: args.presets, check: String(args.check), hygiene: (args.hygiene as never) ?? undefined })
+        .executeJob(jobId, { cwd, holder, callerEnv: args.callerEnv, presets: args.presets, check: String(args.check), hygiene: (args.hygiene as never) ?? undefined })
         .catch((err) => logEvent({ level: 'error', kind: 'job', detail: `job ${jobId} failed outside the verdict path: ${String((err as Error).message ?? err)}` }));
       return { jobId, poll: `runly job ${jobId}` };
     }
@@ -64,8 +64,6 @@ async function dispatch(verb: string, args: Record<string, unknown>, emit: (phas
       return engine.jobStatus(String(args.jobId));
     case 'job-ls':
       return engine.jobList();
-    case 'bind-ref':
-      return engine.bindRef(cwd, String(args.ref), holder, args.ttlMs ? Number(args.ttlMs) : undefined);
     case 'ctx':
       return engine.ctx(cwd, holder);
     case 'sync':
@@ -78,8 +76,8 @@ async function dispatch(verb: string, args: Record<string, unknown>, emit: (phas
       return engine.logs(cwd, String(args.service), Number(args.lines ?? 40), holder);
     case 'token':
       return engine.token(cwd, String(args.role ?? 'admin'), holder);
-    case 'pull':
-      return engine.pull(cwd, holder);
+    case 'warm':
+      return engine.warm(cwd, emit);
     case 'release':
       return engine.release(cwd, holder);
     case 'preview':

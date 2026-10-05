@@ -56,7 +56,7 @@ describe('--watch: save in the worktree, served without calling sync', () => {
     rmSync(wt, { recursive: true, force: true });
   });
 
-  it('streams worktree edits into the environment', async () => {
+  it('worktree edits reach the environment without a sync', async () => {
     makeStack(
       wt,
       `name: watchy
@@ -101,7 +101,7 @@ describe('--watch two-stage reload: an ordinary save must not bounce services', 
     rmSync(wt, { recursive: true, force: true });
   });
 
-  it('projects the file and keeps the service process — stage 2 belongs to the dev server', async () => {
+  it('keeps the service process — the dev server reads the worktree itself', async () => {
     makeStack(
       wt,
       `name: watchtwo
@@ -129,8 +129,8 @@ services:
       await new Promise((r) => setTimeout(r, 300));
     }
     expect(body).toContain('v2 — projected');
-    // The save was projected into the env tree WITHOUT stopping the service:
-    // the same process that served v1 serves v2.
+    // The service runs in the worktree, so the save reached it WITHOUT runly
+    // stopping it: the same process that served v1 serves v2.
     expect(body.split(':')[0]).toBe(pid1);
   }, 60_000);
 });
@@ -249,7 +249,7 @@ auth:
   }, 60_000);
 });
 
-describe('the sync VERB takes the projection path too (2026-07-19 dogfood P1)', () => {
+describe('the sync VERB keeps hot-reload services too (2026-07-19 dogfood P1)', () => {
   const ctx = makeContext();
   const wt = mkdtempSync(join(tmpdir(), 'runly-syncproj-'));
   afterAll(() => {
@@ -259,9 +259,9 @@ describe('the sync VERB takes the projection path too (2026-07-19 dogfood P1)', 
 
   it('a plain source edit + sync is served by the SAME service process', async () => {
     // Dogfooded on the founding monorepo: a one-line edit + `sync` took 57s
-    // and restarted all three services, while the watch machinery projected
-    // the identical edit in 2s. The headline loop verb must use the same
-    // source-only path when nothing needs a rebuild.
+    // and restarted all three services. Hot-reload services read the worktree
+    // themselves, so `sync` must only record the new source when nothing
+    // needs a rebuild.
     makeStack(
       wt,
       `name: syncproj
@@ -289,8 +289,8 @@ upkeep:
     writeFileSync(join(wt, 'dep.lock'), 'lock-v2');
     const sync2 = await ctx.cli(['sync', '--json'], wt);
     expect(sync2.exitCode).toBe(0);
-    const envs = (await ctx.cli(['pool', 'ls', '--json'], wt)).json!.envs as Array<{ id: string }>;
-    const upkeepLog = join(ctx.stateDir, 'envs', envs[0]!.id, 'tree', 'upkeep.log');
+    // The rule ran in the worktree itself (decision 0032), so that is where it wrote.
+    const upkeepLog = join(wt, 'upkeep.log');
     // Two runs: the initial bind applied the rule once, the fallback re-ran it.
     expect(readFileSync(upkeepLog, 'utf8').trim().split('\n')).toHaveLength(2);
   }, 60_000);

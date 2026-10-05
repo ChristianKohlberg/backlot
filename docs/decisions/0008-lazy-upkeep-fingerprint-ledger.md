@@ -1,6 +1,6 @@
 # 0008. Lazy upkeep via a per-environment fingerprint ledger
 
-- Status: Accepted
+- Status: Accepted — amended by [0032](0032-environments-run-in-the-callers-worktree.md): command rules and build stamps are recorded per worktree; `@source` and `@` built-ins stay per environment
 
 ## Decision
 

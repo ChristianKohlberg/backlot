@@ -24,7 +24,17 @@ Services are spawned detached (`detached: true` in `spawn`) so they outlive the 
 
 Consequence: a group kill (`killGroupVerified`) is not sufficient teardown — a service that called `setsid()` or spawned a detached grandchild escapes the `-pgid` signal and can keep holding its port. `stopAll()` must therefore always be followed by a reap of journal-recorded pids plus a tag scan before trusting any port-free check. **Every `stopAll()` call site is bound by this** — `bindAndStart`, `teardownClaimed`, the quiesce path, and `shutdown()`. Deferring the reap to "the next bind will handle it" is the bug (#34): a quiesced env can sit cold for hours, and a stopping daemon has no next anything. `reapEnvProcesses` in `src/daemon/engine.ts` owns this invariant (see its doc comment for the failure modes and the survivor-preservation contract); `tests/env-port-survivor.test.ts` and `tests/agent-lease-and-recycle.test.ts` are the regression tests. Crash recovery follows the same rule: `recover()` reaps recorded pids for every journaled env and re-runs `teardownClaimed` for `state='recycling'` rows.
 
-Supervision initially records top-level service pids; reclamation also records discovered survivors. `reapPids` in `src/daemon/supervisor.ts` owns their identity and group-preservation contract. For anything that also scrubbed the tag, `reapEnvTree` reaps by cwd (`scanByCwd`, which matches a `(deleted)` cwd too). That path is **teardown-only**: a quiesced env keeps its tree on disk and someone's shell may legitimately be sitting in it.
+Supervision initially records top-level service pids; reclamation also records discovered survivors. `reapPids` in `src/daemon/supervisor.ts` owns their identity and group-preservation contract. For anything that also scrubbed the tag, `reapEnvTree` reaps by cwd (`scanByCwd`, which matches a `(deleted)` cwd too) — but only inside the env's PRIVATE directory and only at teardown. Services run in the caller's worktree (decision 0032), and cwd there is never ownership: the agent's shells and builds sit in it. Never point a cwd scan at a worktree.
+
+## Environments run in the caller's worktree — the copy is gone
+
+Decision 0032 removed the projection: services, builds, upkeep, checks, `exec` and `auth.token` all run in the stack root. Sharp edges:
+
+- **Never delete in the worktree.** Teardown removes only `env.root`, and `isPrivateEnvDir` checks it is under `envs/` and does not contain `env.stackRoot` first. `reset-data` touches data only; `pristine` clears the worktree LEDGER (re-run everything), never files.
+- **The ledger is split.** Command upkeep rules and `@built:<service>` stamps live per worktree in `worktrees/<stack>/ledger.json` (`src/core/tree-ledger.ts`); `@source` and `@` built-ins stay on the env row. A per-env copy of a worktree fact goes stale the moment a sibling env (or `runly warm`) installs or builds — that was the reason for the split, do not fold it back.
+- **Lock order: env lock(s) first, then the worktree lock (`treeLocked`).** Binds take one env lock then the worktree lock around upkeep and builds; `warm` takes every env lock of the stack (sorted, `envsLocked`) then the worktree lock. Taking them the other way round deadlocks against a bind.
+- **Source identity is a fingerprint, not a copy** (`src/core/worktree.ts`, on a worker thread). Declared `caches:` are excluded from it; an upkeep command that ran triggers a re-fingerprint BEFORE builds, never after (a later one could vouch for an edit the build never compiled).
+- `tests/in-place.test.ts` (no copy, teardown leaves the worktree, warm, warm's locking) and `tests/worktree.test.ts` (fingerprint) are the regression tests.
 
 ## Publishers own their dialect — the engine must not learn one
 
@@ -87,11 +97,11 @@ label, and `setsid` descendants are outside it — the contract is in
 [decision 0027](docs/decisions/0027-lease-scoped-public-preview.md) and
 `tests/preview-process-group.test.ts` is the regression test.
 
-`reconcilePreviewForBind` owns what a bind **and a `sync`/`--watch` projection**
+`reconcilePreviewForBind` owns what a bind **and a `sync`/`--watch` hot-reload refresh**
 do to a live tunnel: it tears it
 down when `preview.forbidden` appears, when the previewed service leaves the
 running set (a narrowed slice or `--data-only` — nothing brings it back this
-lease), or when its local port moves (a bind only — a projection allocates
+lease), or when its local port moves (a bind only — a refresh allocates
 nothing, and it judges the slice by the env's durable shape, not by live pids);
 the slice and port causes are reconciled at the bind's **epilogue**, once the
 shape they judge against is committed, while `forbidden` is enforced up front so
@@ -105,9 +115,9 @@ delete (it cannot take the env lock — `tryClaim` calls it under the pool lock)
 so no stale snapshot can forget a tunnel someone else just published. `tests/preview-tunnel.test.ts`
 covers all of it.
 
-For the successful-bind configuration ledger and projection/reuse eligibility, see
-[sync and bindings](docs/architecture.md#6-sync--verbs-sync-watch-streams) and
-`tests/projection-config-and-detached-pull.test.ts`.
+For the successful-bind configuration ledger and refresh/reuse eligibility, see
+[in place](docs/architecture.md#6-in-place--verbs-converge-watch-observes) and
+`tests/sync-config-and-detached-outputs.test.ts`.
 
 ## Physical stack identity
 

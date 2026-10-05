@@ -1,10 +1,10 @@
 /**
- * The operational batch: check timeouts (process-group kill), bind --ref,
+ * The operational batch: check timeouts (process-group kill),
  * job ls, pool-policy precedence, and the retention sweep.
  */
 import { describe, it, expect, afterAll, afterEach } from 'vitest';
 import { execFile, execFileSync } from 'node:child_process';
-import { mkdtempSync, rmSync, writeFileSync, readFileSync, mkdirSync, utimesSync, statSync, existsSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync, readFileSync, mkdirSync, utimesSync, statSync, existsSync, readdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -77,12 +77,10 @@ describe('check timeouts and job ls', () => {
     // still produce this message while leaking the real child. The fixture
     // forks deliberately and records the grandchild's pid, so this asserts the
     // thing the test is named for.
-    const envs = (await ctx.cli(['pool', 'ls', '--json'], wt)).json!.envs as Array<{ id: string }>;
+    // The check ran in the worktree (decision 0032), so that is where it wrote.
     let childPid: number | undefined;
-    for (const e of envs) {
-      const f = join(ctx.stateDir, 'envs', e.id, 'tree', 'hung-child.pid');
-      if (existsSync(f)) childPid = Number(readFileSync(f, 'utf8').trim());
-    }
+    const f = join(wt, 'hung-child.pid');
+    if (existsSync(f)) childPid = Number(readFileSync(f, 'utf8').trim());
     expect(childPid, 'the hang fixture should have recorded its child pid').toBeGreaterThan(0);
     const alive = (pid: number) => {
       try {
@@ -110,23 +108,6 @@ describe('check timeouts and job ls', () => {
     const jobs = ls.json!.jobs as Array<{ id: string; state: string; ok: boolean | null }>;
     expect(jobs[0]!.id).toBe(jobId);
     expect(jobs[0]!.ok).toBe(true);
-  }, 60_000);
-
-  it('bind --ref serves the committed state; sync returns to the worktree state', async () => {
-    execFileSync('git', ['add', '-A'], { cwd: wt });
-    execFileSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-qm', 'v1'], { cwd: wt });
-    writeFileSync(join(wt, 'message.txt'), 'v2-dirty');
-
-    const bound = await ctx.cli(['bind', '--ref', 'HEAD', '--json'], wt);
-    expect(bound.exitCode, `stdout: ${bound.stdout ?? ''}\nstderr: ${bound.stderr ?? ''}`).toBe(0);
-    const url = (bound.json!.urls as Record<string, string>).web!;
-    expect(await (await fetch(url)).text()).toBe('v1'); // the COMMIT, not the dirty tree
-
-    await ctx.cli(['sync'], wt);
-    expect(await (await fetch(url)).text()).toBe('v2-dirty'); // back to worktree state
-
-    const bad = await ctx.cli(['bind', '--ref', 'nope-branch', '--json'], wt);
-    expect(bad.exitCode, `stdout: ${bad.stdout ?? ''}\nstderr: ${bad.stderr ?? ''}`).toBe(1); // work-error: not a commit
   }, 60_000);
 });
 
@@ -219,6 +200,28 @@ describe('retention sweep (unit)', () => {
     }
     expect(await pruneTemplates(p)).toBe(2);
     rmSync(dir, { recursive: true, force: true });
+  });
+});
+
+describe('per-worktree state outlives environments, not its worktree (decision 0032)', () => {
+  it('prunes a worktree record only once the worktree is gone and no environment names it', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'runly-wtret-'));
+    const { pruneWorktreeState } = await import('../src/core/retention.js');
+    const live = mkdtempSync(join(tmpdir(), 'runly-wtret-live-'));
+    const record = (id: string, root: string, file = 'ledger.json') => {
+      mkdirSync(join(dir, id), { recursive: true });
+      writeFileSync(join(dir, id, file), JSON.stringify({ root, fingerprints: {} }));
+    };
+    record('gone-stack', join(dir, 'no-such-worktree'));
+    record('gone-hashes-only', join(dir, 'also-gone'), 'hashes.json');
+    record('live-stack', live);
+    record('gone-but-leased', join(dir, 'gone-too'));
+    mkdirSync(join(dir, 'unreadable'));
+    const journal = { envsForStack: (id: string) => (id === 'gone-but-leased' ? [{}] : []) } as never;
+    expect(pruneWorktreeState(journal, dir)).toBe(2);
+    expect(readdirSync(dir).sort()).toEqual(['gone-but-leased', 'live-stack', 'unreadable']);
+    rmSync(dir, { recursive: true, force: true });
+    rmSync(live, { recursive: true, force: true });
   });
 });
 
