@@ -160,13 +160,16 @@ describe('a bind whose holder is already dead is refused, not silently accepted 
 
 describe('pool recycle honours the environment it was given (#40)', () => {
   it('recycles exactly the named environment and leaves the others alone', async () => {
-    const { cli, journal } = ctx({ BACKLOT_LEASE_TTL_MS: '2000' });
-    // Two environments, sequentially, by letting the first lease lapse. Each
-    // `up` from the same worktree refreshes one lease, so a second env needs a
-    // second holder.
+    const { cli, journal, wt } = ctx({ BACKLOT_LEASE_TTL_MS: '2000' });
+    // Two environments need two worktrees: a worktree has exactly one
+    // (decision 0032).
+    const wt2 = mkdtempSync(join(tmpdir(), 'runly-agentlease-wt2-'));
+    cleanups.push(() => rmSync(wt2, { recursive: true, force: true }));
+    for (const f of ['srv.mjs', 'stack.yaml']) writeFileSync(join(wt2, f), readFileSync(join(wt, f)));
+    execFileSync('git', ['init', '-q'], { cwd: wt2 });
     const a = await cli(['up', '--json']);
     expect(a.code).toBe(0);
-    const b = await cli(['up', '--holder', 'other-agent', '--json']);
+    const b = await cli(['up', '--json'], wt2);
     expect(b.code).toBe(0);
     const idA = String(a.json?.envId);
     const idB = String(b.json?.envId);
@@ -175,7 +178,7 @@ describe('pool recycle honours the environment it was given (#40)', () => {
     // Release both so neither is lease-protected — the scope bug has to fail
     // for scope reasons, not because a lease happened to save the sibling.
     await cli(['release', '--json']);
-    await cli(['release', '--holder', 'other-agent', '--json']);
+    await cli(['release', '--json'], wt2);
     await waitFor(() => journal().allLeases().length === 0);
 
     const res = await cli(['pool', 'recycle', idA, '--json']);

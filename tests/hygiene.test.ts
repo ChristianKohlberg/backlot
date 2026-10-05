@@ -199,14 +199,14 @@ describe('sleep pardon (journal level)', () => {
 });
 
 describe('the upkeep ledger belongs to the worktree, not to an environment (decision 0032)', () => {
-  const ctx = makeContext({ BACKLOT_POOL_MAX: '2' });
+  const ctx = makeContext();
   const wt = mkdtempSync(join(tmpdir(), 'runly-ledger-'));
   afterAll(() => {
     ctx.cleanup();
     rmSync(wt, { recursive: true, force: true });
   });
 
-  it('a second environment of the same worktree trusts the install the first one did; pristine re-runs it', async () => {
+  it('a run in the same worktree trusts the install the session did; pristine re-runs it', async () => {
     writeFileSync(join(wt, 'dep.txt'), 'v1\n');
     writeFileSync(join(wt, '.gitignore'), 'node_modules/\nupkeep.log\n');
     writeFileSync(
@@ -223,13 +223,13 @@ checks:
     execFileSync('git', ['init', '-q'], { cwd: wt });
     const runs = () => readFileSync(join(wt, 'upkeep.log'), 'utf8').trim().split('\n').length;
 
-    const up = await ctx.cli(['up', '--json'], wt); // environment 1 installs, in the worktree
+    const up = await ctx.cli(['up', '--json'], wt); // the session installs, in the worktree
     expect(up.exitCode, JSON.stringify(up.json)).toBe(0);
     expect(runs()).toBe(1);
 
-    const run = await ctx.cli(['run', 'deps', '--json'], wt); // environment 2, same worktree
+    const run = await ctx.cli(['run', 'deps', '--json'], wt); // same worktree, same environment
     expect(run.exitCode, JSON.stringify(run.json)).toBe(0);
-    expect(run.json!.envId).not.toBe(up.json!.envId);
+    expect(run.json!.envId).toBe(up.json!.envId);
     expect(runs()).toBe(1); // the install is a fact about the worktree: not repeated
 
     const pristine = await ctx.cli(['run', 'deps', '--pristine', '--json'], wt);

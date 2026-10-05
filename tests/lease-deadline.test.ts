@@ -57,7 +57,7 @@ describe('content operations preserve the lease deadline', () => {
             await expect.poll(async () => {
               if (mode === 'watch projection') {
                 const status = await f.cli(['status']);
-                return status.events.some((e) => e.kind === 'watch' && e.detail?.startsWith('worktree source changed'));
+                return status.events.some((e) => e.kind === 'watch' && e.detail?.startsWith('worktree save seen'));
               }
               const context = await f.cli(['ctx']);
               return context.events.some((e) => e.event === 'started' && e.at > first.events[0].at);

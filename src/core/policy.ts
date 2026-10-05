@@ -8,6 +8,11 @@ import { join } from 'node:path';
 import { stateRoot } from './paths.js';
 
 export interface Policy {
+  /**
+   * The old PER-STACK ceiling. Since decision 0032 a stack (one worktree) has
+   * exactly one environment, so the engine no longer reads it; it is still
+   * resolved and reported by `status` for compatibility.
+   */
   poolMax: number;
   /** Machine-wide ceiling across ALL stacks (the memory heuristic is per host). */
   poolMaxTotal: number;
@@ -62,10 +67,12 @@ function configFile(): ConfigFile {
 
 /**
  * The designed capacity heuristic: min(cores/2, memGB/4), clamped to [2, 8].
+ * It is the machine-wide default (BACKLOT_POOL_MAX_TOTAL).
  *
- * The floor is 2, not 1, because the documented core loop needs two
- * environments: a session `up` holds one, and `run` always mints its own
- * ephemeral holder, so it must be able to take a second. A pool of 1 cannot run
+ * The floor is 2, not 1. It was chosen when the documented core loop needed
+ * two environments per stack (a session `up` plus a `run` on its own
+ * ephemeral holder); since decision 0032 a run binds through the session's
+ * environment, and the floor now only keeps two worktrees runnable at once. A pool of 1 cannot run
  * runly as documented at all — it fails with 'pool at capacity (1/1)', which
  * is what small CI runners hit (3 vCPU / 7 GB gives 1 on both terms).
  *

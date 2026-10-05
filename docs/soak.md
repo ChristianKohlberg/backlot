@@ -32,8 +32,8 @@ fixture stacks in a dedicated temp `BACKLOT_STATE_DIR`, cycling continuously:
 - **Run loop** — `run pass` / `run fail` / `run --detach` + `job` polling /
   unknown check, each with its verdict asserted exactly (a `fail` check must be
   `work-error`; anything else is the silently-wrong-verdict bug).
-- **Capacity churn** — a second stack pinned at `BACKLOT_POOL_MAX=2` with a
-  third holder queueing on short-TTL expiries, plus a quiesce cycle under a
+- **Capacity churn** — a second stack whose one environment (decision 0032) is
+  held by a short-TTL holder while a second holder queues on its expiry, plus a quiesce cycle under a
   short `BACKLOT_LEASED_IDLE_TTL_MS`: leased-idle env goes warm, `exec` refuses
   with the rebind hint, `up` brings the same env back hot. The sweeper
   (`BACKLOT_SWEEP_MS=1000`) must keep reclaiming all of it, all run long.

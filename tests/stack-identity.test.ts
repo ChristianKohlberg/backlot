@@ -2,7 +2,7 @@ import ts from 'typescript';
 import { pathToFileURL } from 'node:url';
 import { expect, it } from 'vitest';
 import { execFile, execFileSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, writeFileSync, symlinkSync, rmSync, readFileSync, existsSync, readdirSync, renameSync, realpathSync } from 'node:fs';
+import { cpSync, mkdtempSync, mkdirSync, writeFileSync, symlinkSync, rmSync, readFileSync, existsSync, readdirSync, renameSync, realpathSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createHash } from 'node:crypto';
@@ -16,6 +16,17 @@ const CLI = join(import.meta.dirname, '..', 'dist/cli/index.js');
 type Context = { datastores: Record<string, { url: string }>; envId: string; urls: Record<string, string>; error?: { message: string }; lease: { id: string } };
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const legacyIdentity = (alias: string, name = 'identity') => `${name}-${createHash('sha256').update(alias).digest('base64url').slice(0, 8)}`;
+/**
+ * A second environment for tests that rebuild an OLDER journal, which could
+ * hold several environments for one worktree. This daemon never creates that
+ * (decision 0032: one environment per worktree), so the second one is bound
+ * from a copy of the worktree and then rewritten into the legacy shape.
+ */
+const secondWorktree = (f: { root: string; wt: string }) => {
+  const copy = join(f.root, 'copy');
+  if (!existsSync(copy)) cpSync(f.wt, copy, { recursive: true });
+  return copy;
+};
 const notesIn = (url: string) => {
   const db = new DatabaseSync(url);
   try { return db.prepare('SELECT note FROM notes').all(); } finally { db.close(); }
@@ -132,7 +143,7 @@ it('converged same-holder legacy leases refuse ambiguity without deleting either
   const f = fixture();
   try {
     const first = await f.cli(['up', '--holder', 'owner']);
-    const second = await f.cli(['up', '--holder', 'other']);
+    const second = await f.at('up', secondWorktree(f), 'other');
     await f.cli(['daemon', 'stop']);
     const journal = new Journal(join(f.state, 'journal.db'));
     const saved = journal.getEnv(second.envId)!;
@@ -261,7 +272,7 @@ it('an existing canonical default lease remains reachable beside a migrated alia
   const f = fixture();
   try {
     const canonical = await f.cli(['up']);
-    const alias = await f.cli(['up', '--holder', f.alias]);
+    const alias = await f.at('up', secondWorktree(f), f.alias);
     await f.cli(['daemon', 'stop']);
     const journal = journalAsLegacyAlias(f, alias.envId, true);
     const result = await f.cli(['up']);
@@ -412,7 +423,8 @@ it('retirement preserves a live template shared by long canonical and legacy sta
     expect((await f.cli(['ctx', '--holder', 'owner'])).envId).toBe(first.envId);
     retiredDir = join(f.state, 'retired-templates', legacyIdentity(f.alias, f.name));
     expect(journal.getEnv(first.envId)!.stack).toBe(legacyIdentity(f.wt, f.name));
-    const second = await f.cli(['up', '--holder', 'other']);
+    // A fresh data reset restores through the canonical template.
+    const second = await f.cli(['reset-data', '--holder', 'owner']);
     expect(second.error).toBeUndefined();
     const file = readdirSync(canonicalDir).find((f) => f.endsWith('.baked'))!;
     const canonical = readFileSync(join(canonicalDir, file), 'utf8');
@@ -527,9 +539,11 @@ it('canonical stack rows recognize a legacy holder whose subdirectory alone was 
     expect(retained.envId).toBe(first.envId);
     expect(retained.lease.id).toBe(first.lease.id);
     expect(notesIn(retained.datastores.main.url)).toEqual([{ note: 'canonical legacy owner' }]);
+    // One environment per worktree (decision 0032): a different holder of the
+    // same worktree is refused rather than handed a second environment.
     const canonical = await f.at('up', sub, sub);
-    expect(canonical.error).toBeUndefined();
-    expect((await f.at('up', sub)).envId).toBe(canonical.envId);
+    expect(canonical.error?.message).toMatch(/exactly one environment/);
+    expect(journal.allEnvs()).toHaveLength(1);
     expect(journal.leaseForEnv(first.envId)!.holder).toBe(holder);
   } finally { await f.cleanup(); }
 }, 30000);

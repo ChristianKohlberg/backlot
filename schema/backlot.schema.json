@@ -41,7 +41,7 @@
       "items": {
         "type": "string"
       },
-      "description": "Build and install output inside the worktree (node_modules, **/obj, .angular, ...). Environments run in the worktree (decision 0032), so this is what is NOT source: it is left out of the source identity (a build writing there does not make the next bind restart) and `--watch` ignores writes there."
+      "description": "Build and install output inside the worktree (node_modules, **/obj, .angular, ...). Environments run in the worktree (decision 0032), so this is what is NOT source: an upkeep `when:` glob never matches it and `--watch` ignores writes there. runly never deletes it."
     },
     "sync": {
       "type": "object",
@@ -59,7 +59,7 @@
           "items": {
             "type": "string"
           },
-          "description": "Git-ignored files that are part of the source state (.env.local): an edit to one changes the source identity, so the next bind restarts what reads it."
+          "description": "Git-ignored files that still count as source (.env.local), so an upkeep `when:` glob can match them."
         }
       }
     },
@@ -227,7 +227,7 @@
         },
         "hot_reload": {
           "type": "boolean",
-          "description": "This service's run: command watches the worktree and reloads changed files itself (ng serve, dotnet watch, vite). When EVERY service declares it, `runly sync` records the new source without restarting services; any service without it forces the full rebind, because a non-watching process silently serves stale code."
+          "description": "This service's run: command watches the worktree and reloads changed files itself (ng serve, dotnet watch, vite). When EVERY service declares it, `runly sync` keeps the services running (they read the worktree themselves) unless an upkeep rule is due; any service without it makes `sync` rebuild and restart, because a non-watching process silently serves stale code."
         }
       }
     },

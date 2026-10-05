@@ -4,7 +4,7 @@ import { dirname, join, resolve } from 'node:path';
 import { parse } from 'yaml';
 import Ajv2020 from 'ajv/dist/2020.js';
 import { fileURLToPath } from 'node:url';
-import { BrokerError } from './util.js';
+import { BrokerError, safeJoin } from './util.js';
 
 export interface ReadySpec {
   http?: string;
@@ -148,9 +148,9 @@ export interface Manifest {
   preview?: PreviewSpec;
   appliances?: Record<string, ApplianceSpec>;
   datastores?: Record<string, DatastoreSpec>;
-  /** Build/install output in the worktree: not part of the source identity, ignored by `--watch` (decision 0032). */
+  /** Build/install output in the worktree: never an upkeep trigger, ignored by `--watch` (decision 0032). */
   caches?: string[];
-  /** `include`: git-ignored files that are part of the source identity. `keep` is accepted and ignored (decision 0032). */
+  /** `include`: git-ignored files an upkeep `when:` glob may still match. `keep` is accepted and ignored (decision 0032). */
   sync?: { keep?: string[]; include?: string[] };
   /** Files a check may regenerate; a run reports which ones changed. */
   outputs?: string[];
@@ -232,6 +232,9 @@ export function loadStack(from: string): Stack {
   if (!file) throw new BrokerError('work-error', `no runly.yml (or backlot.yml / stack.yaml) in ${root}`, 'manifest');
   const manifest = parse(readFileSync(file, 'utf8')) as Manifest;
   validate(manifest);
+  // A path that escapes the worktree is refused at load, whether or not an
+  // upkeep rule ever makes runly read it: it is never a legitimate source file.
+  for (const inc of manifest.sync?.include ?? []) safeJoin(root, inc, 'sync.include');
   // Identity = absolute root + declared name; filesystem-safe. Hash the WHOLE
   // path: slicing base64url(root) kept only the last ~6 bytes, so sibling
   // worktrees like agent-1/myapp and agent-2/myapp collided into one pool.

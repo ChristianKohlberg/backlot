@@ -22,15 +22,20 @@ not just to read or edit code.
 - **It runs in your worktree.** An environment's services build and run in the
   worktree you call from — its caches (node_modules, obj/, …) are your caches.
   What the environment keeps privately is its ports, its datastore namespace and
-  its logs. Binding is fingerprint-gated upkeep and builds (replay only what your
-  change invalidated) — **seconds, not minutes**. A check sees your live
+  its logs. **One environment per worktree.** Binding replays only the upkeep
+  rules whose trigger files changed, then runs your build commands (the build
+  tool decides what is current; runly caches no builds) — **seconds, not
+  minutes**. A check sees your live
   worktree, edits made while it runs included.
 - **Two kinds of lease:**
   - a **session lease** (`up`) — you hold the env, its services stay running, you
     `sync`/`exec`/`ctx`/`logs` against it, and you `release` when done;
-  - a **run lease** (`run <check>`) — self-contained: it takes its *own* env from
-    the pool, binds, executes one declared check, returns a classified verdict,
-    and releases automatically. No prior `up` needed.
+  - a **run** (`run <check>`) — self-contained: it uses this worktree's one env,
+    **resets its data to the template first**, starts the whole app, executes one
+    declared check and returns a classified verdict. If you hold a session lease
+    it runs through it and you keep it (your session data is reset — there is no
+    flag to keep it); otherwise it takes a lease for the check and releases it.
+    No prior `up` needed.
 - **Releasing is a non-event.** `release` (or just letting the lease's TTL lapse)
   returns the env to the pool with its heat intact.
 - **You can lease just a database.** `up --data-only` gives you a seeded, isolated
@@ -58,8 +63,8 @@ stderr is human progress. Exit codes are contractual: `0` ok · `1` work-error �
 | `run <check>` | Run lease: bind → execute the check declared in `runly.yml` → classified verdict → release. `--pristine` re-runs every upkeep rule and build (it never deletes anything in your worktree); the verdict's `outputsChanged` names declared outputs the check rewrote; `--detach` returns a `jobId` immediately (poll with `job <jobId>`). |
 | `ctx` | Re-read the consumer **context blob** (service URLs, login creds, connection strings, recent events) for the env your lease holds — read-only, no re-bind. `up` already returned this once. **A stack may advertise several logins: `logins` is the primary one, `allLogins` is the whole set** — see below. |
 | `release` | Release the current lease; the environment stays warm in the pool. On `{"released": false}` read the `reason` — a lease is keyed by the directory that bound it, so releasing from elsewhere matches nothing. |
-| `sync` | Re-converge the lease to the worktree as it is now: hot-reload services are kept, anything else rebuilds and restarts; see [the rebind conditions](https://github.com/ChristianKohlberg/backlot#quickstart). |
-| `warm` | Run this worktree's upkeep rules and service builds **now, with no lease and no services**, and print each step with its duration. For an idle worktree just moved to a new commit (`git checkout <sha> && runly warm`), so the next bind finds warm caches. |
+| `sync` | **Apply your edits.** Runs due upkeep, then rebuilds and restarts; an all-`hot_reload` stack keeps its services. `up` on a running env reuses it as is and does NOT pick up code changes — after editing, `sync`. See [the rebind conditions](https://github.com/ChristianKohlberg/backlot#quickstart). |
+| `warm` | Run this worktree's due upkeep rules and its service builds **now, with no lease and no services**, and print each step with its duration. For an idle worktree just moved to a new commit (`git checkout <sha> && runly warm`), so the next bind finds the installs done and the build tools' caches current. |
 | `exec <cmd...>` | Run an arbitrary command in your worktree with the lease's ports, URLs and connection strings in its environment (`BACKLOT_URL_*`, `BACKLOT_DS_*`); hands back raw stdout + exit code (not a verdict). Needs an `up` first. |
 | `logs <service> [--lines N]` | Tail a service's logs from the leased env. |
 | `reset-data` | Restore the data template on the current lease (fresh seeded state; builds and caches untouched). |
@@ -135,17 +140,18 @@ empty `allLogins` means the manifest declares none, not that the seed failed.
 
 ## `run` vs `exec`
 
-- **`run <check>` to prove a change.** Self-contained, takes its own env, returns
-  a verdict classified `work` / `env` / `infra` — a dead dev-server is never
-  reported as your test failing — with artifacts, then releases.
+- **`run <check>` to prove a change.** Self-contained, runs against this
+  worktree's env after a fresh data reset, returns a verdict classified `work` /
+  `env` / `infra` — a dead dev-server is never reported as your test failing —
+  with artifacts.
 - **`exec <cmd>` to poke at the live environment** your `up` lease is holding.
   Raw exit code and stdout, no classification.
 
 ## Rules
 
-1. Prefer `run <check>` for anything you need a pass/fail on — it manages its own
+1. Prefer `run <check>` for anything you need a pass/fail on — it manages the
    lease and gives you a classified verdict; don't hand-roll `up` + `exec` for
-   that.
+   that. It resets the environment's data, including your session's.
 2. Use partial `up` to lease just the slice you're working on; don't boot the
    whole app to iterate on one frontend.
 3. `release` when you stop, and size `--ttl` to the work — holding a lease keeps a

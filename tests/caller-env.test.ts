@@ -91,14 +91,21 @@ describe('caller environment inputs', () => {
     const changed = await f.cli(['up', '--holder', 'a'], { TEST_CALLER_KEY: nextSecret });
     expect((await f.response(changed.json)).value).toBe(nextSecret);
     expect(changed.json.bindDiagnostics.reasons).toContain('environment-inputs-changed');
-    const second = await f.cli(['up', '--holder', 'b']);
-    expect((await f.response(second.json)).value).toBeNull();
-    expect((await f.response(changed.json)).value).toBe(nextSecret);
+    // Omitting the input on a continuing lease clears it.
     const cleared = await f.cli(['up', '--holder', 'a']);
     expect((await f.response(cleared.json)).value).toBeNull();
-    const views = await Promise.all([f.cli(['status']), f.cli(['ctx', '--holder', 'a']), f.cli(['logs', 'web', '--holder', 'a'])]);
+    const again = await f.cli(['up', '--holder', 'a'], { TEST_CALLER_KEY: nextSecret });
+    expect((await f.response(again.json)).value).toBe(nextSecret);
+    // One environment per worktree (decision 0032): holder b gets the SAME
+    // environment once a lets go — and none of a's inputs with it.
+    expect((await f.cli(['release', '--holder', 'a'])).code).toBe(0);
+    const second = await f.cli(['up', '--holder', 'b']);
+    expect(second.code, second.stderr + second.stdout).toBe(0);
+    expect(second.json.envId).toBe(first.json.envId);
+    expect((await f.response(second.json)).value).toBeNull();
+    const views = await Promise.all([f.cli(['status']), f.cli(['ctx', '--holder', 'b']), f.cli(['logs', 'web', '--holder', 'b'])]);
     for (const value of [secret, nextSecret]) {
-      expect(JSON.stringify([first, same, synced, reset, changed, ...views])).not.toContain(value);
+      expect(JSON.stringify([first, same, synced, reset, changed, cleared, again, second, ...views])).not.toContain(value);
       const checkFiles = (dir: string) => {
         for (const item of readdirSync(dir, { withFileTypes: true })) {
           const path = join(dir, item.name);

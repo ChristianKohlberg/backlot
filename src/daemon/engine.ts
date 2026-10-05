@@ -9,10 +9,9 @@ import { Journal, JOURNAL_SCHEMA_VERSION, type EnvRow, type LeaseRow } from '../
 import { BUILD, VERSION, compareVersions, versionSkew } from '../core/version.js';
 import { canonicalDirectory, stackIdentity, retiredStackIdentity, loadStack, normalizeLogins, type Stack } from '../core/manifest.js';
 import { hashOutputs } from '../core/worktree.js';
-import { fingerprintWorktreeThreaded } from '../core/fingerprint-thread.js';
-import { buildStamp, clearTreeLedger, pickEnvKeys, pickTreeKeys, readTreeLedger, worktreeStateDir, writeTreeLedger } from '../core/tree-ledger.js';
+import { clearTreeLedger, pickEnvKeys, pickTreeKeys, readTreeLedger, worktreeStateDir, writeTreeLedger } from '../core/tree-ledger.js';
 import { selectPresets } from '../core/presets.js';
-import { runUpkeep, pendingUpkeep, templateBakeKeys, type UpkeepStep } from '../core/upkeep.js';
+import { runUpkeep, pendingUpkeep, templateBakeKeys, triggerSet, type UpkeepStep } from '../core/upkeep.js';
 import { freePort, probeFree } from '../core/ports.js';
 import { envsRoot, artifactsRoot, stateRoot, templatesRoot, retiredTemplatesRoot } from '../core/paths.js';
 import { BrokerError, template, templateEnv, now, shortId, matchesAny, safeJoin } from '../core/util.js';
@@ -95,6 +94,12 @@ export interface UpOptions {
   holderPid?: number;
   /** Set by the daemon per-request; emits progress frames back to the client. */
   onProgress?: Progress;
+  /**
+   * Rebuild and restart even when the running services look reusable. runly
+   * keeps no identity of the worktree's code (decision 0032), so only the verb
+   * can say that a change is to be applied: `sync` sets this.
+   */
+  restart?: boolean;
 }
 
 /**
@@ -186,13 +191,13 @@ export class Engine {
   private poolChain: Promise<unknown> = Promise.resolve();
   private envChains = new Map<string, Promise<unknown>>();
   /**
-   * One lock per WORKTREE (keyed by stack id), held around everything that
+   * One lock per WORKTREE (keyed by stack id), held around everything runly
    * writes into it: upkeep rules, builds, and a pristine bind clearing the
-   * worktree ledger (decision 0032). Several environments of one stack run in
-   * the same worktree, so two binds installing or building there at once would
-   * race on the same node_modules and obj/. Ordering rule: an environment lock
-   * is always taken BEFORE this one, never after — `warm` takes every
-   * environment lock of its stack (sorted) and only then this, so no cycle exists.
+   * worktree ledger (decision 0032). A worktree has one environment, but
+   * `runly warm` runs there with none — and before the first bind creates it —
+   * so the environment lock alone cannot serialize them. Ordering rule: an
+   * environment lock is always taken BEFORE this one, never after — `warm`
+   * takes the environment lock(s) of its stack first, so no cycle exists.
    */
   private treeChains = new Map<string, Promise<unknown>>();
   /** Envs with an operation in flight — the sweeper must not expire/quiesce these. */
@@ -215,8 +220,8 @@ export class Engine {
   /** Opaque in-memory revisions only; no secret values or hashes in the journal. */
   private appliedInputs = new Map<string, string>();
   private appliedInputSpecs = new Map<string, string>();
-  // Memory-only successful-bind configuration: a hot-reload refresh may advance @source,
-  // but cannot apply startup env/commands or other manifest configuration.
+  // Memory-only successful-bind configuration: a hot-reload refresh keeps the
+  // services, so it cannot apply startup env/commands or other manifest configuration.
   private appliedManifests = new Map<string, string>();
   private inputRevision = 0;
 
@@ -274,25 +279,16 @@ export class Engine {
   }
 
   /**
-   * The worktree ledger as one view merged with an environment's own keys, and
-   * a committer that writes back only the worktree's half. MUST be used inside
+   * The worktree's upkeep ledger, and a committer that writes back only the
+   * worktree's half of a merged fingerprint map. MUST be used inside
    * treeLocked: the read-modify-write is what the lock serializes.
    */
   private treeLedgerSession(stack: Stack) {
-    let tree = readTreeLedger(stack.id);
+    let tree = pickTreeKeys(readTreeLedger(stack.id));
     return {
       get: () => tree,
-      /** Replace the rule half from a merged fingerprint map; keep the build stamps. */
       commitRules: (merged: Record<string, string>) => {
-        const stamps = Object.fromEntries(Object.entries(tree).filter(([k]) => k.startsWith('@built:')));
-        const rules = Object.fromEntries(Object.entries(pickTreeKeys(merged)).filter(([k]) => !k.startsWith('@built:')));
-        tree = { ...rules, ...stamps };
-        writeTreeLedger(stack.id, stack.root, tree);
-      },
-      setStamp: (service: string, stamp: string | undefined) => {
-        tree = { ...tree };
-        if (stamp === undefined) delete tree[`@built:${service}`];
-        else tree[`@built:${service}`] = stamp;
+        tree = pickTreeKeys(merged);
         writeTreeLedger(stack.id, stack.root, tree);
       },
       clear: () => {
@@ -346,8 +342,9 @@ export class Engine {
       if (!this.journal.getEnv(env.id)) continue;
       // An older daemon projected a full copy of the worktree here. Nothing runs
       // from it any more (decision 0032) — once its processes are confirmed
-      // gone, the copy is disk to give back. Its per-env build stamps described
-      // that copy, not the worktree, so they go with it.
+      // gone, the copy is disk to give back. Its `@source` and build stamps
+      // described that copy and are dropped; command rules belong to the
+      // worktree's ledger, which starts empty, so they run once in place.
       const legacyTree = this.envDirs(env.id).legacyTree;
       if (Object.keys(survivors).length === 0 && existsSync(legacyTree) && this.isPrivateEnvDir(env)) {
         rmSync(legacyTree, { recursive: true, force: true });
@@ -586,7 +583,12 @@ export class Engine {
     // A free environment of the OTHER shape may only be taken if the shape it
     // would move into has room — otherwise the conversion is unmetered capacity.
     if (env && (env.dataOnly === true) !== dataOnly && !this.convertShape(env, dataOnly)) env = undefined;
-    if (!env && this.capacityBinding(stack.id, dataOnly) === null) env = await this.createEnv(stack, dataOnly);
+    // ONE environment per worktree (decision 0032). A stack is one physical
+    // worktree, and every environment of it would run its services, builds and
+    // checks over the same files — a rebuild by one replacing bin/ under the
+    // other's running services. So a second environment is never created: a
+    // claim on a stack that already has one waits for it (acquireQueued).
+    if (!env && envs.length === 0 && this.capacityBinding(stack.id, dataOnly) === null) env = await this.createEnv(stack, dataOnly);
     if (env) {
       this.journal.saveLease({
         id: `l-${shortId()}`, envId: env.id, kind, holder, hygiene, expiresAt: now() + ttlMs,
@@ -614,7 +616,7 @@ export class Engine {
    * advice, saw nothing change, and could not have (#47). MUST run under the
    * pool lock.
    */
-  private capacityBinding(stackId: string, dataOnly: boolean): 'stack' | 'machine' | 'data-only' | null {
+  private capacityBinding(stackId: string, dataOnly: boolean): 'machine' | 'data-only' | null {
     // Data-only environments are counted against their OWN machine-wide ceiling
     // and against neither application cap (decision 0025). poolMax/poolMaxTotal
     // are derived from cores and memory because they bound running services; a
@@ -625,7 +627,9 @@ export class Engine {
     if (dataOnly) {
       return this.dataOnlyEnvs().length >= POOL_MAX_DATA_ONLY() ? 'data-only' : null;
     }
-    if (this.appEnvs(stackId).length >= POOL_MAX()) return 'stack';
+    // No per-stack cap any more: a stack never has more than one environment
+    // (decision 0032), so BACKLOT_POOL_MAX has nothing left to bound.
+    void stackId;
     if (this.appEnvs().length >= POOL_MAX_TOTAL()) return 'machine';
     return null;
   }
@@ -651,7 +655,7 @@ export class Engine {
       level: 'info',
       kind: 'pool-shape',
       envId: env.id,
-      detail: `reserved ${dataOnly ? 'data-only' : 'an application environment'} — counts against ${dataOnly ? 'BACKLOT_POOL_MAX_DATA_ONLY; application capacity remains reserved until services stop' : 'BACKLOT_POOL_MAX/BACKLOT_POOL_MAX_TOTAL'}`,
+      detail: `reserved ${dataOnly ? 'data-only' : 'an application environment'} — counts against ${dataOnly ? 'BACKLOT_POOL_MAX_DATA_ONLY; application capacity remains reserved until services stop' : 'BACKLOT_POOL_MAX_TOTAL'}`,
     });
     return true;
   }
@@ -800,12 +804,11 @@ export class Engine {
    * Is the pool full of environments whose leases outlast our whole wait?
    *
    * If so, queueing cannot possibly succeed, and reporting "waited 60s" blames a
-   * timing problem that does not exist. This is the shape a session `up`
-   * followed by a `run` hits on a one-environment pool: `run` always mints its
-   * own ephemeral holder, so it needs a SECOND environment that the pool is not
-   * allowed to create. MUST run under the pool lock.
+   * timing problem that does not exist. MUST run under the pool lock.
    */
-  private structuralCapacityBlock(stack: Stack, dataOnly: boolean, deadline: number): { scope: 'stack' | 'machine' | 'data-only'; detail: string } | null {
+  private structuralCapacityBlock(stack: Stack, dataOnly: boolean, deadline: number): { scope: 'worktree' | 'machine' | 'data-only'; detail: string } | null {
+    const held = this.worktreeHold(stack, deadline);
+    if (held !== undefined) return held === null ? null : { scope: 'worktree', detail: held };
     const bound = this.capacityBinding(stack.id, dataOnly);
     if (bound === null) return null; // room to grow
     if (bound === 'data-only') {
@@ -815,28 +818,38 @@ export class Engine {
       if (this.transientlyUnclaimable(rows) || this.evictionCandidates(true).length > 0) return null;
       return { scope: 'data-only', detail: rows.map((e) => `${e.id} (${this.notEvictableBecause(e)})`).join('; ') };
     }
-    const envs = this.appEnvs(stack.id);
+    // The MACHINE-WIDE cap is what bound, and waiting cannot clear it: the
+    // count is of env ROWS, and releasing a lease leaves the row behind. Only
+    // an eviction, an orphan reap or a degraded reap ever lowers it (#47).
     const all = this.appEnvs();
-    if (bound === 'machine') {
-      // The MACHINE-WIDE cap is what bound, and waiting cannot clear it: the
-      // count is of env ROWS, and releasing a lease leaves the row behind. Only
-      // an eviction, an orphan reap or a degraded reap ever lowers it. So this is
-      // structural — not, as the old guard assumed, something another stack's
-      // release will fix (#47). It said so explicitly and returned null here,
-      // which is why a provably hopeless wait still burned the full window.
-      if (this.transientlyUnclaimable(all) || this.evictionCandidates(false).length > 0) return null;
-      return { scope: 'machine', detail: all.map((e) => `${e.id} (${this.notEvictableBecause(e)})`).join('; ') };
-    }
+    if (this.transientlyUnclaimable(all) || this.evictionCandidates(false).length > 0) return null;
+    return { scope: 'machine', detail: all.map((e) => `${e.id} (${this.notEvictableBecause(e)})`).join('; ') };
+  }
+
+  /**
+   * Why this worktree's own environment cannot be claimed, if that is what is
+   * in the way (decision 0032: one environment per worktree, so a second
+   * holder waits for it instead of getting another).
+   *
+   * - `undefined`: the worktree has no environment, or it sits unleased and
+   *   usable — whatever refused the claim is a capacity ceiling, not the
+   *   worktree.
+   * - `null`: it is in the way, but will clear by itself within the wait
+   *   (a lease that lapses in time, a recycle or reap in progress).
+   * - a string: it is leased past the wait window — naming who holds it.
+   */
+  private worktreeHold(stack: Stack, deadline: number): string | null | undefined {
+    const own = this.journal.envsForStack(stack.id);
+    if (own.length === 0) return undefined;
     const holders: string[] = [];
-    for (const env of envs) {
-      // These resolve on their own — the sweeper reaps them and frees capacity.
-      if (env.state === 'degraded' || env.state === 'recycling') return null;
+    for (const env of own) {
+      if (env.state === 'degraded' || env.state === 'recycling' || env.state === 'provisioning') return null;
       const lease = this.journal.leaseForEnv(env.id);
-      if (!lease) return null; // a free env exists; this is a transient race
-      if (lease.expiresAt <= deadline) return null; // it will expire in time
+      if (!lease) return this.busy.has(env.id) ? null : undefined;
+      if (lease.expiresAt <= deadline) return null;
       holders.push(`${env.id} held by '${lease.holder}' (${lease.kind}, ${Math.round((lease.expiresAt - now()) / 60_000)}m left)`);
     }
-    return { scope: 'stack', detail: holders.join('; ') };
+    return holders.join('; ');
   }
 
   /**
@@ -847,10 +860,9 @@ export class Engine {
    * not a count — so a stack with ZERO environments was told "pool at capacity
    * (6/6)" and pointed at the wrong knob (#47).
    */
-  private capacityRefusal(stack: Stack, dataOnly: boolean, scope: 'stack' | 'machine' | 'data-only', blocking: string | null): string {
-    const mine = this.appEnvs(stack.id).length;
+  private capacityRefusal(stack: Stack, dataOnly: boolean, scope: 'worktree' | 'machine' | 'data-only', blocking: string | null): string {
     const total = this.appEnvs().length;
-    const counts = `this stack holds ${mine}/${POOL_MAX()} application environments (BACKLOT_POOL_MAX), the machine holds ${total}/${POOL_MAX_TOTAL()} (BACKLOT_POOL_MAX_TOTAL)`;
+    const counts = `the machine holds ${total}/${POOL_MAX_TOTAL()} application environments (BACKLOT_POOL_MAX_TOTAL)`;
     const waited = blocking === null ? ` after waiting ${Math.round(WAIT_MS() / 1000)}s` : '';
     if (scope === 'data-only') {
       return (
@@ -870,11 +882,12 @@ export class Engine {
         ` Raise BACKLOT_POOL_MAX_TOTAL if the host can take it, or 'runly pool recycle <env-id>' an environment you no longer need.`
       );
     }
+    // scope === 'worktree'
     return (
-      `pool at capacity${waited}: this STACK's cap is what refused — ${counts}. ` +
-      (blocking ? `Every environment is leased past the wait window, so queueing cannot succeed. Blocking: ${blocking}. ` : '') +
-      `A 'run' always takes its own environment, so a session lease plus a run needs BACKLOT_POOL_MAX >= 2 (currently ${POOL_MAX()}). ` +
-      `Raise BACKLOT_POOL_MAX, or release the blocking lease first.`
+      `this worktree's environment is held by another lease${waited}` +
+      (blocking ? ` past the wait window: ${blocking}` : '') +
+      `. A worktree has exactly one environment (decision 0032) — ${stack.root} — so a second holder waits for it instead of getting another. ` +
+      `Use the holder that owns it (--holder), release that lease, or bind from a separate worktree.`
     );
   }
 
@@ -968,14 +981,19 @@ export class Engine {
       // indefinitely, while nothing was running (#46). Give up the
       // least-recently-used cold environment instead and claim its slot.
       if (myTurn && (await this.evictForMachineCapacity(stack, dataOnly))) continue;
+      // This worktree's one environment is dead (a service flapped past its
+      // budget). It used to sit beside a freshly created second one until the
+      // sweeper reaped it; with one environment per worktree, waiting for the
+      // sweep would stall every bind here for a sweep interval. Reap it now.
+      if (myTurn && (await this.reapDegradedOwn(stack))) continue;
       // Refuse to burn the full wait on something that provably cannot resolve.
       const blocked = await this.poolLocked(() => this.structuralCapacityBlock(stack, dataOnly, now() + WAIT_MS()));
       if (blocked) {
         throw new BrokerError('env-error', this.capacityRefusal(stack, dataOnly, blocked.scope, blocked.detail), 'pool');
       }
       if (now() - start > WAIT_MS()) {
-        const bound = (await this.poolLocked(() => this.capacityBinding(stack.id, dataOnly))) ?? 'stack';
-        throw new BrokerError('env-error', this.capacityRefusal(stack, dataOnly, bound, null), 'pool');
+        const scope = (await this.poolLocked(() => (this.worktreeHold(stack, now()) !== undefined ? 'worktree' as const : this.capacityBinding(stack.id, dataOnly)))) ?? 'worktree';
+        throw new BrokerError('env-error', this.capacityRefusal(stack, dataOnly, scope, null), 'pool');
       }
       await new Promise((r) => setTimeout(r, 500));
     }
@@ -1050,7 +1068,7 @@ export class Engine {
     return closure;
   }
 
-  private async bindAndStart(stack: Stack, envSnapshot: EnvRow, hygiene: Hygiene, kind: LeaseKind, watch: boolean, onProgress?: Progress, requestedServices?: string[], freshClaim = false, requestedDataOnly?: boolean, callerEnv?: unknown, requestedPresets?: unknown): Promise<{ env: EnvRow; previewNotice?: string; bindDiagnostics: BindDiagnostics }> {
+  private async bindAndStart(stack: Stack, envSnapshot: EnvRow, hygiene: Hygiene, kind: LeaseKind, watch: boolean, onProgress?: Progress, requestedServices?: string[], freshClaim = false, requestedDataOnly?: boolean, callerEnv?: unknown, requestedPresets?: unknown, restart = false): Promise<{ env: EnvRow; previewNotice?: string; bindDiagnostics: BindDiagnostics }> {
     const say = onProgress ?? (() => undefined);
     const trace = new BindTrace();
     // Re-read under the env lock: the snapshot captured during acquire may be
@@ -1148,15 +1166,15 @@ export class Engine {
       // The environment's PRIVATE state only. The worktree is the caller's and
       // is never deleted (decision 0032) — not its caches, not its build output.
       // What pristine can still honestly promise is that nothing is TRUSTED:
-      // the worktree ledger is cleared, so every upkeep rule and every build
-      // runs again in place.
+      // the worktree's upkeep ledger is cleared, so every upkeep rule runs
+      // again in place (builds run on every bind anyway).
       rmSync(dirs.data, { recursive: true, force: true });
       rmSync(dirs.legacyTree, { recursive: true, force: true });
       mkdirSync(dirs.data, { recursive: true });
       env.fingerprints = {};
       env.presets = {};
-      // Persist the cleared ledger NOW, not at the end of the bind. Appliances,
-      // fingerprinting and upkeep all run before the epilogue, and a crash in
+      // Persist the cleared ledger NOW, not at the end of the bind. Appliances
+      // and upkeep run before the epilogue, and a crash in
       // any of them used to leave the journal asserting fingerprints and presets
       // for state that no longer exists — so the next bind skipped work it had
       // to redo.
@@ -1176,53 +1194,44 @@ export class Engine {
       if (state !== 'up') logEvent({ level: 'info', kind: 'appliance', detail: `'${name}' ${state} (${spec.probe})` });
     }
 
-    // No copy: the services run in the worktree itself (decision 0032). What a
-    // bind still needs from it is its source identity — to tell whether the
-    // running services and the build output are from this state.
-    trace.phase('fingerprint');
-    say('fingerprinting worktree');
-    let source = await fingerprintWorktreeThreaded(stack.root, stack.manifest, worktreeStateDir(stack.id));
-    say(`worktree has ${source.files.length} source files (${source.hashed} re-read)`);
-    trace.result.source = { files: source.files.length, hashed: source.hashed };
+    // No copy: the services run in the worktree itself (decision 0032), and
+    // runly keeps no identity of it. Upkeep reads exactly the files its rules'
+    // `when:` globs match, compared with the worktree's ledger.
     trace.phase('upkeep');
     const waitTree = (s: number) => say(`waiting for another bind in this worktree … ${s}s`);
-    const upkeep = await this.treeLocked(stack.id, async () => {
+    const { upkeep, files } = await this.treeLocked(stack.id, async () => {
+      // Read under the worktree lock: `runly warm` may be mid-install.
+      const triggers = triggerSet(stack.root, stack.manifest, worktreeStateDir(stack.id));
       const ledger = this.treeLedgerSession(stack);
-      const out = await runUpkeep(stack.root, source.files, stack.manifest, { ...pickEnvKeys(env.fingerprints), ...ledger.get() }, say, {
+      const out = await runUpkeep(stack.root, triggers, stack.manifest, { ...pickEnvKeys(env.fingerprints), ...ledger.get() }, say, {
         commit: (fps) => ledger.commitRules(fps),
       });
       ledger.commitRules(out.fingerprints);
-      return out;
+      return { upkeep: out, files: triggers };
     }, waitTree);
     trace.result.upkeep = { ran: upkeep.ran.length, skipped: (stack.manifest.upkeep?.length ?? 0) - upkeep.ran.length };
-    if (upkeep.ran.some((r) => !r.run.startsWith('@'))) {
-      // An upkeep command wrote into the worktree, and whatever it wrote that
-      // git does not ignore is now part of the source. Fingerprint again, so the
-      // build stamps and `@source` describe the state the builds and services
-      // actually start from — otherwise the next bind sees "changed" and
-      // restarts for a file runly itself produced. (Taken BEFORE the builds:
-      // an edit made while a build runs may or may not be in its output, so a
-      // later fingerprint could vouch for code the services never compiled.)
-      source = await fingerprintWorktreeThreaded(stack.root, stack.manifest, worktreeStateDir(stack.id));
-    }
     // Content-derived template identity (vetbill-1i49): divergent
     // migrations/seeds in this worktree yield a different bake key and thus a
     // disjoint template name — two stacks can no longer silently share a
     // template with the wrong schema.
-    const bakeKeys = templateBakeKeys(stack.manifest, stack.root, source.files);
+    const bakeKeys = templateBakeKeys(stack.manifest, stack.root, files);
     for (const dsName of upkeep.rebakeTemplates) {
       const spec = stack.manifest.datastores?.[dsName];
       if (spec) await makeDatastore(dsName, spec, stack.id, bakeKeys[dsName]).rebake(stack.root);
     }
 
-    // Fast path: identical source, services healthy, data untouched -> reuse as-is.
+    // Fast path: services running and healthy in the requested shape, data
+    // untouched, nothing asked for a restart -> reuse as-is, without building.
+    // runly does not know whether the worktree's code changed since the
+    // services started (decision 0032: no source identity); `sync` is the verb
+    // that applies a change, and it always rebuilds and restarts (`restart`).
     // The running service-set must also equal the requested shape — otherwise a
     // full env would be reused for a `up sherlock` (no saving) and a subset env
     // for a full `up` (missing services). A mismatch falls through to a full
-    // stop + start of exactly the requested slice.
+    // stop + build + start of exactly the requested slice.
     const runningServices = new Set(Object.keys(this.supervisor(env).pids()));
     const shapeMatches = runningServices.size === active.size && [...active].every((n) => runningServices.has(n));
-    if (env.fingerprints['@source'] !== source.sourceHash) trace.result.reasons.push('source-changed');
+    if (restart) trace.result.reasons.push('restart-requested');
     if (upkeep.ran.length > 0) trace.result.reasons.push('upkeep-required');
     if (env.state !== 'hot') trace.result.reasons.push('environment-not-running');
     if (!this.supervisor(env).allHealthyPids()) trace.result.reasons.push('service-process-unhealthy');
@@ -1235,26 +1244,18 @@ export class Engine {
       !manifestChanged &&
       !inputsChanged &&
       !presetsChanged &&
-      env.fingerprints['@source'] === source.sourceHash &&
+      !restart &&
       upkeep.ran.length === 0 &&
       env.state === 'hot' &&
       this.supervisor(env).allHealthyPids() &&
       shapeMatches &&
       hygiene === 'reuse';
-    // The environment keeps only its own half of the ledger; the worktree's
-    // half (command rules, build stamps) was written under the worktree lock.
+    // The environment keeps only its own half of the ledger (`@` built-ins);
+    // the worktree's half (command rules) was written under the worktree lock.
     env.fingerprints = pickEnvKeys(upkeep.fingerprints);
     if (unchanged) {
       trace.result.reuse = 'reused';
-      const stamps = readTreeLedger(stack.id);
-      const ctxForStamp = this.templateCtx(stack, env);
-      trace.result.builds = Object.entries(stack.manifest.services)
-        .filter(([name, spec]) => active.has(name) && spec.build)
-        .map(([service, spec]) => stamps[`@built:${service}`] === buildStamp(source.sourceHash, template(spec.build ?? '', ctxForStamp))
-          ? { service, cache: 'hit', reason: 'source-unchanged' }
-          : { service, cache: 'skipped', reason: 'running-service-reused' });
       trace.phase('finalize');
-      env.fingerprints['@source'] = source.sourceHash;
       env.lastUsedAt = now();
       // Refresh from the LIVE supervisor before saving. A service that restarted
       // during this bind updated the journal through onPidsChanged, and writing
@@ -1307,35 +1308,22 @@ export class Engine {
       }
     }
 
-    // Builds: per service, gated on that service's OWN build stamp. A slice
-    // bind builds only its own services, so the whole-source '@source' stamp
-    // can't double as "built" — marking it would let a later
-    // `up <excluded-service>` skip that service's build and run it unbuilt (or
-    // serve stale code) even though its source changed.
-    //
-    // The stamps belong to the WORKTREE (decision 0032): the build output is in
-    // it, so an environment — or `runly warm` — that built this exact command
-    // over this exact source spares every other one the rebuild. They are read
-    // and written under the worktree lock; pristine clears them.
+    // Builds: every service this bind starts that declares one, every time
+    // (decision 0032). runly keeps no build cache — MSBuild, pnpm and the
+    // Angular CLI decide what is already up to date, and a no-op build of theirs
+    // is cheap. A slice bind builds only its own services. Under the worktree
+    // lock: `runly warm` builds into the same output.
     const ctx = this.templateCtx(stack, env);
     trace.phase('build');
     await this.treeLocked(stack.id, async () => {
-      const ledger = this.treeLedgerSession(stack);
       for (const [name, spec] of Object.entries(stack.manifest.services)) {
         if (!active.has(name)) continue; // don't build a slice we won't start
         if (!spec.build) continue;
-        const cmd = template(spec.build, ctx);
-        const stamp = buildStamp(source.sourceHash, cmd);
-        const recorded = ledger.get()[`@built:${name}`];
-        if (recorded === stamp) {
-          trace.result.builds.push({ service: name, cache: 'hit', reason: 'source-unchanged' });
-          continue;
-        }
-        trace.result.builds.push({ service: name, cache: 'miss', reason: recorded ? 'source-changed' : 'no-build-record' });
-        await this.runServiceBuild(name, cmd, stack.root, ledger, stamp, say);
+        const buildStart = performance.now();
+        await this.runServiceBuild(name, template(spec.build, ctx), stack.root, say);
+        trace.result.builds.push({ service: name, durationMs: performance.now() - buildStart });
       }
     }, waitTree);
-    env.fingerprints['@source'] = source.sourceHash;
 
     // Start in dependency order, readiness-gated, fatal-log fast-fail.
     trace.phase('ready');
@@ -1479,21 +1467,8 @@ export class Engine {
     };
   }
 
-  /**
-   * Run one service's build in the worktree and stamp it. MUST run under
-   * treeLocked. The old stamp is dropped BEFORE the command starts: a build that
-   * fails half-way leaves output from neither source state, and a surviving
-   * stamp would let a later revert to that state skip the rebuild over it.
-   */
-  private async runServiceBuild(
-    name: string,
-    cmd: string,
-    root: string,
-    ledger: ReturnType<Engine['treeLedgerSession']>,
-    stamp: string,
-    say: Progress,
-  ): Promise<void> {
-    ledger.setStamp(name, undefined);
+  /** Run one service's build in the worktree. MUST run under treeLocked. */
+  private async runServiceBuild(name: string, cmd: string, root: string, say: Progress): Promise<void> {
     say(`building '${name}'`);
     const buildStart = now();
     const beat = setInterval(() => say(`building '${name}' … ${Math.round((now() - buildStart) / 1000)}s`), 5000);
@@ -1508,7 +1483,6 @@ export class Engine {
     } finally {
       clearInterval(beat);
     }
-    ledger.setStamp(name, stamp);
   }
 
   // ---------------------------------------------------------------- watch
@@ -1584,6 +1558,9 @@ export class Engine {
    */
   private async watchSave(envId: string, cwd: string, holder: string): Promise<void> {
     const { outcome } = await this.refreshInPlace(envId, cwd, holder);
+    if (outcome === 'refreshed') {
+      logEvent({ level: 'info', kind: 'watch', envId, detail: 'worktree save seen — hot-reload services kept; they read the worktree themselves' });
+    }
     if (outcome === 'fallback') {
       // The full bind also covers every state a refresh can't fix on its own:
       // a quiesced/degraded/recycled-away env, or a lapsed lease that must be
@@ -1593,10 +1570,10 @@ export class Engine {
   }
 
   /**
-   * Record that the running hot-reload services now serve the worktree's
-   * current source, without touching them — under the env lock like every
-   * other mutation. Nothing is copied: they read the worktree themselves.
-   * Returns 'fallback' when this source state needs the full bind.
+   * Keep the running hot-reload services — they read the worktree themselves —
+   * after checking, under the env lock like every other mutation, that nothing
+   * they cannot handle is due. Returns 'fallback' when the worktree needs the
+   * full bind (a due upkeep rule, a changed manifest, an unhealthy service).
    */
   private async refreshInPlace(
     envId: string,
@@ -1627,26 +1604,21 @@ export class Engine {
       // service: its own watcher reloads source, not its startup environment.
       if (JSON.stringify(stack.manifest) !== this.appliedManifests.get(env.id)) return fallback();
 
-      trace.phase('fingerprint');
-      const source = await fingerprintWorktreeThreaded(stack.root, stack.manifest, worktreeStateDir(stack.id));
-      trace.result.source = { files: source.files.length, hashed: source.hashed };
-      // The fallback decision: would this source state fire any upkeep rule or
-      // template rebake? (Same trigger hashes runUpkeep would compare, against
-      // the same merged ledger.)
+      // The fallback decision: would the worktree as it is now fire any upkeep
+      // rule or template rebake? (Same trigger hashes runUpkeep would compare,
+      // against the same merged ledger.)
       trace.phase('upkeep');
-      const ledger = { ...pickEnvKeys(env.fingerprints), ...readTreeLedger(stack.id) };
-      if (pendingUpkeep(stack.root, source.files, stack.manifest, ledger).length > 0) {
+      const ledger = { ...pickEnvKeys(env.fingerprints), ...pickTreeKeys(readTreeLedger(stack.id)) };
+      if (pendingUpkeep(stack.root, triggerSet(stack.root, stack.manifest, worktreeStateDir(stack.id)), stack.manifest, ledger).length > 0) {
         return fallback();
       }
       trace.result.upkeep.skipped = stack.manifest.upkeep?.length ?? 0;
       trace.phase('finalize');
 
       // Epilogue on a FRESH row (the onDegraded/onPidsChanged callbacks write
-      // concurrently): record the new source identity and the activity.
+      // concurrently): record the activity.
       const fresh = this.journal.getEnv(env.id);
       if (!fresh || fresh.state !== 'hot') return fallback(); // degraded meanwhile
-      const changed = fresh.fingerprints['@source'] !== source.sourceHash;
-      fresh.fingerprints['@source'] = source.sourceHash;
       fresh.lastUsedAt = now();
       this.journal.saveEnv(fresh);
       // Reconcile against the environment's durable shape, not the
@@ -1669,12 +1641,6 @@ export class Engine {
       // lease through the ordinary acquire path.
       if (!held || held.id !== lease.id || held.expiresAt <= now()) return fallback();
       this.journal.saveLease({ ...held, presets });
-      if (changed) {
-        logEvent({
-          level: 'info', kind: 'watch', envId: env.id,
-          detail: `worktree source changed — hot-reload services kept; they read the worktree themselves`,
-        });
-      }
       trace.result.reuse = 'refreshed';
       trace.result.reasons = ['hot-reload-in-place'];
       return { outcome: 'refreshed', previewNotice: previewNotice ?? forbiddenNotice, bindDiagnostics: trace.finish() };
@@ -1865,7 +1831,7 @@ export class Engine {
     requireCallerEnv(stack.manifest, selectedInputs, suppliedInputs ?? (existingLease ? this.leaseInputs.get(existingLease.id)?.values : undefined) ?? {});
     const kind = opts.kind ?? 'session';
     let hygiene = opts.hygiene ?? 'reuse';
-    opts.onProgress?.(`acquiring an environment (pool ${this.journal.envsForStack(stack.id).length}/${POOL_MAX()})`);
+    opts.onProgress?.(`acquiring this worktree's environment (machine ${this.appEnvs().length}/${POOL_MAX_TOTAL()})`);
     const queueStarted = performance.now();
     let queueMs = 0;
     const { env, fresh } = await this.acquireEnv(stack, holder, kind, hygiene, opts.ttlMs ?? LEASE_TTL(kind), opts.dataOnly === true, opts.holderPid, opts.preserveLeaseDeadline);
@@ -1884,7 +1850,7 @@ export class Engine {
         () => {
           bindStarted();
           queueMs = performance.now() - queueStarted;
-          return this.bindAndStart(stack, env, hygiene, kind, opts.watch ?? false, opts.onProgress, opts.services, fresh, opts.dataOnly, suppliedInputs, opts.presets);
+          return this.bindAndStart(stack, env, hygiene, kind, opts.watch ?? false, opts.onProgress, opts.services, fresh, opts.dataOnly, suppliedInputs, opts.presets, opts.restart === true);
         },
         (s) => opts.onProgress?.(`waiting for another operation on this environment … ${s}s`),
         'a bind',
@@ -1901,10 +1867,11 @@ export class Engine {
         fresh.failStreak += 1;
         this.journal.saveEnv(fresh);
       }
-      // A failed bind must not strand the lease for a run; sessions keep theirs to iterate.
+      // A failed bind must not strand the lease for a run; sessions keep theirs
+      // to iterate — including a session lease a `run` bound through.
       if (kind === 'run') {
         const lease = this.journal.leaseForHolder(holder, stack.id);
-        if (lease) await this.endLease(lease);
+        if (lease && lease.kind === 'run') await this.endLease(lease);
       }
       throw err;
     } finally {
@@ -1999,18 +1966,34 @@ export class Engine {
     if (!check) {
       throw new BrokerError('work-error', `no check '${opts.check}' in runly.yml (have: ${Object.keys(stack.manifest.checks ?? {}).join(', ') || 'none'})`, 'manifest');
     }
-    // A run ALWAYS gets its own ephemeral holder — never the caller's session
-    // holder — so `run` can't reset-data-wipe or delete a live `up` session
-    // that happens to share a --holder. Its lease is uniquely ours to delete.
-    const holder = `run-${shortId()}`;
+    // ONE environment per worktree (decision 0032, owner's call): a check runs
+    // against the worktree's environment, never a second one beside it. When a
+    // session holds it, the run binds THROUGH that session's lease — resetting
+    // its data first (reset-data hygiene: a fresh clone from the template) and
+    // keeping its deadline — and leaves the lease in place afterwards. There is
+    // deliberately no flag to keep the session's data. With no session lease it
+    // takes an ephemeral run lease, which it ends when the check is done; the
+    // environment stays, hot, for the next bind. Another run's lease is not a
+    // session to bind through: this run queues for the environment instead.
+    const live = this.journal
+      .envsForStack(stack.id)
+      .map((e) => this.journal.leaseForEnv(e.id))
+      .find((l): l is LeaseRow => l !== undefined && l !== null && l.kind !== 'run' && l.expiresAt > now());
+    const holder = live ? live.holder : `run-${shortId()}`;
     const startedAt = now();
     // services: [] forces the whole app — a check runs against the full topology,
-    // never the leftover shape of whatever pooled env it happens to reuse. Same
-    // reason for dataOnly: false. The ephemeral holder above already makes every
-    // claim a fresh one (which resets both), but a check silently running against
-    // an environment with no services would be a wrong verdict, so state it here
-    // rather than rely on that.
-    const context = await this.up({ ...opts, holder, kind: 'run', hygiene: opts.hygiene ?? 'reset-data', services: [], dataOnly: false });
+    // never the leftover shape of the session it binds through. Same reason for
+    // dataOnly: false: a check silently running against an environment with no
+    // services would be a wrong verdict.
+    const context = await this.up({
+      ...opts,
+      holder,
+      kind: 'run',
+      hygiene: opts.hygiene ?? 'reset-data',
+      services: [],
+      dataOnly: false,
+      ...(live ? { preserveLeaseDeadline: true, holderPid: undefined } : {}),
+    });
     const env = this.journal.getEnv(context.envId);
     if (!env) {
       // Bound a moment ago, so only a concurrent forced recycle can take it.
@@ -2077,24 +2060,27 @@ export class Engine {
         bindDiagnostics: context.bindDiagnostics,
       };
     } finally {
-      // Only our own ephemeral run lease — guaranteed kind 'run' — is deleted.
-      const lease = this.journal.leaseForHolder(holder, stack.id);
-      if (lease && lease.kind === 'run') await this.endLease(lease); // env stays hot in the pool
+      // Only our own ephemeral run lease — never the session it bound through.
+      const lease = live ? undefined : this.journal.leaseForHolder(holder, stack.id);
+      if (lease && lease.kind === 'run') await this.endLease(lease); // env stays hot for the next bind
     }
   }
 
   /**
-   * `runly warm`: bring THIS worktree's caches up to its current source — the
-   * upkeep rules and the services' `build:` steps — with no lease and no
-   * services (decision 0032). The intended caller is an idle pool slot that was
-   * just moved to a new commit (`git checkout <sha> && runly warm`), so the next
-   * agent's bind finds the installs and builds already done.
+   * `runly warm`: run THIS worktree's due upkeep rules and its services'
+   * `build:` steps, with no lease and no services (decision 0032). The intended
+   * caller is an idle pool slot that was just moved to a new commit
+   * (`git checkout <sha> && runly warm`): the installs are done and the build
+   * tools' own incremental state is current, so the next agent's bind finds
+   * the upkeep fresh and its builds near no-ops.
    *
-   * It writes the same worktree ledger a bind reads, so a step warm ran is a
-   * step the next bind skips. It holds every environment lock of the stack
-   * (an environment of this worktree must not build or run a check while its
-   * output changes underneath it) and then the worktree lock — the same order
-   * every bind uses, so it can wait but never deadlock.
+   * Upkeep rules go through the same worktree ledger a bind reads, so a rule
+   * warm ran is a rule the next bind skips. Builds are not recorded anywhere:
+   * warm runs every one, and the next bind runs them again — cheaply, because
+   * the build tool finds its output current. It holds the environment lock of
+   * this worktree (if it has one: a check must not run while its output
+   * changes underneath it) and then the worktree lock — the same order every
+   * bind uses, so it can wait but never deadlock.
    *
    * What it cannot do without an environment it reports as skipped: a build
    * line that templates an environment's ports or datastores has no values to
@@ -2107,27 +2093,18 @@ export class Engine {
     const envIds = this.journal.envsForStack(stack.id).map((e) => e.id);
     type Step =
       | ({ kind: 'upkeep' } & UpkeepStep)
-      | { kind: 'build'; service: string; status: 'ran' | 'fresh' | 'skipped' | 'failed'; durationMs: number; reason?: string };
+      | { kind: 'build'; service: string; status: 'ran' | 'skipped' | 'failed'; durationMs: number; reason?: string };
     const steps: Step[] = [];
     let failure: { class: string; message: string; source?: string; logExcerpt?: string } | null = null;
-    let fingerprintMs = 0;
-    let sourceFiles = 0;
     await this.envsLocked(envIds, () => this.treeLocked(stack.id, async () => {
-      say('fingerprinting worktree');
-      const fpStart = performance.now();
-      let source = await fingerprintWorktreeThreaded(stack.root, stack.manifest, worktreeStateDir(stack.id));
-      fingerprintMs = performance.now() - fpStart;
-      sourceFiles = source.files.length;
       const ledger = this.treeLedgerSession(stack);
       try {
-        const upkeep = await runUpkeep(stack.root, source.files, stack.manifest, ledger.get(), say, {
+        const upkeep = await runUpkeep(stack.root, triggerSet(stack.root, stack.manifest, worktreeStateDir(stack.id)), stack.manifest, ledger.get(), say, {
           builtins: false,
           commit: (fps) => ledger.commitRules(fps),
         });
         ledger.commitRules(upkeep.fingerprints);
         steps.push(...upkeep.steps.map((st) => ({ kind: 'upkeep' as const, ...st })));
-        // Same rule as a bind: builds are stamped against what upkeep left.
-        if (upkeep.ran.length > 0) source = await fingerprintWorktreeThreaded(stack.root, stack.manifest, worktreeStateDir(stack.id));
       } catch (err) {
         const e = err instanceof BrokerError ? err : new BrokerError('work-error', String((err as Error).message ?? err), 'upkeep');
         failure = e.toJSON();
@@ -2135,20 +2112,15 @@ export class Engine {
       }
       for (const [name, spec] of Object.entries(stack.manifest.services)) {
         if (!spec.build) continue;
-        // No environment means no ports, URLs or datastores to fill in. Running
-        // the line with a placeholder would stamp output no bind would accept.
+        // No environment means no ports, URLs or datastores to fill in, and
+        // running the line with a placeholder would build the wrong thing.
         if (/\{\{/.test(spec.build)) {
           steps.push({ kind: 'build', service: name, status: 'skipped', durationMs: 0, reason: 'its build line templates environment values; the next bind builds it' });
           continue;
         }
-        const stamp = buildStamp(source.sourceHash, spec.build);
-        if (ledger.get()[`@built:${name}`] === stamp) {
-          steps.push({ kind: 'build', service: name, status: 'fresh', durationMs: 0 });
-          continue;
-        }
         const buildStart = performance.now();
         try {
-          await this.runServiceBuild(name, spec.build, stack.root, ledger, stamp, say);
+          await this.runServiceBuild(name, spec.build, stack.root, say);
           steps.push({ kind: 'build', service: name, status: 'ran', durationMs: performance.now() - buildStart });
         } catch (err) {
           steps.push({ kind: 'build', service: name, status: 'failed', durationMs: performance.now() - buildStart });
@@ -2157,7 +2129,7 @@ export class Engine {
           return;
         }
       }
-    }, (s) => say(`waiting for another bind in this worktree … ${s}s`)), (s) => say(`waiting for an operation on this worktree's environments … ${s}s`), 'a warm-up');
+    }, (s) => say(`waiting for another bind in this worktree … ${s}s`)), (s) => say(`waiting for an operation on this worktree's environment … ${s}s`), 'a warm-up');
     const ran = steps.filter((st) => st.status === 'ran').length;
     logEvent({
       level: failure ? 'warn' : 'info',
@@ -2168,8 +2140,6 @@ export class Engine {
       ok: failure === null,
       stack: stack.manifest.name,
       root: stack.root,
-      sourceFiles,
-      fingerprintMs,
       steps,
       failure,
       durationMs: performance.now() - started,
@@ -2297,7 +2267,7 @@ export class Engine {
     }
     // Anything a refresh can't honestly serve — pending upkeep/rebake, a
     // quiesced or degraded env, a lapsed lease — takes the full bind.
-    const result = await this.up({ cwd, holder: h, kind: 'session', hygiene: 'reuse', onProgress, preserveLeaseDeadline: true });
+    const result = await this.up({ cwd, holder: h, kind: 'session', hygiene: 'reuse', onProgress, preserveLeaseDeadline: true, restart: true });
     result.previewNotice ??= refreshNotice;
     if (refreshDiagnostics) {
       // Include the attempt's time instead of hiding it.
@@ -3484,6 +3454,40 @@ export class Engine {
     return { recycled, skipped };
   }
 
+  /** This worktree's degraded, idle environment(s), reaped so a claim can recreate one. */
+  private async reapDegradedOwn(stack: Stack): Promise<boolean> {
+    let reaped = false;
+    for (const env of this.journal.envsForStack(stack.id)) {
+      if (env.state !== 'degraded' || this.busy.has(env.id)) continue;
+      if (await this.recycleOne(env.id, true) === 'recycled') reaped = true;
+    }
+    return reaped;
+  }
+
+  /**
+   * One environment per worktree (decision 0032) holds for every environment
+   * this daemon creates. A journal from an older runly can still hold several
+   * for one stack; the unleased, idle ones beyond the one to keep are recycled
+   * here, so the pool converges. A surplus environment that is still leased is
+   * left to its holder until the lease ends.
+   */
+  private async drainSurplusEnvs(): Promise<void> {
+    const byStack = new Map<string, EnvRow[]>();
+    for (const env of this.journal.allEnvs()) byStack.set(env.stack, [...(byStack.get(env.stack) ?? []), env]);
+    for (const rows of byStack.values()) {
+      if (rows.length < 2) continue;
+      const leased = rows.filter((e) => this.journal.leaseForEnv(e.id));
+      // Keep every leased one; if none is leased, keep the most recently used.
+      const keep = new Set(leased.length > 0 ? leased.map((e) => e.id) : [rows.reduce((a, b) => (a.lastUsedAt >= b.lastUsedAt ? a : b)).id]);
+      for (const env of rows) {
+        if (keep.has(env.id) || this.busy.has(env.id)) continue;
+        if (await this.recycleOne(env.id, false) === 'recycled') {
+          logEvent({ level: 'info', kind: 'pool-evict', envId: env.id, detail: `a second environment for one worktree (from an older runly) — recycled; a worktree has one environment (decision 0032)` });
+        }
+      }
+    }
+  }
+
   /** Reap the provably-dead (degraded) envs now, instead of waiting for the sweep. */
   async poolReconcile() {
     const reaped: string[] = [];
@@ -3736,6 +3740,7 @@ export class Engine {
         }, undefined, 'an idle quiesce');
       }
     }
+    await this.drainSurplusEnvs();
     // Maintenance runs after ownership/expiry/reaping and does at most one
     // bounded external drop per sweep. Recovery never waits for it.
     await this.retireLegacyTemplateBatch();

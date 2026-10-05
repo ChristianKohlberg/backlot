@@ -23,15 +23,19 @@ What the copy bought, and what became of it:
   its start; now it runs against the live worktree, and an edit made mid-run is
   visible to it. An agent that wants a fixed input does not edit while its check runs,
   or runs it from a second worktree.
-- **Two environments from one worktree — kept, with a caveat.** A session env and a
-  run env of one worktree still coexist (own ports, own databases), but they share its
-  build output: a rebuild by one is visible to the other's running services. Writes
-  into the worktree are serialized; their effect on running processes is not.
+- **Two environments from one worktree — given up.** A worktree has exactly one
+  environment now. A `run` binds through the session's environment and resets its
+  data first; a second holder waits for it. Two environments building into one
+  worktree's `bin/` under each other's running services was the alternative, and the
+  owner chose against it. Parallel lanes need separate worktrees.
 - **Free abandonment — kept.** An environment's private directory (data, logs) still
   never holds the only copy of anything, and runly never deletes the worktree, so a
   reclaim needs no deliberation. Teardown checks the path before it deletes.
 - **Clean worktrees — given up.** Services and checks write where they run. Ignore
-  your output (or declare it under `caches:`), or it counts as a source change.
+  your output (or declare it under `caches:`), or an upkeep trigger glob may match it.
+- **runly's build cache — given up.** It used to skip a build whose source and
+  command it had seen before. Builds now run on every bind; MSBuild, pnpm and the
+  Angular CLI decide what is current, which is what they are for.
 
 If those trade-offs matter more to you than a warm cache — many concurrent verdicts
 from one checkout, editing while checks run — give each lane its own worktree.

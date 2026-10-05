@@ -1,6 +1,7 @@
 /**
- * Decision 0032: environments run in the caller's worktree, and `runly warm`
- * brings that worktree's caches up to date with no lease and no services.
+ * Decision 0032: environments run in the caller's worktree — one per worktree —
+ * and `runly warm` runs its due upkeep and its builds with no lease and no
+ * services.
  * Driven through the real CLI against an isolated state dir.
  */
 import { describe, it, expect, afterAll } from 'vitest';
@@ -126,7 +127,7 @@ describe('runly warm', () => {
   const ctx = makeContext();
   afterAll(() => ctx.cleanup());
 
-  it('runs upkeep and builds with no lease, then the next bind finds them done', async () => {
+  it('runs upkeep and builds with no lease; the next bind finds the upkeep done and builds again', async () => {
     const wt = worktree(
       `name: warmup
 services:
@@ -161,18 +162,20 @@ upkeep:
       expect((await ctx.cli(['status', '--json'], wt)).json!.envs).toEqual([]);
       expect(readFileSync(join(wt, 'build.log'), 'utf8')).toBe('built\n');
 
-      // Idempotent: nothing moved, nothing runs.
+      // The upkeep rule is fresh now; builds are never recorded (decision
+      // 0032: the build tool decides what is current), so they run again.
       const again = (await ctx.cli(['warm', '--json'], wt)).json!;
-      expect((again.steps as Array<{ status: string }>).map((s) => s.status)).toEqual(['fresh', 'skipped', 'fresh', 'skipped']);
+      expect((again.steps as Array<{ status: string }>).map((s) => s.status)).toEqual(['fresh', 'skipped', 'ran', 'skipped']);
+      expect(readFileSync(join(wt, 'build.log'), 'utf8')).toBe('built\nbuilt\n');
 
-      // The point of it: the next bind trusts what warm did.
+      // The next bind trusts the upkeep warm did, and builds what it starts.
       const up = await ctx.cli(['up', '--json'], wt);
       expect(up.exitCode, up.stdout + up.stderr).toBe(0);
-      const diag = up.json!.bindDiagnostics as { upkeep: { ran: number }; builds: Array<{ service: string; cache: string }> };
-      expect(diag.builds.find((b) => b.service === 'web')!.cache).toBe('hit');
-      expect(diag.builds.find((b) => b.service === 'templated')!.cache).toBe('miss');
+      const diag = up.json!.bindDiagnostics as { upkeep: { ran: number }; builds: Array<{ service: string }> };
+      expect(diag.upkeep.ran).toBe(1); // only the @rebake built-in, which acts on the environment's data
+      expect(diag.builds.map((b) => b.service).sort()).toEqual(['templated', 'web']);
       expect(readFileSync(join(wt, 'upkeep.log'), 'utf8')).toBe('installed\n');
-      expect(readFileSync(join(wt, 'build.log'), 'utf8')).toBe('built\n');
+      expect(readFileSync(join(wt, 'build.log'), 'utf8')).toBe('built\nbuilt\nbuilt\n');
       await ctx.cli(['release', '--json'], wt);
 
       // Human output names each step and its time, never the command.
@@ -195,7 +198,7 @@ upkeep:
       expect(res.json!.ok).toBe(false);
       expect((res.json!.failure as { class: string; message: string }).message).toMatch(/build failed for service 'web'/);
       expect((res.json!.steps as Array<{ status: string }>).at(-1)!.status).toBe('failed');
-      // A failed build leaves no stamp: the next warm tries again.
+      // Nothing is recorded for a build: the next warm simply runs it again.
       const again = await ctx.cli(['warm', '--json'], wt);
       expect((again.json!.steps as Array<{ status: string }>).at(-1)!.status).toBe('failed');
     } finally {
@@ -222,12 +225,100 @@ checks:
       const order = () => (existsSync(join(wt, 'order.log')) ? readFileSync(join(wt, 'order.log'), 'utf8').trim().split('\n') : []);
       for (let i = 0; i < 100 && !order().includes('check-start'); i++) await new Promise((r) => setTimeout(r, 100));
       expect(order()).toEqual(['build', 'check-start']);
-      writeFileSync(join(wt, 'src.txt'), 'v2'); // the build is now stale
       const warm = await ctx.cli(['warm', '--json'], wt);
       expect(warm.exitCode, warm.stdout + warm.stderr).toBe(0);
       await done;
       // Without the environment lock the rebuild would land mid-check.
       expect(order()).toEqual(['build', 'check-start', 'check-end', 'build']);
+    } finally {
+      rmSync(wt, { recursive: true, force: true });
+    }
+  }, 60_000);
+});
+
+describe('one environment per worktree', () => {
+  const ctx = makeContext({ BACKLOT_SWEEP_MS: '300', BACKLOT_WAIT_MS: '30000' });
+  afterAll(() => ctx.cleanup());
+
+  it('a second holder never gets a second environment: it fails fast, naming who holds it', async () => {
+    const wt = worktree(
+      `name: oneenv
+services:
+  web: { run: node server.mjs, port: web, env: { PORT: "{{ports.web}}" }, ready: { http: /, timeout: 20 } }
+`,
+      { 'server.mjs': SERVER },
+    );
+    try {
+      const up = await ctx.cli(['up', '--ttl', '30', '--json'], wt);
+      expect(up.exitCode, up.stdout + up.stderr).toBe(0);
+      const started = Date.now();
+      const other = await ctx.cli(['up', '--holder', 'someone-else', '--json'], wt);
+      expect(other.exitCode).toBe(2);
+      expect((other.json!.error as { message: string }).message).toMatch(/exactly one environment/);
+      expect(Date.now() - started).toBeLessThan(15_000);
+      const status = (await ctx.cli(['status', '--json'], wt)).json!;
+      expect((status.envs as Array<{ id: string }>).map((e) => e.id)).toEqual([up.json!.envId]);
+      await ctx.cli(['release', '--json'], wt);
+    } finally {
+      rmSync(wt, { recursive: true, force: true });
+    }
+  }, 60_000);
+
+  it('up reuses a running environment without building; sync rebuilds and restarts', async () => {
+    const wt = worktree(
+      `name: rebuild
+services:
+  web:
+    build: "echo built >> build.log"
+    run: node server.mjs
+    port: web
+    env: { PORT: "{{ports.web}}" }
+    ready: { http: /, timeout: 20 }
+`,
+      { 'server.mjs': SERVER, '.gitignore': 'build.log\n' },
+    );
+    try {
+      const builds = () => readFileSync(join(wt, 'build.log'), 'utf8').trim().split('\n').length;
+      const first = await ctx.cli(['up', '--json'], wt);
+      expect(first.exitCode, first.stdout + first.stderr).toBe(0);
+      expect(builds()).toBe(1);
+      const reused = await ctx.cli(['up', '--json'], wt);
+      expect((reused.json!.bindDiagnostics as { reuse: string }).reuse).toBe('reused');
+      expect(builds()).toBe(1);
+      // runly has no idea whether the code changed — sync is how a caller
+      // says "apply it", and it always builds and restarts.
+      const synced = await ctx.cli(['sync', '--json'], wt);
+      expect(synced.exitCode, synced.stdout + synced.stderr).toBe(0);
+      const d = synced.json!.bindDiagnostics as { reuse: string; reasons: string[] };
+      expect(d.reuse).toBe('rebound');
+      expect(d.reasons).toContain('restart-requested');
+      expect(builds()).toBe(2);
+      await ctx.cli(['release', '--json'], wt);
+    } finally {
+      rmSync(wt, { recursive: true, force: true });
+    }
+  }, 60_000);
+
+  it('a second environment an older runly left for the same worktree is drained by the sweep', async () => {
+    const wt = worktree(`name: surplus\nservices:\n  idle: { run: "echo ready; sleep 300", ready: { log: ready, timeout: 20 } }\n`);
+    try {
+      const up = await ctx.cli(['up', '--json'], wt);
+      expect(up.exitCode, up.stdout + up.stderr).toBe(0);
+      await ctx.cli(['release', '--json'], wt);
+      // Plant the shape an older journal can hold: a second, unleased row for
+      // the same stack.
+      const { Journal } = await import('../src/core/journal.js');
+      const journal = new Journal(join(ctx.stateDir, 'journal.db'));
+      const row = journal.getEnv(up.json!.envId as string)!;
+      const twinId = `${row.stack}-e99`;
+      journal.saveEnv({ ...row, id: twinId, state: 'warm', servicePids: {}, ports: {}, root: join(ctx.stateDir, 'envs', twinId), lastUsedAt: row.lastUsedAt - 60_000 });
+      expect(journal.envsForStack(row.stack)).toHaveLength(2);
+      let left = 2;
+      for (let i = 0; i < 60 && left > 1; i++) {
+        await new Promise((r) => setTimeout(r, 250));
+        left = journal.envsForStack(row.stack).length;
+      }
+      expect(journal.envsForStack(row.stack).map((e) => e.id)).toEqual([row.id]);
     } finally {
       rmSync(wt, { recursive: true, force: true });
     }

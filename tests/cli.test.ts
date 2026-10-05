@@ -110,15 +110,27 @@ describe('the local loop (hello-web)', () => {
     expect(((await fetchJson(`${url}/api/greetings`)) as unknown[]).length).toBe(3);
   });
 
-  it('run smoke: second env from the pool, green verdict, lease auto-released', async () => {
+  it('run smoke: runs against the session\'s environment, resets its data first, keeps the session lease', async () => {
+    // One environment per worktree (decision 0032): the check does not get a
+    // second environment beside the session — it binds through the session's,
+    // with a fresh data reset, and the session keeps its lease.
+    const session = (await ctx.cli(['ctx', '--json'], wt.dir)).json!;
+    await ctx.cli(
+      ['exec', `node -e 'const{DatabaseSync}=require("node:sqlite");new DatabaseSync(process.env.BACKLOT_DS_MAIN).prepare("INSERT INTO greetings (message) VALUES (?)").run("session-only")'`],
+      wt.dir,
+    );
+    expect(((await fetchJson(`${url}/api/greetings`)) as unknown[]).length).toBe(4);
     const res = await ctx.cli(['run', 'smoke', '--json'], wt.dir);
     expect(res.exitCode, `stdout: ${res.stdout ?? ''}\nstderr: ${res.stderr ?? ''}`).toBe(0);
     const v = res.json!;
     expect(v.ok).toBe(true);
-    expect(v.envId).not.toBe(''); // ran somewhere real
+    expect(v.envId).toBe(session.envId);
+    expect(((await fetchJson(`${url}/api/greetings`)) as unknown[]).length).toBe(3); // the session's row is gone
+    const after = (await ctx.cli(['ctx', '--json'], wt.dir)).json!;
+    expect(after.envId).toBe(session.envId);
+    expect((after.lease as { id: string }).id).toBe((session.lease as { id: string }).id);
     const status = (await ctx.cli(['status', '--json'], wt.dir)).json!;
-    const envs = status.envs as Array<{ id: string; lease: unknown }>;
-    expect(envs.filter((e) => e.lease === null).length).toBeGreaterThan(0); // run lease released
+    expect((status.envs as unknown[]).length).toBe(1);
   });
 
   it('crash recovery: kill -9 the daemon; next verb respawns, envs recover, port survives', async () => {
@@ -341,6 +353,8 @@ describe('a slice does not leak across a pool handoff (hello-multi)', () => {
     const urls = res.json!.urls as Record<string, string>;
     expect(urls.api).toBeDefined();
     expect(urls.web).toBeDefined();
+    // One environment per worktree: the next holder needs it back.
+    await ctx.cli(['release', '--holder', 'agentB', '--json'], wt.dir);
   });
 
   it('re-claiming a released slice via the fast path reports only the slice, not the whole app', async () => {
@@ -402,7 +416,7 @@ describe('a failed first bind on a re-claimed env keeps ctx truthful (hello-mult
 
 // ---------------------------------------------------------------------------
 
-describe('a slice builds per service, not gated by the whole-source stamp', () => {
+describe('a slice builds the services it starts', () => {
   const stateDir = mkdtempSync(join(tmpdir(), 'runly-bf-'));
   const cliEnv = { ...process.env, BACKLOT_STATE_DIR: stateDir, BACKLOT_SWEEP_MS: '400' };
   const wt = mkdtempSync(join(tmpdir(), 'runly-bfwt-'));
@@ -466,10 +480,8 @@ describe('a slice builds per service, not gated by the whole-source stamp', () =
     expect(res.exitCode, `stdout: ${res.stdout}\nstderr: ${res.stderr}`).toBe(0);
     expect((res.json!.urls as Record<string, string>).built).toBeUndefined();
 
-    // Now bring up `built`. Its build MUST run (creating out/server.js) so it can
-    // serve — regression: the keep-only bind used to stamp the whole-source
-    // '@source' fingerprint as "built", so this bind skipped built's build and
-    // its run failed on the missing artifact (or served stale code).
+    // Now bring up `built`. Its build MUST run (creating out/server.js) so it
+    // can serve: every bind builds the services it starts.
     res = await cli(['up', 'built', '--json']);
     expect(res.exitCode, `stdout: ${res.stdout}\nstderr: ${res.stderr}`).toBe(0);
     const builtUrl = (res.json!.urls as Record<string, string>).built;

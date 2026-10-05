@@ -1,25 +1,21 @@
 /**
- * The worktree ledger (decision 0032): the half of decision 0008's fingerprint
- * ledger that describes the WORKTREE rather than an environment.
+ * The worktree's upkeep ledger (decision 0032): which command upkeep rule was
+ * last applied for which content of its `when:` files.
  *
- * Under the projection every environment had a private tree, so "this upkeep
- * rule was applied here" and "this service was built from that source" were
- * per-environment facts. Running in place, an install or a build lands in the
- * caller's worktree, which every environment of the stack — and `runly warm` —
- * shares. Kept per environment, the ledger would lie: environment A installs
- * lockfile v2, environment B's ledger still says v1 is applied, the lockfile
- * goes back to v1, and B skips the install over a v2 node_modules.
+ * Upkeep commands (an install, a codegen) write into the caller's worktree, so
+ * whether one is due is a fact about the worktree, not about an environment;
+ * `runly warm` reads and writes the same ledger a bind does. It is kept in the
+ * state root, keyed by stack id (one stack = one physical worktree = one
+ * environment), never in the worktree. The `@`-built-in rules act on an
+ * environment's data and stay on the environment row. Writers hold the
+ * engine's per-worktree lock; the file is replaced atomically.
  *
- * So command upkeep rules and `@built:<service>` stamps live here, keyed by
- * stack id (one stack = one physical worktree); `@source` (what the running
- * services were started from) and the `@`-built-in rules (which act on an
- * environment's data) stay on the environment row. Writers hold the engine's
- * per-worktree lock; the file is replaced atomically.
+ * Builds are NOT recorded here or anywhere: a service's `build:` runs on every
+ * bind that starts it, and the build tool decides what is up to date.
  */
 import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { worktreesRoot } from './paths.js';
-import { sha256 } from './util.js';
 
 export interface TreeLedgerFile {
   /** The physical worktree this ledger describes — retention reads it. */
@@ -47,28 +43,19 @@ export function writeTreeLedger(stackId: string, root: string, fingerprints: Rec
   renameSync(tmp, ledgerPath(stackId));
 }
 
-/** `--pristine`: forget what was applied, so every rule and build runs again. */
+/** `--pristine`: forget what was applied, so every rule runs again. */
 export function clearTreeLedger(stackId: string): void {
   rmSync(ledgerPath(stackId), { force: true });
 }
 
-/** Which ledger a key belongs to. `@source` and `@`-built-in rules are per environment. */
+/** Which ledger a key belongs to: command rules are the worktree's, `@` keys the environment's. */
 export function isTreeKey(key: string): boolean {
-  if (key.startsWith('@built:')) return true;
-  if (key.startsWith('@')) return false; // @source and any future env-scoped stamp
+  if (key.startsWith('@')) return false; // a leftover stamp from an older runly
   return !key.includes(' -> @');
 }
 
 export const pickTreeKeys = (fps: Record<string, string>): Record<string, string> =>
   Object.fromEntries(Object.entries(fps).filter(([k]) => isTreeKey(k)));
+/** The environment's half: `@`-built-in rules only (`@source`/`@built:` stamps are gone). */
 export const pickEnvKeys = (fps: Record<string, string>): Record<string, string> =>
-  Object.fromEntries(Object.entries(fps).filter(([k]) => !isTreeKey(k)));
-
-/**
- * A build stamp. The RESOLVED command is part of it: a build line that
- * templates an environment's port or datastore produces different output per
- * environment, so two environments may share a stamp only when they would run
- * the identical command over the identical source.
- */
-export const buildStamp = (sourceHash: string, resolvedCommand: string): string =>
-  sha256(`${sourceHash}\n${resolvedCommand}`);
+  Object.fromEntries(Object.entries(fps).filter(([k]) => !k.startsWith('@') && k.includes(' -> @')));

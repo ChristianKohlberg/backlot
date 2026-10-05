@@ -1,11 +1,17 @@
 /**
  * The fingerprint ledger (decision 0008): a closed list of (trigger -> action)
- * rules, evaluated per environment at bind time, direction-agnostic. Actions
+ * rules, evaluated at bind (and `runly warm`) time, direction-agnostic. Actions
  * are repo commands, or engine built-ins prefixed with @.
+ *
+ * A rule's fingerprint is the content of the files its `when:` glob matches —
+ * those files and nothing else (decision 0032). runly keeps no identity of the
+ * rest of the worktree and no record of builds.
  */
+import { mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { cmdTimeoutS, runBounded } from './exec.js';
 import { globToRegex, sha256, fileHash, BrokerError } from './util.js';
+import { enumerateSource } from './worktree.js';
 import type { Manifest } from './manifest.js';
 
 export interface UpkeepStep {
@@ -44,10 +50,84 @@ export interface UpkeepOptions {
 
 export const ruleKey = (rule: { when: string; run: string }): string => `${rule.when} -> ${rule.run}`;
 
-export function triggerHash(root: string, files: string[], when: string): string {
+/**
+ * The worktree files any upkeep rule's `when:` glob matches — the only files a
+ * bind reads to decide what upkeep is due. Empty, without asking git, when the
+ * manifest declares no rules.
+ */
+export function triggerFiles(root: string, manifest: Manifest): string[] {
+  const whens = (manifest.upkeep ?? []).map((rule) => rule.when);
+  return whens.length === 0 ? [] : enumerateSource(root, manifest, whens);
+}
+
+/**
+ * The trigger files with their content hashes, read once per bind.
+ *
+ * Trigger globs can match large files — a consumer's database backups are
+ * 160 MB, named by several @rebake-template rules each — so hashing them per
+ * rule on every bind would re-read the same bytes several times on the
+ * daemon's thread. Each file is hashed once per bind, and only when its
+ * (size, mtime) moved since the cache under `cacheDir` recorded it. The cache
+ * holds the trigger files and nothing else, and lives in the state root.
+ *
+ * Filesystem mtimes are coarse, so a same-size rewrite inside one timestamp
+ * tick of the recorded stat is indistinguishable from the file already hashed.
+ * git's "racily clean" rule applies: an entry whose mtime is not strictly older
+ * than the cache write (minus a window) is re-hashed.
+ */
+export interface TriggerSet {
+  files: string[];
+  hashOf: (rel: string) => string | null;
+}
+
+interface TriggerCacheEntry { hash: string; size: number; mtime: number }
+const RACY_WINDOW_MS = 2000;
+
+export function triggerSet(root: string, manifest: Manifest, cacheDir?: string): TriggerSet {
+  const files = triggerFiles(root, manifest);
+  let cache: { writtenAt?: number; entries: Record<string, TriggerCacheEntry> } = { entries: {} };
+  if (cacheDir) {
+    try {
+      const raw = JSON.parse(readFileSync(join(cacheDir, 'triggers.json'), 'utf8'));
+      if (raw && typeof raw === 'object' && raw.entries && typeof raw.entries === 'object') cache = raw;
+    } catch {
+      /* absent or torn: hash everything once */
+    }
+  }
+  const racyFrom = cache.writtenAt === undefined ? -Infinity : cache.writtenAt - RACY_WINDOW_MS;
+  const next: Record<string, TriggerCacheEntry> = {};
+  const hashes = new Map<string, string | null>();
+  for (const rel of files) {
+    const abs = join(root, rel);
+    let st: { size: number; mtimeMs: number };
+    try {
+      st = statSync(abs);
+    } catch {
+      hashes.set(rel, null);
+      continue;
+    }
+    const cached = cache.entries[rel];
+    const trust = cached !== undefined && cached.size === st.size && cached.mtime === st.mtimeMs && cached.mtime < racyFrom;
+    const hash = trust ? cached.hash : fileHash(abs);
+    hashes.set(rel, hash);
+    if (hash !== null) next[rel] = { hash, size: st.size, mtime: st.mtimeMs };
+  }
+  if (cacheDir) {
+    mkdirSync(cacheDir, { recursive: true });
+    const tmp = join(cacheDir, `triggers.json.${process.pid}.${Math.random().toString(36).slice(2)}.tmp`);
+    writeFileSync(tmp, JSON.stringify({ root, writtenAt: Date.now(), entries: next }));
+    renameSync(tmp, join(cacheDir, 'triggers.json'));
+  }
+  return { files, hashOf: (rel) => (hashes.has(rel) ? (hashes.get(rel) ?? null) : fileHash(join(root, rel))) };
+}
+
+/** The fingerprint of one `when:` glob: the content of exactly the files it matches. */
+export function triggerHash(root: string, files: string[] | TriggerSet, when: string): string {
   const re = globToRegex(when);
-  const matching = files.filter((f) => re.test(f)).sort();
-  return sha256(matching.map((f) => `${f}:${fileHash(join(root, f)) ?? 'gone'}`).join('\n'));
+  const list = Array.isArray(files) ? files : files.files;
+  const hashOf = Array.isArray(files) ? (rel: string) => fileHash(join(root, rel)) : files.hashOf;
+  const matching = list.filter((f) => re.test(f)).sort();
+  return sha256(matching.map((f) => `${f}:${hashOf(f) ?? 'gone'}`).join('\n'));
 }
 
 /**
@@ -65,7 +145,7 @@ export function triggerHash(root: string, files: string[], when: string): string
  * Datastores with no @rebake-template rule get no key (undefined) and keep
  * their historical template names — existing bakes stay valid.
  */
-export function templateBakeKeys(manifest: Manifest, root: string, files: string[]): Record<string, string> {
+export function templateBakeKeys(manifest: Manifest, root: string, files: string[] | TriggerSet): Record<string, string> {
   const perDs: Record<string, string[]> = {};
   for (const rule of manifest.upkeep ?? []) {
     if (!rule.run.startsWith('@rebake-template')) continue;
@@ -81,13 +161,13 @@ export function templateBakeKeys(manifest: Manifest, root: string, files: string
  * Which rules WOULD fire for this worktree — the exact trigger check runUpkeep
  * performs, without running anything. A `sync` or `--watch` save under
  * hot-reload services uses it to decide honestly between "record the new
- * source, keep the services" and the full bind path: a save that changes what
+ * state, keep the services" and the full bind path: a save that changes what
  * a rule (or @rebake-template) fingerprints cannot be served by the dev
  * servers' own watchers alone.
  */
 export function pendingUpkeep(
   root: string,
-  files: string[],
+  files: string[] | TriggerSet,
   manifest: Manifest,
   previous: Record<string, string>,
 ): string[] {
@@ -101,7 +181,7 @@ export function pendingUpkeep(
 
 export async function runUpkeep(
   root: string,
-  files: string[],
+  files: string[] | TriggerSet,
   manifest: Manifest,
   previous: Record<string, string>,
   onProgress?: (phase: string) => void,

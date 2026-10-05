@@ -237,7 +237,6 @@ describe('a cold, unleased environment no longer holds a machine-wide slot forev
     expect(msg).toMatch(/Releasing a lease will not help/);
     // Real counts, not the cap printed twice.
     expect(msg).toMatch(/machine holds 1\/1/);
-    expect(msg).toMatch(/this stack holds 0\/9/);
     // Waiting cannot clear a machine-wide block, so it must not wait.
     expect(elapsed).toBeLessThan(15_000);
 

@@ -41,7 +41,7 @@ async function context(args: string[]): Promise<Context> {
 }
 function checkTimings(d: BindDiagnostics) {
   expect(d.durationMs).toBeGreaterThan(0);
-  expect(Object.keys(d.phasesMs).sort()).toEqual(['queue', 'prepare', 'appliances', 'fingerprint', 'upkeep', 'stop', 'data', 'build', 'ready', 'finalize'].sort());
+  expect(Object.keys(d.phasesMs).sort()).toEqual(['queue', 'prepare', 'appliances', 'upkeep', 'stop', 'data', 'build', 'ready', 'finalize'].sort());
   for (const ms of Object.values(d.phasesMs)) expect(ms).toBeGreaterThanOrEqual(0);
   expect(JSON.stringify(d)).not.toMatch(/build-secret-marker|mkdir|echo/);
 }
@@ -54,17 +54,15 @@ afterAll(async () => {
 });
 
 describe('request-local bind diagnostics', () => {
-  it('explains actual cold builds, warm skips and changed-source rebuilds without persisting timings', async () => {
+  it('explains a cold bind, a reuse and a rebind — builds run on every bind, never on a reuse', async () => {
     const cold = await context(['up', '--ttl', '5']);
     const d = cold.bindDiagnostics!;
     checkTimings(d);
     expect(d.reuse).toBe('rebound');
-    expect(d.builds).toEqual([{ service: 'web', cache: 'miss', reason: 'no-build-record' }]);
+    expect(d.builds.map((b) => b.service)).toEqual(['web']);
+    expect(d.builds[0]!.durationMs).toBeGreaterThanOrEqual(150);
     expect(d.phasesMs.build).toBeGreaterThanOrEqual(150);
-    expect(d.source.files).toBeGreaterThan(0);
-    expect(d.source.hashed).toBeGreaterThan(0);
-    // The build ran in the worktree (decision 0032); `.build` is a declared
-    // cache, so its output is not source and does not unsettle the next bind.
+    // The build ran in the worktree (decision 0032).
     const countFile = join(wt, '.build', 'count');
     const builds = () => readFileSync(countFile, 'utf8').trim().split('\n').length;
     expect(builds()).toBe(1);
@@ -72,17 +70,17 @@ describe('request-local bind diagnostics', () => {
     const warm = await context(['up']);
     checkTimings(warm.bindDiagnostics!);
     expect(warm.bindDiagnostics?.reuse).toBe('reused');
-    expect(warm.bindDiagnostics?.builds).toEqual([{ service: 'web', cache: 'hit', reason: 'source-unchanged' }]);
-    expect(warm.bindDiagnostics?.source.files).toBe(d.source.files);
+    expect(warm.bindDiagnostics?.builds).toEqual([]);
     expect(builds()).toBe(1);
     expect((await context(['ctx'])).bindDiagnostics).toBeUndefined();
 
-    writeFileSync(join(wt, 'content'), 'two');
-    const changed = await context(['up']);
-    checkTimings(changed.bindDiagnostics!);
-    expect(changed.bindDiagnostics?.reuse).toBe('rebound');
-    expect(changed.bindDiagnostics?.reasons).toContain('source-changed');
-    expect(changed.bindDiagnostics?.builds).toEqual([{ service: 'web', cache: 'miss', reason: 'source-changed' }]);
+    // No build cache (decision 0032): a rebind with nothing changed in the
+    // worktree still runs the build — the build tool decides what is current.
+    const rebound = await context(['reset-data']);
+    checkTimings(rebound.bindDiagnostics!);
+    expect(rebound.bindDiagnostics?.reuse).toBe('rebound');
+    expect(rebound.bindDiagnostics?.reasons).toContain('hygiene-reset-data');
+    expect(rebound.bindDiagnostics?.builds.map((b) => b.service)).toEqual(['web']);
     expect(builds()).toBe(2);
   });
 
@@ -92,14 +90,13 @@ describe('request-local bind diagnostics', () => {
     const d = projected.bindDiagnostics!;
     checkTimings(d);
     expect(d.reuse).toBe('refreshed');
-    expect(d.source.hashed).toBeGreaterThan(0);
-    expect(d.builds.every((build) => build.cache === 'hit')).toBe(true);
+    expect(d.builds).toEqual([]);
     expect(d.phasesMs.build).toBe(0);
     expect(await (await fetch(projected.urls.web)).text()).toBe('refreshed-three');
     expect((await context(['ctx'])).bindDiagnostics).toBeUndefined();
     const reused = await context(['up']);
     expect(reused.bindDiagnostics?.reuse).toBe('reused');
-    expect(reused.bindDiagnostics?.builds).toEqual([{ service: 'web', cache: 'skipped', reason: 'running-service-reused' }]);
+    expect(reused.bindDiagnostics?.builds).toEqual([]);
     expect(readFileSync(join(wt, '.build', 'count'), 'utf8').trim().split('\n')).toHaveLength(2);
   });
 

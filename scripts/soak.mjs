@@ -26,8 +26,9 @@
  *       burst storms, and an upkeep-trigger touch that MUST produce the
  *       documented fallback restart (new service pid + upkeep marker)
  *   (c) run loop — checks with verdict assertions (pass, fail, detach, unknown)
- *   (d) capacity churn — a second stack at POOL_MAX with extra holders
- *       queueing, short-TTL lease expiries, and a quiesce/rebind cycle under a
+ *   (d) capacity churn — a second stack whose one environment (decision
+ *       0032) is held by a short-TTL holder while another queues on its
+ *       expiry, lease expiries, and a quiesce/rebind cycle under a
  *       short BACKLOT_LEASED_IDLE_TTL_MS — the sweeper must keep reclaiming
  *   (e) chaos ticks every ~2 min — SIGKILL the daemon (next verb must
  *       recover), SIGSTOP/SIGCONT (starvation-shaped; a true lid-close sleep
@@ -107,8 +108,7 @@ mkdirSync(stacksDir, { recursive: true });
 const daemonEnv = Object.fromEntries(Object.entries(process.env).filter(([k]) => !k.startsWith('BACKLOT_')));
 Object.assign(daemonEnv, {
   BACKLOT_STATE_DIR: stateDir,
-  BACKLOT_POOL_MAX: '2', // per stack: session + run, the documented core loop
-  BACKLOT_POOL_MAX_TOTAL: '6', // A(2) + B(2) + one chaos stack, with headroom
+  BACKLOT_POOL_MAX_TOTAL: '6', // A + B + one chaos stack (one environment each, decision 0032), with headroom
   BACKLOT_SWEEP_MS: '1000', // expiries/quiesces/reaps within seconds, not minutes
   BACKLOT_GC_MS: '15000',
   BACKLOT_IDLE_TTL_MS: '45000',
@@ -551,7 +551,7 @@ async function phaseWatch() {
   }
 
   // The upkeep-trigger touch. A save that changes what an upkeep rule
-  // fingerprints CANNOT be served by projection — the engine documents a
+  // fingerprints CANNOT be served by the hot-reload refresh — the engine documents a
   // deliberate fallback to the full bind path: rule runs, services restart.
   // Observe both halves from outside: the marker the rule writes, and a new
   // service pid on the same (stable) URL.
@@ -572,7 +572,8 @@ async function phaseWatch() {
       log(`  fallback restart observed: pid ${pidBefore} -> ${restarted}`);
     }
   }
-  // The lease stays up: phase (c) runs against a pool that also holds a session.
+  // The lease stays up: phase (c)'s runs bind through this session (decision
+  // 0032: one environment per worktree), resetting its data first.
 }
 
 /** (c) The run loop: verdicts an agent would branch on, asserted exactly. */
@@ -613,13 +614,13 @@ async function statusEnvs() {
 /** (d) Capacity churn on stack B: queueing, expiries, quiesce — the sweeper's beat. */
 async function phaseCapacity() {
   log(`phase capacity (cycle ${cycle})`);
-  // Two short-TTL holders occupy POOL_MAX=2; a third queues on the expiry.
-  const h1 = await cli(['up', '--holder', 'soak-h1', '--ttl', '0.12'], { cwd: stackB }); // ~7s
-  const h2 = await cli(['up', '--holder', 'soak-h2', '--ttl', '0.07'], { cwd: stackB }); // ~4s
-  must(h1.body?.state === 'hot' && h2.body?.state === 'hot', 'capacity', 'stack B holders failed to bind', `${h1.stdout.slice(0, 200)} ${h2.stdout.slice(0, 200)}`);
+  // A short-TTL holder holds stack B's one environment (decision 0032); a
+  // second holder queues on its expiry.
+  const h1 = await cli(['up', '--holder', 'soak-h1', '--ttl', '0.07'], { cwd: stackB }); // ~4s
+  must(h1.body?.state === 'hot', 'capacity', 'stack B holder failed to bind', h1.stdout.slice(0, 200));
   const t0 = Date.now();
   const h3 = await cli(['up', '--holder', 'soak-h3'], { cwd: stackB, timeoutMs: 90_000 });
-  if (must(h3.body?.state === 'hot', 'capacity', 'queued holder never acquired at POOL_MAX (waited past the expiry window)', h3.stdout.slice(0, 300))) {
+  if (must(h3.body?.state === 'hot', 'capacity', 'queued holder never acquired the worktree\'s environment (waited past the expiry window)', h3.stdout.slice(0, 300))) {
     stats.queuedAcquires++;
     log(`  queued acquire served after ${Date.now() - t0}ms`);
   }
@@ -630,7 +631,7 @@ async function phaseCapacity() {
     const envs = await statusEnvs();
     return envs.filter((e) => e.stack.startsWith('soak-b') && e.lease).length === 0;
   });
-  if (must(cleared, 'capacity', 'expired stack-B leases were never swept')) stats.leaseExpiries += 2;
+  if (must(cleared, 'capacity', 'expired stack-B leases were never swept')) stats.leaseExpiries += 1;
 
   // Quiesce cycle: a leased-but-idle env must lose its heat (services stop,
   // lease kept), refuse exec with a rebind hint, and come back hot on `up`.
@@ -844,7 +845,6 @@ async function convergence() {
   for (const [args, cwd] of [
     [['release'], stackA],
     [['release', '--holder', 'soak-h1'], stackB],
-    [['release', '--holder', 'soak-h2'], stackB],
     [['release', '--holder', 'soak-hq'], stackB],
   ]) {
     try {

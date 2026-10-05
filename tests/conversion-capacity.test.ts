@@ -770,7 +770,9 @@ console.log(JSON.stringify({tagged:tagged.pid,untagged:untagged.pid}));
       ]);
       for (const result of competing) {
         expect(result.status).toBe('rejected');
-        if (result.status === 'rejected') expect(result.reason.message).toMatch(/cap/);
+        // Holder b shares a's worktree, so it waits for its one environment
+        // (decision 0032); c's worktree needs an application slot.
+        if (result.status === 'rejected') expect(result.reason.message).toMatch(/cap|exactly one environment/);
       }
       expect(journal.allEnvs()).toHaveLength(1);
       expect(journal.getEnv(first.envId)?.servicePids).toEqual(original.servicePids);
@@ -793,8 +795,9 @@ console.log(JSON.stringify({tagged:tagged.pid,untagged:untagged.pid}));
   });
 
   it('keeps the per-stack charge after early upkeep failure and permits returning to the app', async () => {
-    const f = fixture(2, 1);
+    const f = fixture(1, 1);
     const tree = f.stack('app');
+    const other = f.stack('other');
     const original = readFileSync(join(tree, 'backlot.yml'), 'utf8');
     const first = await f.cli(tree, 'up', '--holder', 'a');
     expect(first.code, first.stdout + first.stderr).toBe(0);
@@ -847,8 +850,9 @@ console.log(JSON.stringify({tagged:tagged.pid,untagged:untagged.pid}));
   });
 
   it('releases the application slot when a conversion fails after its services were stopped', async () => {
-    const f = fixture(2, 1);
+    const f = fixture(1, 1);
     const tree = f.stack('app');
+    const other = f.stack('other');
     const original = readFileSync(join(tree, 'backlot.yml'), 'utf8');
     const first = await f.cli(tree, 'up', '--holder', 'a');
     expect(first.code, first.stdout + first.stderr).toBe(0);
@@ -861,9 +865,11 @@ console.log(JSON.stringify({tagged:tagged.pid,untagged:untagged.pid}));
     expect(row?.state).toBe('warm');
     expect(row?.servicePids).toEqual({});
     writeFileSync(join(tree, 'backlot.yml'), original);
-    // Nothing runs on that row any more, so the stack's single application slot
-    // is free for another holder — and the failed converter no longer owns it.
-    const competing = await f.cli(tree, 'up', '--holder', 'b');
+    // Nothing runs on that row any more, so the machine's single application
+    // slot is free for another worktree — and the failed converter no longer
+    // owns it. (A second holder of the SAME worktree would wait for its one
+    // environment instead, decision 0032.)
+    const competing = await f.cli(other, 'up', '--holder', 'b');
     expect(competing.code, competing.stdout + competing.stderr).toBe(0);
     expect(competing.data.envId).not.toBe(first.data.envId);
     await f.alive(competing.data);

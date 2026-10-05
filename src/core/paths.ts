@@ -61,8 +61,8 @@ export const templatesRoot = (): string => join(stateRoot(), 'templates');
 export const retiredTemplatesRoot = (): string => join(stateRoot(), 'retired-templates');
 export const artifactsRoot = (): string => join(stateRoot(), 'artifacts');
 /**
- * Per-worktree state (decision 0032): the source-hash stat cache and the
- * worktree's upkeep/build ledger. It describes the caller's worktree, which
+ * Per-worktree state (decision 0032): the trigger-file hash cache and the
+ * worktree's upkeep ledger. It describes the caller's worktree, which
  * every environment of that stack runs in, so it is keyed by stack id rather
  * than by environment — and lives here, never inside the worktree.
  */

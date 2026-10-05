@@ -1,10 +1,12 @@
 /**
  * Fleet review finding: 'pool at capacity (1/1) — waited 60s' on macOS CI is
- * not a slow-runner problem. poolMaxHeuristic resolves to 1 on a 3-vCPU/7 GB
- * runner, and `run` always mints its own ephemeral holder — so a session lease
- * plus a run structurally needs two environments. Waiting can never help, and
- * the old message blamed timing, which sent the diagnosis the wrong way for
- * months.
+ * not a slow-runner problem when waiting can never help, and the old message
+ * blamed timing, which sent the diagnosis the wrong way for months.
+ *
+ * Since decision 0032 a worktree has exactly ONE environment, and `run` binds
+ * through the session's lease instead of needing a second one. What can still
+ * be structurally hopeless is a second HOLDER on the same worktree while the
+ * first one's lease outlasts the wait — that must fail fast, naming the holder.
  */
 import { describe, it, expect, afterAll } from 'vitest';
 import { execFile, execFileSync } from 'node:child_process';
@@ -58,25 +60,34 @@ describe('pool capacity diagnostics', () => {
   it('never resolves below the two environments the core loop needs', () => {
     // The raw terms genuinely reach 1 on a 3 vCPU / 7 GB runner...
     expect(Math.min(Math.floor(3 / 2), Math.floor(7 / 4))).toBe(1);
-    // ...but the floor is 2, because `up` + `run` structurally needs two envs.
-    // A pool of 1 cannot run runly as documented.
+    // ...but the floor is 2. (It was chosen when `up` + `run` needed two
+    // environments; since decision 0032 a stack has one and BACKLOT_POOL_MAX
+    // bounds nothing in the engine — the heuristic is kept for status output.)
     expect(poolMaxHeuristic()).toBeGreaterThanOrEqual(2);
     expect(poolMaxHeuristic()).toBeLessThanOrEqual(8);
   });
 
-  it('fails fast with a structural diagnosis instead of waiting out the window', async () => {
+  it('a session plus a run needs ONE environment: the run binds through the session', async () => {
+    const { cli } = ctx();
+    const up = await cli(['up', '--json']);
+    expect(up.json?.state).toBe('hot');
+    const run = await cli(['run', 'ok', '--json']);
+    expect(run.json?.ok).toBe(true);
+    expect(run.json?.envId).toBe(up.json?.envId);
+  }, 60_000);
+
+  it('a second holder on the same worktree fails fast with a structural diagnosis instead of waiting out the window', async () => {
     const { cli } = ctx();
     const up = await cli(['up', '--json']);
     expect(up.json?.state).toBe('hot');
 
     const started = Date.now();
-    const run = await cli(['run', 'ok', '--json']);
+    const other = await cli(['up', '--holder', 'someone-else', '--json']);
     const elapsed = Date.now() - started;
 
-    const msg = String((run.json?.error as { message?: string })?.message ?? '');
-    expect(msg).toContain('queueing cannot succeed');
-    expect(msg).toContain('BACKLOT_POOL_MAX >= 2');
-    expect(msg).toMatch(/held by/); // names the blocking lease
+    const msg = String((other.json?.error as { message?: string })?.message ?? '');
+    expect(msg).toContain('exactly one environment');
+    expect(msg).toMatch(/held by '/); // names the blocking lease
     // The whole point: it must NOT burn the 30s wait on something impossible.
     expect(elapsed).toBeLessThan(15_000);
   }, 60_000);
@@ -84,10 +95,10 @@ describe('pool capacity diagnostics', () => {
   it('still queues normally when a lease will expire inside the window', async () => {
     const { cli } = ctx();
     // A short-TTL session lease frees the env well inside the wait window, so
-    // this must WAIT and succeed rather than fail fast.
+    // a second holder must WAIT and succeed rather than fail fast.
     await cli(['up', '--ttl', '0.05', '--json']); // 3s
-    const run = await cli(['run', 'ok', '--json']);
-    expect(run.json?.ok).toBe(true);
+    const other = await cli(['up', '--holder', 'someone-else', '--json']);
+    expect(other.json?.state).toBe('hot');
   }, 90_000);
 });
 

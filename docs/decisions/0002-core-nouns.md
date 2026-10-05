@@ -1,6 +1,6 @@
 # 0002. Core nouns: Stack, Substrate, Environment, Binding, Lease, Run
 
-- Status: Accepted — amended by [0032](0032-environments-run-in-the-callers-worktree.md): an Environment runs in the caller's worktree instead of owning a tree copy, and a Binding is no longer an immutable snapshot
+- Status: Accepted — amended by [0032](0032-environments-run-in-the-callers-worktree.md): an Environment runs in the caller's worktree instead of owning a tree copy, a worktree has exactly one Environment, and a Binding is no longer an immutable snapshot
 
 ## Decision
 

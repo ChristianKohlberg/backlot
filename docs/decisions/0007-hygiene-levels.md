@@ -1,6 +1,6 @@
 # 0007. Hygiene levels: reuse / reset-data / pristine, with auto-escalation
 
-- Status: Accepted — amended by [0032](0032-environments-run-in-the-callers-worktree.md): `reset-data` restores data only, and `pristine` re-runs every upkeep rule and build in place instead of deleting a tree
+- Status: Accepted — amended by [0032](0032-environments-run-in-the-callers-worktree.md): `reset-data` restores data only, and `pristine` re-runs every upkeep rule in place instead of deleting a tree (builds run on every bind anyway)
 
 ## Decision
 

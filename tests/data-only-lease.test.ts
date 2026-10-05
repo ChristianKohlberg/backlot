@@ -196,12 +196,17 @@ describe('a data-only lease hands over a seeded store and nothing else', () => {
     expect(notes(url)).toEqual(['one', 'two', 'three']);
   }, 120_000);
 
-  it('gives two holders two separate stores — a database per consumer', async () => {
+  it('gives two worktrees two separate stores — a database per consumer', async () => {
     // This is the actual ask: a per-run database on the pooled server rather
-    // than a container per test collection.
-    const { cli, journal } = ctx();
+    // than a container per test collection. A worktree has exactly one
+    // environment (decision 0032), so the consumer unit is the worktree.
+    const { cli, journal, wt } = ctx();
+    const wt2 = mkdtempSync(join(tmpdir(), 'runly-dataonly-wt2-'));
+    cleanups.push(() => rmSync(wt2, { recursive: true, force: true }));
+    for (const f of ['srv.mjs', 'seed.mjs', 'stack.yaml']) writeFileSync(join(wt2, f), readFileSync(join(wt, f)));
+    execFileSync('git', ['init', '-q'], { cwd: wt2 });
     const a = await cli(['up', '--data-only', '--json']);
-    const b = await cli(['up', '--data-only', '--holder', 'lane-2', '--json']);
+    const b = await cli(['up', '--data-only', '--json'], wt2);
     expect(a.code, a.stderr).toBe(0);
     expect(b.code, b.stderr).toBe(0);
     expect(a.json?.envId).not.toBe(b.json?.envId);

@@ -213,7 +213,7 @@ describe('per-worktree state outlives environments, not its worktree (decision 0
       writeFileSync(join(dir, id, file), JSON.stringify({ root, fingerprints: {} }));
     };
     record('gone-stack', join(dir, 'no-such-worktree'));
-    record('gone-hashes-only', join(dir, 'also-gone'), 'hashes.json');
+    record('gone-triggers-only', join(dir, 'also-gone'), 'triggers.json');
     record('live-stack', live);
     record('gone-but-leased', join(dir, 'gone-too'));
     mkdirSync(join(dir, 'unreadable'));

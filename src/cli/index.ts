@@ -21,22 +21,26 @@ Usage:
   runly up [service...] [--watch] [--reset-data|--pristine] [--ttl <minutes>] [--holder-pid <pid>]
                           (no service = whole app; named services start only that
                            slice plus its depends_on closure)
-                          session lease: upkeep, build and start services IN this
-                          worktree, print context
+                          session lease on THIS worktree's one environment: upkeep,
+                          build and start services in the worktree, print context.
+                          Already running in that shape: reused as-is (no rebuild)
   runly up --data-only  lease the DATASTORES alone — a seeded database, no
                           services, no builds. For test lanes that need a
                           database per run rather than a whole application.
                           Connection strings arrive in the same ctx blob.
   runly run <check> [--pristine] [--detach]
-                          run lease: bind -> execute the check -> verdict -> release
+                          against this worktree's environment: reset its data (a
+                          fresh clone of the template), build and start, execute
+                          the check, verdict. A session lease on it is used and
+                          kept; otherwise a run lease is taken and released.
                           --detach: submit-and-poll — returns a jobId immediately
   runly job <jobId>     poll a detached run (pending|running|done + verdict)
   runly ctx             the consumer context blob (URLs, logins, conn strings)
-  runly sync            re-converge the lease to the worktree as it is now
-                          (hot-reload services are kept; others rebuild/restart)
-  runly warm            run this worktree's upkeep rules and service builds now —
-                          no lease, no services. For an idle worktree just moved
-                          to a new commit, so the next bind finds warm caches
+  runly sync            apply the worktree as it is now: due upkeep, then rebuild
+                          and restart (all-hot-reload stacks keep their services)
+  runly warm            run this worktree's due upkeep rules and its service
+                          builds now — no lease, no services. For an idle worktree
+                          just moved to a new commit
   runly exec <cmd...>   run a command in the worktree with the lease's ports,
                           URLs and connection strings in its environment
   runly logs <service> [--lines N]
@@ -411,8 +415,6 @@ async function main(): Promise<void> {
       const w = res.data as {
         ok: boolean;
         root: string;
-        sourceFiles: number;
-        fingerprintMs: number;
         durationMs: number;
         steps: Array<{ kind: string; index?: number; when?: string; service?: string; status: string; durationMs: number; reason?: string }>;
         failure: RpcError | null;
@@ -423,7 +425,7 @@ async function main(): Promise<void> {
         // upkeep COMMAND is never printed — commands may carry credentials —
         // only the rule's position and its trigger glob.
         const secs = (ms: number) => `${(ms / 1000).toFixed(1)}s`;
-        console.log(`warming ${w.root} (${w.sourceFiles} source files fingerprinted in ${secs(w.fingerprintMs)})`);
+        console.log(`warming ${w.root}`);
         for (const st of w.steps) {
           const what = st.kind === 'upkeep' ? `upkeep rule ${st.index} (${st.when})` : `build '${st.service}'`;
           console.log(`  ${what}: ${st.status}${st.status === 'ran' || st.status === 'failed' ? ` in ${secs(st.durationMs)}` : ''}${st.reason ? ` — ${st.reason}` : ''}`);

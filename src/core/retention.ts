@@ -140,7 +140,7 @@ export async function pruneTemplates(p: Policy, root = templatesRoot(), protecte
 }
 
 /**
- * Per-worktree state (decision 0032 — the source-hash cache and the worktree
+ * Per-worktree state (decision 0032 — the trigger-file hash cache and the upkeep
  * ledger) for a worktree that no longer exists. It must outlive every
  * environment, because `runly warm` writes it for a worktree with none; so it
  * goes only when its recorded root is gone AND no environment still names the
@@ -151,7 +151,7 @@ export function pruneWorktreeState(journal: Journal, root = worktreesRoot()): nu
   for (const stackId of entriesOf(root)) {
     const dir = join(root, stackId);
     try {
-      const recordedRoot = ['ledger.json', 'hashes.json']
+      const recordedRoot = ['ledger.json', 'triggers.json']
         .map((f) => {
           try {
             return (JSON.parse(readFileSync(join(dir, f), 'utf8')) as { root?: unknown }).root;

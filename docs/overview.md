@@ -52,9 +52,11 @@ Two inversions carry the whole design:
   When an agent crashes or a
   human forgets, the lease lapses and the environment returns to the pool **warm**, heat
   intact. Abandonment costs nothing, so nothing gets hoarded.
-- **Environments run in your worktree; ports never move.** Services build and run where
-  you work, so your warm caches are theirs and no source is copied
-  ([decision 0032](decisions/0032-environments-run-in-the-callers-worktree.md)). What an
+- **Environments run in your worktree — one per worktree; ports never move.** Services
+  build and run where you work, so your warm caches are theirs, no source is copied, and
+  runly keeps no build cache of its own — your build tools decide what is current
+  ([decision 0032](decisions/0032-environments-run-in-the-callers-worktree.md)). A
+  `run` uses the same environment as your session, resetting its data first. What an
   environment keeps to itself — ports (and so URLs), database namespace, logs — is
   stable for its lifetime.
 
@@ -68,7 +70,7 @@ reclaim — lease expiry, recycle, even losing the machine — safe by construct
 stateDiagram-v2
     [*] --> pristine : provision (templates + shared caches)
     pristine --> hot : bind + start (seconds; minutes on first build)
-    hot --> hot : rebind (fingerprint + upkeep, seconds)
+    hot --> hot : sync (due upkeep + your builds, seconds)
     hot --> warm : idle TTL — services stop, caches stay
     warm --> hot : next verb (start + ready-wait)
     hot --> degraded : service flaps past its restart budget
@@ -77,13 +79,14 @@ stateDiagram-v2
 ```
 
 Binding converges an environment to what you asked for instead of restoring a snapshot:
-a fingerprint ledger replays only the upkeep rules whose triggers changed (lockfile →
-install, migrations → migrate), and data states restore from baked templates in seconds.
+a fingerprint ledger replays only the upkeep rules whose trigger files changed
+(lockfile → install, migrations → migrate), your build commands run and decide for
+themselves what is current, and data states restore from baked templates in seconds.
 Hygiene is per-bind: `reuse` keeps everything (inspection), `reset-data` restores the
 data template and nothing else (the default for runs), `--pristine` re-runs every
-upkeep rule and build in place (merge-grade verdicts; it never deletes anything in your
-worktree). `runly warm` does the upkeep and builds ahead of time, with no lease, for an
-idle worktree moved to a new commit. Two consecutive bind failures on the same environment
+upkeep rule in place (merge-grade verdicts; it never deletes anything in your
+worktree). `runly warm` does the due upkeep and the builds ahead of time, with no lease,
+for an idle worktree moved to a new commit. Two consecutive bind failures on the same environment
 auto-escalate the next bind to pristine — the standard defense against stale-cache
 heisenbugs.
 

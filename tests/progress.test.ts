@@ -69,7 +69,7 @@ describe('streaming progress', () => {
     // survives the recycle above, so a plain `up` would find the rule fresh.
     const r = await run(['up', '--pristine', '--progress', '--json']);
     const phases = r.stderr.replace(/\r/g, '\n');
-    expect(phases).toMatch(/fingerprinting worktree/);
+    expect(phases).toMatch(/acquiring this worktree's environment/);
     expect(phases).toMatch(/starting 'web'/);
     expect(phases).toMatch(/upkeep rule 1: starting/);
     expect(phases).toMatch(/upkeep rule 1: finished/);

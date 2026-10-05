@@ -26,15 +26,17 @@ Consequence: a group kill (`killGroupVerified`) is not sufficient teardown — a
 
 Supervision initially records top-level service pids; reclamation also records discovered survivors. `reapPids` in `src/daemon/supervisor.ts` owns their identity and group-preservation contract. For anything that also scrubbed the tag, `reapEnvTree` reaps by cwd (`scanByCwd`, which matches a `(deleted)` cwd too) — but only inside the env's PRIVATE directory and only at teardown. Services run in the caller's worktree (decision 0032), and cwd there is never ownership: the agent's shells and builds sit in it. Never point a cwd scan at a worktree.
 
-## Environments run in the caller's worktree — the copy is gone
+## Environments run in the caller's worktree — one per worktree, no build cache
 
 Decision 0032 removed the projection: services, builds, upkeep, checks, `exec` and `auth.token` all run in the stack root. Sharp edges:
 
-- **Never delete in the worktree.** Teardown removes only `env.root`, and `isPrivateEnvDir` checks it is under `envs/` and does not contain `env.stackRoot` first. `reset-data` touches data only; `pristine` clears the worktree LEDGER (re-run everything), never files.
-- **The ledger is split.** Command upkeep rules and `@built:<service>` stamps live per worktree in `worktrees/<stack>/ledger.json` (`src/core/tree-ledger.ts`); `@source` and `@` built-ins stay on the env row. A per-env copy of a worktree fact goes stale the moment a sibling env (or `runly warm`) installs or builds — that was the reason for the split, do not fold it back.
-- **Lock order: env lock(s) first, then the worktree lock (`treeLocked`).** Binds take one env lock then the worktree lock around upkeep and builds; `warm` takes every env lock of the stack (sorted, `envsLocked`) then the worktree lock. Taking them the other way round deadlocks against a bind.
-- **Source identity is a fingerprint, not a copy** (`src/core/worktree.ts`, on a worker thread). Declared `caches:` are excluded from it; an upkeep command that ran triggers a re-fingerprint BEFORE builds, never after (a later one could vouch for an edit the build never compiled).
-- `tests/in-place.test.ts` (no copy, teardown leaves the worktree, warm, warm's locking) and `tests/worktree.test.ts` (fingerprint) are the regression tests.
+- **Never delete in the worktree.** Teardown removes only `env.root`, and `isPrivateEnvDir` checks it is under `envs/` and does not contain `env.stackRoot` first. `reset-data` touches data only; `pristine` clears the worktree's upkeep LEDGER (re-run every rule), never files.
+- **One environment per worktree.** `tryClaim` creates an environment only when the stack has none; a second holder queues for it, and `worktreeHold` makes the refusal structural (fail fast, naming the holder) when the lease outlasts the wait. `run` binds THROUGH a live session lease (reset-data, whole app, lease kept) and only takes — and ends — its own run lease when there is none. Never reintroduce a second environment for a stack; `drainSurplusEnvs` recycles the ones an older journal left.
+- **runly caches no builds.** There is no `@source`, no source fingerprint, no build stamp: a `build:` runs on every bind that starts its service (and on every `warm`). A reuse (`up` on a healthy env in the requested shape with nothing changed) builds nothing; `sync` passes `restart` and always rebuilds unless every service is `hot_reload`.
+- **Upkeep reads only its trigger files.** `triggerSet` (`src/core/upkeep.ts`) lists the files the `when:` globs match and hashes them, stat-gated, with a small cache in `worktrees/<stack>/triggers.json`. Keep it scoped to trigger files — a whole-worktree hash is exactly what was removed.
+- **The upkeep ledger is the worktree's.** Command rules live in `worktrees/<stack>/ledger.json` (`src/core/tree-ledger.ts`); `@` built-ins stay on the env row. `warm` writes the same ledger a bind reads.
+- **Lock order: env lock first, then the worktree lock (`treeLocked`).** Binds take the env lock then the worktree lock around upkeep and builds; `warm` takes the stack's env lock(s) (`envsLocked`) then the worktree lock — it can run before any env exists, which is why the worktree lock is still needed. Taking them the other way round deadlocks against a bind.
+- `tests/in-place.test.ts` (no copy, teardown leaves the worktree, warm, one env per worktree, sync rebuilds, surplus drain) and `tests/worktree.test.ts` (trigger enumeration and hashing) are the regression tests.
 
 ## Publishers own their dialect — the engine must not learn one
 
