@@ -11,7 +11,8 @@ import { snapshotOutputs } from '../core/worktree.js';
 import { clearTreeLedger, pickEnvKeys, pickTreeKeys, readTreeLedger, worktreeStateDir, writeTreeLedger } from '../core/tree-ledger.js';
 import { selectPresets } from '../core/presets.js';
 import { runUpkeep, templateBakeKeys, triggerSet, type UpkeepStep } from '../core/upkeep.js';
-import { freePort, probeFree } from '../core/ports.js';
+import { allocateInBlock, blockConflicts, ephemeralRange, inBlock, internalBlock, publicBlock, tunnelBlock } from '../core/ports.js';
+import { PortInUse, ProxyHub } from './proxy.js';
 import { envsRoot, stateRoot, templatesRoot, retiredTemplatesRoot } from '../core/paths.js';
 import { BrokerError, template, templateEnv, now, shortId } from '../core/util.js';
 import { callerEnvSpec, requireCallerEnv, selectCallerEnv, serviceCallerEnv, validateCallerEnv } from '../core/caller-env.js';
@@ -106,6 +107,8 @@ export class Engine {
   constructor(private readonly reapServiceGroup: typeof killGroupVerified = killGroupVerified) {}
 
   readonly journal = new Journal();
+  /** The L4 proxy holding every environment's public ports (decision 0033). */
+  readonly proxy = new ProxyHub();
   private supervisors = new Map<string, EnvSupervisor>();
   private lastSweep = now();
   private lastRetention = now();
@@ -306,6 +309,20 @@ export class Engine {
     if (gc.reclaimed.length) {
       logEvent({ level: 'warn', kind: 'gc', detail: `reclaimed ${gc.reclaimed.length} orphaned process(es) at startup` });
     }
+    // Take the public ports back (decision 0033): the proxy held them in the
+    // previous daemon life and must hold them again before anyone else can.
+    // Nothing runs behind them yet — recovery stopped every service — so they
+    // refuse connections until the next bind. A journal from runly 0.13 has
+    // ports outside the public block; those are reallocated here, once.
+    for (const warning of blockConflicts()) logEvent({ level: 'warn', kind: 'proxy', detail: warning });
+    for (const env of this.journal.allEnvs()) {
+      if (env.state === 'recycling') continue;
+      try {
+        await this.ensureProxies(env);
+      } catch (err) {
+        logEvent({ level: 'warn', kind: 'proxy', envId: env.id, detail: `could not hold its public ports at startup (the next bind retries): ${String((err as Error).message ?? err)}` });
+      }
+    }
   }
 
   /**
@@ -399,20 +416,13 @@ export class Engine {
     const id = `${stack.id}-e${n}`;
     const dirs = this.envDirs(id);
     mkdirSync(dirs.data, { recursive: true });
-    // freePort asks the OS for an unused port and immediately closes the
-    // listener, so nothing stops the SAME port being handed to the next
-    // environment moments later — two warm envs would then collide the first
-    // time both went hot. Exclude everything already recorded pool-wide.
-    const taken = new Set<number>();
-    for (const e of this.journal.allEnvs()) for (const p of Object.values(e.ports)) taken.add(p);
+    // Public ports come from the public block (decision 0033), excluding every
+    // port any environment has recorded — a port probed free and released at
+    // once could otherwise be handed to the next environment moments later.
+    // The proxy listener the bind opens is what then holds it.
     const ports: Record<string, number> = {};
     for (const [, spec] of Object.entries(stack.manifest.services)) {
-      if (spec.port && !(spec.port in ports)) {
-        let port = await freePort();
-        for (let attempt = 0; attempt < 50 && taken.has(port); attempt++) port = await freePort();
-        taken.add(port);
-        ports[spec.port] = port;
-      }
+      if (spec.port && !(spec.port in ports)) ports[spec.port] = await this.allocPublicPort(new Set(Object.values(ports)));
     }
     const env: EnvRow = {
       id, stack: stack.id, stackRoot: stack.root, state: 'warm', root: dirs.root,
@@ -422,6 +432,89 @@ export class Engine {
     };
     this.journal.saveEnv(env);
     return env;
+  }
+
+  /**
+   * A public port nobody holds: inside the public block, recorded on no
+   * environment row, not one this daemon listens on, and probed free (which
+   * also skips a port a tunnel or another process binds on any address).
+   */
+  private async allocPublicPort(exclude: Set<number> = new Set()): Promise<number> {
+    const taken = new Set<number>([...exclude, ...this.proxy.heldPorts()]);
+    for (const e of this.journal.allEnvs()) for (const p of Object.values(e.ports)) taken.add(p);
+    const block = publicBlock();
+    const port = await allocateInBlock(block, taken);
+    if (port === undefined) {
+      throw new BrokerError('env-error', `no free public port left in ${block.lo}-${block.hi} — recycle unused environments ('runly status' lists them) or widen BACKLOT_PORT_RANGE`, 'pool');
+    }
+    return port;
+  }
+
+  /** A fresh internal port for one service start (decision 0033). */
+  private async allocInternalPort(exclude: Set<number>): Promise<number> {
+    const block = internalBlock();
+    const port = await allocateInBlock(block, new Set([...exclude, ...this.proxy.assignedInternalPorts()]));
+    if (port === undefined) {
+      throw new BrokerError('env-error', `no free internal port left in ${block.lo}-${block.hi} — something else is listening there; widen BACKLOT_INTERNAL_PORT_RANGE`, 'pool');
+    }
+    return port;
+  }
+
+  /**
+   * Make the proxy hold every public port of `env` (decision 0033). Idempotent.
+   *
+   * A recorded port is kept whenever it can be: the whole point is that it is
+   * stable. It moves only when it cannot be held — it lies outside the public
+   * block (a journal from runly 0.13, whose ports came from the OS ephemeral
+   * range), or another process took it while no listener held it (the daemon
+   * was down). A move is saved to the journal at once and reported; returns
+   * one line per moved port, empty when nothing moved.
+   */
+  private async ensureProxies(env: EnvRow): Promise<string[]> {
+    const moved: string[] = [];
+    const block = publicBlock();
+    for (const [key, port] of Object.entries(env.ports)) {
+      if (this.proxy.holds(env.id, key, port)) continue;
+      let why: string | undefined;
+      if (!inBlock(port, block)) {
+        why = `outside the public block ${block.lo}-${block.hi} (allocated by an older runly)`;
+      } else {
+        try {
+          await this.proxy.listen(env.id, key, port);
+          continue;
+        } catch (err) {
+          if (!(err instanceof PortInUse)) throw err;
+          why = 'taken by another process while runly was not holding it';
+        }
+      }
+      let next: number | undefined;
+      const tried = new Set<number>();
+      for (let attempt = 0; attempt < 10 && next === undefined; attempt++) {
+        const candidate = await this.allocPublicPort(tried);
+        tried.add(candidate);
+        try {
+          await this.proxy.listen(env.id, key, candidate);
+          next = candidate;
+        } catch (err) {
+          if (!(err instanceof PortInUse)) throw err;
+        }
+      }
+      if (next === undefined) {
+        throw new BrokerError('env-error', `could not hold a public port for '${key}' on environment ${env.id}: every candidate was taken`, 'pool');
+      }
+      env.ports[key] = next;
+      const line = `public port for '${key}' moved ${port} → ${next}: the old one was ${why}`;
+      moved.push(line);
+      logEvent({ level: 'warn', kind: 'proxy', envId: env.id, detail: line });
+    }
+    if (moved.length > 0) {
+      const live = this.journal.getEnv(env.id);
+      if (live) {
+        live.ports = { ...live.ports, ...env.ports };
+        this.journal.saveEnv(live);
+      }
+    }
+    return moved;
   }
 
   /** The operation in flight on an environment, or null when nothing owns it. */
@@ -931,11 +1024,20 @@ export class Engine {
 
   // ---------------------------------------------------------------- bind
 
-  private templateCtx(stack: Stack, env: EnvRow) {
+  /**
+   * The values `{{…}}` resolves to. Everything is PUBLIC (decision 0033): the
+   * ports and URLs users, builds, exec and other services see are the proxy's.
+   * The one exception is a service's own command line and env, given
+   * `own = { key, port }`: there `{{ports.<own key>}}` is the INTERNAL port the
+   * service must listen on. `{{public_ports.<key>}}` is always the public one,
+   * for a service that has to advertise its own address.
+   */
+  private templateCtx(stack: Stack, env: EnvRow, own?: { key: string; port: number }) {
     const services: Record<string, { url: string }> = {};
     for (const [name, spec] of Object.entries(stack.manifest.services)) {
       if (spec.port) services[name] = { url: `http://localhost:${env.ports[spec.port]}` };
     }
+    const ports = own ? { ...env.ports, [own.key]: own.port } : env.ports;
     const datastores: Record<string, { url: string; ns: string }> = {};
     const dirs = this.envDirs(env.id);
     const h: DsHandle = { envId: env.id, cwd: env.stackRoot, dataDir: dirs.data };
@@ -943,7 +1045,7 @@ export class Engine {
       const ds = makeDatastore(name, spec, stack.id);
       datastores[name] = { url: ds.url(h), ns: ds.ns(h) };
     }
-    return { ports: env.ports, services, datastores };
+    return { ports, public_ports: env.ports, services, datastores };
   }
 
   private supervisor(env: EnvRow): EnvSupervisor {
@@ -968,6 +1070,10 @@ export class Engine {
           const s = this.supervisors.get(env.id);
           if (s) this.journal.updateServicePids(env.id, s.pids());
         },
+        // Nothing listens behind its public port any more. A restart has
+        // already marked the port `starting`, which this leaves alone, so
+        // connections keep being held until the new process is ready.
+        (service) => this.proxy.serviceStopped(env.id, service),
       );
       this.supervisors.set(env.id, sup);
     }
@@ -999,6 +1105,17 @@ export class Engine {
   }
 
   private async bindAndStart(stack: Stack, envSnapshot: EnvRow, hygiene: Hygiene, kind: LeaseKind, onProgress?: Progress, requestedServices?: string[], freshClaim = false, requestedDataOnly?: boolean, callerEnv?: unknown, requestedPresets?: unknown): Promise<{ env: EnvRow; previewNotice?: string; bindDiagnostics: BindDiagnostics }> {
+    try {
+      return await this.bindAndStartInner(stack, envSnapshot, hygiene, kind, onProgress, requestedServices, freshClaim, requestedDataOnly, callerEnv, requestedPresets);
+    } finally {
+      // A public port marked `starting` whose service never became ready (a
+      // failed build, a boot timeout) must not keep holding connections until
+      // they time out: they are closed, as a client found it before the proxy.
+      this.proxy.settle(envSnapshot.id);
+    }
+  }
+
+  private async bindAndStartInner(stack: Stack, envSnapshot: EnvRow, hygiene: Hygiene, kind: LeaseKind, onProgress?: Progress, requestedServices?: string[], freshClaim = false, requestedDataOnly?: boolean, callerEnv?: unknown, requestedPresets?: unknown): Promise<{ env: EnvRow; previewNotice?: string; bindDiagnostics: BindDiagnostics }> {
     const say = onProgress ?? (() => undefined);
     const trace = new BindTrace();
     // Re-read under the env lock: the snapshot captured during acquire may be
@@ -1078,18 +1195,18 @@ export class Engine {
     // undefined lookup — permanently, for envs created before the edit.
     // Existing keys are never reassigned, so stability holds.
     let addedPort = false;
-    const takenPorts = new Set<number>();
-    for (const e of this.journal.allEnvs()) for (const p of Object.values(e.ports)) takenPorts.add(p);
     for (const spec of Object.values(stack.manifest.services)) {
       if (spec.port && !(spec.port in env.ports)) {
-        let port = await freePort();
-        for (let attempt = 0; attempt < 50 && takenPorts.has(port); attempt++) port = await freePort();
-        takenPorts.add(port);
-        env.ports[spec.port] = port;
+        env.ports[spec.port] = await this.allocPublicPort();
         addedPort = true;
       }
     }
     if (addedPort) this.journal.saveEnv(env);
+    // The proxy holds every public port from here on (decision 0033). A port it
+    // cannot hold moves, and a service that templates another one's address
+    // then needs a restart to see the new number — hence a full bind below.
+    const portsMoved = await this.ensureProxies(env);
+    for (const line of portsMoved) say(line);
     if (hygiene === 'pristine') {
       say('preparing a pristine environment');
       await this.stopForBind(env);
@@ -1172,7 +1289,9 @@ export class Engine {
     if (manifestChanged) trace.result.reasons.push('manifest-changed');
     if (presetSelectionChanged) trace.result.reasons.push('datastore-preset-changed');
     if (hygiene !== 'reuse') trace.result.reasons.push(`hygiene-${hygiene}`);
+    if (portsMoved.length > 0) trace.result.reasons.push('public-port-moved');
     const keepRunning =
+      portsMoved.length === 0 &&
       !manifestChanged &&
       !inputsChanged &&
       !presetsChanged &&
@@ -1190,8 +1309,8 @@ export class Engine {
     // output changed; the slice's other members are already running, so they
     // count as started for depends_on.
     const startSlice = async (only: Set<string>): Promise<void> => {
-    const ctx = this.templateCtx(stack, env);
     const sup = this.supervisor(env);
+    const internalTaken = new Set<number>();
     const started = new Set<string>([...active].filter((n) => !only.has(n)));
     // Only the requested slice (already a depends_on closure, so every dep of a
     // member is also here and the topological order below still resolves).
@@ -1202,62 +1321,29 @@ export class Engine {
       const ready = pending.filter(([, s]) => (s.depends_on ?? []).every((d) => started.has(d)));
       if (ready.length === 0) throw new BrokerError('work-error', 'depends_on cycle in runly.yml', 'manifest');
       for (const [name, spec] of ready) {
+        // The service listens on a fresh INTERNAL port (decision 0033); the
+        // proxy keeps the public one and forwards to it once it is ready.
+        let internal: number | undefined;
         if (spec.port) {
           // The allocation loop at the top of this bind fills every declared
-          // port key, so a miss here is a corrupted port ledger — classify it
-          // instead of crashing on the undefined a few lines down.
-          const port = env.ports[spec.port];
-          if (port === undefined) {
+          // port key, so a miss here is a corrupted port ledger — classify it.
+          if (env.ports[spec.port] === undefined) {
             throw new BrokerError('env-error', `environment ${env.id} has no port recorded for service '${name}' — the port ledger is inconsistent; try 'runly pool recycle ${env.id}'`, name);
           }
-          // Grace window: the previous holder may be this env's own just-
-          // signalled service still tearing down (SIGTERM handlers, FD
-          // flushes). Only after the window is the port genuinely foreign.
-          let free = false;
-          for (let attempt = 0; attempt < 10 && !(free = await probeFree(port)); attempt++) {
-            await new Promise((r) => setTimeout(r, 150));
-          }
-          if (!free) {
-            // Try to name the holder so the error is actionable. After
-            // reapEnvProcesses ran, any remaining tagged process survived our
-            // SIGKILL (extremely unlikely) or is truly foreign (not from
-            // runly). Either way, naming it beats a bare port number.
-            let staleHint = '';
-            if (procScanSupported()) {
-              // Earlier iterations of this start loop already launched healthy
-              // services carrying the same tag — don't name our own. Exclude
-              // by group, not just leader pid: `sh -c` forks, so the real
-              // server is a same-group sibling of the recorded leader.
-              const own = new Set(Object.values(sup.pids()).map((r) => r.pid));
-              const tagged = scanTagged(stateRoot());
-              const leasedPreviews = this.leasedPreviewPids(tagged);
-              const stale = tagged.filter(
-                (p) => p.envId === env.id && !leasedPreviews.has(p.pid) && !own.has(p.pid) && !own.has(processGroup(p.pid) ?? -1),
-              );
-              if (stale.length > 0) {
-                staleHint = ` — surviving process(es): ${stale.map((p) => `pid ${p.pid} (${p.service})`).join(', ')}; run 'runly pool gc' to reclaim`;
-              }
-            }
-            throw new BrokerError(
-              'env-error',
-              // Name THIS environment in the remedy. A bare "try pool recycle"
-              // was read as an instruction to recycle the pool, which on a
-              // shared box tears down other people's live leases to fix one
-              // stuck port.
-              `port ${port} for service '${name}' is occupied${
-                staleHint || ` by a foreign process — 'runly pool gc' reclaims strays, or 'runly pool recycle ${env.id}' rebuilds just this environment`
-              }`,
-              name,
-            );
-          }
+          internal = await this.allocInternalPort(internalTaken);
+          internalTaken.add(internal);
+          this.proxy.starting(env.id, spec.port, name);
         }
+        const ctx = this.templateCtx(stack, env, spec.port && internal !== undefined ? { key: spec.port, port: internal } : undefined);
         // Template the COMMANDS too — ports/urls may ride in the run line itself
         // (e.g. `ng serve --port {{ports.web}}`), not only in env:.
         const resolved = { ...spec, run: template(spec.run, ctx) };
         const callerValues = serviceCallerEnv(spec, inputs.values);
         const serviceEnv = { ...templateEnv(spec.env, ctx), ...callerValues };
         sup.start(name, resolved, serviceEnv, Object.values(callerValues).filter((value): value is string => value !== undefined));
-        const url = spec.port ? `http://localhost:${env.ports[spec.port]}` : undefined;
+        // Readiness goes to the internal port, past the proxy: runly's own
+        // probes are never client activity.
+        const url = internal !== undefined ? `http://localhost:${internal}` : undefined;
         say(`starting '${name}', waiting until ready`);
         const readyStart = now();
         const beat = setInterval(() => say(`waiting for '${name}' … ${Math.round((now() - readyStart) / 1000)}s`), 3000);
@@ -1265,6 +1351,7 @@ export class Engine {
         try {
           await sup.waitReady(name, spec, url, serviceEnv);
           clearInterval(beat);
+          if (spec.port && internal !== undefined) this.proxy.up(env.id, spec.port, internal, name);
           say(`'${name}' ready`);
         } catch (err) {
           clearInterval(beat);
@@ -1334,12 +1421,16 @@ export class Engine {
       trace.result.reuse = 'restarted';
       trace.result.restarted = [...toRestart];
       trace.phase('stop');
+      // Hold, don't refuse: a client arriving while these restart waits on the
+      // public port and is forwarded once the new process is ready.
+      this.markStarting(env, stack, toRestart);
       await this.stopServicesForRestart(env, toRestart);
       trace.phase('ready');
       await startSlice(new Set(toRestart));
     } else {
     // Services must not hold open handles across a data restore or code change.
     trace.phase('stop');
+    this.markStarting(env, stack, [...active]);
     await this.stopForBind(env);
 
     // Data state: create-or-restore per hygiene (probe first — infra-error, not code blame).
@@ -1432,6 +1523,14 @@ export class Engine {
       previewNotice: forbiddenNotice ?? (await this.reconcilePreviewForBind(env, stack, active, say, { hygiene, portsReallocated: true })),
       bindDiagnostics: trace.finish(),
     };
+  }
+
+  /** The public ports of `services` hold new connections until their service is ready again. */
+  private markStarting(env: EnvRow, stack: Stack, services: string[]): void {
+    for (const name of services) {
+      const key = stack.manifest.services[name]?.port;
+      if (key) this.proxy.starting(env.id, key, name);
+    }
   }
 
   /** Run one service's build in the worktree. MUST run under treeLocked. */
@@ -1719,8 +1818,14 @@ export class Engine {
       state: env.state,
       lease: lease ? { id: lease.id, kind: lease.kind, hygiene: lease.hygiene, expiresAt: lease.expiresAt } : null,
       urls,
-      /** The environment's allocated ports by manifest key (`runly ctx --env` → RUNLY_PORT_<KEY>). */
+      /** The environment's PUBLIC ports by manifest key (`runly ctx --env` → RUNLY_PORT_<KEY>). */
       ports: { ...env.ports },
+      /**
+       * The proxy in front of each public port, by port key (decision 0033):
+       * state, client→server bytes and the last client byte's time. runly's
+       * own readiness probes bypass it and are never counted.
+       */
+      proxy: this.proxy.stats(env.id),
       previewUrls,
       /**
        * True when this lease is over the DATASTORES ONLY, so `urls` is empty by
@@ -2364,6 +2469,8 @@ export class Engine {
         lease?.holderPid === undefined ? null : sameProcess(lease.holderPid, lease.holderStart);
       return {
         id: e.id, stack: e.stack, state: e.state, ports: e.ports, bindCount: e.bindCount,
+        /** Proxy state and traffic per public port (decision 0033). */
+        proxy: this.proxy.stats(e.id),
         /** Where its services run: the caller's worktree (decision 0032). */
         worktree: e.stackRoot,
         lease,
@@ -2400,7 +2507,8 @@ export class Engine {
                   : 'free and quiesced — the next bind takes it and restarts its services',
       };
     });
-    return { pid: process.pid, envs, poolMaxTotal: POOL_MAX_TOTAL(), events: recentEvents(15) };
+    const ports = { public: publicBlock(), internal: internalBlock(), tunnel: tunnelBlock(), ephemeral: ephemeralRange(), conflicts: blockConflicts() };
+    return { pid: process.pid, envs, poolMaxTotal: POOL_MAX_TOTAL(), ports, events: recentEvents(15) };
   }
 
   /** Who a restart would make rebind: every live lease, named. */
@@ -2922,6 +3030,8 @@ export class Engine {
     if (this.isPrivateEnvDir(env)) rmSync(env.root, { recursive: true, force: true });
     else logEvent({ level: 'error', kind: 'teardown', envId: env.id, detail: `refused to delete ${env.root}: it is not a private environment directory under ${envsRoot()}, or it contains the worktree ${env.stackRoot}` });
     this.journal.deleteEnv(env.id);
+    // Its public ports go back to the block only now, with the row that recorded them.
+    this.proxy.closeEnv(env.id);
     if (lease) this.leaseInputs.delete(lease.id);
     this.appliedInputs.delete(env.id);
     this.appliedInputSpecs.delete(env.id);
@@ -3350,5 +3460,8 @@ export class Engine {
       fresh.servicePids = unreaped;
       this.journal.saveEnv(fresh);
     }
+    // The listeners go with the process anyway; closing them explicitly lets
+    // a successor daemon bind them the moment this one has stopped.
+    this.proxy.closeAll();
   }
 }

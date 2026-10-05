@@ -26,6 +26,11 @@ not just to read or edit code.
   rules whose trigger files changed, then runs your build commands (the build
   tool decides what is current; runly caches no builds) — **seconds, not
   minutes**. Your tests see the live worktree, edits made while they run included.
+- **URLs are stable and survive restarts.** The daemon holds each public port
+  (20000–29999) and proxies it to the service, so a request that arrives while
+  an `up` restarts a service waits until it is ready instead of failing. Always
+  take ports and URLs from `ctx`; the port a service process listens on is an
+  internal one that changes at every start.
 - **One lease kind: `up`.** You hold the env, its services stay running, you
   `up` again after edits, `exec`/`ctx`/`logs` against it, and `release` when done.
 - **runly runs no checks.** Run the repo's own tests yourself against the

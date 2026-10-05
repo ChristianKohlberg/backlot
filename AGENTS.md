@@ -38,6 +38,15 @@ Decision 0032 removed the projection: services, builds, upkeep, `exec` and `auth
 - **Lock order: env lock first, then the worktree lock (`treeLocked`).** Binds take the env lock then the worktree lock around upkeep and builds; `warm` takes the stack's env lock(s) (`envsLocked`) then the worktree lock — it can run before any env exists, which is why the worktree lock is still needed. Taking them the other way round deadlocks against a bind.
 - `tests/in-place.test.ts` (no copy, teardown leaves the worktree, warm, one env per worktree, output-based restarts, surplus drain) and `tests/worktree.test.ts` (trigger enumeration and hashing) are the regression tests.
 
+## Public ports are held by the daemon's proxy; services listen on internal ports
+
+Decision 0033: `src/daemon/proxy.ts` (`ProxyHub`) listens on every environment's public ports (127.0.0.1 + ::1) for the environment's life and pipes TCP to the internal port the service was started on (fresh per start, `allocInternalPort`). Sharp edges:
+
+- **Only a service's own `{{ports.<its key>}}` is internal** (`templateCtx(stack, env, own)`). Every other consumer — other services, builds, `exec`, `ctx`, preview — gets the public port; `{{public_ports.x}}` is always public. Readiness probes use the internal URL so they never count as activity.
+- **The engine drives the proxy state:** `markStarting` before a stop that a start will follow, `proxy.up` after `waitReady`, the supervisor's `onStopped` → `serviceStopped` (leaves `starting` alone), and `bindAndStart`'s `finally` → `settle` (a failed bind closes held connections). A new stop/start path must keep this, or clients are refused or held until timeout.
+- **`ensureProxies` is the only place a public port moves** (outside the public block = a 0.13 journal; or `PortInUse`). It runs in `recover()` after the gc and at every bind; a move forces a full bind. Listeners close only in `teardownClaimed` (after `deleteEnv`) and `shutdown()`.
+- Counters are in memory, per daemon life. `tests/proxy.test.ts` covers hold-across-restart, byte counting, WebSockets, block allocation, recovery re-bind, a foreign squatter and the 0.13 migration.
+
 ## Publishers own their dialect — the engine must not learn one
 
 `preview.publisher` selects an adapter; `src/drivers/preview.ts` holds the

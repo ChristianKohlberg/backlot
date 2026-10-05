@@ -67,7 +67,7 @@ names, and your own test command reads them:
 | Variable | Value |
 | --- | --- |
 | `RUNLY_ENV_ID` | the environment's id |
-| `RUNLY_PORT_<PORT>` | each allocated port, by its manifest key |
+| `RUNLY_PORT_<PORT>` | each public port, by its manifest key |
 | `RUNLY_URL_<SERVICE>` | each running service's URL |
 | `RUNLY_DATASTORE_<NAME>_URL` | each datastore's connection string |
 | `RUNLY_LOGIN_USER`, `RUNLY_LOGIN_PASSWORD` | the primary login, when the stack declares one |
@@ -145,6 +145,24 @@ knowing:
 - **One environment per worktree.** A second holder (`--holder`) of the same
   worktree waits for its environment — and is refused at once, naming the holder,
   when that lease outlasts the wait. Parallel lanes need separate worktrees.
+
+### Upgrading to 0.14 — ports ([decision 0033](docs/decisions/0033-the-daemon-holds-public-ports-behind-an-l4-proxy.md))
+
+- **The daemon now holds every environment's public port** and proxies TCP to the
+  service, which listens on a fresh internal port per start. Public ports come
+  from **20000–29999**, internal ones from **30000–31999**, derived tailnet
+  ports from **32000–32767** — all below the OS ephemeral range.
+- **Your environment's ports change once.** The first 0.14 daemon moves every
+  port a 0.13 journal recorded (they came from the ephemeral range) into the
+  public block and journals the new number. Re-read `ctx` after `runly update`;
+  a preview tunnel did not survive the daemon restart anyway — publish again.
+- **Nothing to change in a manifest that uses `{{ports.x}}`.** In a service's own
+  `run:`/`env:`, its own `{{ports.x}}` is now the internal port it must listen
+  on; everywhere else (other services, builds, `exec`, `ctx`) it is the public
+  port. A service that has to advertise its own public address uses the new
+  `{{public_ports.x}}`.
+- A pinned `--https-port`/`preview.https_port` keeps working anywhere, including
+  inside 20000–29999: tailscale binds the tailnet address, the proxy loopback.
 
 ### Upgrading to 0.13 — breaking ([decision 0032](docs/decisions/0032-environments-run-in-the-callers-worktree.md))
 
@@ -409,6 +427,29 @@ auth:
 
 Your tests are yours: `eval "$(runly ctx --env)" && pnpm e2e`.
 
+**Ports: public and internal.** Each `port:` key gets a **public** port for the
+environment's whole life (20000–29999), which the daemon listens on and pipes to
+the service ([decision 0033](docs/decisions/0033-the-daemon-holds-public-ports-behind-an-l4-proxy.md)).
+The service itself is started on a fresh **internal** port (30000–31999): in its
+own `run:` and `env:`, `{{ports.<its key>}}` is that internal port, so
+`ng serve --port {{ports.web}}` keeps working unchanged. Everywhere else —
+another service's `env:`, builds, `exec`, `ctx` — `{{ports.x}}` and
+`{{services.x.url}}` are public; `{{public_ports.x}}` is public everywhere.
+Because of that indirection:
+
+- the URL survives every restart, and a connection that arrives while its
+  service (re)starts is **held** until it is ready (up to
+  `BACKLOT_PROXY_HOLD_MS`, default 90 s), not refused;
+- traffic is counted: `ctx --json` and `status --json` report, per port,
+  `proxy: { state, clientBytes, lastActivityAt, open, held, accepted }`.
+  runly's own readiness probes bypass the proxy and never count;
+- it is pure TCP — WebSockets and any other protocol pass through.
+
+The blocks are configurable (`BACKLOT_PORT_RANGE`, `BACKLOT_INTERNAL_PORT_RANGE`,
+`BACKLOT_TUNNEL_PORT_RANGE`, form `LO-HI`); `status --json` shows them under
+`ports`. A public port moves only when it cannot be held — another process took
+it while the daemon was down — and the move is reported.
+
 An upkeep rule may set `timeout` in seconds, for example
 `{ when: Cargo.lock, run: cargo build --release, timeout: 1200 }`.
 Rules without it keep the 300-second default; `BACKLOT_CMD_TIMEOUT_S` overrides
@@ -552,8 +593,8 @@ sudo would move `tailscale serve` out of the process group and environment it
 reaps by.
 
 **Leave `https_port` unset unless you mean it.** Unset, the port is derived from
-the environment id and service (in 21000–21999, past anything this machine
-already serves), so the same environment gets the same address every time it
+the environment id and service (in the tunnel block 32000–32767, past anything
+this machine already serves), so the same environment gets the same address every time it
 publishes. Pin it only for an address a human has to remember, and only where
 one environment of the stack publishes at a time; a pinned port that is already
 served is refused, not taken over.

@@ -166,7 +166,7 @@ describe('caller environment inputs', () => {
   it('keeps a templated manifest default for an omitted optional input and masks the daemon without one', async () => {
     const f = fixture();
     writeFileSync(join(f.tree, 'backlot.yml'), readFileSync(join(f.tree, 'backlot.yml'), 'utf8')
-      .replace("env: { PORT: '{{ports.web}}' }", "env: { PORT: '{{ports.web}}', TEST_CALLER_KEY: 'default-{{ports.web}}' }"));
+      .replace("env: { PORT: '{{ports.web}}' }", "env: { PORT: '{{ports.web}}', TEST_CALLER_KEY: 'default-{{public_ports.web}}' }"));
     // Boot the daemon with a same-named value: the manifest default must win over it.
     expect((await f.cli(['status'], { TEST_CALLER_KEY: 'stale-daemon-value' }, f.root)).code).toBe(0);
     const defaulted = await f.cli(['up']);
@@ -183,7 +183,7 @@ describe('caller environment inputs', () => {
     expect((await f.response(returned.json)).value).toBe(`default-${port}`);
     // Drop the default again: omission now masks the daemon's own value.
     writeFileSync(join(f.tree, 'backlot.yml'), readFileSync(join(f.tree, 'backlot.yml'), 'utf8')
-      .replace(", TEST_CALLER_KEY: 'default-{{ports.web}}'", ''));
+      .replace(", TEST_CALLER_KEY: 'default-{{public_ports.web}}'", ''));
     const masked = await f.cli(['up']);
     expect(masked.code, masked.stderr + masked.stdout).toBe(0);
     expect((await f.response(masked.json)).value).toBeNull();
