@@ -28,6 +28,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Journal } from '../src/core/journal.js';
 import { procScanSupported, scanTagged, scanByCwd } from '../src/core/procscan.js';
+import { disposeStateSync } from './support/leaks.js';
 
 const repo = join(import.meta.dirname, '..');
 const CLI = join(repo, 'dist', 'cli', 'index.js');
@@ -76,7 +77,7 @@ function ctx(extraEnv: Record<string, string> = {}) {
         /* gone */
       }
     }
-    rmSync(stateDir, { recursive: true, force: true });
+    disposeStateSync(stateDir);
     rmSync(wt, { recursive: true, force: true });
   });
   return { stateDir, wt, cli, journal };

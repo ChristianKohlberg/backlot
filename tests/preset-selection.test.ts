@@ -4,6 +4,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync,
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
+import { disposeStateSync } from './support/leaks.js';
 const CLI = join(import.meta.dirname, '../dist/cli/index.js');
 
 function fixture(multi = false) {
@@ -26,7 +27,7 @@ db.prepare('INSERT INTO marker VALUES (?)').run(process.argv[3]);db.close();\n`)
   const mutate = (ctx:any,name='main') => { const db=new DatabaseSync(ctx.datastores[name].url);db.exec("UPDATE marker SET value='user-data'");db.close(); };
   const cleanup = async()=>{
     if(existsSync(join(state,'daemon.pid'))){const pid=Number(readFileSync(join(state,'daemon.pid'),'utf8'));await cli(['daemon','stop']);for(let i=0;i<200;i++){try{process.kill(pid,0);}catch{break;}await new Promise(r=>setTimeout(r,50));}}
-    rmSync(root,{recursive:true,force:true});
+    disposeStateSync(root);
   };
   return {root,state,tree,env,cli,value,mutate,cleanup};
 }

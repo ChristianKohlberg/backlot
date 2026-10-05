@@ -13,6 +13,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { Journal } from '../src/core/journal.js';
 import { killGroupVerified } from '../src/daemon/supervisor.js';
 import { scanTagged, procScanSupported, startTime, sameProcess, groupAlive } from '../src/core/procscan.js';
+import { disposeStateSync } from './support/leaks.js';
 
 const repo = join(import.meta.dirname, '..');
 const CLI = join(repo, 'dist', 'cli', 'index.js');
@@ -47,7 +48,7 @@ function makeContext(extra: Record<string, string> = {}) {
         /* gone */
       }
     }
-    rmSync(stateDir, { recursive: true, force: true });
+    disposeStateSync(stateDir);
   };
   return { stateDir, env, cli, cleanup, daemonPid };
 }
@@ -128,7 +129,7 @@ const contexts: Array<() => void> = [];
 const dirs: string[] = [];
 afterAll(() => {
   for (const c of contexts) c();
-  for (const d of dirs) rmSync(d, { recursive: true, force: true });
+  for (const d of dirs) disposeStateSync(d);
 });
 
 describe('process identity', () => {
@@ -332,10 +333,16 @@ describe('orphan reclaim (issue #5)', () => {
     const journal = new Journal(join(ctx.stateDir, 'journal.db'));
     journal.deleteEnv(journal.allEnvs()[0]!.id);
 
-    const doc = await ctx.cli(['pool', 'doctor', '--json'], wt);
+    const doc = await ctx.cli(['doctor', '--json'], wt);
     expect(doc.json?.ok).toBe(false);
     const issues = doc.json?.issues as Array<{ issue: string }>;
     expect(issues.some((i) => i.issue.includes('orphaned process'))).toBe(true);
+    // pool doctor (decision 0037) names the same process, and --fix reclaims it.
+    const pool = await ctx.cli(['pool', 'doctor', '--json'], wt);
+    expect(pool.json?.clean).toBe(false);
+    expect((pool.json?.findings as Array<{ kind: string }>).some((f) => f.kind === 'process')).toBe(true);
+    const fixed = await ctx.cli(['pool', 'doctor', '--fix', '--json'], wt);
+    expect((fixed.json?.findings as Array<{ kind: string; fixed?: boolean }>).filter((f) => f.kind === 'process').every((f) => f.fixed)).toBe(true);
   }, 60_000);
 });
 

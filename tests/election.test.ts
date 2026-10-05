@@ -13,6 +13,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { electSelf, releaseSelf } from '../src/daemon/election.js';
 import { startTime } from '../src/core/procscan.js';
+import { disposeStateSync } from './support/leaks.js';
 
 const repo = join(import.meta.dirname, '..');
 const CLI = join(repo, 'dist', 'cli', 'index.js');
@@ -31,7 +32,7 @@ afterAll(() => {
     } catch {
       /* not a state dir, or already gone */
     }
-    rmSync(d, { recursive: true, force: true });
+    disposeStateSync(d);
   }
 });
 

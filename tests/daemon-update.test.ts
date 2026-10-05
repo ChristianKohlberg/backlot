@@ -32,6 +32,7 @@ import { Journal, JOURNAL_SCHEMA_VERSION } from '../src/core/journal.js';
 import { Engine } from '../src/daemon/engine.js';
 import { compareVersions, versionSkew } from '../src/core/version.js';
 import { scanTagged } from '../src/core/procscan.js';
+import { disposeStateSync } from './support/leaks.js';
 
 const repo = join(import.meta.dirname, '..');
 const CLI = join(repo, 'dist', 'cli', 'index.js');
@@ -96,7 +97,7 @@ function ctx(opts: { service?: boolean } = {}) {
         /* gone */
       }
     }
-    rmSync(stateDir, { recursive: true, force: true });
+    disposeStateSync(stateDir);
     rmSync(wt, { recursive: true, force: true });
   });
   return { stateDir, wt, cli };

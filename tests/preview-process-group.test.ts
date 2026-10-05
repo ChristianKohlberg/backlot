@@ -4,6 +4,7 @@ import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSy
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
+import { disposeStateSync } from './support/leaks.js';
 
 const CLI = join(import.meta.dirname, '../dist/cli/index.js');
 const URL = 'https://wrapper-preview-test.trycloudflare.com';
@@ -52,7 +53,7 @@ process.on('SIGTERM',()=>{});child.on('exit',()=>process.exit(0));
   writeFileSync(bin, `#!/bin/sh\nexec '${process.execPath.replaceAll("'", "'\\''")}' '${launcher.replaceAll("'", "'\\''")}' "$@"\n`);
   chmodSync(bin, 0o755);
   const env = { ...process.env, BACKLOT_STATE_DIR: state, BACKLOT_CLOUDFLARED: bin,
-    BACKLOT_SWEEP_MS: quiesce ? '100' : '60000', BACKLOT_LEASED_IDLE_TTL_MS: quiesce ? '1500' : '3600000',
+    BACKLOT_SWEEP_MS: quiesce ? '100' : '60000', BACKLOT_SERVICE_IDLE_MS: quiesce ? '1500' : '3600000',
     TEST_PREVIEW_LEADER_PID: join(root, 'leader.pid'), TEST_PREVIEW_CHILD_PID: join(root, 'child.pid') };
   const cli = (...args: string[]) => new Promise<{ code: number; data: Record<string, unknown>; output: string }>((resolve) => {
     execFile(process.execPath, [CLI, ...args, '--json'], { cwd: tree, env, timeout: 20_000 }, (error, stdout, stderr) => {
@@ -84,7 +85,7 @@ process.on('SIGTERM',()=>{});child.on('exit',()=>process.exit(0));
     const stopped = await cli('daemon', 'stop');
     expect(recycled.code, recycled.output).toBe(0);
     expect(stopped.code, stopped.output).toBe(0);
-    rmSync(root, { recursive: true, force: true });
+    disposeStateSync(root);
   });
   return { tree, state, cli, pids, bothAlive, start, release };
 }

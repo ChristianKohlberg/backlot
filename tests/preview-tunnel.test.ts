@@ -9,6 +9,7 @@ import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { parse, stringify } from 'yaml';
 import { scanTagged } from '../src/core/procscan.js';
+import { disposeStateSync } from './support/leaks.js';
 
 const repo = join(import.meta.dirname, '..');
 const CLI = join(repo, 'dist', 'cli', 'index.js');
@@ -140,7 +141,7 @@ function ctx(extraEnv: Record<string, string> = {}, stackExtra = '', hotReload =
     } catch {
       /* never started, or already gone */
     }
-    rmSync(stateDir, { recursive: true, force: true });
+    disposeStateSync(stateDir);
     rmSync(wt, { recursive: true, force: true });
     expect(stopped.code, stopped.stdout + stopped.stderr).toBe(0);
   };
@@ -338,7 +339,7 @@ describe('preview tunnels', () => {
   // the tag scan sees a tagged process with no live env. Reporting that as an
   // orphan is a permanent error naming a remedy (`pool gc`) that skips this pid.
   it('doctor does not call a quiesced lease-scoped tunnel an orphan', async () => {
-    const { cli, stateDir } = ctx({ BACKLOT_LEASED_IDLE_TTL_MS: '400', BACKLOT_IDLE_TTL_MS: '400' });
+    const { cli, stateDir } = ctx({ BACKLOT_SERVICE_IDLE_MS: '400', BACKLOT_IDLE_TTL_MS: '400' });
     await cli(['up', '--json']);
     await cli(['preview', 'web', '--json']);
     const pid = tunnelPid(stateDir);

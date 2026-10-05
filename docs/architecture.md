@@ -223,9 +223,41 @@ Local pools are convergence all the way down. Same verbs above the driver line.
 
 ### Environment states
 
-`hot` (services up) → `warm` (services stopped, caches intact; reached by idle TTL) →
-recycled (`pristine` rebuild). Rebind from hot ≈ seconds; from warm ≈ start + ready-wait;
-pristine ≈ full provision (bounded by templates and shared caches, below).
+`hot` (services up) → `warm` (services stopped, caches intact; reached when every
+service has idle-stopped) → recycled (`pristine` rebuild). Rebind from hot ≈ seconds;
+from warm ≈ start + ready-wait; pristine ≈ full provision (bounded by templates and
+shared caches, below).
+
+**Lifecycle since 0.16** ([decision 0035](decisions/0035-services-idle-on-their-own-clock-and-wake-on-demand.md)).
+Each running service has its own idle clock: the last runly verb on its environment,
+the last client byte through its own public port, its own start. Past
+`BACKLOT_SERVICE_IDLE_MS` (10 min; `idle:` per service) the sweeper stops it under the
+environment lock; lease, data, ports and the other services stay, and `ps` says
+`idle`. A connection to its public port wakes it (the proxy's wake hook → `wakeService`:
+closure, appliances, datastores kept, load budget, build only if needed) and is held
+until it is ready; services reach each other through public ports, so wakes chain. A
+crash restart marks the port `starting` (supervisor hooks `onCrashed` / `onRelaunched` /
+`onGaveUp`), and a refused forward is retried and held, so the self-restart gap holds
+connections too. Activity clocks are persisted (`envs.activity`, throttled to 5 s, and
+at sweep and shutdown). A lease or copy tethered to a holder process is torn down
+completely once the holder has been dead for `BACKLOT_TETHER_GRACE_MS` (60 s); a live
+holder renews its lease's TTL. Under Claude Code the CLI tethers to `CLAUDE_PID` when it
+is a live ancestor. A worktree that is gone (or holds another stack) takes its
+environment with it, leased or not; `runly destroy` does it on request.
+
+**Load budget** ([decision 0036](decisions/0036-a-server-wide-load-budget.md)).
+`src/daemon/budget.ts`: every bind and wake computes its need (run resources of what
+it starts, the largest build it runs; declared `resources:` or the default) and asks
+`LoadBudget.admit`, a FIFO queue checked against committed resources across every
+environment, Linux MemAvailable minus a reserve, and the load average. The build share
+is released after the build phase (`Reservation.releaseBuild`), the rest when the
+operation ends. `runly plan` runs the same computation without acting.
+
+**Cleanup** ([decision 0037](decisions/0037-cleanup-by-reference-and-pool-doctor.md)).
+Drop recipes are recorded on the environment row before a datastore is created;
+templates restored from are recorded on rows and kept, the newest per datastore and
+preset too, everything else goes after a grace; `runly pool doctor [--fix]` lists and
+removes orphans that are provably runly's own.
 
 **One environment per worktree, a machine-wide cap, and eviction.** A stack (one
 worktree) has exactly one environment since decision 0032, so the old per-stack
@@ -264,7 +296,11 @@ environment runs in the caller's worktree — exactly one environment per worktr
 nothing is copied. Nothing observes the worktree either, and runly keeps no identity of
 its source and no build cache: it reads only the files the upkeep rules' `when:` globs
 match (§7), and a service's `build:` runs on every `up` that starts it, leaving
-incrementality to the build tool.
+incrementality to the build tool — unless the build opts in to a skip with
+`build: { run, when: [globs] }` ([decision 0038](decisions/0038-time-stamped-logs-and-build-skip.md)):
+then it is skipped while the matched files (path, size, mtime) and the command are
+unchanged since its last successful build in this worktree (`src/core/builds.ts`,
+ledger `worktrees/<stack>/builds.json`; `up --rebuild` forces).
 
 - **One environment per worktree.** A bind for a worktree always lands on its
   environment; a second holder waits for it (refused at once, naming the holder, when
@@ -281,7 +317,8 @@ incrementality to the build tool.
   different), caller inputs changed, an upkeep rule ran, a public port moved, the
   hygiene is `reset-data`/`pristine`, or the environment is not hot and healthy.
   Otherwise each running service's build runs between two snapshots of its declared
-  `outputs:` (path, size, mtime — `snapshotOutputs` in `worktree.ts`), and only the
+  `outputs:` (path, size, mtime — `snapshotOutputs` in `worktree.ts`; or a content hash
+  with `outputs: { paths, compare: content }`), and only the
   services whose snapshot differs — or that declare no outputs — are stopped and
   started again (`stopServicesForRestart`, then `startSlice` over just those, with
   the rest counted as already started for `depends_on`); the services the request
@@ -335,9 +372,9 @@ build/start:
   `@` built-ins describe an **environment** and stay on its row. Comparison stays
   **direction-agnostic**, so binding *older* work also converges correctly. A rule
   drops its entry before it runs, so one that fails half-way is never vouched for.
-- Builds are not part of the ledger. A service's `build:` runs on every bind that
-  starts it and on every `warm`; MSBuild, pnpm or the Angular CLI decide what is
-  current.
+- Builds are not part of the upkeep ledger. A service's `build:` runs on every bind
+  that starts it and on every `warm`; MSBuild, pnpm or the Angular CLI decide what is
+  current. A `build: { run, when }` keeps its own ledger (decision 0038).
 - The ledger cannot see what happens to the worktree outside runly: a `node_modules`
   deleted by hand is still "applied". `--pristine` clears the worktree ledger.
 - **Pool divergence is normal and harmless.** Idle worktrees are never touched by
@@ -425,12 +462,11 @@ Every failure is classified — the field an agent branches on mechanically:
   agent harness, where every command gets a fresh shell, so `$$` is already gone. It presented
   as a stale seed template and cost hours in the wrong subsystem; refusing at bind time is
   the whole fix.
-- **A lease no longer exempts an environment from reclaiming HEAT.** Holding one used to keep
-  services (and their memory) alive for the full TTL even if nothing had touched the
-  environment since the bind. Now a leased env that goes untouched past `leasedIdleTtlMs`
-  quiesces to warm: the lease survives, only the services stop, and the next verb rebinds.
-  "Untouched" counts real use — `exec`, `ctx`, `logs` — not just binds, so an actively
-  worked environment is never quiesced underneath its agent.
+- **A lease does not exempt a service from its idle clock** (decision 0035). Each service
+  stops after `BACKLOT_SERVICE_IDLE_MS` without a runly verb on its environment or a client
+  byte on its port; the lease, data and ports survive, and the next connection or `up`
+  starts it again. A live agent is not activity. (Until 0.16 a leased environment
+  quiesced whole after `leasedIdleTtlMs`; that knob is now ignored.)
 - **Leases need no heartbeat daemon** because losing a lease is designed to be
   worthless: an explicit `up` refreshes the TTL (`reset-data` and read-only verbs deliberately do not,
   so an idle agent that only polls `ctx` does not hold an environment forever);
@@ -459,8 +495,10 @@ Every failure is classified — the field an agent branches on mechanically:
 The CLI **is** the API: every verb takes `--json`; stdout is data, stderr is human.
 
 ```
-runly up [service...] [--preset [ds=]p]... [--reset-data|--pristine] [--ttl <minutes>]
-                                               # lease; ADD services; upkeep + builds, restart what changed
+runly up [service...] [--preset [ds=]p]... [--reset-data|--pristine] [--rebuild] [--ttl <minutes>]
+                                               # lease; ADD services; upkeep + builds (when: may skip), restart what changed
+runly plan [service...] [--rebuild]            # what up would build/start, its cost, starts now | would wait for X
+runly destroy                                  # tear down everything this worktree holds, now
 runly down [service...]                        # stop just these (none = all); lease, data, ports stay
 runly ctx [--env]                              # the context blob (below); --env: RUNLY_* lines
 runly ps [--all]                               # services and database copies (this worktree | server)
@@ -468,12 +506,13 @@ runly db new <ds> [--preset p] | db with <ds> [--preset p] -- <cmd...> | db ls [
                                                # database copies outside any environment (decision 0034)
 runly warm                                     # due upkeep + builds in this worktree, no lease
 runly exec <cmd...>                            # run anything in the worktree, with the lease's env
-runly logs <service> [--lines N]               # supervised service logs
+runly logs [service...] [--lines N] [--since up|<dur>] [--grep re] [-f [--until re] [--timeout s]] [--build]
+                                               # interleaved, time-stamped service logs (decision 0038); --until: 0 | 124
 runly token --role <r>                         # mint a token via auth.token
 runly reset-data | release
 runly preview <service> [--ttl <minutes>] | preview stop   # publish one service publicly (below)
 runly status | doctor                          # pool state | active health check
-runly pool ls|recycle [--all]|reconcile|gc|doctor
+runly pool ls|recycle [--all]|reconcile|gc|doctor [--fix]   # doctor: orphans, dry run unless --fix
 runly daemon stop                              # waits until the daemon and its services are gone (README)
 runly update [--check] [--force]               # run the INSTALLED build (below)
 runly --version
@@ -572,13 +611,25 @@ decision 0032, the data-only ceiling (`BACKLOT_POOL_MAX_DATA_ONLY` /
 | Env var | config.json key | Default |
 | --- | --- | --- |
 | `BACKLOT_STATE_DIR` | — | `$XDG_STATE_HOME/backlot` (the per-machine root; 0700) |
-| `BACKLOT_LEASED_IDLE_TTL_MS` | `leasedIdleTtlMs` | `2 x idleTtlMs` — a LEASED but untouched env stops its services (keeps the lease) |
-| `BACKLOT_POOL_MAX_TOTAL` | `poolMaxTotal` | `min(cores/2, memGB/4)`, clamped **[2,8]**, **machine-wide across every stack**, every environment. When this is what binds, a cold unleased env is evicted rather than the caller refused |
+| `BACKLOT_SERVICE_IDLE_MS` | `serviceIdleMs` | 10 min — a running service with no verb on its environment and no client byte on its port is stopped (decision 0035); `idle:` per service overrides |
+| `BACKLOT_TETHER_GRACE_MS` | `tetherGraceMs` | 60 s — how long a holder process must stay dead before its environment or copy is torn down |
+| `BACKLOT_TETHER` | — | `off` disables the automatic Claude Code tether (`CLAUDE_PID`) |
+| `BACKLOT_PROXY_HOLD_MS` | — | 90 s — how long a connection is held while its service starts or wakes |
+| `BACKLOT_POOL_MAX_TOTAL` | `poolMaxTotal` | With the load budget on: `2 x cores`, clamped **[4,64]** — a cap on environments HELD, machine-wide. With `BACKLOT_BUDGET=off`: `min(cores/2, memGB/4)`, clamped **[2,8]**. When this is what binds, a cold unleased env is evicted rather than the caller refused |
+| `BACKLOT_BUDGET` | `budget.enabled` | on — `off` admits everything (decision 0036) |
+| `BACKLOT_BUDGET_MEMORY` | `budget.memory` | 70 % of RAM — declared memory runly may commit at once |
+| `BACKLOT_BUDGET_CPU` | `budget.cpu` | 1.5 x cores |
+| `BACKLOT_BUDGET_RESERVE` | `budget.reserve` | max(2 GiB, 10 % of RAM) — Linux MemAvailable kept free after a start |
+| `BACKLOT_BUDGET_LOAD_PER_CORE` | `budget.loadPerCore` | 2 — a start waits while load1 is above this x cores |
+| `BACKLOT_BUDGET_WAIT_MS` | `budget.waitMs` | 10 min — longest wait in the budget queue |
+| `BACKLOT_BUDGET_MAX_QUEUE` | `budget.maxQueue` | 64 waiters |
+| `BACKLOT_TEMPLATE_GRACE_MS` | `templateGraceMs` | 1 h — an unreferenced, superseded template is kept this long after it was baked |
+| `BACKLOT_LEASED_IDLE_TTL_MS` | `leasedIdleTtlMs` | ignored since 0.16 (decision 0035) |
 | `BACKLOT_LEASE_TTL_MS` | `sessionTtlMs` | 30 min |
 | `BACKLOT_IDLE_TTL_MS` | `idleTtlMs` | 30 min |
 | `BACKLOT_WAIT_MS` | `waitMs` | 60 s (queue-at-capacity timeout) |
-| `BACKLOT_LOG_CAP_BYTES` | `logCapBytes` | 5 MB |
-| `BACKLOT_TEMPLATES_KEEP` | `templatesKeep` | 4 per stack |
+| `BACKLOT_LOG_CAP_BYTES` | `logCapBytes` | 20 MB per log file, one rotation (`.log.1`) |
+| `BACKLOT_TEMPLATES_KEEP` | `templatesKeep` | 1 per datastore and preset, plus every template a row references (decision 0037) |
 | `BACKLOT_SWEEP_MS` | — | 15 s (lease/idle sweep cadence) |
 | `BACKLOT_PREVIEW_PUBLISHER` | — | `cloudflare-quick` — the preview publisher adapter. The one knob a stack outranks: the manifest's `preview.publisher` wins over it |
 | `BACKLOT_CLOUDFLARED` | — | `cloudflared` off `PATH` — the executable that publisher runs. A launcher that forks the real tunnel must stay alive and keep it in its own process group (README, "A preview URL that is still valid tomorrow") |
@@ -624,8 +675,12 @@ services:
     ready:      { http: /health, timeout: 300 }
     fatal_logs: 'Unhandled exception|Build FAILED'
   web:
-    build: pnpm exec ng build myapp
-    outputs: [dist/myapp]                 # a directory: everything under it
+    build:                                # skipped while these files are unchanged (decision 0038)
+      run: pnpm exec ng build myapp
+      when: ["src/**", angular.json, pnpm-lock.yaml]
+    outputs: { paths: [dist/myapp], compare: content }   # restart only when the bytes changed
+    resources: { memory: 1G, cpu: 1, build: { memory: 3G, cpu: 4 } }   # the load budget (0036)
+    idle: 30m                             # stop after 30 idle minutes instead of 10 (0035)
     run:   npx serve-dist dist/myapp --proxy /api={{services.api.url}}
     port:  web
     ready: { http: / }
@@ -640,6 +695,7 @@ datastores:
     create: bin/rails db:prepare db:seed  # or any repo command; {{preset}} {{ns}} available
     presets: [dev, empty]
     template: true
+    list:   psql -Atc "select datname from pg_database"   # only `runly pool doctor` reads it (0037)
   cache:
     driver: redis
     ephemeral: true                       # reset-data = flush

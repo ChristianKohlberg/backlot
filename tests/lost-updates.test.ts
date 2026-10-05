@@ -14,6 +14,7 @@ import { mkdtempSync, rmSync, writeFileSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Journal } from '../src/core/journal.js';
+import { disposeStateSync } from './support/leaks.js';
 
 const repo = join(import.meta.dirname, '..');
 const CLI = join(repo, 'dist', 'cli', 'index.js');
@@ -26,7 +27,7 @@ afterAll(() => {
     } catch {
       /* not a state dir */
     }
-    rmSync(d, { recursive: true, force: true });
+    disposeStateSync(d);
   }
 });
 

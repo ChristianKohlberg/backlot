@@ -3,6 +3,7 @@ import { execFileSync } from 'node:child_process';
 import { mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { disposeStateSync } from './support/leaks.js';
 
 const CLI = join(import.meta.dirname, '../dist/cli/index.js');
 const cleanups: Array<() => void> = [];
@@ -21,7 +22,7 @@ function fixture() {
     try { cli(['pool', 'recycle']); } catch { /* daemon stop still reaps */ }
     try { cli(['daemon', 'stop']); } catch { /* already gone */ }
     rmSync(cwd, { recursive: true, force: true });
-    rmSync(state, { recursive: true, force: true });
+    disposeStateSync(state);
   });
   return { cwd, cli, write: (name: string, value: string) => writeFileSync(join(cwd, name), value) };
 }

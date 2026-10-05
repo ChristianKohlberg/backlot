@@ -16,6 +16,7 @@ import { execFile, execFileSync } from 'node:child_process';
 import { mkdtempSync, rmSync, writeFileSync, mkdirSync, readFileSync, utimesSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { disposeStateSync } from './support/leaks.js';
 
 const repo = join(import.meta.dirname, '..');
 const CLI = join(repo, 'dist', 'cli', 'index.js');
@@ -36,7 +37,7 @@ afterAll(async () => {
     } catch {
       /* none */
     }
-    rmSync(d, { recursive: true, force: true });
+    disposeStateSync(d);
   }
 });
 
@@ -168,9 +169,10 @@ describe('template pruning survives a hung persisted drop command (unit)', () =>
       const marker = join(root, 'stk', 'main-dev@abc.baked');
       writeFileSync(marker, JSON.stringify({ v: 1, ns: 'tpl_x', drop: 'sleep 600' }));
       utimesSync(marker, new Date(0), new Date(0));
-      writeFileSync(join(root, 'stk', 'keep-1'), 'x');
+      // A newer template of the same datastore and preset supersedes it (decision 0037).
+      writeFileSync(join(root, 'stk', 'main-dev@def.baked'), JSON.stringify({ v: 1, ns: 'tpl_y', drop: null }));
       const started = Date.now();
-      const pruned = await pruneTemplates({ ...policy(), templatesKeep: 1 }, root);
+      const pruned = await pruneTemplates({ ...policy(), templatesKeep: 1, templateGraceMs: 0 }, root);
       expect(pruned).toBe(1);
       expect(Date.now() - started).toBeLessThan(10_000); // bounded, not 600s
     } finally {

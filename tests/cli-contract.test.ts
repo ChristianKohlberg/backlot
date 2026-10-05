@@ -14,6 +14,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { classifyClientError } from '../src/cli/client.js';
 import { VERSION } from '../src/core/version.js';
+import { disposeStateSync } from './support/leaks.js';
 
 const repo = join(import.meta.dirname, '..');
 const CLI = join(repo, 'dist', 'cli', 'index.js');
@@ -28,7 +29,7 @@ afterAll(() => {
     } catch {
       /* none */
     }
-    rmSync(d, { recursive: true, force: true });
+    disposeStateSync(d);
   }
 });
 

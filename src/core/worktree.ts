@@ -17,7 +17,8 @@
  * declared `caches:`).
  */
 import { execFileSync } from 'node:child_process';
-import { existsSync, lstatSync, readdirSync } from 'node:fs';
+import { existsSync, lstatSync, readdirSync, readFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 import { join } from 'node:path';
 import { isFile, matchesAny, safeJoin } from './util.js';
 import type { Manifest } from './manifest.js';
@@ -140,14 +141,26 @@ function walkAll(root: string, prefix = ''): string[] {
  * globs, with its size and mtime, as one comparable string. `up` takes one
  * before and one after the service's build and restarts the service only when
  * they differ (decision 0032). Path + size + mtime is what a build tool
- * changes when it writes; content is not read.
+ * changes when it writes; content is read only with `compare: content`
+ * (decision 0038).
  *
  * Each glob is walked from its literal prefix only, so `backend/host/bin/**`
  * never walks the rest of the worktree. A glob that escapes the worktree is
  * ignored.
  */
-export function snapshotOutputs(stackRoot: string, globs: string[]): string {
+export function snapshotOutputs(stackRoot: string, globs: string[], compare: 'stat' | 'content' = 'stat'): string {
   const seen = new Map<string, string>();
+  // `content` (decision 0038): a build tool that rewrites identical files
+  // (the Angular CLI does) moves every mtime and would restart the service
+  // for nothing; hashing what is IN the files ignores that.
+  const fingerprint = (full: string, st: { size: number; mtimeMs: number }): string => {
+    if (compare === 'stat') return `${st.size}:${st.mtimeMs}`;
+    try {
+      return `${st.size}:${createHash('sha256').update(readFileSync(full)).digest('hex')}`;
+    } catch {
+      return `${st.size}:unreadable`;
+    }
+  };
   const walk = (dir: string, rel: string, all = false) => {
     let names: string[];
     try {
@@ -166,7 +179,7 @@ export function snapshotOutputs(stackRoot: string, globs: string[]): string {
         continue; // vanished mid-walk
       }
       if (st.isDirectory()) walk(full, childRel, all);
-      else if (all || matchesAny(childRel, globs)) seen.set(childRel, `${st.size}:${st.mtimeMs}`);
+      else if (all || matchesAny(childRel, globs)) seen.set(childRel, fingerprint(full, st));
     }
   };
   for (const glob of globs) {
@@ -182,8 +195,9 @@ export function snapshotOutputs(stackRoot: string, globs: string[]): string {
     if (stop === -1) {
       // A literal file path: stat it directly.
       try {
-        const st = lstatSync(safeJoin(stackRoot, parts.join('/'), 'outputs'));
-        if (st.isFile()) seen.set(parts.join('/'), `${st.size}:${st.mtimeMs}`);
+        const literal = safeJoin(stackRoot, parts.join('/'), 'outputs');
+        const st = lstatSync(literal);
+        if (st.isFile()) seen.set(parts.join('/'), fingerprint(literal, st));
         else if (st.isDirectory()) walk(join(stackRoot, parts.join('/')), parts.join('/'), true); // a directory: everything under it
       } catch {
         /* absent */

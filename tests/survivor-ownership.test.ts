@@ -18,6 +18,7 @@ import type { ServicePid } from '../src/core/types.js';
 import { Engine } from '../dist/daemon/engine.js';
 import { killGroupVerified, reapPids } from '../dist/daemon/supervisor.js';
 import { groupAlive, isAlive, procScanSupported, processGroup, scanTagged, serviceTag, startTime } from '../src/core/procscan.js';
+import { disposeStateSync } from './support/leaks.js';
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -155,7 +156,7 @@ console.log(p.pid);p.unref();${path === 'both groups' ? 'setInterval(()=>{},1000
       await engine.shutdown();
       for (const key of Object.keys(process.env)) if (!(key in saved)) delete process.env[key];
       Object.assign(process.env, saved);
-      rmSync(root, { recursive: true, force: true });
+      disposeStateSync(root);
     }
   });
 
@@ -257,7 +258,7 @@ console.log(JSON.stringify({tagged:tagged.pid,untagged:untagged.pid}));
       await engine.shutdown();
       for (const key of Object.keys(process.env)) if (!(key in saved)) delete process.env[key];
       Object.assign(process.env, saved);
-      rmSync(root, { recursive: true, force: true });
+      disposeStateSync(root);
     }
   });
 
@@ -347,7 +348,7 @@ console.log(JSON.stringify({tagged:tagged.pid,untagged:untagged.pid}));
       await engine.shutdown();
       for (const key of Object.keys(process.env)) if (!(key in saved)) delete process.env[key];
       Object.assign(process.env, saved);
-      rmSync(root, { recursive: true, force: true });
+      disposeStateSync(root);
     }
   });
 
@@ -437,7 +438,7 @@ console.log(JSON.stringify({tagged:tagged.pid,untagged:untagged.pid}));
       await engine.shutdown();
       for (const key of Object.keys(process.env)) if (!(key in saved)) delete process.env[key];
       Object.assign(process.env, saved);
-      rmSync(root, { recursive: true, force: true });
+      disposeStateSync(root);
     }
   });
 
@@ -528,7 +529,7 @@ console.log(JSON.stringify({tagged:tagged.pid,untagged:untagged.pid}));
       await engine.shutdown();
       for (const key of Object.keys(process.env)) if (!(key in saved)) delete process.env[key];
       Object.assign(process.env, saved);
-      rmSync(root, { recursive: true, force: true });
+      disposeStateSync(root);
     }
   });
 
@@ -647,7 +648,7 @@ console.log(JSON.stringify({tagged:tagged.pid,untagged:untagged.pid}));
       await engine.shutdown();
       for (const key of Object.keys(process.env)) if (!(key in saved)) delete process.env[key];
       Object.assign(process.env, saved);
-      rmSync(root, { recursive: true, force: true });
+      disposeStateSync(root);
     }
   });
 
@@ -706,7 +707,7 @@ console.log(JSON.stringify({tagged:tagged.pid,untagged:untagged.pid}));
       await engine.shutdown();
       for (const key of Object.keys(process.env)) if (!(key in saved)) delete process.env[key];
       Object.assign(process.env, saved);
-      rmSync(root, { recursive: true, force: true });
+      disposeStateSync(root);
     }
   });
 

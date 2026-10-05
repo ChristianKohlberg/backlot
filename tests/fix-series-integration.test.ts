@@ -4,6 +4,7 @@ import { appendFileSync, chmodSync, existsSync, mkdirSync, mkdtempSync, readFile
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
+import { disposeStateSync } from './support/leaks.js';
 
 const CLI = join(import.meta.dirname, '../dist/cli/index.js');
 const publicUrl = 'https://integration-preview.trycloudflare.com';
@@ -45,7 +46,7 @@ function fixture() {
       await cli(['release']);
       const recycled = await cli(['pool', 'recycle', '--force']); expect(recycled.code, recycled.output).toBe(0);
       const stopped = await cli(['daemon', 'stop']); expect(stopped.code, stopped.output).toBe(0);
-    } finally { rmSync(root, { recursive: true, force: true }); }
+    } finally { disposeStateSync(root); }
   };
   return { root, tree, alias, state, manifest, save, cli, pids, value, cleanup };
 }

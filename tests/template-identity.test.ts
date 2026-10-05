@@ -230,7 +230,7 @@ describe('pruneTemplates drops server-side DBs', () => {
       const old = new Date(now - 10 * 60_000);
       utimesSync(legacy, old, old);
 
-      const pruned = await pruneTemplates(policy(), root);
+      const pruned = await pruneTemplates({ ...policy(), templateGraceMs: 0 }, root);
       expect(pruned).toBe(3); // keep=1 → newest survives, 3 pruned
 
       const dropped = readFileSync(log, 'utf8');

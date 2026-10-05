@@ -13,6 +13,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { Journal } from '../src/core/journal.js';
+import { disposeStateSync } from './support/leaks.js';
 
 const CLI = join(import.meta.dirname, '..', 'dist', 'cli', 'index.js');
 
@@ -27,7 +28,7 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 function makeContext(extraEnv: Record<string, string> = {}) {
   const stateDir = mkdtempSync(join(tmpdir(), 'runly-db-'));
-  const env: NodeJS.ProcessEnv = { ...process.env, BACKLOT_STATE_DIR: stateDir, BACKLOT_SWEEP_MS: '600000', ...extraEnv };
+  const env: NodeJS.ProcessEnv = { ...process.env, BACKLOT_STATE_DIR: stateDir, BACKLOT_SWEEP_MS: '600000', BACKLOT_TETHER_GRACE_MS: '0', ...extraEnv };
   delete env.BACKLOT_HOLDER_PID;
   const cli = (args: string[], cwd: string, more: Record<string, string> = {}): Promise<CliResult> =>
     new Promise((resolve) => {
@@ -63,7 +64,7 @@ function makeContext(extraEnv: Record<string, string> = {}) {
   const cleanup = async (cwd: string) => {
     await cli(['pool', 'recycle', '--force', '--json'], cwd);
     await stopDaemon(cwd);
-    rmSync(stateDir, { recursive: true, force: true });
+    disposeStateSync(stateDir);
   };
   const journal = () => new Journal(join(stateDir, 'journal.db'));
   return { stateDir, cli, cleanup, stopDaemon, daemonPid, journal };
@@ -463,7 +464,7 @@ describe('runly ps', () => {
 
     const human = await ctx.cli(['ps'], wt);
     expect(human.code, human.stderr).toBe(0);
-    expect(human.stdout).toMatch(/ENV\s+SERVICE\s+STATE\s+PORT\s+INTERNAL\s+PID\s+IDLE\s+RSS/);
+    expect(human.stdout).toMatch(/ENV\s+SERVICE\s+STATE\s+PORT\s+INTERNAL\s+PID\s+IDLE\s+STOPS IN\s+RSS/);
     expect(human.stdout).toMatch(new RegExp(`\\ba\\s+running\\s+${up.json.ports.a}\\b`));
     expect(human.stdout).toMatch(/NAME\s+DATASTORE\s+PRESET\s+STATE\s+HOLDER\s+CREATED/);
     expect(human.stdout).toContain(copy.json.name);

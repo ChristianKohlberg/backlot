@@ -14,6 +14,7 @@ import { mkdtempSync, rmSync, writeFileSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { poolMaxHeuristic } from '../src/core/policy.js';
+import { disposeStateSync } from './support/leaks.js';
 
 const repo = join(import.meta.dirname, '..');
 const CLI = join(repo, 'dist', 'cli', 'index.js');
@@ -26,7 +27,7 @@ afterAll(() => {
     } catch {
       /* not a state dir */
     }
-    rmSync(d, { recursive: true, force: true });
+    disposeStateSync(d);
   }
 });
 
@@ -62,8 +63,12 @@ describe('pool capacity diagnostics', () => {
     expect(Math.min(Math.floor(3 / 2), Math.floor(7 / 4))).toBe(1);
     // ...but the floor is 2. It is the machine-wide default
     // (BACKLOT_POOL_MAX_TOTAL); the per-stack cap is gone (decision 0032).
-    expect(poolMaxHeuristic()).toBeGreaterThanOrEqual(2);
-    expect(poolMaxHeuristic()).toBeLessThanOrEqual(8);
+    expect(poolMaxHeuristic(false)).toBeGreaterThanOrEqual(2);
+    expect(poolMaxHeuristic(false)).toBeLessThanOrEqual(8);
+    // With the load budget on (the default since 0.16, decision 0036) the cap
+    // only bounds HELD rows: 2 x cores in [4, 64].
+    expect(poolMaxHeuristic(true)).toBeGreaterThanOrEqual(4);
+    expect(poolMaxHeuristic(true)).toBeLessThanOrEqual(64);
   });
 
   it('a second holder on the same worktree fails fast with a structural diagnosis instead of waiting out the window', async () => {

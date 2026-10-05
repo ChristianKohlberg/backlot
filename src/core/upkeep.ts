@@ -46,6 +46,8 @@ export interface UpkeepOptions {
    * the old trigger would let a later revert to that trigger skip the repair.
    */
   commit?: (fingerprints: Record<string, string>) => void;
+  /** Receives each command rule's output as it runs (`upkeep.build.log`, decision 0038). */
+  onOutput?: { begin: (label: string) => void; data: (stream: 'out' | 'err', chunk: string) => void; end: (stream: 'out' | 'err') => void };
 }
 
 export const ruleKey = (rule: { when: string; run: string }): string => `${rule.when} -> ${rule.run}`;
@@ -205,7 +207,8 @@ export async function runUpkeep(
       heartbeat?.unref();
       let r;
       try {
-        r = await runBounded(rule.run, root, timeoutS);
+        opts.onOutput?.begin(`${label} (when: ${rule.when})`);
+        r = await runBounded(rule.run, root, timeoutS, undefined, opts.onOutput);
       } finally {
         if (heartbeat) clearInterval(heartbeat);
       }

@@ -3,6 +3,7 @@ import { execFile } from 'node:child_process';
 import { mkdtempSync, writeFileSync, rmSync, mkdirSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { disposeStateSync } from './support/leaks.js';
 
 const CLI = join(import.meta.dirname, '..', 'dist', 'cli', 'index.js');
 
@@ -37,7 +38,7 @@ async function fixture(hotReload: boolean, sweepMs = 400) {
   };
   return { wt, cli, raw, cleanup: async () => {
     try { await cli(['release']); await cli(['pool', 'recycle']); } finally {
-      await cli(['daemon', 'stop']); rmSync(root, { recursive: true, force: true });
+      await cli(['daemon', 'stop']); disposeStateSync(root);
     }
   } };
 }
