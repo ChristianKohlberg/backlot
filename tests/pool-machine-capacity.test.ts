@@ -16,7 +16,7 @@
  *    full. The ceiling measured history rather than load.
  * 2. The refusal printed the per-stack cap in both the ratio and the remedy.
  *    `(6/6)` was not even a count — it was `POOL_MAX` twice — and the advice it
- *    gave (`BACKLOT_POOL_MAX=8`) cannot clear a machine-wide block.
+ *    gave cannot clear a machine-wide block.
  *
  * The fix is eviction rather than simply not counting cold rows: the caps gate
  * environment CREATION only — rebinding an existing environment is never
@@ -64,7 +64,7 @@ function ctx(opts: { total: number; idleTtlMs?: number; sweepMs?: number; stubbo
   const env = {
     ...process.env,
     BACKLOT_STATE_DIR: stateDir,
-    BACKLOT_POOL_MAX: '9', // per-stack cap must never be the binding one here
+    // per-stack cap must never be the binding one here
     BACKLOT_POOL_MAX_TOTAL: String(opts.total),
     BACKLOT_IDLE_TTL_MS: String(opts.idleTtlMs ?? 250),
     // Long, so a fail-fast is unmistakable: the reported bug burned 60s.
@@ -84,8 +84,8 @@ function ctx(opts: { total: number; idleTtlMs?: number; sweepMs?: number; stubbo
       // finish until the kill escalates — which is what makes "a quiesce is in
       // flight" a deterministic condition rather than a race.
       opts.stubbornService
-        ? `name: ${name}\nservices:\n  idle: { run: "trap 'sleep 30' TERM; echo ready; sleep 300", ready: { log: ready, timeout: 20 } }\nchecks:\n  ok: { run: "true" }\n`
-        : `name: ${name}\nservices:\n  idle: { run: "echo ready; sleep 300", ready: { log: ready, timeout: 20 } }\nchecks:\n  ok: { run: "true" }\n`,
+        ? `name: ${name}\nservices:\n  idle: { run: "trap 'sleep 30' TERM; echo ready; sleep 300", ready: { log: ready, timeout: 20 } }\n`
+        : `name: ${name}\nservices:\n  idle: { run: "echo ready; sleep 300", ready: { log: ready, timeout: 20 } }\n`,
     );
     execFileSync('git', ['init', '-q'], { cwd: wt });
     return wt;

@@ -11,7 +11,7 @@ import { mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync, statSync, 
 import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { enumerateSource, hashOutputs } from '../src/core/worktree.js';
+import { enumerateSource, snapshotOutputs } from '../src/core/worktree.js';
 import { triggerFiles, triggerHash, triggerSet } from '../src/core/upkeep.js';
 
 const dirs: string[] = [];
@@ -19,7 +19,7 @@ afterAll(() => {
   for (const d of dirs) rmSync(d, { recursive: true, force: true });
 });
 
-const manifest = { name: 'wt', services: {}, checks: {} } as never;
+const manifest = { name: 'wt', services: {} } as never;
 const withRules = (...whens: string[]) =>
   ({ name: 'wt', services: {}, upkeep: whens.map((when) => ({ when, run: 'true' })) }) as never;
 
@@ -157,13 +157,35 @@ describe('trigger hashing', () => {
   });
 });
 
-describe('declared outputs', () => {
-  it('hashes what exists, reports null for what does not, and refuses to leave the worktree', () => {
+describe('declared outputs (snapshotOutputs)', () => {
+  it('changes when a matched file is rewritten, added or removed, and only then', () => {
     const { src } = repo();
+    mkdirSync(join(src, 'bin', 'Debug'), { recursive: true });
+    writeFileSync(join(src, 'bin', 'Debug', 'app.dll'), 'v1');
+    writeFileSync(join(src, 'unrelated.txt'), 'x');
+    const globs = ['bin/**'];
+    const first = snapshotOutputs(src, globs);
+    expect(first).toContain('bin/Debug/app.dll');
+    expect(snapshotOutputs(src, globs)).toBe(first); // stable when nothing changed
+    writeFileSync(join(src, 'unrelated.txt'), 'changed outside the outputs');
+    expect(snapshotOutputs(src, globs)).toBe(first);
+    writeFileSync(join(src, 'bin', 'Debug', 'app.dll'), 'version 2');
+    const second = snapshotOutputs(src, globs);
+    expect(second).not.toBe(first);
+    writeFileSync(join(src, 'bin', 'Debug', 'new.dll'), 'n');
+    const third = snapshotOutputs(src, globs);
+    expect(third).not.toBe(second);
+    rmSync(join(src, 'bin', 'Debug', 'new.dll'));
+    expect(snapshotOutputs(src, globs)).toBe(second);
+  });
+
+  it('takes a literal file or a literal directory, skips what is absent, and refuses to leave the worktree', () => {
+    const { src } = repo();
+    mkdirSync(join(src, 'dist', 'nested'), { recursive: true });
+    writeFileSync(join(src, 'dist', 'nested', 'main.js'), 'm');
     writeFileSync(join(src, 'lock.json'), '{}');
-    const h = hashOutputs(src, ['lock.json', 'missing.ts', '../escape.txt']);
-    expect(typeof h['lock.json']).toBe('string');
-    expect(h['missing.ts']).toBeNull();
-    expect('../escape.txt' in h).toBe(false);
+    const snap = snapshotOutputs(src, ['dist', 'lock.json', 'missing.ts', '../escape.txt']);
+    expect(snap.split('\n').map((l) => l.slice(0, l.indexOf(':'))).sort()).toEqual(['dist/nested/main.js', 'lock.json']);
+    expect(snapshotOutputs(src, ['missing/**'])).toBe('');
   });
 });

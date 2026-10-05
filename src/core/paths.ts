@@ -59,6 +59,7 @@ export const journalPath = (): string => join(stateRoot(), 'journal.db');
 export const envsRoot = (): string => join(stateRoot(), 'envs');
 export const templatesRoot = (): string => join(stateRoot(), 'templates');
 export const retiredTemplatesRoot = (): string => join(stateRoot(), 'retired-templates');
+/** Where an older runly kept `run` artifacts; retention deletes it (decision 0032). */
 export const artifactsRoot = (): string => join(stateRoot(), 'artifacts');
 /**
  * Per-worktree state (decision 0032): the trigger-file hash cache and the

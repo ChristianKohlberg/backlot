@@ -4,8 +4,6 @@
  * (decision 0009). One RPC endpoint; the CLI is a thin client. Serializes
  * requests through a simple queue — policy code stays race-free.
  */
-import { selectPresets } from '../core/presets.js';
-import { loadStack } from '../core/manifest.js';
 import { createServer, request } from 'node:http';
 import { existsSync, rmSync, writeFileSync, chmodSync } from 'node:fs';
 import { socketPath, pidPath, stateRoot } from '../core/paths.js';
@@ -36,38 +34,16 @@ async function dispatch(verb: string, args: Record<string, unknown>, emit: (phas
       return engine.up({
         cwd, holder, holderPid, callerEnv: args.callerEnv, presets: args.presets,
         hygiene: (args.hygiene as never) ?? undefined,
-        watch: Boolean(args.watch),
         ttlMs: args.ttlMs ? Number(args.ttlMs) : undefined,
         // [] (not undefined) so the `up` verb always means the whole app unless
         // a slice is named — undefined is reserved for internal shape-preserving
-        // rebinds (reset-data/watch/bind), which never come through this RPC.
+        // rebinds (reset-data), which never come through this RPC.
         services: Array.isArray(args.services) ? (args.services as unknown[]).map(String) : [],
         dataOnly: Boolean(args.dataOnly),
         onProgress: emit,
       });
-    case 'run':
-      return engine.run({ cwd, holder, callerEnv: args.callerEnv, presets: args.presets, check: String(args.check), hygiene: (args.hygiene as never) ?? undefined, onProgress: emit });
-    case 'run-detach': {
-      if (args.presets !== undefined) selectPresets(loadStack(cwd).manifest, 'run', args.presets);
-      const jobId = engine.createJob(cwd, String(args.check));
-      // Fire-and-forget — env/pool locks make it safe; the journaled verdict
-      // outlives the client (decision 0015).
-      // Fire-and-forget by design (the verdict is journaled and outlives the
-      // client) — but a REJECTION here is process-fatal without a catch, and
-      // the job would be lost with no record of why.
-      void engine
-        .executeJob(jobId, { cwd, holder, callerEnv: args.callerEnv, presets: args.presets, check: String(args.check), hygiene: (args.hygiene as never) ?? undefined })
-        .catch((err) => logEvent({ level: 'error', kind: 'job', detail: `job ${jobId} failed outside the verdict path: ${String((err as Error).message ?? err)}` }));
-      return { jobId, poll: `runly job ${jobId}` };
-    }
-    case 'job':
-      return engine.jobStatus(String(args.jobId));
-    case 'job-ls':
-      return engine.jobList();
     case 'ctx':
       return engine.ctx(cwd, holder);
-    case 'sync':
-      return engine.syncLease(cwd, holder, emit);
     case 'reset-data':
       return engine.resetData(cwd, holder, emit, args.presets);
     case 'exec':

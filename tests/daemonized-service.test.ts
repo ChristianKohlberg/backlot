@@ -61,7 +61,7 @@ describe('a service that daemonizes is refused, fast and with the blame on the r
     // returns 0 at once. The declared ready gate would wait 30s if polled.
     writeFileSync(
       join(wt, 'stack.yaml'),
-      `name: dmz\nservices:\n  bg: { run: "sleep 300 &", ready: { log: "never-logged", timeout: 30 } }\nchecks:\n  ok: { run: "true" }\n`,
+      `name: dmz\nservices:\n  bg: { run: "sleep 300 &", ready: { log: "never-logged", timeout: 30 } }\n`,
     );
     execFileSync('git', ['init', '-q'], { cwd: wt });
     // Sweep interval kept LONG so the degraded env is still observable below

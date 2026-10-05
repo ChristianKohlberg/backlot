@@ -15,8 +15,8 @@ const db = new DatabaseSync(process.argv[2]);db.exec('DROP TABLE IF EXISTS marke
 db.prepare('INSERT INTO marker VALUES (?)').run(process.argv[3]);db.close();\n`);
   writeFileSync(join(tree, 'server.mjs'), `import {createServer} from 'node:http';createServer((q,s)=>s.end('ready')).listen(Number(process.env.PORT),'127.0.0.1');\n`);
   const datastore = {driver:'sqlite',create:'node seed.mjs "{{ns}}" "{{preset}}"',template:true,presets:['dev','alternate'],default_preset:{session:'dev',run:'dev'}};
-  writeFileSync(join(tree, 'stack.yaml'), JSON.stringify({name:'preset-selection',services:{web:{run:'node server.mjs',port:'web',env:{PORT:'{{ports.web}}'},ready:{http:'/',timeout:10}}},datastores:{main:datastore,...(multi?{audit:datastore}:{})},checks:{alternate:{env:{BACKLOT_DS_MAIN:'{{datastores.main.url}}'},run:`node -e 'const {DatabaseSync}=require("node:sqlite");const d=new DatabaseSync(process.env.BACKLOT_DS_MAIN);process.exit(d.prepare("SELECT value FROM marker").get().value==="alternate"?0:1)'`}}}));
-  const env = {...process.env,BACKLOT_STATE_DIR:state,BACKLOT_POOL_MAX:'1',BACKLOT_POOL_MAX_TOTAL:'1'};
+  writeFileSync(join(tree, 'stack.yaml'), JSON.stringify({name:'preset-selection',services:{web:{run:'node server.mjs',port:'web',env:{PORT:'{{ports.web}}'},ready:{http:'/',timeout:10}}},datastores:{main:datastore,...(multi?{audit:datastore}:{})}}));
+  const env = {...process.env,BACKLOT_STATE_DIR:state,BACKLOT_POOL_MAX_TOTAL:'1'};
   const cli = (args:string[]) => new Promise<{code:number;json:any;stdout:string;stderr:string}>(resolve=>{
     execFile(process.execPath,[CLI,...args,'--json'],{cwd:tree,env,timeout:25000},(error,stdout,stderr)=>{
       let json;try{json=JSON.parse(stdout);}catch{json=null;}resolve({code:error?Number(error.code??1):0,json,stdout,stderr});
@@ -48,9 +48,9 @@ it('rejects an unknown preset on a fresh request',async()=>{const f=fixture();tr
 }finally{await f.cleanup();}},30000);
 
 it('refuses --preset on an unsupported verb as a usage error without touching the daemon',async()=>{const f=fixture();try{
-  for(const verb of ['ctx','sync','help','--help','version','--version']){
+  for(const verb of ['ctx','warm','help','--help','version','--version']){
     const bad=await f.cli([verb,'--preset','alternate']);
-    expect(bad.code,bad.stderr).toBe(64);expect(bad.stdout).toBe('');expect(bad.stderr).toContain('--preset is supported by up, run and reset-data');
+    expect(bad.code,bad.stderr).toBe(64);expect(bad.stdout).toBe('');expect(bad.stderr).toContain('--preset is supported by up and reset-data');
   }
   expect(existsSync(join(f.state,'daemon.pid'))).toBe(false);
   const invalid=await f.cli(['up','--preset','missing']);expect(invalid.code,invalid.stdout).toBe(1);expect(invalid.json.error.class).toBe('work-error');
@@ -69,13 +69,12 @@ it('labels a preset as changed only against a previously recorded selection',asy
 }finally{await f.cleanup();}},30000);
 
 
-it('retains selection on warm up, sync, reset and daemon restart; a fresh holder gets the default',async()=>{
+it('retains selection on warm up, reset and daemon restart; a fresh holder gets the default',async()=>{
   const f=fixture();try{
     const first=await f.cli(['up','--preset','alternate']);expect(first.code,first.stdout).toBe(0);
     f.mutate(first.json);
     const same=await f.cli(['up']);expect(same.code,same.stdout).toBe(0);expect(f.value(same.json)).toBe('user-data');expect(same.json.datastores.main.preset).toBe('alternate');
     expect(same.json.bindDiagnostics.reuse).toBe('reused');
-    const synced=await f.cli(['sync']);expect(synced.code,synced.stdout).toBe(0);expect(f.value(synced.json)).toBe('user-data');
     const reset=await f.cli(['reset-data']);expect(reset.code,reset.stdout).toBe(0);expect(f.value(reset.json)).toBe('alternate');
     const pristine=await f.cli(['up','--pristine']);expect(pristine.code,pristine.stdout).toBe(0);expect(f.value(pristine.json)).toBe('alternate');
     const pid=Number(readFileSync(join(f.state,'daemon.pid'),'utf8'));await f.cli(['daemon','stop']);
@@ -97,28 +96,6 @@ it('selects individual datastores and rejects ambiguous or duplicate choices',as
     const reset=await f.cli(['reset-data','--preset','main=alternate']);expect(reset.code,reset.stdout).toBe(0);expect(f.value(reset.json)).toBe('alternate');
   }finally{await f.cleanup();}
 },30000);
-
-it('uses the selected preset for synchronous and detached checks',async()=>{
-  const f=fixture();try{
-    const run=await f.cli(['run','alternate','--preset','alternate']);expect(run.code,JSON.stringify(run)).toBe(0);
-    const detached=await f.cli(['run','alternate','--preset','alternate','--detach']);expect(detached.code,detached.stdout).toBe(0);
-    let job;
-    for(let i=0;i<100;i++){job=await f.cli(['job',detached.json.jobId]);if(job.json.state==='done')break;await new Promise(r=>setTimeout(r,100));}
-    expect(job!.json.state).toBe('done');expect(job!.json.verdict.ok).toBe(true);
-    const invalid=await f.cli(['run','alternate','--preset','missing','--detach']);expect(invalid.code,invalid.stdout).toBe(1);
-  }finally{await f.cleanup();}
-},30000);
-
-it('journals a detached run failure as a job verdict unless explicit presets are refused up front',async()=>{const f=fixture();try{
-  const path=join(f.tree,'stack.yaml');const manifest=JSON.parse(readFileSync(path,'utf8'));manifest.datastores.main.default_preset.run='missing';writeFileSync(path,JSON.stringify(manifest));
-  const detached=await f.cli(['run','alternate','--detach']);expect(detached.code,detached.stdout).toBe(0);expect(typeof detached.json.jobId).toBe('string');
-  let job;
-  for(let i=0;i<100;i++){job=await f.cli(['job',detached.json.jobId]);if(job.json.state==='done')break;await new Promise(r=>setTimeout(r,100));}
-  expect(job!.json.state).toBe('done');expect(job!.json.verdict.ok).toBe(false);expect(job!.json.verdict.failure.class).toBe('work-error');expect(job!.json.verdict.failure.message).toContain('missing');
-  const refused=await f.cli(['run','alternate','--detach','--preset','main=missing']);expect(refused.code,refused.stdout).toBe(1);
-  expect((await f.cli(['job','ls'])).json.jobs.filter((j:any)=>j.id!==detached.json.jobId)).toHaveLength(0);
-  expect((await f.cli(['status'])).json.envs).toHaveLength(0);
-}finally{await f.cleanup();}},30000);
 
 it('treats an empty presets catalog like an omitted one',async()=>{const f=fixture();try{
   const path=join(f.tree,'stack.yaml');const manifest=JSON.parse(readFileSync(path,'utf8'));manifest.datastores.main.presets=[];writeFileSync(path,JSON.stringify(manifest));
@@ -176,19 +153,18 @@ it('retains explicit lease intent through a pristine upkeep failure and daemon r
   expect(retry.json.datastores.main.preset).toBe('alternate');expect(f.value(retry.json)).toBe('alternate');
 }finally{await f.cleanup();}},30000);
 
-it('validates hot-reload refreshes and rebinds when an inherited preset disappears',async()=>{const f=fixture();try{
+it('validates a reusing up and rebinds when an inherited preset disappears',async()=>{const f=fixture();try{
   const path=join(f.tree,'stack.yaml');const manifest=JSON.parse(readFileSync(path,'utf8'));
-  manifest.services.web.hot_reload=true;writeFileSync(path,JSON.stringify(manifest));
   writeFileSync(join(f.tree,'content.txt'),'original');
   const first=await f.cli(['up','--preset','alternate']);expect(first.code,first.stdout).toBe(0);
-  const projected=await f.cli(['sync']);expect(projected.code,projected.stdout).toBe(0);expect(projected.json.bindDiagnostics.reuse).toBe('refreshed');
+  const projected=await f.cli(['up']);expect(projected.code,projected.stdout).toBe(0);expect(projected.json.bindDiagnostics.reuse).toBe('reused');
   f.mutate(first.json);
   manifest.datastores.main.default_preset.session='missing';writeFileSync(path,JSON.stringify(manifest));
   writeFileSync(join(f.tree,'content.txt'),'changed');
-  const invalid=await f.cli(['sync']);expect(invalid.code,invalid.stdout).toBe(1);expect(invalid.json.error.message).toContain('missing');
+  const invalid=await f.cli(['up']);expect(invalid.code,invalid.stdout).toBe(1);expect(invalid.json.error.message).toContain('missing');
   expect(f.value(first.json)).toBe('user-data');
   manifest.datastores.main.default_preset.session='dev';manifest.datastores.main.presets=['dev'];writeFileSync(path,JSON.stringify(manifest));
-  const synced=await f.cli(['sync']);expect(synced.code,synced.stdout).toBe(0);
+  const synced=await f.cli(['up']);expect(synced.code,synced.stdout).toBe(0);
   expect(synced.json.bindDiagnostics.reasons).toContain('datastore-preset-changed');
   expect(synced.json.datastores.main.preset).toBe('dev');expect(f.value(synced.json)).toBe('dev');
 }finally{await f.cleanup();}},30000);

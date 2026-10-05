@@ -84,14 +84,15 @@ caches: [cache]
 
     expect((await ctx.cli(['up', '--json'], wt)).exitCode).toBe(0); // healthy first
     rmSync(join(wt, 'cache'), { recursive: true, force: true }); // wiped by hand; the ledger still vouches
-    // Nudge the source so the next bind actually restarts (the fast path
-    // correctly reuses a healthy env when nothing changed).
-    writeFileSync(join(wt, 'nudge.txt'), 'restart me');
+    writeFileSync(join(wt, 'nudge.txt'), 'untracked, must survive');
 
-    expect((await ctx.cli(['sync', '--json'], wt)).exitCode).toBe(1); // strike 1 (work-error)
-    expect((await ctx.cli(['sync', '--json'], wt)).exitCode).toBe(1); // strike 2
+    // A plain `up` keeps a healthy service running (web has no build:), so the
+    // first strike forces a restart through a data reset; once the bind has
+    // failed the env is no longer hot and every `up` restarts.
+    expect((await ctx.cli(['up', '--reset-data', '--json'], wt)).exitCode).toBe(1); // strike 1 (work-error)
+    expect((await ctx.cli(['up', '--json'], wt)).exitCode).toBe(1); // strike 2
 
-    const third = await ctx.cli(['sync', '--json'], wt); // auto-escalated to pristine
+    const third = await ctx.cli(['up', '--json'], wt); // auto-escalated to pristine
     expect(third.exitCode, `stdout: ${third.stdout ?? ''}\nstderr: ${third.stderr ?? ''}`).toBe(0);
     expect(third.json!.state).toBe('hot');
     expect(existsSync(join(wt, 'cache', 'dep'))).toBe(true); // the rule ran again, in place
@@ -206,7 +207,7 @@ describe('the upkeep ledger belongs to the worktree, not to an environment (deci
     rmSync(wt, { recursive: true, force: true });
   });
 
-  it('a run in the same worktree trusts the install the session did; pristine re-runs it', async () => {
+  it('a data reset in the same worktree trusts the install already done; pristine re-runs it', async () => {
     writeFileSync(join(wt, 'dep.txt'), 'v1\n');
     writeFileSync(join(wt, '.gitignore'), 'node_modules/\nupkeep.log\n');
     writeFileSync(
@@ -216,8 +217,6 @@ services:
   idle: { run: "echo ready; sleep 300", ready: { log: "ready", timeout: 20 } }
 upkeep:
   - { when: dep.txt, run: "mkdir -p node_modules && echo installed > node_modules/marker && echo ran >> upkeep.log" }
-checks:
-  deps: { run: "test -f node_modules/marker" }
 `,
     );
     execFileSync('git', ['init', '-q'], { cwd: wt });
@@ -227,12 +226,13 @@ checks:
     expect(up.exitCode, JSON.stringify(up.json)).toBe(0);
     expect(runs()).toBe(1);
 
-    const run = await ctx.cli(['run', 'deps', '--json'], wt); // same worktree, same environment
-    expect(run.exitCode, JSON.stringify(run.json)).toBe(0);
-    expect(run.json!.envId).toBe(up.json!.envId);
+    const reset = await ctx.cli(['up', '--reset-data', '--json'], wt); // same worktree, same environment
+    expect(reset.exitCode, JSON.stringify(reset.json)).toBe(0);
+    expect(reset.json!.envId).toBe(up.json!.envId);
     expect(runs()).toBe(1); // the install is a fact about the worktree: not repeated
+    expect(existsSync(join(wt, 'node_modules', 'marker'))).toBe(true);
 
-    const pristine = await ctx.cli(['run', 'deps', '--pristine', '--json'], wt);
+    const pristine = await ctx.cli(['up', '--pristine', '--json'], wt);
     expect(pristine.exitCode, JSON.stringify(pristine.json)).toBe(0);
     expect(runs()).toBe(2); // pristine trusts nothing: the rule ran again
   }, 60_000);

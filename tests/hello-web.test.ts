@@ -1,6 +1,6 @@
 /**
  * Circles around hello-web: seed determinism, template-as-file-copy semantics
- * (the sqlite driver's capability), boot-to-ready, the smoke check as a run,
+ * (the sqlite driver's capability), boot-to-ready, the smoke test,
  * and preset behavior. These are engine conformance properties proven against
  * the fixture before the engine exists.
  */

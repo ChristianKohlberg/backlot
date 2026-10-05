@@ -67,7 +67,7 @@ db.close();
       (withStore
         ? `datastores:\n  main:\n    driver: sqlite\n    create: node seed.mjs {{ns}} {{preset}}\n    presets: [dev, empty]\n    default_preset: { session: dev, run: empty }\n    template: true\n`
         : '') +
-      `checks:\n  ok: { run: "true" }\n`,
+      ``,
   );
   execFileSync('git', ['init', '-q'], { cwd: wt });
   const env = { ...process.env, BACKLOT_STATE_DIR: stateDir, BACKLOT_SWEEP_MS: '400' };
@@ -284,12 +284,5 @@ describe('a data-only request that cannot mean anything is refused', () => {
     const res = await cli(['up', '--data-only', '--json']);
     expect(res.code).toBe(1);
     expect(JSON.stringify(res.json)).toMatch(/needs at least one datastore/);
-  }, 60_000);
-
-  it('refuses --watch under --data-only, which has nothing to reload', async () => {
-    const { cli } = ctx();
-    const res = await cli(['up', '--data-only', '--watch', '--json']);
-    expect(res.code).toBe(64);
-    expect(res.stderr).toMatch(/nothing to do/);
   }, 60_000);
 });

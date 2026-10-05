@@ -90,11 +90,11 @@ process.on('SIGTERM',()=>{});child.on('exit',()=>process.exit(0));
 }
 
 describe('leased preview process groups', () => {
-  it('preserves a wrapper and child across dirty sync, then releases the whole group', async () => {
+  it('preserves a wrapper and child across a repeated up on a dirty tree, then releases the whole group', async () => {
     const f = fixture();
     await f.start();
     writeFileSync(join(f.tree, 'change.txt'), 'force service restart');
-    const sync = await f.cli('sync', '--holder', 'a');
+    const sync = await f.cli('up', '--holder', 'a');
     expect(sync.code, sync.output).toBe(0);
     expect(f.bothAlive()).toBe(true);
     expect(sync.data.previewUrls).toEqual({ web: URL });

@@ -10,6 +10,7 @@ export type EnvState = 'provisioning' | 'hot' | 'warm' | 'degraded' | 'recycling
 
 export type Hygiene = 'reuse' | 'reset-data' | 'pristine';
 
+/** Every lease is a session lease; `run` survives only in journals from before 0.13 (decision 0032). */
 export type LeaseKind = 'session' | 'run';
 
 /** The field an agent branches on mechanically (decision 0010). */
@@ -71,18 +72,6 @@ export interface Failure {
   logExcerpt?: string;
 }
 
-export interface Verdict {
-  check: string;
-  ok: boolean;
-  exitCode: number;
-  failure?: Failure;
-  artifactsDir?: string;
-  /** Declared outputs the env offers back; pulled only explicitly (decision 0011). */
-  outputsChanged: string[];
-  binding: Binding;
-  durationMs: number;
-}
-
 /** What `runly ctx --json` returns — the consumer's entire interface. */
 export interface Context {
   /** Present on bind responses only; ctx never replays another request's timings. */
@@ -91,6 +80,8 @@ export interface Context {
   envId: string;
   lease: Lease;
   urls: Record<string, string>;
+  /** Allocated ports by manifest key. */
+  ports?: Record<string, number>;
   /**
    * Public preview URLs for services explicitly published via `runly preview`.
    * Each URL is world-readable and unauthenticated — anyone with the link reaches
@@ -99,7 +90,7 @@ export interface Context {
   previewUrls?: Record<string, string>;
   /**
    * What a bind did to a live preview, returned on that bind's OWN response
-   * (`up`, `sync`, `reset-data`) — never on a plain `ctx` read, which cannot
+   * (`up`, `reset-data`) — never on a plain `ctx` read, which cannot
    * know which bind a notice belongs to. Set when the bind tore the tunnel down
    * (the manifest now forbids preview, the previewed service left the running
    * set, or its local port moved) or when `--reset-data`/`--pristine` left the
@@ -125,7 +116,6 @@ export interface Context {
   /** How a CONSUMER actually mints a token: `runly token --role <role> --raw`. */
   tokenVia?: string;
   datastores: Record<string, { url: string }>;
-  artifactsDir: string;
   hygiene: Hygiene;
   events: Array<{ at: number; service: string; event: string }>;
 }

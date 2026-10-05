@@ -16,9 +16,17 @@ export interface ReadySpec {
 export interface ServiceSpec {
   run: string;
   build?: string;
+  /** Accepted and ignored since decision 0032 (`--watch` was removed). */
   watch_run?: string;
-  /** run: self-reloads on worktree changes — lets `sync` keep it running. */
+  /** Accepted and ignored since decision 0032: a service without `build:` keeps running on `up` anyway. */
   hot_reload?: boolean;
+  /**
+   * Globs (relative to the stack root) of what this service's `build:`
+   * produces. Snapshotted (path, size, mtime) around the build on every `up`;
+   * the service is restarted only when they changed. Without it, a service
+   * with a build is restarted after every build (decision 0032).
+   */
+  outputs?: string[];
   cwd?: string;
   port?: string;
   env?: Record<string, string>;
@@ -53,15 +61,6 @@ export interface ApplianceSpec {
   /** Optional readiness gate polled after TCP accepts (exit 0 = ready). */
   ready?: string;
   /** Seconds to wait after start for probe+ready. Default 60. */
-  timeout?: number;
-}
-
-export interface CheckSpec {
-  run: string;
-  cwd?: string;
-  env?: Record<string, string>;
-  artifacts?: string[];
-  /** Hard kill (whole process group) after this many seconds. Default 600. */
   timeout?: number;
 }
 
@@ -148,15 +147,32 @@ export interface Manifest {
   preview?: PreviewSpec;
   appliances?: Record<string, ApplianceSpec>;
   datastores?: Record<string, DatastoreSpec>;
-  /** Build/install output in the worktree: never an upkeep trigger, ignored by `--watch` (decision 0032). */
+  /** Build/install output in the worktree: never an upkeep trigger (decision 0032). */
   caches?: string[];
   /** `include`: git-ignored files an upkeep `when:` glob may still match. `keep` is accepted and ignored (decision 0032). */
   sync?: { keep?: string[]; include?: string[] };
-  /** Files a check may regenerate; a run reports which ones changed. */
+  /** Accepted and ignored since decision 0032 (it served `runly run`). */
   outputs?: string[];
   upkeep?: UpkeepRule[];
   auth?: { logins?: LoginsSpec; token?: string };
-  checks?: Record<string, CheckSpec>;
+  /**
+   * Accepted and ignored since decision 0032: `runly run` was removed. Repo
+   * scripts read `runly ctx --env` instead. A manifest that still declares it
+   * loads, with a one-line deprecation warning (`manifestDeprecations`).
+   */
+  checks?: Record<string, unknown>;
+}
+
+/**
+ * One-line warnings for manifest sections runly accepts but no longer acts on.
+ * The CLI prints them to stderr; the manifest still loads.
+ */
+export function manifestDeprecations(manifest: Manifest): string[] {
+  const out: string[] = [];
+  if (manifest.checks !== undefined) {
+    out.push(`runly.yml declares 'checks:', which is ignored since 'runly run' was removed (decision 0032) — run your checks yourself, with 'runly ctx --env' for the environment`);
+  }
+  return out;
 }
 
 export interface Stack {

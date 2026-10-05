@@ -57,7 +57,7 @@ describe('a surviving lease on a restarted daemon', () => {
     dirs.push(stateDir, wt);
     writeFileSync(
       join(wt, 'stack.yaml'),
-      `name: warm\nservices:\n  web: { run: "echo ready; sleep 300", ready: { log: ready, timeout: 20 } }\nchecks:\n  ok: { run: "true" }\n`,
+      `name: warm\nservices:\n  web: { run: "echo ready; sleep 300", ready: { log: ready, timeout: 20 } }\n`,
     );
     execFileSync('git', ['init', '-q'], { cwd: wt });
     const env = { ...process.env, BACKLOT_STATE_DIR: stateDir, BACKLOT_SWEEP_MS: '60000' };

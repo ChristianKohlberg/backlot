@@ -61,7 +61,7 @@ function ctx(opts: { service?: boolean } = {}) {
       join(wt, 'stack.yaml'),
       `name: upd\n` +
         `services:\n  web: { run: node srv.mjs, port: web, env: { PORT: "{{ports.web}}" }, ready: { log: ready, timeout: 20 } }\n` +
-        `checks:\n  ok: { run: "true" }\n`,
+        ``,
     );
     execFileSync('git', ['init', '-q'], { cwd: wt });
   }

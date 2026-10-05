@@ -1,12 +1,13 @@
-# The smoke check: stdlib-only vertical proof. Exit code = the verdict.
+# The smoke test: stdlib-only vertical proof. Exit code = the verdict.
+#   eval "$(runly ctx --env)" && python3 smoke.py
 import json
 import os
 import sys
 import urllib.request
 
-base = os.environ.get("BASE_URL")
+base = os.environ.get("RUNLY_URL_WEB") or os.environ.get("BASE_URL")
 if not base:
-    print("BASE_URL not set — run through `runly run smoke`", file=sys.stderr)
+    print('RUNLY_URL_WEB not set — run: eval "$(runly ctx --env)" && python3 smoke.py', file=sys.stderr)
     sys.exit(2)
 
 health = json.load(urllib.request.urlopen(f"{base}/health"))

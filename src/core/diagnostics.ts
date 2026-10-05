@@ -3,20 +3,24 @@ export interface BindDiagnostics {
   durationMs: number;
   phasesMs: Record<BindPhase, number>;
   /**
-   * `reused`: the environment was already running in the requested shape and
-   * nothing asked for a restart, so nothing was built or restarted; `rebound`:
-   * the ordinary prepare/build/start path; `refreshed`: hot-reload services kept
-   * running (they read the worktree themselves).
+   * `reused`: the services kept running — every build ran and none changed a
+   * service's declared outputs; `restarted`: the services kept running except
+   * `restarted`, whose build output changed (or which declare none); `rebound`:
+   * the full stop/data/build/start path.
    */
-  reuse: 'reused' | 'rebound' | 'refreshed';
+  reuse: 'reused' | 'restarted' | 'rebound';
+  /** The services an `up` restarted because their build output changed. */
+  restarted: string[];
   reasons: string[];
   upkeep: { ran: number; skipped: number };
   /**
-   * The services whose `build:` ran in this bind. runly keeps no build cache
-   * (decision 0032): every bind that starts a service with a `build:` runs it,
-   * and the build tool decides what is already up to date.
+   * Every `build:` that ran in this operation — all of them, every `up`
+   * (decision 0032: runly keeps no build cache; the build tool decides what is
+   * current) — and whether its service was restarted, with why:
+   * `outputs-changed`, `outputs-unchanged`, `no-outputs-declared` (always
+   * restarted) or `full-rebind`.
    */
-  builds: Array<{ service: string; durationMs: number }>;
+  builds: Array<{ service: string; durationMs: number; restart: boolean; reason: 'outputs-changed' | 'outputs-unchanged' | 'no-outputs-declared' | 'full-rebind' }>;
 }
 
 type BindPhase = 'queue' | 'prepare' | 'appliances' | 'upkeep' | 'stop' | 'data' | 'build' | 'ready' | 'finalize';
@@ -25,7 +29,7 @@ export class BindTrace {
   readonly result: BindDiagnostics = {
     durationMs: 0,
     phasesMs: { queue: 0, prepare: 0, appliances: 0, upkeep: 0, stop: 0, data: 0, build: 0, ready: 0, finalize: 0 },
-    reuse: 'rebound', reasons: [],
+    reuse: 'rebound', restarted: [], reasons: [],
     upkeep: { ran: 0, skipped: 0 }, builds: [],
   };
   private started = performance.now();

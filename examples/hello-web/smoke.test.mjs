@@ -1,8 +1,9 @@
-// The `smoke` check for hello-web: proves the whole vertical (HTTP -> sqlite)
-// against whatever BASE_URL runly injected. Exit code = the verdict.
-const base = process.env.BASE_URL;
+// hello-web's smoke test: proves the whole vertical (HTTP -> sqlite) against the
+// environment `runly ctx --env` describes. Exit code = the verdict.
+//   eval "$(runly ctx --env)" && node smoke.test.mjs
+const base = process.env.RUNLY_URL_WEB ?? process.env.BASE_URL;
 if (!base) {
-  console.error('BASE_URL not set — run through `runly run smoke`');
+  console.error('RUNLY_URL_WEB not set — run: eval "$(runly ctx --env)" && node smoke.test.mjs');
   process.exit(2);
 }
 

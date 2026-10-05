@@ -50,7 +50,6 @@ function mkStack(yaml: string, extraFiles: Record<string, string> = {}) {
   const env = {
     ...process.env,
     BACKLOT_STATE_DIR: stateDir,
-    BACKLOT_POOL_MAX: '2',
     BACKLOT_SWEEP_MS: '500',
     BACKLOT_CMD_TIMEOUT_S: '2',
   };

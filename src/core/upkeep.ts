@@ -157,28 +157,6 @@ export function templateBakeKeys(manifest: Manifest, root: string, files: string
   );
 }
 
-/**
- * Which rules WOULD fire for this worktree — the exact trigger check runUpkeep
- * performs, without running anything. A `sync` or `--watch` save under
- * hot-reload services uses it to decide honestly between "record the new
- * state, keep the services" and the full bind path: a save that changes what
- * a rule (or @rebake-template) fingerprints cannot be served by the dev
- * servers' own watchers alone.
- */
-export function pendingUpkeep(
-  root: string,
-  files: string[] | TriggerSet,
-  manifest: Manifest,
-  previous: Record<string, string>,
-): string[] {
-  const pending: string[] = [];
-  for (const rule of manifest.upkeep ?? []) {
-    const key = ruleKey(rule);
-    if (previous[key] !== triggerHash(root, files, rule.when)) pending.push(key);
-  }
-  return pending;
-}
-
 export async function runUpkeep(
   root: string,
   files: string[] | TriggerSet,

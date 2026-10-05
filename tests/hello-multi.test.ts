@@ -58,7 +58,7 @@ describe('hello-multi fixture', () => {
     expect(res.output).toContain('smoke ok');
     expect(res.exitCode, `stdout: ${res.stdout ?? ''}\nstderr: ${res.stderr ?? ''}`).toBe(0);
 
-    // The manifest declares artifacts: [smoke-report.json] — it must exist and be honest.
+    // The smoke test writes smoke-report.json — it must exist and be honest.
     const reportPath = join(example, 'smoke-report.json');
     expect(existsSync(reportPath)).toBe(true);
     const report = JSON.parse(readFileSync(reportPath, 'utf8'));

@@ -93,7 +93,7 @@ describe('daemon singleton under a real race', () => {
     writeFileSync(join(wt, 'srv.mjs'), `import{createServer}from'node:http';console.log('up');createServer((q,s)=>s.end('ok')).listen(Number(process.env.PORT), '127.0.0.1');\n`);
     writeFileSync(
       join(wt, 'stack.yaml'),
-      `name: race\nservices:\n  web: { run: node srv.mjs, port: web, env: { PORT: "{{ports.web}}" }, ready: { http: /, timeout: 20 } }\nchecks:\n  ok: { run: "true" }\n`,
+      `name: race\nservices:\n  web: { run: node srv.mjs, port: web, env: { PORT: "{{ports.web}}" }, ready: { http: /, timeout: 20 } }\n`,
     );
     execFileSync('git', ['init', '-q'], { cwd: wt });
     const env = { ...process.env, BACKLOT_STATE_DIR: stateDir, BACKLOT_SWEEP_MS: '300' };

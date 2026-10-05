@@ -96,7 +96,7 @@ describe('progress while queued behind a busy environment', () => {
     expect(up.code, up.stdout).toBe(0);
     const slow = run(['exec', 'sleep', '4']); // holds the env lock
     await new Promise((r) => setTimeout(r, 500));
-    const queued = await run(['sync', '--progress', '--json']);
+    const queued = await run(['up', '--progress', '--json']);
     expect(queued.code, queued.stdout).toBe(0);
     expect(queued.stderr.replace(/\r/g, '\n')).toMatch(/waiting for another operation/);
     await slow;

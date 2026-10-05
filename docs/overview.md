@@ -10,8 +10,8 @@ This is the condensed, human-first tour. The full design (with every decision ar
 ## The problem, in one paragraph
 
 Agents iterating on a web app constantly need three things: a running instance to
-**inspect**, a deterministic environment to **prove** changes against (e2e, with a
-machine-readable verdict), and a fix-sync-retest loop that runs in **seconds** — before
+**inspect**, a deterministic environment to **prove** changes against (their e2e
+suite, against known data), and a fix-rebind-retest loop that runs in **seconds** — before
 any commit, long before CI. Hand-rolled harnesses all reinvent the same machinery (port
 allocation, DB namespacing, zombie reaping) welded to one repo. And because environments
 are expensive to make, everyone hoards them "just in case" until the machine is full of
@@ -20,11 +20,12 @@ and make *ownership* — not the environment — the disposable thing.
 
 ## How it works
 
-One `runly.yml` at your repo root declares services, datastores, seed presets, and
-checks. A per-machine daemon (auto-spawned by the CLI, nothing to deploy) supervises a
+One `runly.yml` at your repo root declares services, datastores, seed presets and
+upkeep rules. A per-machine daemon (auto-spawned by the CLI, nothing to deploy) supervises a
 pool of environments, each with its own ports, its own datastore namespace and its own
 logs, all running **in your worktree** — no copy of your source is made. Verbs *lease* an
-environment, converge it to your worktree, and hand you URLs, credentials, and verdicts.
+environment, converge it to your worktree, and hand you URLs, credentials and
+connection strings — `runly ctx --env` as shell variables your own tests read.
 
 ```mermaid
 flowchart LR
@@ -32,17 +33,17 @@ flowchart LR
         WT["code + dirty edits"]
     end
     subgraph broker["runly (per-machine daemon)"]
-        CLI["CLI verbs<br/>up · run · sync · ctx · exec"]
+        CLI["CLI verbs<br/>up · ctx · exec · warm"]
         subgraph pool["warm pool"]
             E1["env 1 · leased<br/>services up · ports 491xx<br/>db ns e1 · caches warm"]
             E2["env 2 · hot, free"]
             E3["env 3 · warm<br/>(services stopped, caches kept)"]
         end
     end
-    E1 -- "runs in place: builds, services,<br/>checks (no copy)" --> WT
+    E1 -- "runs in place: upkeep, builds,<br/>services (no copy)" --> WT
     CLI -- "lease + bind" --> E1
     E1 -- "URLs · credentials · logs" --> WT
-    E1 -- "run &lt;check&gt; → verdict<br/>ok / work-error / env-error / infra-error" --> WT
+    E1 -- "ctx --env → RUNLY_URL_* …<br/>for your own tests" --> WT
 ```
 
 Two inversions carry the whole design:
@@ -55,8 +56,8 @@ Two inversions carry the whole design:
 - **Environments run in your worktree — one per worktree; ports never move.** Services
   build and run where you work, so your warm caches are theirs, no source is copied, and
   runly keeps no build cache of its own — your build tools decide what is current
-  ([decision 0032](decisions/0032-environments-run-in-the-callers-worktree.md)). A
-  `run` uses the same environment as your session, resetting its data first. What an
+  ([decision 0032](decisions/0032-environments-run-in-the-callers-worktree.md)). Every
+  `up` runs your builds and restarts only the services whose build output changed. What an
   environment keeps to itself — ports (and so URLs), database namespace, logs — is
   stable for its lifetime.
 
@@ -70,7 +71,7 @@ reclaim — lease expiry, recycle, even losing the machine — safe by construct
 stateDiagram-v2
     [*] --> pristine : provision (templates + shared caches)
     pristine --> hot : bind + start (seconds; minutes on first build)
-    hot --> hot : sync (due upkeep + your builds, seconds)
+    hot --> hot : up (due upkeep + your builds; restarts what changed)
     hot --> warm : idle TTL — services stop, caches stay
     warm --> hot : next verb (start + ready-wait)
     hot --> degraded : service flaps past its restart budget
@@ -83,8 +84,8 @@ a fingerprint ledger replays only the upkeep rules whose trigger files changed
 (lockfile → install, migrations → migrate), your build commands run and decide for
 themselves what is current, and data states restore from baked templates in seconds.
 Hygiene is per-bind: `reuse` keeps everything (inspection), `reset-data` restores the
-data template and nothing else (the default for runs), `--pristine` re-runs every
-upkeep rule in place (merge-grade verdicts; it never deletes anything in your
+data template and nothing else (before tests that need known data), `--pristine`
+re-runs every upkeep rule in place (merge-grade; it never deletes anything in your
 worktree). `runly warm` does the due upkeep and the builds ahead of time, with no lease,
 for an idle worktree moved to a new commit. Two consecutive bind failures on the same environment
 auto-escalate the next bind to pristine — the standard defense against stale-cache
@@ -98,8 +99,9 @@ runly up                  # lease an env; upkeep, build, start — in your workt
                             #  that slice plus its depends_on closure)
 runly ctx --json          # URLs, login creds, DB strings, recent events — all an agent needs
 # …edit code in your worktree…
-runly sync                # dev servers already see the edits; this rebuilds what doesn't
-runly run e2e --json      # second env from the pool, fresh data, JSON verdict
+runly up                  # due upkeep + builds; restarts only what the builds changed
+runly up --reset-data     # known data before the tests
+eval "$(runly ctx --env)" && pnpm e2e   # your tests, fed RUNLY_URL_* / RUNLY_DATASTORE_*
 runly release             # or just walk away — the lease lapses harmlessly
 ```
 
@@ -115,19 +117,19 @@ the class is what an agent branches on:
 
 | Class | Meaning | Exit | Who acts |
 | --- | --- | --- | --- |
-| `work-error` | your synced code is at fault | 1 | you fix, re-sync |
+| `work-error` | your code is at fault | 1 | you fix, `up` again |
 | `env-error` | the environment is at fault | 2 | runly recycles it |
 | `infra-error` | something external (DB down, registry) | 3 | actionable message, nobody's code blamed |
 
-A service that dies mid-check fails the run *explicitly* as `env-error` — never a
-silently wrong verdict that sends an agent off to "fix" healthy code.
+A service that dies during a bind fails it *explicitly* as `env-error` — never a
+silently wrong answer that sends an agent off to "fix" healthy code.
 
 ## What runly never does
 
 No compute ownership (local processes now; BYO cloud sandboxes via drivers later). No
 build-system knowledge — it invokes your repo's commands, it never understands them. Not
 CI — CI may call runly, never the reverse. Not the agent — no LLM calls, no browser
-driving; it guarantees URLs, credentials, data states, and verdicts, and what you do with
+driving, no test runner; it guarantees URLs, credentials and data states, and what you do with
 them is your business.
 
 ## Where to go next

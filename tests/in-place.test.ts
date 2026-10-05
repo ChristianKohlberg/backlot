@@ -21,7 +21,7 @@ interface CliResult {
 
 function makeContext(extraEnv: Record<string, string> = {}) {
   const stateDir = mkdtempSync(join(tmpdir(), 'runly-inplace-'));
-  const env = { ...process.env, BACKLOT_STATE_DIR: stateDir, BACKLOT_SWEEP_MS: '600000', BACKLOT_POOL_MAX: '3', ...extraEnv };
+  const env = { ...process.env, BACKLOT_STATE_DIR: stateDir, BACKLOT_SWEEP_MS: '600000', ...extraEnv };
   const cli = (args: string[], cwd: string): Promise<CliResult> =>
     new Promise((resolve) => {
       execFile(process.execPath, [CLI, ...args], { cwd, env, maxBuffer: 16 * 1024 * 1024 }, (err, stdout, stderr) => {
@@ -52,6 +52,10 @@ function worktree(stackYaml: string, files: Record<string, string> = {}): string
   execFileSync('git', ['init', '-q'], { cwd: wt });
   return wt;
 }
+
+const PID_SERVER = `import { createServer } from 'node:http';
+createServer((q, s) => s.end(String(process.pid))).listen(Number(process.env.PORT), '127.0.0.1');
+`;
 
 const SERVER = `import { createServer } from 'node:http';
 createServer((q, s) => s.end(process.cwd())).listen(Number(process.env.PORT), '127.0.0.1');
@@ -211,25 +215,24 @@ upkeep:
       `name: warmlock
 services:
   worker:
-    build: "echo build >> order.log"
+    build: "echo build-start >> order.log; sleep 2; echo build-end >> order.log"
     run: "echo ready; sleep 300"
     ready: { log: ready, timeout: 20 }
-checks:
-  slow: { run: "echo check-start >> order.log; sleep 2; echo check-end >> order.log" }
 `,
       { 'src.txt': 'v1', '.gitignore': 'order.log\n' },
     );
     try {
-      const run = spawn(process.execPath, [CLI, 'run', 'slow', '--json'], { cwd: wt, env: ctx.env, stdio: 'ignore' });
-      const done = new Promise((r) => run.once('exit', r));
+      const up = spawn(process.execPath, [CLI, 'up', '--ttl', '5', '--json'], { cwd: wt, env: ctx.env, stdio: 'ignore' });
+      const done = new Promise((r) => up.once('exit', r));
       const order = () => (existsSync(join(wt, 'order.log')) ? readFileSync(join(wt, 'order.log'), 'utf8').trim().split('\n') : []);
-      for (let i = 0; i < 100 && !order().includes('check-start'); i++) await new Promise((r) => setTimeout(r, 100));
-      expect(order()).toEqual(['build', 'check-start']);
+      for (let i = 0; i < 100 && !order().includes('build-start'); i++) await new Promise((r) => setTimeout(r, 100));
+      expect(order()).toEqual(['build-start']);
       const warm = await ctx.cli(['warm', '--json'], wt);
       expect(warm.exitCode, warm.stdout + warm.stderr).toBe(0);
       await done;
-      // Without the environment lock the rebuild would land mid-check.
-      expect(order()).toEqual(['build', 'check-start', 'check-end', 'build']);
+      // Without the environment lock warm's build would interleave with the bind's.
+      expect(order()).toEqual(['build-start', 'build-end', 'build-start', 'build-end']);
+      await ctx.cli(['release', '--json'], wt);
     } finally {
       rmSync(wt, { recursive: true, force: true });
     }
@@ -264,35 +267,113 @@ services:
     }
   }, 60_000);
 
-  it('up reuses a running environment without building; sync rebuilds and restarts', async () => {
+  it('every up runs the builds and restarts only the services whose build output changed', async () => {
+    // api: output declared, build rewrites it only when its source changed.
+    // tool: a build with no outputs declared, so it is restarted after every build.
+    // idle: no build at all, so it is never restarted by an up.
     const wt = worktree(
-      `name: rebuild
+      `name: outputs
+services:
+  api:
+    build: "mkdir -p out && (cmp -s api-src.txt out/api.txt || cp api-src.txt out/api.txt); echo api >> build.log"
+    outputs: [out/**]
+    run: node pid.mjs
+    port: api
+    env: { PORT: "{{ports.api}}" }
+    ready: { http: /, timeout: 20 }
+  tool:
+    build: "echo tool >> build.log"
+    run: "echo ready; sleep 300"
+    ready: { log: ready, timeout: 20 }
+  idle:
+    run: "echo ready; sleep 300"
+    ready: { log: ready, timeout: 20 }
+`,
+      { 'pid.mjs': PID_SERVER, 'api-src.txt': 'v1', '.gitignore': 'build.log\nout/\n' },
+    );
+    type Diag = { reuse: string; restarted: string[]; builds: Array<{ service: string; restart: boolean; reason: string }> };
+    const reason = (d: Diag, svc: string) => d.builds.find((b) => b.service === svc)?.reason;
+    let envId = '';
+    const pids = async (): Promise<Record<string, number>> => {
+      const { Journal } = await import('../src/core/journal.js');
+      const journal = new Journal(join(ctx.stateDir, 'journal.db'));
+      return { ...journal.getEnv(envId)!.servicePids };
+    };
+    try {
+      const builds = () => readFileSync(join(wt, 'build.log'), 'utf8').trim().split('\n');
+      const first = await ctx.cli(['up', '--json'], wt);
+      expect(first.exitCode, first.stdout + first.stderr).toBe(0);
+      expect((first.json!.bindDiagnostics as Diag).reuse).toBe('rebound');
+      expect(builds().sort()).toEqual(['api', 'tool']);
+      envId = first.json!.envId as string;
+      const apiUrl = (first.json!.urls as Record<string, string>).api!;
+      const apiPid1 = await fetch(apiUrl).then((r) => r.text());
+      const before = await pids();
+
+      // Nothing changed: both builds still run (runly keeps no build cache), the
+      // api's output is untouched so it keeps running; tool declares no outputs.
+      const second = await ctx.cli(['up', '--json'], wt);
+      expect(second.exitCode, second.stdout + second.stderr).toBe(0);
+      const d2 = second.json!.bindDiagnostics as Diag;
+      expect(d2.reuse).toBe('restarted');
+      expect(d2.restarted).toEqual(['tool']);
+      expect(reason(d2, 'api')).toBe('outputs-unchanged');
+      expect(reason(d2, 'tool')).toBe('no-outputs-declared');
+      expect(d2.builds.map((b) => b.service)).not.toContain('idle');
+      expect(builds()).toHaveLength(4);
+      expect(await fetch(apiUrl).then((r) => r.text())).toBe(apiPid1);
+      const after2 = await pids();
+      expect(after2.idle).toEqual(before.idle);
+      expect(after2.tool).not.toEqual(before.tool);
+
+      // The api's source changed: its build rewrites the output, so it restarts.
+      writeFileSync(join(wt, 'api-src.txt'), 'version two');
+      const third = await ctx.cli(['up', '--json'], wt);
+      expect(third.exitCode, third.stdout + third.stderr).toBe(0);
+      const d3 = third.json!.bindDiagnostics as Diag;
+      expect(d3.restarted.sort()).toEqual(['api', 'tool']);
+      expect(reason(d3, 'api')).toBe('outputs-changed');
+      expect((third.json!.urls as Record<string, string>).api).toBe(apiUrl); // same port
+      expect(await fetch(apiUrl).then((r) => r.text())).not.toBe(apiPid1);
+      expect((await pids()).idle).toEqual(before.idle);
+      await ctx.cli(['release', '--json'], wt);
+    } finally {
+      rmSync(wt, { recursive: true, force: true });
+    }
+  }, 90_000);
+
+  it('an up whose every build left its outputs alone reuses the running services', async () => {
+    const wt = worktree(
+      `name: allquiet
 services:
   web:
-    build: "echo built >> build.log"
-    run: node server.mjs
+    build: "mkdir -p dist && test -f dist/app.js || echo built > dist/app.js"
+    outputs: [dist]
+    run: node pid.mjs
     port: web
     env: { PORT: "{{ports.web}}" }
     ready: { http: /, timeout: 20 }
 `,
-      { 'server.mjs': SERVER, '.gitignore': 'build.log\n' },
+      { 'pid.mjs': PID_SERVER, '.gitignore': 'dist/\n' },
     );
     try {
-      const builds = () => readFileSync(join(wt, 'build.log'), 'utf8').trim().split('\n').length;
       const first = await ctx.cli(['up', '--json'], wt);
       expect(first.exitCode, first.stdout + first.stderr).toBe(0);
-      expect(builds()).toBe(1);
-      const reused = await ctx.cli(['up', '--json'], wt);
-      expect((reused.json!.bindDiagnostics as { reuse: string }).reuse).toBe('reused');
-      expect(builds()).toBe(1);
-      // runly has no idea whether the code changed — sync is how a caller
-      // says "apply it", and it always builds and restarts.
-      const synced = await ctx.cli(['sync', '--json'], wt);
-      expect(synced.exitCode, synced.stdout + synced.stderr).toBe(0);
-      const d = synced.json!.bindDiagnostics as { reuse: string; reasons: string[] };
-      expect(d.reuse).toBe('rebound');
-      expect(d.reasons).toContain('restart-requested');
-      expect(builds()).toBe(2);
+      const url = (first.json!.urls as Record<string, string>).web!;
+      const pid = await fetch(url).then((r) => r.text());
+      const again = await ctx.cli(['up', '--json'], wt);
+      expect(again.exitCode, again.stdout + again.stderr).toBe(0);
+      const d = again.json!.bindDiagnostics as { reuse: string; restarted: string[]; builds: Array<{ reason: string }> };
+      expect(d.reuse).toBe('reused');
+      expect(d.restarted).toEqual([]);
+      expect(d.builds.map((b) => b.reason)).toEqual(['outputs-unchanged']);
+      expect(await fetch(url).then((r) => r.text())).toBe(pid);
+      // A new file in a declared output directory is a change.
+      writeFileSync(join(wt, 'dist', 'extra.js'), 'x');
+      const third = await ctx.cli(['up', '--json'], wt);
+      // The snapshot is taken around the build, so a change made between two
+      // ups is already in the "before" picture and does not restart.
+      expect((third.json!.bindDiagnostics as { reuse: string }).reuse).toBe('reused');
       await ctx.cli(['release', '--json'], wt);
     } finally {
       rmSync(wt, { recursive: true, force: true });

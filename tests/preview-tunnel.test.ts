@@ -367,16 +367,16 @@ describe('preview tunnels', () => {
     expect(await goneWithin(tunnelPid(stateDir), 5000)).toBe(true);
   });
 
-  // A projection re-reads the manifest and refreshes the lease clock, so under
-  // a watcher the kill switch would otherwise not take effect for days.
-  it('honours preview.forbidden on a projecting sync, not only on a full bind', async () => {
+  // A reusing up re-reads the manifest and refreshes the lease clock, so the
+  // kill switch must take effect there too, not only on a full bind.
+  it('honours preview.forbidden on a repeated up, not only on a full bind', async () => {
     const { cli, wt, stateDir } = ctx({}, '', true);
     await cli(['up', '--json']);
     await cli(['preview', 'web', '--json']);
     const pid = tunnelPid(stateDir);
     writeFileSync(join(wt, 'stack.yaml'), readFileSync(join(wt, 'stack.yaml'), 'utf8') + 'preview:\n  forbidden: true\n');
     writeFileSync(join(wt, 'note.txt'), 'edited\n');
-    const synced = await cli(['sync', '--json']);
+    const synced = await cli(['up', '--json']);
     expect(synced.code).toBe(0);
     expect(synced.json?.previewUrls).toEqual({});
     expect(String(synced.json?.previewNotice)).toMatch(/work-error: runly.yml now sets preview.forbidden/);
@@ -394,7 +394,7 @@ describe('preview tunnels', () => {
       join(wt, 'stack.yaml'),
       readFileSync(join(wt, 'stack.yaml'), 'utf8').replace('port: web, env: { PORT: "{{ports.web}}" }', 'port: frontend, env: { PORT: "{{ports.frontend}}" }'),
     );
-    const synced = await cli(['sync', '--json']);
+    const synced = await cli(['up', '--json']);
     expect(synced.code).toBe(0);
     expect(synced.json?.bindDiagnostics?.reuse).toBe('rebound');
     expect(synced.json?.previewUrls).toEqual({});
@@ -409,7 +409,7 @@ describe('preview tunnels', () => {
     const pid = tunnelPid(stateDir);
     writeFileSync(join(wt, 'stack.yaml'), readFileSync(join(wt, 'stack.yaml'), 'utf8')
       .replace('env: { PORT:', 'env: { VALUE: changed, PORT:'));
-    const synced = await cli(['sync', '--json']);
+    const synced = await cli(['up', '--json']);
     expect(synced.code).toBe(0);
     expect(synced.json?.bindDiagnostics?.reuse).toBe('rebound');
     expect(synced.json?.urls).toEqual(before.json?.urls);
@@ -530,10 +530,8 @@ db.prepare('INSERT INTO marker VALUES (?)').run(process.argv[3]);db.close();
 it.each([
   { args: ['up'], hotReload: false },
   { args: ['reset-data'], hotReload: false },
-  { args: ['sync'], hotReload: false },
   { args: ['up', '--preset', 'alternate'], hotReload: false },
   { args: ['reset-data', '--preset', 'alternate'], hotReload: false },
-  { args: ['sync'], hotReload: true },
 ])('enforces forbidden preview before invalid presets: $args reload=$hotReload', async ({ args, hotReload }) => {
   const f = presetPreview(hotReload);
   try {
@@ -565,15 +563,15 @@ it('retains the forbidden preview notice through a preset refresh fallback', asy
   try {
     const up = await f.cli(['up', '--preset', 'alternate', '--json']);
     expect(up.code, up.stdout + up.stderr).toBe(0);
-    const projected = await f.cli(['sync', '--json']);
-    expect((projected.json?.bindDiagnostics as {reuse: string}).reuse).toBe('refreshed');
+    const projected = await f.cli(['up', '--json']);
+    expect((projected.json?.bindDiagnostics as {reuse: string}).reuse).toBe('reused');
     const published = await f.cli(['preview', 'web', '--json']);
     expect(published.code, published.stdout + published.stderr).toBe(0);
     const pid = tunnelPid(f.stateDir);
     f.manifest.preview = { forbidden: true };
     f.manifest.datastores.main.presets = ['dev'];
     writeFileSync(f.manifestPath, stringify(f.manifest));
-    const synced = await f.cli(['sync', '--json']);
+    const synced = await f.cli(['up', '--json']);
     expect(synced.code, synced.stdout + synced.stderr).toBe(0);
     expect(synced.json?.previewUrls).toEqual({});
     expect(String(synced.json?.previewNotice)).toMatch(/preview.forbidden.*torn down/);

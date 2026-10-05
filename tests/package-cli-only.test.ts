@@ -34,7 +34,7 @@ it('packs a working CLI without stale adapter outputs from an older build', asyn
       encoding: 'utf8', timeout: 10_000, killSignal: 'SIGKILL',
     });
     expect(help).toContain('runly up');
-    expect(help).toContain('runly run');
+    expect(help).toContain('runly ctx [--env]');
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

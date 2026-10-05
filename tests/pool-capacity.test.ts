@@ -37,12 +37,12 @@ function ctx() {
   writeFileSync(join(wt, 'srv.mjs'), `import{createServer}from'node:http';console.log('up');createServer((q,s)=>s.end('ok')).listen(Number(process.env.PORT), '127.0.0.1');\n`);
   writeFileSync(
     join(wt, 'stack.yaml'),
-    `name: cap\nservices:\n  web: { run: node srv.mjs, port: web, env: { PORT: "{{ports.web}}" }, ready: { http: /, timeout: 20 } }\nchecks:\n  ok: { run: "true" }\n`,
+    `name: cap\nservices:\n  web: { run: node srv.mjs, port: web, env: { PORT: "{{ports.web}}" }, ready: { http: /, timeout: 20 } }\n`,
   );
   execFileSync('git', ['init', '-q'], { cwd: wt });
-  // POOL_MAX=1 reproduces a small CI runner exactly. WAIT_MS stays long so a
+  // One environment per worktree, as on a small CI runner. WAIT_MS stays long so a
   // fail-fast is unmistakable: the old code burned the whole window.
-  const env = { ...process.env, BACKLOT_STATE_DIR: stateDir, BACKLOT_POOL_MAX: '1', BACKLOT_WAIT_MS: '30000', BACKLOT_SWEEP_MS: '300' };
+  const env = { ...process.env, BACKLOT_STATE_DIR: stateDir, BACKLOT_WAIT_MS: '30000', BACKLOT_SWEEP_MS: '300' };
   const cli = (args: string[]) =>
     new Promise<{ json?: Record<string, unknown> }>((resolve) => {
       execFile(process.execPath, [CLI, ...args], { cwd: wt, env, maxBuffer: 16 * 1024 * 1024 }, (_e, stdout) => {
@@ -60,21 +60,11 @@ describe('pool capacity diagnostics', () => {
   it('never resolves below the two environments the core loop needs', () => {
     // The raw terms genuinely reach 1 on a 3 vCPU / 7 GB runner...
     expect(Math.min(Math.floor(3 / 2), Math.floor(7 / 4))).toBe(1);
-    // ...but the floor is 2. (It was chosen when `up` + `run` needed two
-    // environments; since decision 0032 a stack has one and BACKLOT_POOL_MAX
-    // bounds nothing in the engine — the heuristic is kept for status output.)
+    // ...but the floor is 2. It is the machine-wide default
+    // (BACKLOT_POOL_MAX_TOTAL); the per-stack cap is gone (decision 0032).
     expect(poolMaxHeuristic()).toBeGreaterThanOrEqual(2);
     expect(poolMaxHeuristic()).toBeLessThanOrEqual(8);
   });
-
-  it('a session plus a run needs ONE environment: the run binds through the session', async () => {
-    const { cli } = ctx();
-    const up = await cli(['up', '--json']);
-    expect(up.json?.state).toBe('hot');
-    const run = await cli(['run', 'ok', '--json']);
-    expect(run.json?.ok).toBe(true);
-    expect(run.json?.envId).toBe(up.json?.envId);
-  }, 60_000);
 
   it('a second holder on the same worktree fails fast with a structural diagnosis instead of waiting out the window', async () => {
     const { cli } = ctx();
@@ -104,7 +94,7 @@ describe('pool capacity diagnostics', () => {
 
 describe('the capacity queue is per-stack, and holders bypass it', () => {
   it('a full stack A queue neither blocks stack B nor a holder rebinding its own lease', async () => {
-    // One daemon, two stacks. Stack A: POOL_MAX=1, its env leased by A1 with a
+    // One daemon, two stacks. Stack A: one environment, leased by A1 with a
     // short TTL, and a second holder A2 queued on the expiry. The global FIFO
     // used to make (a) stack B's up — free capacity, instantly satisfiable —
     // and (b) A1's own rebind — refreshes its existing lease, consumes no
@@ -127,7 +117,6 @@ describe('the capacity queue is per-stack, and holders bypass it', () => {
     const env = {
       ...process.env,
       BACKLOT_STATE_DIR: stateDir,
-      BACKLOT_POOL_MAX: '1',
       BACKLOT_POOL_MAX_TOTAL: '4',
       BACKLOT_LEASE_TTL_MS: '15000',
       BACKLOT_WAIT_MS: '40000',
@@ -188,7 +177,6 @@ describe('an expired-but-unswept lease cannot jump the queue', () => {
     const env = {
       ...process.env,
       BACKLOT_STATE_DIR: stateDir,
-      BACKLOT_POOL_MAX: '1',
       BACKLOT_POOL_MAX_TOTAL: '2',
       BACKLOT_LEASE_TTL_MS: '1500',
       BACKLOT_WAIT_MS: '30000',

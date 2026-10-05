@@ -54,7 +54,6 @@ function ctx(opts: { total?: number; dataOnly?: number; idleTtlMs?: number } = {
   const env = {
     ...process.env,
     BACKLOT_STATE_DIR: stateDir,
-    BACKLOT_POOL_MAX: '9',
     BACKLOT_POOL_MAX_TOTAL: String(opts.total ?? 1),
     BACKLOT_POOL_MAX_DATA_ONLY: String(opts.dataOnly ?? 4),
     BACKLOT_IDLE_TTL_MS: String(opts.idleTtlMs ?? 250),
@@ -79,7 +78,7 @@ db.close();
       `name: ${name}\n` +
         `services:\n  idle: { run: "echo ready; sleep 300", ready: { log: ready, timeout: 20 } }\n` +
         `datastores:\n  main:\n    driver: sqlite\n    create: node seed.mjs {{ns}}\n    presets: [dev]\n    default_preset: { session: dev, run: dev }\n` +
-        `checks:\n  ok: { run: "true" }\n`,
+        ``,
     );
     execFileSync('git', ['init', '-q'], { cwd: wt });
     return wt;

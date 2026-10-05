@@ -9,7 +9,8 @@
  * - which files match an upkeep rule's `when:` glob (and a datastore's
  *   @rebake-template trigger) — `enumerateSource` lists the candidates the
  *   globs are matched against; only the matching files are ever read;
- * - which declared `outputs:` a check changed — `hashOutputs`.
+ * - whether a service's declared build `outputs:` changed across its build —
+ *   `snapshotOutputs`, which decides whether `up` restarts the service.
  *
  * Git decides what belongs to the worktree (tracked + untracked-unignored
  * under the stack root, plus sync.include and checked-out submodules, minus
@@ -18,7 +19,7 @@
 import { execFileSync } from 'node:child_process';
 import { existsSync, lstatSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
-import { fileHash, isFile, matchesAny, safeJoin } from './util.js';
+import { isFile, matchesAny, safeJoin } from './util.js';
 import type { Manifest } from './manifest.js';
 
 function gitFiles(root: string): string[] | null {
@@ -135,21 +136,61 @@ function walkAll(root: string, prefix = ''): string[] {
 }
 
 /**
- * Content hashes of the declared `outputs:`, for reporting which of them a
- * check changed. There is no write-back any more — the check wrote them where
- * they belong — but naming them in the verdict is still how a caller learns
- * that a run regenerated a lockfile or a client.
+ * A snapshot of a service's declared build outputs: every file matching the
+ * globs, with its size and mtime, as one comparable string. `up` takes one
+ * before and one after the service's build and restarts the service only when
+ * they differ (decision 0032). Path + size + mtime is what a build tool
+ * changes when it writes; content is not read.
+ *
+ * Each glob is walked from its literal prefix only, so `backend/host/bin/**`
+ * never walks the rest of the worktree. A glob that escapes the worktree is
+ * ignored.
  */
-export function hashOutputs(stackRoot: string, outputs: string[]): Record<string, string | null> {
-  const out: Record<string, string | null> = {};
-  for (const rel of outputs) {
-    let abs: string;
+export function snapshotOutputs(stackRoot: string, globs: string[]): string {
+  const seen = new Map<string, string>();
+  const walk = (dir: string, rel: string, all = false) => {
+    let names: string[];
     try {
-      abs = safeJoin(stackRoot, rel, 'outputs');
+      names = readdirSync(dir);
+    } catch {
+      return;
+    }
+    for (const name of names) {
+      if (name === '.git') continue;
+      const childRel = rel ? `${rel}/${name}` : name;
+      const full = join(dir, name);
+      let st;
+      try {
+        st = lstatSync(full);
+      } catch {
+        continue; // vanished mid-walk
+      }
+      if (st.isDirectory()) walk(full, childRel, all);
+      else if (all || matchesAny(childRel, globs)) seen.set(childRel, `${st.size}:${st.mtimeMs}`);
+    }
+  };
+  for (const glob of globs) {
+    const parts = glob.replace(/^\.\//, '').split('/');
+    const stop = parts.findIndex((seg) => /[*?[]/.test(seg));
+    const base = (stop === -1 ? parts.slice(0, -1) : parts.slice(0, stop)).join('/');
+    let start: string;
+    try {
+      start = base ? safeJoin(stackRoot, base, 'outputs') : stackRoot;
     } catch {
       continue;
     }
-    out[rel] = fileHash(abs);
+    if (stop === -1) {
+      // A literal file path: stat it directly.
+      try {
+        const st = lstatSync(safeJoin(stackRoot, parts.join('/'), 'outputs'));
+        if (st.isFile()) seen.set(parts.join('/'), `${st.size}:${st.mtimeMs}`);
+        else if (st.isDirectory()) walk(join(stackRoot, parts.join('/')), parts.join('/'), true); // a directory: everything under it
+      } catch {
+        /* absent */
+      }
+      continue;
+    }
+    walk(start, base);
   }
-  return out;
+  return [...seen].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)).map(([f, v]) => `${f}:${v}`).join('\n');
 }

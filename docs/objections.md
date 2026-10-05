@@ -20,25 +20,26 @@ warm caches from its earlier tasks. So environments now run **in** the worktree.
 What the copy bought, and what became of it:
 
 - **Uncontaminated verdicts — given up.** A check ran against the snapshot synced at
-  its start; now it runs against the live worktree, and an edit made mid-run is
-  visible to it. An agent that wants a fixed input does not edit while its check runs,
-  or runs it from a second worktree.
+  its start; now the services run from the live worktree, and an edit made while the
+  tests run is visible to them. An agent that wants a fixed input does not edit while
+  its tests run, or runs them from a second worktree. (runly no longer runs checks at
+  all: the repo's own tests read `runly ctx --env`.)
 - **Two environments from one worktree — given up.** A worktree has exactly one
-  environment now. A `run` binds through the session's environment and resets its
-  data first; a second holder waits for it. Two environments building into one
+  environment now; a second holder waits for it. Two environments building into one
   worktree's `bin/` under each other's running services was the alternative, and the
   owner chose against it. Parallel lanes need separate worktrees.
 - **Free abandonment — kept.** An environment's private directory (data, logs) still
   never holds the only copy of anything, and runly never deletes the worktree, so a
   reclaim needs no deliberation. Teardown checks the path before it deletes.
-- **Clean worktrees — given up.** Services and checks write where they run. Ignore
+- **Clean worktrees — given up.** Upkeep, builds and services write where they run. Ignore
   your output (or declare it under `caches:`), or an upkeep trigger glob may match it.
 - **runly's build cache — given up.** It used to skip a build whose source and
-  command it had seen before. Builds now run on every bind; MSBuild, pnpm and the
-  Angular CLI decide what is current, which is what they are for.
+  command it had seen before. Builds now run on every `up`; MSBuild, pnpm and the
+  Angular CLI decide what is current, which is what they are for, and runly restarts
+  only the services whose declared build output changed.
 
-If those trade-offs matter more to you than a warm cache — many concurrent verdicts
-from one checkout, editing while checks run — give each lane its own worktree.
+If those trade-offs matter more to you than a warm cache — many concurrent test
+lanes from one checkout, editing while tests run — give each lane its own worktree.
 
 ## "My agent just runs `dotnet run` and `ng serve` itself — just as good."
 
@@ -101,7 +102,7 @@ overlap. The structural gaps:
    `.angular`) is exactly what an image does not carry, so it becomes
    hand-managed volumes.
 3. **No data or verdict layer.** Presets, template restore, `reset-data`
-   mid-lease, hygiene escalation, machine verdicts, artifact collection —
+   mid-lease, hygiene escalation, a classified error taxonomy —
    compose has no concept of any of it (v2.30 added generic
    `post_start`/`pre_stop` hooks; still no named data states, no
    reset-to-baseline), so teams script it around compose.

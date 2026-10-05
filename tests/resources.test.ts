@@ -29,7 +29,7 @@ describe('log truncation survives a very large log', () => {
     const chunk = 'x'.repeat(1024 * 1024);
     writeFileSync(full, `HEAD-MARKER\n${chunk.repeat(8)}TAIL-MARKER`);
 
-    const policy = { logCapBytes: 1024 * 1024, artifactDays: 7, jobDays: 7, templatesKeep: 4, poolMax: 2, sessionTtlMs: 1, runTtlMs: 1, idleTtlMs: 1, waitMs: 1 };
+    const policy = { logCapBytes: 1024 * 1024, templatesKeep: 4, sessionTtlMs: 1, idleTtlMs: 1, waitMs: 1 };
     const n = truncateLogs(policy, root);
 
     expect(n).toBe(1);
@@ -49,7 +49,7 @@ describe('log truncation survives a very large log', () => {
     mkdirSync(logDir, { recursive: true });
     const full = join(logDir, 'web.log');
     writeFileSync(full, 'short and sweet');
-    const policy = { logCapBytes: 1024 * 1024, artifactDays: 7, jobDays: 7, templatesKeep: 4, poolMax: 2, sessionTtlMs: 1, runTtlMs: 1, idleTtlMs: 1, waitMs: 1 };
+    const policy = { logCapBytes: 1024 * 1024, templatesKeep: 4, sessionTtlMs: 1, idleTtlMs: 1, waitMs: 1 };
     expect(truncateLogs(policy, root)).toBe(0);
     expect(readFileSync(full, 'utf8')).toBe('short and sweet');
   });
@@ -69,14 +69,14 @@ describe('ports are reserved pool-wide', () => {
       writeFileSync(join(wt, 'srv.mjs'), `import{createServer}from'node:http';console.log('up');createServer((q,s)=>s.end('ok')).listen(Number(process.env.PORT), '127.0.0.1');\n`);
       writeFileSync(
         join(wt, 'stack.yaml'),
-        `name: ports\nservices:\n  web: { run: node srv.mjs, port: web, env: { PORT: "{{ports.web}}" }, ready: { http: /, timeout: 20 } }\nchecks:\n  ok: { run: "true" }\n`,
+        `name: ports\nservices:\n  web: { run: node srv.mjs, port: web, env: { PORT: "{{ports.web}}" }, ready: { http: /, timeout: 20 } }\n`,
       );
       execFileSync('git', ['init', '-q'], { cwd: wt });
       return wt;
     });
     dirs.push(stateDir);
     const wt = wts[0]!;
-    const env = { ...process.env, BACKLOT_STATE_DIR: stateDir, BACKLOT_POOL_MAX: '4', BACKLOT_SWEEP_MS: '500' };
+    const env = { ...process.env, BACKLOT_STATE_DIR: stateDir, BACKLOT_SWEEP_MS: '500' };
     const CLI = join(import.meta.dirname, '..', 'dist', 'cli', 'index.js');
     const cli = (args: string[], cwd = wt) =>
       new Promise<Record<string, unknown> | undefined>((resolve) => {

@@ -1,6 +1,6 @@
 /**
  * Integration: the REAL product loop through the REAL CLI — daemon auto-spawn,
- * lease/bind/run/ctx/sync/exec/reset-data/release, crash recovery, lease
+ * lease/bind/ctx/up/exec/reset-data/release, crash recovery, lease
  * expiry, and the multi-service topology. Each block gets an isolated state
  * dir (its own daemon), exactly how a consumer machine would look.
  */
@@ -82,18 +82,44 @@ describe('the local loop (hello-web)', () => {
     expect(greetings.length).toBe(3);
   });
 
-  it('bind-by-sync: edit the worktree, sync, same URL serves the new code', async () => {
+  it('edit the worktree, up again, same URL serves the new code', async () => {
     const src = readFileSync(join(wt.dir, 'server.mjs'), 'utf8').replace('<h1>hello-web</h1>', '<h1>hello-web EDITED</h1>');
     writeFileSync(join(wt.dir, 'server.mjs'), src);
-    const res = await ctx.cli(['sync', '--json'], wt.dir);
+    const res = await ctx.cli(['up', '--json'], wt.dir);
     expect(res.exitCode, `stdout: ${res.stdout ?? ''}\nstderr: ${res.stderr ?? ''}`).toBe(0);
     const page = await (await fetch(url)).text(); // SAME url — the watcher never moved
     expect(page).toContain('hello-web EDITED');
+    // web's build declares no outputs, so it is restarted after every build.
+    expect((res.json!.bindDiagnostics as { restarted: string[] }).restarted).toEqual(['web']);
+  });
+
+  it('ctx --env prints the environment as shell-exportable lines with stable names', async () => {
+    const res = await ctx.cli(['ctx', '--env'], wt.dir);
+    expect(res.exitCode, res.stderr).toBe(0);
+    const lines = res.stdout.trim().split('\n');
+    const vars = Object.fromEntries(lines.map((l) => [l.slice(0, l.indexOf('=')), l.slice(l.indexOf('=') + 1)]));
+    expect(Object.keys(vars).sort()).toEqual(
+      ['RUNLY_DATASTORE_MAIN_URL', 'RUNLY_ENV_ID', 'RUNLY_PORT_WEB', 'RUNLY_URL_WEB'].sort(),
+    );
+    expect(vars.RUNLY_URL_WEB).toBe(url);
+    expect(url).toContain(`:${vars.RUNLY_PORT_WEB}`);
+    expect(vars.RUNLY_DATASTORE_MAIN_URL).toContain('main.db');
+    // Exportable as is: a shell evaluating it sees the same values.
+    const echoed = execFileSync('sh', ['-c', `${res.stdout}\nprintf %s "$RUNLY_URL_WEB"`], { encoding: 'utf8' });
+    expect(echoed).toBe(url);
+    // --env is an alternative to --json, not a modifier of it.
+    expect((await ctx.cli(['ctx', '--env', '--json'], wt.dir)).exitCode).toBe(64);
+  });
+
+  it('the example smoke test runs against ctx --env, outside runly', async () => {
+    const env = (await ctx.cli(['ctx', '--env'], wt.dir)).stdout;
+    const out = execFileSync('sh', ['-c', `${env}\nexport RUNLY_URL_WEB\nexec node smoke.test.mjs`], { cwd: wt.dir, encoding: 'utf8' });
+    expect(out).toContain('ok');
   });
 
   it('untracked files ride along with a binding', async () => {
     writeFileSync(join(wt.dir, 'scratch-note.txt'), 'dirty state travels');
-    await ctx.cli(['sync'], wt.dir);
+    await ctx.cli(['up'], wt.dir);
     const res = await ctx.cli(['exec', 'cat scratch-note.txt'], wt.dir);
     expect(res.stdout).toContain('dirty state travels');
   });
@@ -108,29 +134,6 @@ describe('the local loop (hello-web)', () => {
     expect(res.exitCode, `stdout: ${res.stdout ?? ''}\nstderr: ${res.stderr ?? ''}`).toBe(0);
     expect((res.json!.urls as Record<string, string>).web).toBe(url);
     expect(((await fetchJson(`${url}/api/greetings`)) as unknown[]).length).toBe(3);
-  });
-
-  it('run smoke: runs against the session\'s environment, resets its data first, keeps the session lease', async () => {
-    // One environment per worktree (decision 0032): the check does not get a
-    // second environment beside the session — it binds through the session's,
-    // with a fresh data reset, and the session keeps its lease.
-    const session = (await ctx.cli(['ctx', '--json'], wt.dir)).json!;
-    await ctx.cli(
-      ['exec', `node -e 'const{DatabaseSync}=require("node:sqlite");new DatabaseSync(process.env.BACKLOT_DS_MAIN).prepare("INSERT INTO greetings (message) VALUES (?)").run("session-only")'`],
-      wt.dir,
-    );
-    expect(((await fetchJson(`${url}/api/greetings`)) as unknown[]).length).toBe(4);
-    const res = await ctx.cli(['run', 'smoke', '--json'], wt.dir);
-    expect(res.exitCode, `stdout: ${res.stdout ?? ''}\nstderr: ${res.stderr ?? ''}`).toBe(0);
-    const v = res.json!;
-    expect(v.ok).toBe(true);
-    expect(v.envId).toBe(session.envId);
-    expect(((await fetchJson(`${url}/api/greetings`)) as unknown[]).length).toBe(3); // the session's row is gone
-    const after = (await ctx.cli(['ctx', '--json'], wt.dir)).json!;
-    expect(after.envId).toBe(session.envId);
-    expect((after.lease as { id: string }).id).toBe((session.lease as { id: string }).id);
-    const status = (await ctx.cli(['status', '--json'], wt.dir)).json!;
-    expect((status.envs as unknown[]).length).toBe(1);
   });
 
   it('crash recovery: kill -9 the daemon; next verb respawns, envs recover, port survives', async () => {
@@ -162,56 +165,36 @@ describe('verbs removed with the projection say what replaced them (decision 003
     wt.drop();
   });
 
-  it('pull, run --pull and bind --ref are usage errors naming the decision', async () => {
-    for (const args of [['pull'], ['run', 'smoke', '--pull'], ['bind', '--ref', 'HEAD']]) {
+  it('pull, sync, bind, run, job, --watch, --detach, --pull and --ref are usage errors naming the decision', async () => {
+    for (const args of [['pull'], ['sync'], ['bind'], ['bind', '--ref', 'HEAD'], ['run', 'smoke'], ['run', 'smoke', '--detach'], ['job', 'ls'], ['up', '--watch'], ['up', '--pull'], ['up', '--detach']]) {
       const res = await ctx.cli([...args, '--json'], wt.dir);
       expect(res.exitCode, `${args.join(' ')}: ${res.stderr}`).toBe(64);
       expect(res.stderr).toContain('decision 0032');
     }
     // Refused before a daemon is ever needed.
     expect(existsSync(join(ctx.stateDir, 'daemon.sock'))).toBe(false);
+    const run = await ctx.cli(['run', 'smoke'], wt.dir);
+    expect(run.stderr).toContain('runly ctx --env');
+  });
+
+  it('a manifest that still declares checks: loads, with a one-line warning naming the decision', async () => {
+    appendFileSync(join(wt.dir, 'runly.yml'), `checks:\n  smoke: { run: node smoke.test.mjs }\n`);
+    const res = await ctx.cli(['up', '--json'], wt.dir);
+    expect(res.exitCode, `stdout: ${res.stdout}\nstderr: ${res.stderr}`).toBe(0);
+    expect(res.json!.state).toBe('hot'); // stdout is still clean JSON
+    const warnings = res.stderr.split('\n').filter((l) => l.includes("'checks:'"));
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toContain('decision 0032');
+    await ctx.cli(['release'], wt.dir);
   });
 });
 
 // ---------------------------------------------------------------------------
 
-describe('verdicts, outputs, and the error taxonomy', () => {
+describe('the error taxonomy', () => {
   const ctx = makeContext();
-  const wt = makeWorktree('hello-web');
   afterAll(async () => {
     await ctx.cleanup();
-    wt.drop();
-  });
-
-  it('a failing check is a work-error verdict with the check exit code', async () => {
-    appendFileSync(
-      join(wt.dir, 'runly.yml'),
-      `  fail:\n    run: node -e 'console.error("boom"); process.exit(3)'\n`,
-    );
-    const res = await ctx.cli(['run', 'fail', '--json'], wt.dir);
-    expect(res.exitCode, `stdout: ${res.stdout ?? ''}\nstderr: ${res.stderr ?? ''}`).toBe(1); // CLI contract: failed run exits 1
-    const v = res.json!;
-    expect(v.ok).toBe(false);
-    expect(v.exitCode, `stdout: ${v.stdout ?? ''}\nstderr: ${v.stderr ?? ''}`).toBe(3);
-    expect((v.failure as { class: string }).class).toBe('work-error');
-  });
-
-  it('an unknown check is a work-error naming the available checks', async () => {
-    const res = await ctx.cli(['run', 'nope', '--json'], wt.dir);
-    expect(res.exitCode, `stdout: ${res.stdout ?? ''}\nstderr: ${res.stderr ?? ''}`).toBe(1);
-    expect((res.json!.error as { message: string }).message).toContain('smoke');
-  });
-
-  it('outputs contract: a check writes in place and its run reports which declared outputs it changed', async () => {
-    // `checks:` is the manifest's last block, so the check entry goes first.
-    appendFileSync(join(wt.dir, 'runly.yml'), `  regen:\n    run: echo produced-by-check > generated.txt\n`);
-    appendFileSync(join(wt.dir, 'runly.yml'), `outputs: [generated.txt, untouched.txt]\n`);
-    writeFileSync(join(wt.dir, 'untouched.txt'), 'same');
-    const res = await ctx.cli(['run', 'regen', '--json'], wt.dir);
-    expect(res.exitCode, `stdout: ${res.stdout}\nstderr: ${res.stderr}`).toBe(0);
-    // There is no copy to pull from any more: the check ran in the worktree.
-    expect(readFileSync(join(wt.dir, 'generated.txt'), 'utf8')).toContain('produced-by-check');
-    expect(res.json!.outputsChanged).toEqual(['generated.txt']);
   });
 
   it('ctx without a lease is an env-error telling you the fix', async () => {
@@ -310,14 +293,12 @@ describe('the multi-service topology (hello-multi)', () => {
     expect((bad.json!.error as { message: string }).message).toContain("no service 'nope'");
   });
 
-  it('run smoke uses the run preset (dev), collects the artifact, verdict green', async () => {
-    const res = await ctx.cli(['run', 'smoke', '--json'], wt.dir);
-    expect(res.exitCode, `stdout: ${res.stdout ?? ''}\nstderr: ${res.stderr ?? ''}`).toBe(0);
-    const v = res.json!;
-    expect(v.ok).toBe(true);
-    expect(v.artifactsDir).toBeTruthy();
-    const files = readdirSync(v.artifactsDir as string);
-    expect(files).toContain('smoke-report.json');
+  it('the example smoke test passes against ctx --env and writes its report in the worktree', async () => {
+    const env = (await ctx.cli(['ctx', '--env'], wt.dir)).stdout;
+    expect(env).toMatch(/^RUNLY_URL_API=/m);
+    expect(env).toMatch(/^RUNLY_URL_WEB=/m);
+    execFileSync('sh', ['-c', `${env}\nexport RUNLY_URL_API RUNLY_URL_WEB\nexec node smoke.test.mjs`], { cwd: wt.dir, encoding: 'utf8' });
+    expect(existsSync(join(wt.dir, 'smoke-report.json'))).toBe(true);
   });
 
   it('pool recycle clears unleased environments', async () => {
@@ -345,10 +326,10 @@ describe('a slice does not leak across a pool handoff (hello-multi)', () => {
     res = await ctx.cli(['release', '--holder', 'agentA', '--json'], wt.dir);
     expect(res.exitCode).toBe(0);
 
-    // Holder B arrives via sync as first contact — never asked for a slice, so it
+    // Holder B arrives via a plain up as first contact — never asked for a slice, so it
     // must get the FULL app, not agentA's leftover api-only shape. (Regression:
     // tryClaim used to hand the fresh claim the previous owner's activeServices.)
-    res = await ctx.cli(['sync', '--holder', 'agentB', '--json'], wt.dir);
+    res = await ctx.cli(['up', '--holder', 'agentB', '--json'], wt.dir);
     expect(res.exitCode, `stdout: ${res.stdout ?? ''}\nstderr: ${res.stderr ?? ''}`).toBe(0);
     const urls = res.json!.urls as Record<string, string>;
     expect(urls.api).toBeDefined();

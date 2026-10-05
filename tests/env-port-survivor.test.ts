@@ -79,7 +79,7 @@ createServer((q, s) => s.end('ok')).listen(Number(process.env.PORT), '127.0.0.1'
   );
   writeFileSync(
     join(dir, 'stack.yaml'),
-    `name: ${name}\nservices:\n  web: { run: node server.mjs, port: web, env: { PORT: "{{ports.web}}" }, ready: { log: up, timeout: 20 } }\nchecks:\n  ok: { run: "true" }\n`,
+    `name: ${name}\nservices:\n  web: { run: node server.mjs, port: web, env: { PORT: "{{ports.web}}" }, ready: { log: up, timeout: 20 } }\n`,
   );
   execFileSync('git', ['init', '-q'], { cwd: dir });
   return dir;
@@ -273,7 +273,7 @@ setInterval(() => {}, 1e6);
       );
       writeFileSync(
         join(wt, 'stack.yaml'),
-        `name: quiesce\nservices:\n  web: { run: node server.mjs, port: web, env: { PORT: "{{ports.web}}" }, ready: { log: up, timeout: 20 } }\nchecks:\n  ok: { run: "true" }\n`,
+        `name: quiesce\nservices:\n  web: { run: node server.mjs, port: web, env: { PORT: "{{ports.web}}" }, ready: { log: up, timeout: 20 } }\n`,
       );
       execFileSync('git', ['init', '-q'], { cwd: wt });
 

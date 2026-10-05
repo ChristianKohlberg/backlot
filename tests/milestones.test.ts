@@ -54,39 +54,6 @@ function makeWorktree(example: string): { dir: string; drop: () => void } {
   return { dir, drop: () => rmSync(dir, { recursive: true, force: true }) };
 }
 
-// ---------------------------------------------------------------- 0.3
-
-describe('detached runs (submit-and-poll, decision 0015)', () => {
-  const ctx = makeContext();
-  const wt = makeWorktree('hello-web');
-  afterAll(async () => {
-    await ctx.cleanup();
-    wt.drop();
-  });
-
-  it('run --detach returns a jobId immediately; the verdict outlives the client', async () => {
-    const submit = await ctx.cli(['run', 'smoke', '--detach', '--json'], wt.dir);
-    expect(submit.exitCode, `stdout: ${submit.stdout ?? ''}\nstderr: ${submit.stderr ?? ''}`).toBe(0);
-    const jobId = submit.json!.jobId as string;
-    expect(jobId).toMatch(/^job-/);
-
-    // The submitting "client" is gone; a NEW client polls until done.
-    let job: Record<string, unknown> = {};
-    for (let i = 0; i < 100; i++) {
-      job = (await ctx.cli(['job', jobId, '--json'], wt.dir)).json!;
-      if (job.state === 'done') break;
-      await new Promise((r) => setTimeout(r, 300));
-    }
-    expect(job.state).toBe('done');
-    expect((job.verdict as { ok: boolean }).ok).toBe(true);
-  });
-
-  it('polling an unknown job is an env-error', async () => {
-    const res = await ctx.cli(['job', 'job-nope', '--json'], wt.dir);
-    expect(res.exitCode, `stdout: ${res.stdout ?? ''}\nstderr: ${res.stderr ?? ''}`).toBe(2);
-  });
-});
-
 // ---------------------------------------------------------------- 0.4: foreign consumer
 
 describe.skipIf(!hasPython)('the foreign consumer (hello-python)', () => {
@@ -104,8 +71,8 @@ describe.skipIf(!hasPython)('the foreign consumer (hello-python)', () => {
     const facts = (await (await fetch(`${url}/api/facts`)).json()) as unknown[];
     expect(facts.length).toBe(3);
 
-    const run = await ctx.cli(['run', 'smoke', '--json'], wt.dir);
-    expect(run.exitCode, `stdout: ${run.stdout ?? ''}\nstderr: ${run.stderr ?? ''}`).toBe(0);
-    expect(run.json!.ok).toBe(true);
+    // Its own smoke test runs against `ctx --env`, outside runly (decision 0032).
+    const env = (await ctx.cli(['ctx', '--env'], wt.dir)).stdout;
+    execFileSync('sh', ['-c', `${env}\nexport RUNLY_URL_WEB\nexec python3 smoke.py`], { cwd: wt.dir, encoding: 'utf8' });
   });
 });

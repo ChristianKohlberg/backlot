@@ -6,9 +6,10 @@ environment broker — against any repo that has a `runly.yml`. This plugin
 bundles:
 
 - **The `runly` skill** — a stack-agnostic guide to the lease model (warm pool,
-  bind-by-sync, session vs run leases) and the verb table (`up` incl. the
-  partial/per-service form, `run`, `ctx`, `release`, `sync`, `exec`, `logs`,
-  `reset-data`, `token`, `preview`, `status`), so the agent leases a running, seeded,
+  one environment per worktree, what a repeated `up` restarts) and the verb table
+  (`up` incl. the partial/per-service form, `ctx` and `ctx --env` for your own
+  tests, `release`, `warm`, `exec`, `logs`, `reset-data`, `token`, `preview`,
+  `status`), so the agent leases a running, seeded,
   authenticated env correctly instead of hand-rolling dev servers.
 
 runly is a **CLI-only** tool, so this plugin ships **only the skill — there is

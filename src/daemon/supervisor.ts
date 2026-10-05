@@ -86,8 +86,8 @@ export class EnvSupervisor {
     return [...this.services.values()].every((r) => r.proc.exitCode === null);
   }
 
-  start(name: string, spec: ServiceSpec, env: NodeJS.ProcessEnv, watchMode: boolean, secrets: string[] = []): void {
-    const cmd = watchMode && spec.watch_run ? spec.watch_run : spec.run;
+  start(name: string, spec: ServiceSpec, env: NodeJS.ProcessEnv, secrets: string[] = []): void {
+    const cmd = spec.run;
     // A repo can already run arbitrary shell here, so this is not a privilege
     // boundary — it makes an ACCIDENT loud. `cwd: ../sibling` silently ran the
     // service outside the worktree it is bound to, against files runly never
@@ -253,8 +253,19 @@ export class EnvSupervisor {
 
   /** Stop every service; returns any that refused to die (empty is the norm). */
   async stopAll(): Promise<Record<string, ServicePid>> {
+    return this.stopSome([...this.services.keys()]);
+  }
+
+  /**
+   * Stop just these services (an `up` restarting only the ones whose build
+   * output changed, decision 0032); the rest keep running. Same contract as
+   * stopAll: survivors are returned so the caller can reap and record them.
+   */
+  async stopSome(names: string[]): Promise<Record<string, ServicePid>> {
     const survivors: Record<string, ServicePid> = {};
-    for (const [name, r] of this.services) {
+    for (const name of names) {
+      const r = this.services.get(name);
+      if (!r) continue;
       r.expectedExit = true;
       // Cancel any pending restart BEFORE it can fire — otherwise launch()
       // respawns an untracked process that squats the port after teardown.
@@ -277,8 +288,8 @@ export class EnvSupervisor {
         }
       }
       this.note(name, survivors[name] ? 'stop failed' : 'stopped');
+      this.services.delete(name);
     }
-    this.services.clear();
     return survivors;
   }
 }

@@ -41,10 +41,4 @@ datastores:
 upkeep:
   - { when: seed.mjs, run: "@rebake-template main" }
 
-checks:
-  smoke:
-    run: node smoke.test.mjs
-    env:
-      API_URL: "{{services.api.url}}"
-      WEB_URL: "{{services.web.url}}"
-    artifacts: [smoke-report.json]
+# The smoke test is the repo's own: eval "$(runly ctx --env)" && node smoke.test.mjs

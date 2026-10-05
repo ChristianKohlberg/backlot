@@ -12,7 +12,6 @@ import { hasOtherTemplateOwner, parseBakedMarker, withBakeLock } from '../driver
 import type { Journal } from './journal.js';
 import type { Policy } from './policy.js';
 
-const dayMs = 24 * 60 * 60 * 1000;
 
 const entriesOf = (dir: string): string[] => {
   try {
@@ -22,24 +21,15 @@ const entriesOf = (dir: string): string[] => {
   }
 };
 
-/** Artifacts older than N days are pruned (verdict dirs are timestamped). */
-export function pruneArtifacts(p: Policy, root = artifactsRoot()): number {
-  let pruned = 0;
-  for (const envDir of entriesOf(root)) {
-    for (const runDir of entriesOf(join(root, envDir))) {
-      const full = join(root, envDir, runDir);
-      try {
-        if (Date.now() - statSync(full).mtimeMs > p.artifactDays * dayMs) {
-          rmSync(full, { recursive: true, force: true });
-          pruned++;
-        }
-      } catch {
-        /* raced */
-      }
-    }
-    if (entriesOf(join(root, envDir)).length === 0) rmSync(join(root, envDir), { recursive: true, force: true });
-  }
-  return pruned;
+/**
+ * Check artifacts are gone with `runly run` (decision 0032); an older runly
+ * left them under the state root. Nothing reads them any more, so the whole
+ * directory goes.
+ */
+export function pruneArtifacts(root = artifactsRoot()): number {
+  const n = entriesOf(root).length;
+  if (n > 0 || existsSync(root)) rmSync(root, { recursive: true, force: true });
+  return n;
 }
 
 /** Service log files past the cap keep only their tail (in-place truncate). */
@@ -74,11 +64,6 @@ export function truncateLogs(p: Policy, root = envsRoot()): number {
     }
   }
   return truncated;
-}
-
-/** Done jobs older than N days leave the journal. */
-export function pruneJobs(journal: Journal, p: Policy): number {
-  return journal.pruneJobs(Date.now() - p.jobDays * dayMs);
 }
 
 /**
@@ -175,12 +160,11 @@ export async function retentionSweep(
   journal: Journal,
   p: Policy,
   protectedStacks: ReadonlySet<string> = new Set(),
-): Promise<{ artifacts: number; logs: number; jobs: number; templates: number; worktrees: number }> {
+): Promise<{ artifacts: number; logs: number; templates: number; worktrees: number }> {
   return {
     worktrees: pruneWorktreeState(journal),
-    artifacts: pruneArtifacts(p),
+    artifacts: pruneArtifacts(),
     logs: truncateLogs(p),
-    jobs: pruneJobs(journal, p),
     templates: await pruneTemplates(p, templatesRoot(), protectedStacks),
   };
 }

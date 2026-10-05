@@ -1,6 +1,6 @@
 # 0015. Remote runs are submit-and-poll; remote environments carry provider TTLs
 
-- Status: Accepted
+- Status: Local half superseded by [0032](0032-environments-run-in-the-callers-worktree.md) — `runly run`, `--detach`, `runly job`, the job journal and verdict artifacts are removed; the provider-TTL and tagging half stands for a future remote substrate
 
 ## Decision
 

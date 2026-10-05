@@ -24,8 +24,7 @@ function fixture(total: number, perStack: number, opts: { dataOnlyMax?: number; 
   const state = join(root, 'state');
   const gate = join(root, 'gate');
   mkdirSync(gate);
-  const env = { ...process.env, BACKLOT_STATE_DIR: state, BACKLOT_POOL_MAX: String(perStack),
-    BACKLOT_POOL_MAX_TOTAL: String(total), BACKLOT_POOL_MAX_DATA_ONLY: String(opts.dataOnlyMax ?? 4),
+  const env = { ...process.env, BACKLOT_STATE_DIR: state, BACKLOT_POOL_MAX_TOTAL: String(total), BACKLOT_POOL_MAX_DATA_ONLY: String(opts.dataOnlyMax ?? 4),
     BACKLOT_IDLE_TTL_MS: String(opts.idleTtlMs ?? 30 * 60_000),
     BACKLOT_SWEEP_MS: '60000', BACKLOT_WAIT_MS: '1000', BACKLOT_TEST_GATE_DIR: gate };
   const cli = (cwd: string, ...args: string[]) => new Promise<Result>((resolve) => {
@@ -114,7 +113,7 @@ describe('application capacity survives an unfinished data-only conversion', () 
     const state = join(root, 'state');
     const saved = { ...process.env };
     Object.assign(process.env, {
-      BACKLOT_STATE_DIR: state, BACKLOT_POOL_MAX: '1', BACKLOT_POOL_MAX_TOTAL: '1',
+      BACKLOT_STATE_DIR: state, BACKLOT_POOL_MAX_TOTAL: '1',
       BACKLOT_POOL_MAX_DATA_ONLY: '4', BACKLOT_SWEEP_MS: '60000', BACKLOT_WAIT_MS: '100',
     });
     let victim: ServicePid | undefined;
@@ -229,7 +228,7 @@ console.log(p.pid);p.unref();${path === 'both groups' ? 'setInterval(()=>{},1000
     const state = join(root, 'state');
     const saved = { ...process.env };
     Object.assign(process.env, {
-      BACKLOT_STATE_DIR: state, BACKLOT_POOL_MAX: '1', BACKLOT_POOL_MAX_TOTAL: '1',
+      BACKLOT_STATE_DIR: state, BACKLOT_POOL_MAX_TOTAL: '1',
       BACKLOT_POOL_MAX_DATA_ONLY: '4', BACKLOT_SWEEP_MS: '60000', BACKLOT_WAIT_MS: '100',
     });
     let blocked: number | undefined;
@@ -332,7 +331,7 @@ console.log(JSON.stringify({tagged:tagged.pid,untagged:untagged.pid}));
     const state = join(root, 'state');
     const saved = { ...process.env };
     Object.assign(process.env, {
-      BACKLOT_STATE_DIR: state, BACKLOT_POOL_MAX: '1', BACKLOT_POOL_MAX_TOTAL: '1',
+      BACKLOT_STATE_DIR: state, BACKLOT_POOL_MAX_TOTAL: '1',
       BACKLOT_POOL_MAX_DATA_ONLY: '4', BACKLOT_SWEEP_MS: '60000', BACKLOT_WAIT_MS: '100', BACKLOT_IDLE_TTL_MS: '1',
     });
     const blocked = new Map<number, ServicePid>();
@@ -424,7 +423,7 @@ console.log(JSON.stringify({tagged:tagged.pid,untagged:untagged.pid}));
     const state = join(root, 'state');
     const saved = { ...process.env };
     Object.assign(process.env, {
-      BACKLOT_STATE_DIR: state, BACKLOT_POOL_MAX: '1', BACKLOT_POOL_MAX_TOTAL: '1',
+      BACKLOT_STATE_DIR: state, BACKLOT_POOL_MAX_TOTAL: '1',
       BACKLOT_POOL_MAX_DATA_ONLY: '4', BACKLOT_SWEEP_MS: '60000', BACKLOT_WAIT_MS: '100',
     });
     let victim: ServicePid | undefined;
@@ -516,7 +515,7 @@ console.log(JSON.stringify({tagged:tagged.pid,untagged:untagged.pid}));
     const state = join(root, 'state');
     const saved = { ...process.env };
     Object.assign(process.env, {
-      BACKLOT_STATE_DIR: state, BACKLOT_POOL_MAX: '1', BACKLOT_POOL_MAX_TOTAL: '1',
+      BACKLOT_STATE_DIR: state, BACKLOT_POOL_MAX_TOTAL: '1',
       BACKLOT_POOL_MAX_DATA_ONLY: '4', BACKLOT_SWEEP_MS: '60000', BACKLOT_WAIT_MS: '100',
     });
     const blocked = new Set<number>();
@@ -611,7 +610,7 @@ console.log(JSON.stringify({tagged:tagged.pid,untagged:untagged.pid}));
     const state = join(root, 'state');
     const saved = { ...process.env };
     Object.assign(process.env, {
-      BACKLOT_STATE_DIR: state, BACKLOT_POOL_MAX: '1', BACKLOT_POOL_MAX_TOTAL: '1',
+      BACKLOT_STATE_DIR: state, BACKLOT_POOL_MAX_TOTAL: '1',
       BACKLOT_POOL_MAX_DATA_ONLY: '4', BACKLOT_SWEEP_MS: '60000', BACKLOT_WAIT_MS: '100',
     });
     let duringReap: (() => void) | undefined;
@@ -734,7 +733,7 @@ console.log(JSON.stringify({tagged:tagged.pid,untagged:untagged.pid}));
     const root = realpathSync(mkdtempSync(join(tmpdir(), 'bl-convert-survivors-')));
     const saved = { ...process.env };
     Object.assign(process.env, {
-      BACKLOT_STATE_DIR: join(root, 'state'), BACKLOT_POOL_MAX: '1', BACKLOT_POOL_MAX_TOTAL: '1',
+      BACKLOT_STATE_DIR: join(root, 'state'), BACKLOT_POOL_MAX_TOTAL: '1',
       BACKLOT_POOL_MAX_DATA_ONLY: '4', BACKLOT_SWEEP_MS: '60000', BACKLOT_WAIT_MS: '100',
     });
     const engine = new Engine();
@@ -950,7 +949,7 @@ console.log(JSON.stringify({tagged:tagged.pid,untagged:untagged.pid}));
     mkdirSync(gate);
     const saved = { ...process.env };
     Object.assign(process.env, {
-      BACKLOT_STATE_DIR: join(root, 'state'), BACKLOT_POOL_MAX: '2', BACKLOT_POOL_MAX_TOTAL: '1',
+      BACKLOT_STATE_DIR: join(root, 'state'), BACKLOT_POOL_MAX_TOTAL: '1',
       BACKLOT_POOL_MAX_DATA_ONLY: '4', BACKLOT_SWEEP_MS: '60000', BACKLOT_WAIT_MS: '30000', BACKLOT_TEST_GATE_DIR: gate,
     });
     const engine = new Engine();

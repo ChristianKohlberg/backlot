@@ -36,7 +36,7 @@ function ctx(extraEnv: Record<string, string> = {}) {
   writeFileSync(join(wt, 'srv.mjs'), `import{createServer}from'node:http';console.log('ready');createServer((q,s)=>s.end('ok')).listen(Number(process.env.PORT), '127.0.0.1');\n`);
   writeFileSync(
     join(wt, 'stack.yaml'),
-    `name: lease\nservices:\n  web: { run: node srv.mjs, port: web, env: { PORT: "{{ports.web}}" }, ready: { log: ready, timeout: 20 } }\nchecks:\n  ok: { run: "true" }\n`,
+    `name: lease\nservices:\n  web: { run: node srv.mjs, port: web, env: { PORT: "{{ports.web}}" }, ready: { log: ready, timeout: 20 } }\n`,
   );
   execFileSync('git', ['init', '-q'], { cwd: wt });
   const env = { ...process.env, BACKLOT_STATE_DIR: stateDir, BACKLOT_SWEEP_MS: '300', ...extraEnv };
@@ -204,7 +204,7 @@ describe('a quiesce is never published as a teardown (decision 0021)', () => {
     const c = ctx({ BACKLOT_LEASED_IDLE_TTL_MS: '1000', BACKLOT_LEASE_TTL_MS: '600000' });
     writeFileSync(
       join(c.wt, 'stack.yaml'),
-      `name: lease\nservices:\n  web: { run: "trap '' TERM; echo ready; sleep 300", ready: { log: ready, timeout: 20 } }\nchecks:\n  ok: { run: "true" }\n`,
+      `name: lease\nservices:\n  web: { run: "trap '' TERM; echo ready; sleep 300", ready: { log: ready, timeout: 20 } }\n`,
     );
     expect((await c.cli(['up', '--json'])).code).toBe(0);
     const envId = c.journal().allEnvs()[0]!.id;
