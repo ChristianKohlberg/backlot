@@ -12,7 +12,7 @@ The `backlot` command and `backlot.yml` manifests remain accepted. `runly.yml` t
 It brokers environments; it never provides them. Local processes today, your own cloud
 sandboxes (Morph, Sprites, SSH) tomorrow — same verbs, same model.
 
-> **Status: 0.15.** The local loop — pool, leases, in-place binds, data states —
+> **Status: 0.16.** The local loop — pool, leases, in-place binds, data states —
 > is complete, hardened by two full review cycles, and proven end to end against
 > a real .NET + Angular + MSSQL monorepo (its Playwright e2e suite runs against a
 > runly environment, and each release is verified by driving a real session
@@ -57,13 +57,22 @@ runly up api             # ADD a service (and its depends_on) — up never stops
 runly down web           # stop one service; lease, data and ports stay
 runly up --preset main=empty   # reload ONE datastore; the others keep their data
 runly ps                 # what runs for this worktree: services and database copies
+runly plan               # would an up start now, or wait for the server-wide load budget (and for what)?
+runly logs -f --until 'compiled' --timeout 120   # follow all services' logs until a line matches (124 = timed out)
 runly db with main -- npm test # a fresh database copy for one command, dropped after it
 runly warm               # due upkeep + builds in this worktree, no lease, no services (prepare an idle worktree)
 runly exec <cmd>         # run a command in the worktree with your lease's URLs/ports/conn strings (raw exit, not a verdict)
 runly preview <service>  # publish one service (public tunnel via cloudflared, or the tailnet via tailscale)
 runly preview stop       # stop the preview tunnel on your lease
 runly release            # environment returns to the pool, warm
+runly destroy            # tear down everything this worktree holds, now (worktree pools)
 ```
+
+**Idle services stop by themselves, and start again when used** (0.16). A service
+that saw no runly verb and no client byte for 10 minutes is stopped; its port,
+data and lease stay, and the next connection to it starts it and is held until it
+answers. Under Claude Code the environment is tied to the session and torn down a
+minute after it ends. See [Idle, wake and teardown](#idle-wake-and-teardown).
 
 **Your tests, runly's environment.** runly does not run checks (decision 0032).
 `runly ctx --env` prints the environment as shell-exportable lines with stable
@@ -128,9 +137,10 @@ names its replacement.
 `runly warm` runs the stack's due upkeep rules and services' `build:` steps in the
 current worktree **without a lease and without starting services**, printing each
 step and how long it took (`--json` for the structured form). Upkeep it ran is
-recorded, so the next `up` skips it; builds are not recorded — the next `up`
-runs them again, your build tool finds its output current, and the services keep
-running when their `outputs:` did not change. The intended
+recorded, so the next `up` skips it; a plain `build:` is not — the next `up`
+runs it again, your build tool finds its output current, and the services keep
+running when their `outputs:` did not change. A `build: { run, when }` that
+succeeded is recorded, so the next `up` skips it while its inputs are unchanged. The intended
 use is a pooled worktree moved to a new commit between tasks:
 
 ```bash
@@ -159,28 +169,78 @@ knowing:
   worktree waits for its environment — and is refused at once, naming the holder,
   when that lease outlasts the wait. Parallel lanes need separate worktrees.
 
-### Upgrading to 0.15 — additive `up`, `runly db` ([decision 0034](docs/decisions/0034-additive-up-database-copies-and-ps.md))
+### Upgrading to 0.16 (from 0.14) — additive `up`, `runly db`, idle and wake, load budget, logs ([decisions 0034–0038](docs/decisions/))
+
+After installing, run `runly update`: the journal schema is 4 (an older daemon
+refuses it), and the running daemon must be the installed build. 0.15 and 0.16
+change behaviour in these ways — a 0.14 user reads all of it, a 0.15 user from
+"**New in 0.16**" on.
+
+**From 0.15** ([decision 0034](docs/decisions/0034-additive-up-database-copies-and-ps.md)):
 
 - **`up <service>` no longer stops the services you did not name.** It adds.
   To stop one, `runly down <service>`; to stop all and keep the environment,
   `runly down`. A script that relied on `up api` taking `web` down needs a
   `down web`.
 - **No `--preset` keeps the data**, also for a new holder (0.14 reseeded a fresh
-  holder's stores to their defaults). A lane that needs known data says so:
-  `--preset <store>=<preset>` for one store, `--reset-data` for all.
-- **`--preset` reloads only the store it names** and restarts only the services
-  that use it, instead of restarting the environment. Naming the preset a store
-  already holds now reloads it too.
-- **`up --data-only` is gone** (exit 64). Use `runly db with <store> -- <cmd>`
-  (or `runly db new <store>`). `BACKLOT_POOL_MAX_DATA_ONLY` is ignored. On its
-  first start the 0.15 daemon turns a **leased** data-only environment into an
-  environment with no services wanted (lease and data kept) and **recycles** an
-  unleased one.
+  holder's stores to their defaults). A lane that needs known data says so.
+  The forms: `--preset NAME` when the stack has one datastore,
+  `--preset <store>=<preset>` (repeatable) to reload just that store, `--reset-data`
+  for all of them. `--preset` restarts only the services that use the store, and
+  naming the preset a store already holds reloads it too.
+- **`up --data-only` is gone** (exit 64, naming the replacement). A database
+  without the application is a copy: `runly db with <store> [--preset NAME] -- <cmd>`
+  (a fresh copy for one command, `RUNLY_DB_URL`/`RUNLY_DB_NAME`, dropped when it
+  exits, its exit code passed on) or `runly db new <store>` (prints `name=`, `url=`,
+  `preset=`; dropped by `runly db drop <name>`, or when its holder or worktree goes).
+  A repo wrapper like `with-test-db` becomes `runly db with <store> -- <cmd>`.
+  `BACKLOT_POOL_MAX_DATA_ONLY` is ignored. On its first start the daemon turns a
+  **leased** data-only environment into one with no services wanted (lease and data
+  kept) and **recycles** an unleased one.
 - `ctx.dataOnly` is gone; `ctx.services` reports what runs, and
-  `.datastores.<name>.preset` is now always the preset the store holds.
-  `ctx --env` adds `RUNLY_DATASTORE_<NAME>_PRESET`.
-- The journal schema is 4: an older daemon refuses it. Run `runly update` after
-  installing.
+  `.datastores.<name>.preset` is always the preset the store holds.
+  `ctx --env` adds `RUNLY_DATASTORE_<NAME>_PRESET`. `runly ps` is new.
+
+**New in 0.16** ([0035](docs/decisions/0035-services-idle-on-their-own-clock-and-wake-on-demand.md),
+[0036](docs/decisions/0036-a-server-wide-load-budget.md),
+[0037](docs/decisions/0037-cleanup-by-reference-and-pool-doctor.md),
+[0038](docs/decisions/0038-time-stamped-logs-and-build-skip.md)):
+
+- **Services stop after 10 idle minutes** (no runly verb on the environment, no
+  client byte on their port) and start again on the next connection, which is
+  held meanwhile. A test lane that idles longer than that between steps pays one
+  start, not a failure. To keep one running, `idle: never` (or `idle: 2h`) on the
+  service; server-wide, `BACKLOT_SERVICE_IDLE_MS`. `BACKLOT_LEASED_IDLE_TTL_MS` is
+  ignored.
+- **A dead holder now tears the environment down** (after a 1-minute grace), not
+  just the lease; under Claude Code `up` and `db new` tie to the session
+  automatically (`CLAUDE_PID`; `BACKLOT_TETHER=off` opts out). A deleted worktree
+  takes its environment with it even while leased. `runly destroy` does both now.
+- **A server-wide load budget** queues an `up` that does not fit (FIFO, up to
+  10 min, then env-error, exit 2). Declare what services cost —
+  `resources: { memory: 1G, cpu: 1, build: { memory: 3G, cpu: 4 } }` — or the
+  default (512M / 0.5 cpu running, 1G / 1 cpu building) is assumed. `runly plan`
+  shows whether an `up` would start now. `BACKLOT_BUDGET=off` disables it. The
+  default `BACKLOT_POOL_MAX_TOTAL` rises to 2 x cores (it now bounds held
+  environments; the budget bounds load).
+- **`runly logs` is new in shape**: no service = all of them, interleaved with
+  `svc | ` prefixes; `--since up|10m`, `--grep`, `-f --until <re> --timeout <s>`
+  (exit 124 on timeout), `--build`. One named service prints bare lines as before;
+  `--json` keeps `lines` (the text) and adds `entries`. Logs are capped at 20 MB
+  with one rotation, and a polling loop over `runly logs` can become one
+  `runly logs <svc> -f --until '<ready line>' --timeout 300`.
+- **`build: { run, when: [globs] }`** skips a build while the files it reads are
+  unchanged (`build api: skipped (when: unchanged)`); `up --rebuild` forces every
+  build. **`outputs: { paths, compare: content }`** restarts a service only when
+  its build changed bytes, not just mtimes. Plain `build:`/`outputs:` behave as before.
+- **Templates are kept per datastore and preset** (the newest, plus every one an
+  environment or copy uses; `BACKLOT_TEMPLATES_KEEP` default 1, after a 1-hour
+  grace), and `runly pool doctor [--fix]` lists — and with `--fix` removes —
+  what runly left behind. A datastore may declare `list:` (a command printing its
+  namespaces) so doctor can find orphaned server-side databases. The old drift
+  report is `runly doctor`.
+- `ps` adds the `idle` state and a `STOPS IN` column; `status --json` and
+  `ps --json` add `budget`.
 
 ### Upgrading to 0.14 — ports ([decision 0033](docs/decisions/0033-the-daemon-holds-public-ports-behind-an-l4-proxy.md))
 
@@ -396,9 +456,128 @@ runly ps --json
 ```
 
 One row per service — environment, service, state (`running`, `starting`,
-`stopped`, `down`), public and internal port, pid, idle time since the last
-client byte through the proxy, resident memory (Linux) — and one per database
-copy — name, datastore, preset, state, holder, age.
+`idle` (stopped for idleness, wakes on a connection), `stopped`, `down`), public
+and internal port, pid, idle time since the last use, when it stops for
+idleness, resident memory (Linux) — and one per database copy — name, datastore,
+preset, state, holder, age. With the load budget on, a last line says how much
+of it is committed.
+
+### Idle, wake and teardown
+
+[Decision 0035](docs/decisions/0035-services-idle-on-their-own-clock-and-wake-on-demand.md).
+Each running service has its own idle clock. It is reset by any runly verb on the
+environment (`up`, `ctx`, `exec`, `logs`, `ps`, …), by any client byte through the
+service's public port, and by its own start. An agent merely being alive does
+not count. After 10 minutes (`BACKLOT_SERVICE_IDLE_MS`; per service
+`idle: 30m` / `idle: never`) the service is stopped. Its lease, data and public
+port stay.
+
+The next connection to that port **starts it again** and is held until it is
+ready (`BACKLOT_PROXY_HOLD_MS`, 90 s): appliances ensured, data kept, its build
+run only if needed. Because services reach each other through public ports, a
+browser hitting an idle SPA whose dev server forwards `/api` wakes the SPA, and
+the SPA's request wakes the API. A service whose *readiness check* needs another
+service must list it in `depends_on`. A service stopped with `runly down` stays
+down; an unleased environment is never woken by traffic. A crashing service's
+restart gap is held the same way.
+
+**When everything goes.** An environment is torn down completely — services,
+data, preview, ports, lease — when:
+
+- its **holder process** (`--holder-pid`, `BACKLOT_HOLDER_PID`, or Claude Code's
+  automatic tether) has been gone for a minute (`BACKLOT_TETHER_GRACE_MS`). While
+  it lives, the lease does not expire;
+- its **worktree** no longer exists, leased or not, also across a daemon restart;
+- you run **`runly destroy`** — for worktree pools that take a worktree back,
+  which runly cannot see on its own.
+
+**Claude Code.** Claude Code exports `CLAUDE_PID`, the `claude` process every
+Bash tool call runs under. `up` and `db new` tie to it when it is alive and an
+ancestor of the CLI. The tether is kept alive by that session process: subagents,
+background shells and tool calls all run under it. Ending, closing or killing
+the session starts the one-minute grace. `BACKLOT_TETHER=off` opts out; the lease
+then lives by its TTL.
+
+### The load budget: `runly plan`
+
+[Decision 0036](docs/decisions/0036-a-server-wide-load-budget.md). One daemon
+serves every stack on the box and admits every start and build against one
+budget. By default that is 70 % of RAM and 1.5 x cores of *declared* resources.
+On Linux, MemAvailable must also stay above max(2 GiB, 10 % of RAM), and the
+1-minute load must be at most 2 x cores. A build holds its share only while it
+builds, and an idle-stopped service holds none.
+
+```yaml
+services:
+  api:
+    resources: { memory: 1G, cpu: 1, build: { memory: 3G, cpu: 4 } }
+appliances:
+  mssql: { probe: "localhost:1433", start: "...", resources: { memory: 4G, cpu: 2 } }
+```
+
+Undeclared costs are 512M / 0.5 cpu running and 1G / 1 cpu building; `runly plan`
+says which costs were assumed. An `up` that does not fit **queues** first come,
+first served, showing its position and what it waits for. After
+`BACKLOT_BUDGET_WAIT_MS` (10 min) it fails with env-error (exit 2), naming what
+is committed.
+
+```bash
+runly plan            # every service: starts now | would wait for <memory|cpu|free memory|load>
+runly plan web --json
+```
+
+Knobs: `BACKLOT_BUDGET=off`, `BACKLOT_BUDGET_MEMORY` (`48G`), `BACKLOT_BUDGET_CPU`,
+`BACKLOT_BUDGET_RESERVE`, `BACKLOT_BUDGET_LOAD_PER_CORE`, `BACKLOT_BUDGET_WAIT_MS`,
+`BACKLOT_BUDGET_MAX_QUEUE`, or `budget: {…}` in `config.json`.
+`BACKLOT_POOL_MAX_TOTAL` still caps how many environments are *held*. Its default
+is 2 x cores, clamped to 4–64; with the budget off it reverts to the pre-0.16
+heuristic.
+
+### Logs: `runly logs`
+
+[Decision 0038](docs/decisions/0038-time-stamped-logs-and-build-skip.md).
+
+```bash
+runly logs                         # every service, interleaved: "api | …", "web | …" (last 40 lines)
+runly logs api --since up          # only the current api process (since its last start)
+runly logs --since 10m --grep 'ERROR|WARN'
+runly logs web -f --until 'Compiled successfully' --timeout 300   # 0 on match, 124 on timeout
+runly logs --build                 # each service's last build output, and the last upkeep output
+```
+
+Each line is stored with its arrival time. Logs survive idle stops and daemon
+restarts, are capped at 20 MB per service with one rotation
+(`BACKLOT_LOG_CAP_BYTES`), and are deleted with the environment.
+
+### Cleanup: `runly pool doctor`
+
+[Decision 0037](docs/decisions/0037-cleanup-by-reference-and-pool-doctor.md).
+`runly pool doctor` lists what runly left behind and is a dry run by default:
+
+- environment and copy directories nobody references;
+- worktree records of deleted worktrees;
+- superseded, unreferenced templates;
+- service processes of gone environments;
+- listeners of gone environments;
+- with a datastore `list:` command, server-side databases in runly's naming that
+  nothing references.
+
+`--fix` removes them. It only ever touches runly's own: files under the state
+root, processes tagged with this state root, and databases of stacks this state
+root knows. Another state root's databases are shown as `foreign-namespace` and
+left alone.
+
+```yaml
+datastores:
+  main:
+    driver: mssql
+    drop: scripts/db drop {{ns}}
+    list: scripts/db list          # one database name per line
+```
+
+Each environment records how to drop its databases when it creates them, so a
+deleted worktree's databases are still dropped with the command it was created
+with.
 
 ### How long you hold it: `--ttl` for agents, `--holder-pid` for shells
 
@@ -416,10 +595,11 @@ a continuing lease's absolute deadline. Use `up --ttl <minutes>` to extend it;
 expired acquisition takes a normal new deadline; `reset-data` requires a live
 lease and refuses an expired one before changing data.
 
-**`--ttl` is the form for anything automated.** `--holder-pid <pid>` (or
-`BACKLOT_HOLDER_PID`) pins the lease to a process so the environment returns to
-the pool the instant that process exits instead of waiting out the TTL — which is
-only useful if the process genuinely outlives the command.
+**`--ttl` is the form for anything automated** — except under Claude Code, which
+tethers automatically (above). `--holder-pid <pid>` (or `BACKLOT_HOLDER_PID`) pins
+the lease to a process: a minute after that process exits the environment is torn
+down instead of waiting out the TTL, and while it lives the lease does not expire.
+That is only useful if the process genuinely outlives the command.
 
 It does **not** work from an agent harness, because those run each command in a
 fresh shell: by the time `runly up` returns, the `$$` it was given is a shell
@@ -445,8 +625,11 @@ The manifest, by example ([schema](schema/runly.schema.json)):
 name: myapp
 services:
   api:
-    build: dotnet build backend/Host
+    build:
+      run: dotnet build backend/Host
+      when: ["backend/**/*.cs", "backend/**/*.csproj"]   # skipped while these are unchanged
     outputs: [backend/Host/bin/**]   # restarted on `up` only when the build changed these
+    resources: { memory: 1G, cpu: 1, build: { memory: 3G, cpu: 4 } }   # the load budget
     run: dotnet run --no-build --project backend/Host
     port: api
     env: { ConnectionStrings__Main: "{{datastores.main.url}}" }

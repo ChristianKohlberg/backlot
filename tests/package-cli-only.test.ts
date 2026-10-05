@@ -4,6 +4,7 @@ import { execFile } from 'node:child_process';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { promisify } from 'node:util';
+import { disposeStateSync } from './support/leaks.js';
 
 const run = promisify(execFile);
 
@@ -36,6 +37,6 @@ it('packs a working CLI without stale adapter outputs from an older build', asyn
     expect(help).toContain('runly up');
     expect(help).toContain('runly ctx [--env]');
   } finally {
-    rmSync(root, { recursive: true, force: true });
+    disposeStateSync(root);
   }
 }, 150_000);

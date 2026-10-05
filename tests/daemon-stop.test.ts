@@ -6,6 +6,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { awaitDaemonGone, DAEMON_STOP_TIMEOUT_MS } from '../src/cli/client.js';
 import { VERSION } from '../src/core/version.js';
+import { disposeStateSync } from './support/leaks.js';
 
 const CLI = join(import.meta.dirname, '../dist/cli/index.js');
 function alive(pid: number) { try { process.kill(pid, 0); return true; } catch { return false; } }
@@ -26,7 +27,7 @@ function fixture() {
       for (let i = 0; i < 200 && alive(pid); i++) await new Promise((resolve) => setTimeout(resolve, 50));
       expect(alive(pid), `private daemon ${pid} did not stop`).toBe(false);
     }
-    rmSync(root, { recursive: true, force: true });
+    disposeStateSync(root);
   };
   return { root, state, cli, cleanup };
 }

@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { BindDiagnostics } from '../src/core/diagnostics.js';
 import type { Context } from '../src/core/types.js';
+import { disposeStateSync } from './support/leaks.js';
 
 const CLI = join(import.meta.dirname, '..', 'dist', 'cli', 'index.js');
 const state = mkdtempSync(join(tmpdir(), 'backlot-diag-state-'));
@@ -49,7 +50,7 @@ afterAll(async () => {
   await cli(['release']);
   await cli(['pool', 'recycle']);
   await cli(['daemon', 'stop']);
-  rmSync(state, { recursive: true, force: true });
+  disposeStateSync(state);
   rmSync(wt, { recursive: true, force: true });
 });
 

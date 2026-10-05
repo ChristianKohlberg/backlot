@@ -12,6 +12,7 @@ import Ajv2020 from 'ajv/dist/2020.js';
 import { ensureAppliance, stopAppliance, probeTcp } from '../src/drivers/appliances.js';
 import { BrokerError } from '../src/core/util.js';
 import { tempDir, freePort } from './helpers.js';
+import { disposeStateSync } from './support/leaks.js';
 
 const root = join(import.meta.dirname, '..');
 const schema = JSON.parse(readFileSync(join(root, 'schema/runly.schema.json'), 'utf8'));
@@ -224,7 +225,9 @@ describe('the appliance start lock is machine-wide, not process-wide', () => {
   });
   afterEach(() => {
     delete process.env.BACKLOT_STATE_DIR;
-    lockState.cleanup();
+    // The appliance this test starts is daemonized by design (decision 0018):
+    // it carries the state dir in its environment, which is how it is found.
+    disposeStateSync(lockState.dir);
   });
 
   it('holds the lock as a filesystem artifact under the shared state root', async () => {

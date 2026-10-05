@@ -44,7 +44,22 @@ not just to read or edit code.
   `RUNLY_DB_URL`/`RUNLY_DB_NAME`, and drops the copy when it exits — as many in
   parallel as you like, no lease, your running app untouched. Don't stand up your
   own container for that. (`up --data-only` was removed in 0.15: exit 64.)
-- **How long you hold it: use `--ttl <minutes>`.** That is the form for you.
+- **Idle services stop; your next request starts them.** A service with no runly
+  verb and no client byte for 10 minutes is stopped (`ps` says `idle`); its URL,
+  data and lease stay. The next request to its URL is held while it starts —
+  slower, never refused. Nothing to do on your side; don't "keep it warm" with
+  polling.
+- **Under Claude Code your environment is tied to your session.** `up` and
+  `db new` tether to the `claude` process (`CLAUDE_PID`) automatically; a minute
+  after the session ends everything goes (services, data, ports, lease). While
+  the session lives, the lease does not lapse. A deleted worktree takes its
+  environment with it; `runly destroy` does it now.
+- **The box has a load budget.** An `up` that does not fit waits in a queue
+  (its position and reason are on stderr with `--progress`) and fails with
+  env-error after 10 minutes. `runly plan` tells you beforehand whether it would
+  start now or wait, and for what. Don't retry in a loop — `runly ps --all`
+  shows what is running.
+- **How long you hold it: use `--ttl <minutes>`** (outside Claude Code). That is the form for you.
   There is a second form, `--holder-pid <pid>` / `BACKLOT_HOLDER_PID`, which ties
   the lease to a process so it frees the instant that process exits — it is for
   interactive shells and long-lived supervisors only. **Do not write
@@ -61,23 +76,25 @@ stderr is human progress. Exit codes are contractual: `0` ok · `1` work-error �
 
 | Verb | What it does |
 | --- | --- |
-| `up [service...]` | Session lease: upkeep, build and start services in this worktree, print context. **Additive: named services (plus their `depends_on` closure) start next to what already runs; nothing running is stopped. No service = add every service.** **Every `up` applies your edits:** it runs the due upkeep and the builds, then restarts only the services whose build output changed (see below). Flags: `--preset <ds>=<preset>` (reload that one datastore, restart the services that use it), `--reset-data`\|`--pristine`, `--ttl <minutes>` (**the lease form for agents**), `--holder-pid <pid>` (interactive shells only — see above). |
+| `up [service...]` | Session lease: upkeep, build and start services in this worktree, print context. A `build: {run, when}` is skipped while its inputs are unchanged (`build <svc>: skipped (when: unchanged)`); `--rebuild` forces every build. **Additive: named services (plus their `depends_on` closure) start next to what already runs; nothing running is stopped. No service = add every service.** **Every `up` applies your edits:** it runs the due upkeep and the builds, then restarts only the services whose build output changed (see below). Flags: `--preset <ds>=<preset>` (reload that one datastore, restart the services that use it), `--reset-data`\|`--pristine`, `--ttl <minutes>` (**the lease form for agents**), `--holder-pid <pid>` (interactive shells only — see above). |
 | `down [service...]` | Stop just the named services (no name = all). The lease, the data and the public ports stay; `up` brings them back. Dependents keep running and are named in the answer. |
 | `db new\|with\|ls\|drop` | Database copies outside any environment, from the same templates: `db new <ds> [--preset p]` prints `name`/`url`/`preset`; `db with <ds> [--preset p] -- <cmd>` runs the command with `RUNLY_DB_URL`/`RUNLY_DB_NAME`, drops the copy on exit and returns the command's exit code; `db ls [--all]`; `db drop <name>`. A copy is reaped when its holder exits or its worktree goes. No TTL. |
-| `ps [--all]` | What runs for this worktree (`--all`: the whole box): services (state, public/internal port, pid, idle, rss) and database copies (name, datastore, preset, holder, created). |
+| `ps [--all]` | What runs for this worktree (`--all`: the whole box): services (state — `running`, `starting`, `idle` (stopped for idleness, wakes on a request), `stopped`, `down` — public/internal port, pid, idle, stops-in, rss) and database copies (name, datastore, preset, holder, created). |
+| `plan [service...]` | Would an `up` start now, or wait for the load budget — and for what (memory, cpu, free memory, load)? Itemises what it would build and start and what each costs (declared `resources:` or an assumed default). Changes nothing. |
+| `destroy` | Tear down everything runly holds for this worktree now: environment, data, copies, ports, lease. |
 | `ctx` | Re-read the consumer **context blob** (service URLs, login creds, connection strings, recent events) for the env your lease holds — read-only, no re-bind. `up` already returned this once. **A stack may advertise several logins: `logins` is the primary one, `allLogins` is the whole set** — see below. |
 | `ctx --env` | The same environment as shell-exportable `KEY=value` lines for your own tests: `RUNLY_ENV_ID`, `RUNLY_PORT_<PORT>`, `RUNLY_URL_<SERVICE>`, `RUNLY_DATASTORE_<NAME>_URL`, `RUNLY_DATASTORE_<NAME>_PRESET` (the preset it holds), `RUNLY_LOGIN_USER`, `RUNLY_LOGIN_PASSWORD` (names upper-cased, other characters as `_`: `web-audit` → `RUNLY_URL_WEB_AUDIT`). Use `eval "$(runly ctx --env)" && <tests>`. |
 | `release` | Release the current lease; the environment stays warm in the pool. On `{"released": false}` read the `reason` — a lease is keyed by the directory that bound it, so releasing from elsewhere matches nothing. |
 | `warm` | Run this worktree's due upkeep rules and its service builds **now, with no lease and no services**, and print each step with its duration. For an idle worktree just moved to a new commit (`git checkout <sha> && runly warm`), so the next bind finds the installs done and the build tools' caches current. |
 | `exec <cmd...>` | Run an arbitrary command in your worktree with the lease's ports, URLs and connection strings in its environment (`BACKLOT_URL_*`, `BACKLOT_DS_*`); hands back raw stdout + exit code. Needs an `up` first. |
-| `logs <service> [--lines N]` | Tail a service's logs from the leased env. |
+| `logs [service...]` | Service logs, interleaved with `svc \| ` prefixes (none named = all). `--lines N` (40), `--since up` (current process only) or `--since 10m`, `--grep <re>`, `--build` (last build/upkeep output). **Wait for a line instead of polling:** `runly logs web -f --until 'Compiled successfully' --timeout 300` exits 0 on the match and 124 on timeout. |
 | `reset-data` | Restore the data template on the current lease (fresh seeded state; builds and caches untouched). |
 | `token --role <r>` | Mint an auth token via the stack's `auth.token` hook — for authenticating as a given role. Prints JSON (`{token, role}`); **add `--raw` for the bare token**, which is what an `Authorization` header wants. Piping the JSON into a header gets you a 401 that looks like a permissions problem. |
 | `preview <service>` | Publish **one** service from your lease on a public quick tunnel (needs `cloudflared`) so a human on another machine can look at it. The URL is **unauthenticated — anyone with the link reaches the app**, so only run it when you were asked to share, and end it with `preview stop` (releasing the lease also does). Opt-in per invocation; a stack may forbid it in `runly.yml` (work-error). It is scoped to the **lease**, not the services: a repeated `up` or a rebind leaves it up, and a bind that invalidated it says so in `previewNotice`. |
 | `status` | Daemon, pool, and lease overview. Per environment, `available` answers "will the next bind take this one?" — `heat: "cold"` just means quiesced, which is a **healthy free** pool entry, not a stuck one. |
 
 Adjacent: `appliance ls|start|stop`
-(shared backing servers), `pool ls|recycle|reconcile|gc|doctor`, `daemon stop`,
+(shared backing servers), `pool ls|recycle|reconcile|gc|doctor [--fix]` (doctor: what runly left behind; dry run unless `--fix`, only ever runly's own), `daemon stop`,
 `update` (see below), `--version`.
 
 **If a verb fails with `infra-error` naming two versions, that is version skew.**

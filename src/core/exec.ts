@@ -45,17 +45,27 @@ export function runBounded(
   cwd: string,
   timeoutS: number = DEFAULT_CMD_TIMEOUT_S,
   env?: NodeJS.ProcessEnv,
+  /** Sees every chunk as it arrives (a build log, decision 0038); `end` once per stream. */
+  onOutput?: { data: (stream: 'out' | 'err', chunk: string) => void; end: (stream: 'out' | 'err') => void },
 ): Promise<CmdResult> {
   return new Promise((resolve) => {
     const proc = spawn('sh', ['-c', cmd], { cwd, env, stdio: ['ignore', 'pipe', 'pipe'], detached: true });
     let out = '';
     let settled = false;
     let timedOut = false;
-    const sink = (d: Buffer) => {
-      out = (out + d.toString()).slice(-16_000);
+    const sink = (stream: 'out' | 'err') => (d: Buffer) => {
+      const text = d.toString();
+      out = (out + text).slice(-16_000);
+      try {
+        onOutput?.data(stream, text);
+      } catch {
+        /* a log write must never fail the command */
+      }
     };
-    proc.stdout!.on('data', sink);
-    proc.stderr!.on('data', sink);
+    proc.stdout!.on('data', sink('out'));
+    proc.stderr!.on('data', sink('err'));
+    proc.stdout!.on('end', () => onOutput?.end('out'));
+    proc.stderr!.on('end', () => onOutput?.end('err'));
 
     const timer = setTimeout(() => {
       timedOut = true;

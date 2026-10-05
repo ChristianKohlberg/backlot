@@ -6,8 +6,7 @@
  */
 import { spawn, type ChildProcess } from 'node:child_process';
 import { StringDecoder } from 'node:string_decoder';
-import { appendFileSync, mkdirSync } from 'node:fs';
-import { join } from 'node:path';
+import { mkdirSync } from 'node:fs';
 import { BrokerError, now, safeJoin } from '../core/util.js';
 import { runBounded } from '../core/exec.js';
 import { redactStream } from '../core/caller-env.js';
@@ -15,6 +14,7 @@ import { stateRoot } from '../core/paths.js';
 import { groupAlive, processGroup, sameProcess, serviceTag, startTime } from '../core/procscan.js';
 import type { ReadySpec, ServiceSpec } from '../core/manifest.js';
 import type { ServicePid } from '../core/types.js';
+import { LogWriter, logFileOf, startMarker } from '../core/logs.js';
 
 export interface ServiceEvent {
   at: number;
@@ -37,6 +37,18 @@ interface Running {
   startedAt: number;
   /** A spawn 'error' is being handled; 'exit' may or may not follow it. */
   spawnFailed?: boolean;
+  /** The service's log, time-stamped per line (decision 0038). */
+  log: LogWriter;
+}
+
+/** What the engine learns about a service between starts (decision 0035). */
+export interface SupervisorHooks {
+  /** It exited on its own and a restart is pending: hold its port's connections. */
+  onCrashed?: (service: string) => void;
+  /** The pending restart launched a new process: probe it and forward again. */
+  onRelaunched?: (service: string) => void;
+  /** It gave up restarting (flapping, or a daemonized service). */
+  onGaveUp?: (service: string) => void;
 }
 
 /** Uptime past which a crash counts as fresh rather than part of a flap. */
@@ -59,6 +71,7 @@ export class EnvSupervisor {
     private readonly onPidsChanged?: () => void,
     /** Fired after a service was stopped on purpose — the proxy stops forwarding to it (decision 0033). */
     private readonly onStopped?: (service: string) => void,
+    private readonly hooks: SupervisorHooks = {},
   ) {
     mkdirSync(logDir, { recursive: true });
   }
@@ -69,7 +82,7 @@ export class EnvSupervisor {
   }
 
   logPath(name: string): string {
-    return join(this.logDir, `${name}.log`);
+    return logFileOf(this.logDir, name);
   }
 
   logs(name: string): string {
@@ -95,11 +108,13 @@ export class EnvSupervisor {
     // service outside the worktree it is bound to, against files runly never
     // fingerprinted.
     const cwd = spec.cwd ? safeJoin(this.root, spec.cwd, `service '${name}' cwd`) : this.root;
-    const running: Running = { proc: null as unknown as ChildProcess, buf: '', probeBuf: '', restarts: 0, expectedExit: false, restartTimer: null, startedAt: now() };
+    const running: Running = { proc: null as unknown as ChildProcess, buf: '', probeBuf: '', restarts: 0, expectedExit: false, restartTimer: null, startedAt: now(), log: new LogWriter(this.logPath(name)) };
+    let launches = 0;
     const launch = () => {
       running.restartTimer = null;
       // A teardown that landed while this restart was pending: do not respawn.
       if (running.expectedExit) return;
+      launches++;
       const proc = spawn('sh', ['-c', cmd], {
         cwd,
         // The tag rides in the environment so it is INHERITED by every
@@ -122,24 +137,26 @@ export class EnvSupervisor {
       // Capture identity immediately: once the pid exits this is unreadable,
       // and an un-pinned pid is one the reaper must refuse to signal.
       running.startTime = proc.pid ? startTime(proc.pid) : undefined;
+      // `--since up` reads from the last of these (decision 0038).
+      running.log.line(startMarker(name, proc.pid, launches > 1 ? `restart ${launches - 1} after it exited` : ''));
       this.onPidsChanged?.();
-      const sink = (s: string) => {
-        running.buf = (running.buf + s).slice(-64_000);
-        try {
-          appendFileSync(this.logPath(name), s);
-        } catch {
-          /* log dir gone mid-teardown */
-        }
-      };
-      for (const stream of [proc.stdout!, proc.stderr!]) {
+      if (launches > 1) this.hooks.onRelaunched?.(name);
+      for (const [label, stream] of [['out', proc.stdout!], ['err', proc.stderr!]] as const) {
         const decoder = new StringDecoder('utf8');
         const redact = redactStream(secrets);
+        const sink = (s: string) => {
+          running.buf = (running.buf + s).slice(-64_000);
+          running.log.write(label, s);
+        };
         stream.on('data', (d: Buffer) => {
           const text = decoder.write(d);
           running.probeBuf = (running.probeBuf + text).slice(-64_000);
           sink(redact(text));
         });
-        stream.on('end', () => sink(redact(decoder.end(), true)));
+        stream.on('end', () => {
+          sink(redact(decoder.end(), true));
+          running.log.end(label);
+        });
       }
       // A spawn failure (EAGAIN/EMFILE under fleet load) emits 'error'; with no
       // listener it becomes an uncaught exception that kills the whole daemon.
@@ -153,6 +170,7 @@ export class EnvSupervisor {
         this.onPidsChanged?.();
         if (running.restarts < 3) {
           running.restarts++;
+          this.hooks.onCrashed?.(name);
           this.note(name, `restarting after spawn failure (attempt ${running.restarts})`);
           running.restartTimer = setTimeout(() => {
             running.spawnFailed = false;
@@ -161,6 +179,7 @@ export class EnvSupervisor {
           running.restartTimer.unref();
         } else {
           this.note(name, 'spawn keeps failing — giving up (environment degraded)');
+          this.hooks.onGaveUp?.(name);
           this.onDegraded?.(name);
         }
       });
@@ -174,6 +193,7 @@ export class EnvSupervisor {
         if (code === 0 && now() - running.startedAt < 2000 && running.restarts === 0) {
           this.note(name, 'exited 0 immediately — a service must stay in the FOREGROUND (it looks daemonized)');
           running.expectedExit = true;
+          this.hooks.onGaveUp?.(name);
           this.onDegraded?.(name);
           return;
         }
@@ -186,11 +206,15 @@ export class EnvSupervisor {
         // Bounded restart for long-lived services (decision 0010).
         if (running.restarts < 3) {
           running.restarts++;
+          // Hold, don't refuse (decision 0035): a client arriving between the
+          // crash and the relaunch waits on the public port.
+          this.hooks.onCrashed?.(name);
           this.note(name, `restarting (attempt ${running.restarts})`);
           running.restartTimer = setTimeout(launch, 500 * running.restarts);
           running.restartTimer.unref();
         } else {
           this.note(name, 'flapping — giving up (environment degraded)');
+          this.hooks.onGaveUp?.(name);
           this.onDegraded?.(name);
         }
       });

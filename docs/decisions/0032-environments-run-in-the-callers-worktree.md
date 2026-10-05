@@ -1,6 +1,6 @@
 # 0032. Environments run in the caller's worktree — one per worktree — `up` is the only bind verb, and runly runs no checks
 
-- Status: Accepted — amended by [0034](0034-additive-up-database-copies-and-ps.md): `up` is additive (a different service set is no longer a full-bind reason, `down` stops services), a preset reloads one datastore instead of forcing the full path, and the data-only ceiling is gone
+- Status: Accepted — amended by [0034](0034-additive-up-database-copies-and-ps.md): `up` is additive (a different service set is no longer a full-bind reason, `down` stops services), a preset reloads one datastore instead of forcing the full path, and the data-only ceiling is gone; amended by [0036](0036-a-server-wide-load-budget.md) (the pool cap bounds held rows, the load budget bounds load), [0037](0037-cleanup-by-reference-and-pool-doctor.md) (templates kept per datastore and preset, by reference) and [0038](0038-time-stamped-logs-and-build-skip.md) (`build: {run, when}` may skip an unchanged build)
 - Date: 2026-10
 - Supersedes: [0004](0004-watchers-never-move-bindings-move.md) (environments own a
   tree), [0005](0005-git-sync-immutable-bindings.md) (sync transport, immutable

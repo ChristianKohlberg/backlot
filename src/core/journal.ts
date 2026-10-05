@@ -44,6 +44,15 @@ export const JOURNAL_SCHEMA_VERSION = 4;
  * `{"web": {"pid":1234,"startTime":99}}`. Journals outlive releases, so read
  * both shapes; a bare number simply has no identity pin (see ServicePid).
  */
+function parseJson<T>(raw: unknown): T | undefined {
+  if (typeof raw !== 'string' || raw === '') return undefined;
+  try {
+    return JSON.parse(raw) as T;
+  } catch {
+    return undefined;
+  }
+}
+
 function parseServicePids(raw: string): Record<string, ServicePid> {
   const out: Record<string, ServicePid> = {};
   let parsed: unknown;
@@ -98,6 +107,29 @@ export interface EnvRow {
    * and recycles an unleased one; nothing else reads it.
    */
   dataOnly?: boolean;
+  /**
+   * When each public port last carried a client byte (decision 0035), by port
+   * key. Persisted (throttled) so a daemon restart does not reset every idle
+   * clock to "active"; the proxy's in-memory counters start from it.
+   */
+  activity?: Record<string, number>;
+  /**
+   * How to drop each datastore namespace this environment holds, recorded
+   * when it is created (decision 0037): the templated drop command and where
+   * to run it, or the file to delete. Teardown needs neither the manifest nor
+   * the worktree — both may be gone by the time it runs.
+   */
+  dropRecipes?: Record<string, DropRecipe>;
+  /** The template each datastore was last restored from (decision 0037: templates are kept by reference). */
+  templates?: Record<string, string>;
+}
+
+/** Everything needed to drop one namespace without the manifest (decision 0037). */
+export interface DropRecipe {
+  cmd?: string;
+  cwd?: string;
+  /** A file (sqlite) to delete instead, with its -wal/-shm/-journal sidecars. */
+  path?: string;
 }
 
 export interface LeaseRow {
@@ -158,6 +190,8 @@ export interface DbCopyRow {
   createdAt: number;
   dropAttempts: number;
   nextDropAt: number;
+  /** The template it was restored from (`<stack>/<marker>`), so retention keeps it (decision 0037). */
+  template?: string;
 }
 
 export class Journal {
@@ -268,6 +302,15 @@ export class Journal {
     } catch (err) {
       if (!/duplicate column name/i.test(String((err as Error).message ?? err))) throw err;
     }
+    // 0.16 (decisions 0035, 0037): additive — an older daemon ignores them and
+    // reads everything else correctly, so they are no schema bump.
+    for (const [table, col] of [['envs', 'activity TEXT'], ['envs', 'drop_recipes TEXT'], ['envs', 'templates TEXT'], ['db_copies', 'template TEXT']] as const) {
+      try {
+        this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${col}`);
+      } catch (err) {
+        if (!/duplicate column name/i.test(String((err as Error).message ?? err))) throw err;
+      }
+    }
     // Stamp LAST: every migration above has run, so the stamp means "this
     // journal has the schema that number describes" rather than "a build with
     // that number opened it". 0 covers both a fresh journal and one written
@@ -320,27 +363,46 @@ export class Journal {
       failStreak: (r.fail_streak as number) ?? 0,
       activeServices: r.active_services ? (JSON.parse(r.active_services as string) as string[]) : undefined,
       dataOnly: Boolean(r.data_only),
+      activity: parseJson(r.activity),
+      dropRecipes: parseJson(r.drop_recipes),
+      templates: parseJson(r.templates),
     };
   }
 
   saveEnv(e: EnvRow): void {
     this.db
       .prepare(
-        `INSERT INTO envs (id, stack, stack_root, state, root, ports, datastore_ns, fingerprints, presets, bind_count, created_at, last_used_at, service_pids, fail_streak, active_services, data_only)
-         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        `INSERT INTO envs (id, stack, stack_root, state, root, ports, datastore_ns, fingerprints, presets, bind_count, created_at, last_used_at, service_pids, fail_streak, active_services, data_only, drop_recipes, templates)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
          ON CONFLICT(id) DO UPDATE SET state=excluded.state, ports=excluded.ports,
            datastore_ns=excluded.datastore_ns, fingerprints=excluded.fingerprints,
            presets=excluded.presets, bind_count=excluded.bind_count,
            last_used_at=excluded.last_used_at, service_pids=excluded.service_pids,
            fail_streak=excluded.fail_streak, active_services=excluded.active_services,
-           data_only=excluded.data_only`,
+           data_only=excluded.data_only,
+           drop_recipes=COALESCE(excluded.drop_recipes, envs.drop_recipes),
+           templates=COALESCE(excluded.templates, envs.templates)`,
       )
       .run(
         e.id, e.stack, e.stackRoot, e.state, e.root,
         JSON.stringify(e.ports), JSON.stringify(e.datastoreNs), JSON.stringify(e.fingerprints),
         JSON.stringify(e.presets), e.bindCount, e.createdAt, e.lastUsedAt, JSON.stringify(e.servicePids),
         e.failStreak, e.activeServices ? JSON.stringify(e.activeServices) : null, e.dataOnly ? 1 : 0,
+        e.dropRecipes ? JSON.stringify(e.dropRecipes) : null, e.templates ? JSON.stringify(e.templates) : null,
       );
+  }
+
+  /**
+   * Record the proxy's activity clocks (decision 0035). Its own statement, so
+   * a snapshot saved by a verb can never roll them back, and merged so a
+   * clock only moves forward.
+   */
+  saveActivity(id: string, activity: Record<string, number>): void {
+    const row = this.db.prepare('SELECT activity FROM envs WHERE id = ?').get(id) as { activity?: string | null } | undefined;
+    if (!row) return;
+    const merged: Record<string, number> = { ...(parseJson<Record<string, number>>(row.activity) ?? {}) };
+    for (const [k, v] of Object.entries(activity)) merged[k] = Math.max(merged[k] ?? 0, v);
+    this.db.prepare('UPDATE envs SET activity = ? WHERE id = ?').run(JSON.stringify(merged), id);
   }
 
   getEnv(id: string): EnvRow | undefined {
@@ -389,6 +451,7 @@ export class Journal {
       createdAt: r.created_at as number,
       dropAttempts: (r.drop_attempts as number) ?? 0,
       nextDropAt: (r.next_drop_at as number) ?? 0,
+      template: (r.template as string | null) ?? undefined,
     };
   }
 
@@ -396,15 +459,15 @@ export class Journal {
     this.db
       .prepare(
         `INSERT INTO db_copies (name, stack, stack_root, datastore, preset, ns, url, state, holder, holder_pid, holder_start,
-           drop_cmd, drop_cwd, drop_path, created_at, drop_attempts, next_drop_at)
-         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+           drop_cmd, drop_cwd, drop_path, created_at, drop_attempts, next_drop_at, template)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
          ON CONFLICT(name) DO UPDATE SET state=excluded.state, drop_attempts=excluded.drop_attempts,
-           next_drop_at=excluded.next_drop_at`,
+           next_drop_at=excluded.next_drop_at, template=COALESCE(excluded.template, db_copies.template)`,
       )
       .run(
         c.name, c.stack, c.stackRoot, c.datastore, c.preset, c.ns, c.url, c.state, c.holder,
         c.holderPid ?? null, c.holderStart ?? null, c.dropCmd ?? null, c.dropCwd ?? null, c.dropPath ?? null,
-        c.createdAt, c.dropAttempts, c.nextDropAt,
+        c.createdAt, c.dropAttempts, c.nextDropAt, c.template ?? null,
       );
   }
 

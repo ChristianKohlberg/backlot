@@ -15,6 +15,7 @@ import { Journal } from '../src/core/journal.js';
 import { scanTagged } from '../src/core/procscan.js';
 import { ProxyHub } from '../src/daemon/proxy.js';
 import { allocateInBlock, DEFAULT_INTERNAL_BLOCK, DEFAULT_PUBLIC_BLOCK, DEFAULT_TUNNEL_BLOCK, ephemeralRange } from '../src/core/ports.js';
+import { disposeStateSync } from './support/leaks.js';
 
 const repo = join(import.meta.dirname, '..');
 const CLI = join(repo, 'dist', 'cli', 'index.js');
@@ -62,7 +63,7 @@ function daemonCtx(extra: Record<string, string> = {}) {
         /* gone */
       }
     }
-    rmSync(stateDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
+    disposeStateSync(stateDir);
   };
   return { stateDir, cli, cleanup };
 }

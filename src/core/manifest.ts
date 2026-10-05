@@ -13,9 +13,61 @@ export interface ReadySpec {
   timeout?: number;
 }
 
+/**
+ * What a service (or an appliance) costs the box, for the server-wide load
+ * budget (decision 0036). `memory` is a size (`600M`, `2G`, or bytes), `cpu`
+ * a number of cores. `build` is what its build costs while it runs. Anything
+ * left out is a conservative default, and `runly plan` says so.
+ */
+export interface ResourceSpec {
+  memory?: string | number;
+  cpu?: number;
+  build?: { memory?: string | number; cpu?: number };
+}
+
+/**
+ * A build step. The string form runs on every `up` that starts or keeps the
+ * service. The object form adds `when:` — globs of the files the build reads;
+ * when none of the matched files changed (path, size, mtime) since the last
+ * SUCCESSFUL build of this service in this worktree, the build is skipped
+ * (decision 0038).
+ */
+export type BuildSpec = string | { run: string; when?: string[] };
+
+/**
+ * What a build produces. String/array form: globs compared by path, size and
+ * mtime. Object form: `compare: content` hashes the files instead, so a build
+ * that rewrites identical files does not restart the service (decision 0038).
+ */
+export type OutputsSpec = string | string[] | { paths: string[]; compare?: 'stat' | 'content' };
+
+/** The build line and its `when:` globs, whichever form the manifest used. */
+export function buildOf(spec: { build?: BuildSpec }): { run: string; when?: string[] } | undefined {
+  if (spec.build === undefined) return undefined;
+  if (typeof spec.build === 'string') return { run: spec.build };
+  return { run: spec.build.run, when: spec.build.when };
+}
+
+/** The output globs and how they are compared, whichever form the manifest used. */
+export function outputsOf(spec: { outputs?: OutputsSpec }): { paths: string[]; compare: 'stat' | 'content' } {
+  const o = spec.outputs;
+  if (o === undefined) return { paths: [], compare: 'stat' };
+  if (typeof o === 'string') return { paths: [o], compare: 'stat' };
+  if (Array.isArray(o)) return { paths: o, compare: 'stat' };
+  return { paths: o.paths, compare: o.compare ?? 'stat' };
+}
+
 export interface ServiceSpec {
   run: string;
-  build?: string;
+  build?: BuildSpec;
+  /**
+   * How long this service may sit with no client bytes through its public
+   * port and no runly verb on its environment before it is stopped (decision
+   * 0035). A duration (`90s`, `10m`, `2h`), seconds as a number, or `never`.
+   * Default: BACKLOT_SERVICE_IDLE_MS (10 minutes).
+   */
+  idle?: string | number;
+  resources?: ResourceSpec;
   /** Accepted and ignored since decision 0032 (`--watch` was removed). */
   watch_run?: string;
   /** Accepted and ignored since decision 0032: a service without `build:` keeps running on `up` anyway. */
@@ -26,7 +78,7 @@ export interface ServiceSpec {
    * the service is restarted only when they changed. Without it, a service
    * with a build is restarted after every build (decision 0032).
    */
-  outputs?: string[];
+  outputs?: OutputsSpec;
   cwd?: string;
   port?: string;
   env?: Record<string, string>;
@@ -49,6 +101,13 @@ export interface DatastoreSpec {
   default_preset?: { run?: string; session?: string };
   template?: boolean;
   ephemeral?: boolean;
+  /**
+   * Repo command printing the namespaces ({{ns}} values) of this datastore
+   * that exist on its server, one per line. Only `runly pool doctor` reads it:
+   * a listed name that matches runly's naming and no journal row references is
+   * an orphan, and `--fix` drops it with `drop:` (decision 0037).
+   */
+  list?: string;
 }
 
 export interface ApplianceSpec {
@@ -62,6 +121,8 @@ export interface ApplianceSpec {
   ready?: string;
   /** Seconds to wait after start for probe+ready. Default 60. */
   timeout?: number;
+  /** What it costs while running, counted against the load budget when runly would start it (decision 0036). */
+  resources?: ResourceSpec;
 }
 
 export interface UpkeepRule {

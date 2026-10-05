@@ -9,6 +9,7 @@ import { execFile, execFileSync } from 'node:child_process';
 import { cpSync, mkdtempSync, rmSync, writeFileSync, readFileSync, appendFileSync, existsSync, readdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { disposeStateSync } from './support/leaks.js';
 
 const repo = join(import.meta.dirname, '..');
 const CLI = join(repo, 'dist', 'cli', 'index.js');
@@ -42,7 +43,7 @@ function makeContext(extraEnv: Record<string, string> = {}) {
     } catch {
       /* daemon already gone */
     }
-    rmSync(stateDir, { recursive: true, force: true });
+    disposeStateSync(stateDir);
   };
   return { stateDir, cli, cleanup };
 }
@@ -461,7 +462,7 @@ describe('a slice builds the services it starts', () => {
     } catch {
       /* daemon already gone */
     }
-    rmSync(stateDir, { recursive: true, force: true });
+    disposeStateSync(stateDir);
     rmSync(wt, { recursive: true, force: true });
   });
 

@@ -10,6 +10,7 @@ import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { makeDatastore, type DsHandle } from '../src/drivers/datastores.js';
 import { runBounded } from '../src/core/exec.js';
+import { disposeStateSync } from './support/leaks.js';
 
 const dirs: string[] = [];
 const mk = (p: string) => {
@@ -18,7 +19,7 @@ const mk = (p: string) => {
   return d;
 };
 afterAll(() => {
-  for (const d of dirs) rmSync(d, { recursive: true, force: true });
+  for (const d of dirs) disposeStateSync(d);
 });
 
 function handle(envId = 'ds-e1'): DsHandle {

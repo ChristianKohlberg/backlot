@@ -25,9 +25,11 @@ export interface BindDiagnostics {
    * (decision 0032: runly keeps no build cache; the build tool decides what is
    * current) — and whether its service was restarted, with why:
    * `outputs-changed`, `outputs-unchanged`, `no-outputs-declared` (always
-   * restarted), `not-running` (a service this `up` adds) or `full-rebind`.
+   * restarted), `not-running` (a service this `up` adds), `full-rebind`, or
+   * `when-unchanged` (decision 0038: a `build: { when: }` whose inputs did
+   * not change since its last successful build — skipped, durationMs 0).
    */
-  builds: Array<{ service: string; durationMs: number; restart: boolean; reason: 'outputs-changed' | 'outputs-unchanged' | 'no-outputs-declared' | 'not-running' | 'full-rebind' }>;
+  builds: Array<{ service: string; durationMs: number; restart: boolean; reason: 'outputs-changed' | 'outputs-unchanged' | 'no-outputs-declared' | 'not-running' | 'full-rebind' | 'when-unchanged' }>;
 }
 
 type BindPhase = 'queue' | 'prepare' | 'appliances' | 'upkeep' | 'stop' | 'data' | 'build' | 'ready' | 'finalize';

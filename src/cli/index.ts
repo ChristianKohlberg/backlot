@@ -14,18 +14,25 @@ import { collectCallerEnv } from '../core/caller-env.js';
 import { loadStack, manifestDeprecations } from '../core/manifest.js';
 import { parsePresetArgs } from '../core/presets.js';
 import { BrokerError } from '../core/util.js';
+import { parseSince, showLogs, type LogsSpec } from './logs.js';
+import { autoTether } from './tether.js';
+import { formatDuration, formatSize, parseDuration } from '../core/units.js';
 
 const USAGE = `runly — puts a working instance of a web application in front of you.
 
 Usage:
   runly up [service...] [--preset [DATASTORE=]NAME]... [--reset-data|--pristine]
-           [--ttl <minutes>] [--holder-pid <pid>]
+           [--rebuild] [--ttl <minutes>] [--holder-pid <pid>]
                           session lease on THIS worktree's one environment.
                           ADDITIVE: starts the named services plus their
                           depends_on closure (none named = every service) and
                           never stops one that is already running. Every up
                           applies the worktree as it is now: the due upkeep
-                          rules, then every build: of the services it runs.
+                          rules, then every build: of the services it runs —
+                          except a build: {run, when: [globs]} whose matched
+                          files are unchanged since its last successful build
+                          ('build <svc>: skipped (when: unchanged)'); --rebuild
+                          runs every build regardless.
                           A running service whose build OUTPUT changed (its
                           outputs: globs; none declared = always) is restarted;
                           one whose output is unchanged, or that has no build:,
@@ -34,6 +41,19 @@ Usage:
                           keeps its data; --preset reloads ONLY that datastore
                           from its template and restarts the running services
                           that use it.
+                          A service idle for 10 minutes (no runly verb on the
+                          environment, no bytes through its port; idle: per
+                          service) is stopped, its port kept; the next
+                          connection starts it again and is held until it is up.
+                          Waits in the server-wide load budget's queue when the
+                          box is full ('runly plan' says whether it would).
+  runly plan [service...] [--rebuild]
+                          what an up would build and start, what that costs
+                          (resources:, or the default — said so), and whether
+                          it starts now or would wait (and for what)
+  runly destroy           tear down everything runly holds for this worktree
+                          now: services, data, copies, ports, lease, records.
+                          For a worktree pool taking a worktree back
   runly down [service...] stop just these services (none named = all of them).
                           The lease, the data and the public ports stay.
   runly ctx [--env]     the consumer context blob (URLs, services, logins,
@@ -64,7 +84,15 @@ Usage:
                           just moved to a new commit
   runly exec <cmd...>   run a command in the worktree with the lease's ports,
                           URLs and connection strings in its environment
-  runly logs <service> [--lines N]
+  runly logs [service...] [--lines N] [--since up|<duration>] [--grep <re>]
+             [-f|--follow [--until <re>] [--timeout <s>]] [--build]
+                          the services' output, interleaved by time with a
+                          'service | ' prefix when there are several (none
+                          named = all). --since up: only the current process
+                          of each; --since 10m: the last ten minutes. -f keeps
+                          following; --until exits 0 at the first matching line
+                          and 124 when --timeout runs out. --build: the output
+                          of each service's last build (and of upkeep)
   runly reset-data      restore the data template on the current lease
   runly token --role <r> [--raw]
                           mint an auth token via the stack's auth.token hook.
@@ -83,12 +111,15 @@ Usage:
   runly status          daemon, pool, and lease overview
   runly appliance ls|start|stop [name]
                           shared backing servers: probe, ensure up, explicit stop
-  runly pool ls|recycle [<env-id>] [--force]|reconcile|gc|doctor
+  runly pool ls|recycle [<env-id>] [--force]|reconcile|gc|doctor [--fix]
                           recycle with an env-id recycles exactly that one; with
                           none, the whole pool. A LEASED environment is never
                           taken without --force (--all is the old spelling).
                           gc reclaims service processes orphaned by an ungraceful
-                          exit; doctor reports drift without acting on it
+                          exit; doctor lists what runly left behind (databases,
+                          templates, copies, processes, listeners, state dirs)
+                          and --fix removes it — only runly's own
+  runly doctor          daemon health and drift, without acting on it
   runly daemon stop     stop the daemon (environments are recovered on next use)
   runly update [--check] [--force]
                           make the RUNNING daemon be the INSTALLED build. An
@@ -107,9 +138,12 @@ Holding an environment — two forms, and the right one depends on who you are:
   --ttl <minutes>          THE FORM FOR AGENTS AND SCRIPTS. The lease lives for the
                            stated time no matter what process asked for it.
   --holder-pid <pid>       For an interactive shell, or any caller that OUTLIVES the
-  (BACKLOT_HOLDER_PID)     command. Ties the lease to that process so the environment
-                           returns to the pool the moment it exits, rather than
-                           waiting out the TTL.
+  (BACKLOT_HOLDER_PID)     command. Ties the lease to that process: a minute after it
+                           exits, the environment is torn down (services, data,
+                           ports, lease) rather than waiting out the TTL.
+
+Under Claude Code, up and db new tether to the agent automatically (CLAUDE_PID,
+when it is a live ancestor of the CLI); BACKLOT_TETHER=off opts out.
 
 'BACKLOT_HOLDER_PID=$$ runly up' works at a shell prompt and CANNOT work from an
 agent harness: each command runs in a fresh shell, so '$$' names a process that has
@@ -137,8 +171,8 @@ const verb = rawArgv[0];
 // flag's value is never mis-bound as a positional (and an inner command's own
 // flags survive) — the F1 class of argv bugs. Everything after a lone `--`, and
 // EVERYTHING for `exec`, is treated as a raw passthrough command.
-const VALUE_FLAGS = new Set(['--holder', '--holder-pid', '--ttl', '--role', '--lines', '--ref', '--spec', '--preset', '--https-port']);
-const BOOL_FLAGS = new Set(['--json', '--env', '--watch', '--reset-data', '--pristine', '--pull', '--detach', '--all', '--force', '--raw', '--data-only', '--progress', '--quiet', '--check']);
+const VALUE_FLAGS = new Set(['--holder', '--holder-pid', '--ttl', '--role', '--lines', '--ref', '--spec', '--preset', '--https-port', '--since', '--grep', '--until', '--timeout']);
+const BOOL_FLAGS = new Set(['--json', '--env', '--watch', '--reset-data', '--pristine', '--pull', '--detach', '--all', '--force', '--raw', '--data-only', '--progress', '--quiet', '--check', '--rebuild', '--follow', '--build', '--fix']);
 
 const flagVals = new Map<string, string>();
 const presetArgs: string[] = [];
@@ -149,7 +183,8 @@ let passthrough: string[] | null = null; // for `exec` / after `--`
 {
   const body = rawArgv.slice(1);
   for (let i = 0; i < body.length; i++) {
-    const a = body[i]!;
+    // `-f` is the one short flag: `logs -f`, as tail(1) has it.
+    const a = body[i] === '-f' && verb === 'logs' && passthrough === null ? '--follow' : body[i]!;
     // `exec` consumes the entire remainder verbatim (its own flags included),
     // except a leading `--json` which is ours; `--` also opens passthrough.
     if (verb === 'exec' && passthrough === null && a !== '--json' && !a.startsWith('--')) {
@@ -292,7 +327,7 @@ async function main(): Promise<void> {
     }
   }
 
-  const known = ['up', 'down', 'ctx', 'ps', 'db', 'warm', 'exec', 'logs', 'token', 'reset-data', 'release', 'preview', 'status', 'doctor', 'appliance', 'pool', 'daemon', 'update'];
+  const known = ['up', 'down', 'ctx', 'ps', 'plan', 'db', 'warm', 'exec', 'logs', 'token', 'reset-data', 'release', 'destroy', 'preview', 'status', 'doctor', 'appliance', 'pool', 'daemon', 'update'];
   if (!known.includes(verb)) {
     console.error(`runly: unknown verb '${verb}'\n\n${USAGE}`);
     process.exit(64);
@@ -408,6 +443,10 @@ async function main(): Promise<void> {
       process.exit(64);
     }
   }
+  // No explicit holder process: tether to the agent this CLI runs under, when
+  // it can be found (decision 0035) — Claude Code's CLAUDE_PID, if it is a
+  // live ancestor. BACKLOT_TETHER=off opts out.
+  if (holderPid === undefined && (verb === 'up' || (verb === 'db' && positional[0] === 'new'))) holderPid = autoTether();
 
   let res: RpcResponse | undefined;
   switch (verb) {
@@ -423,10 +462,15 @@ async function main(): Promise<void> {
       }
       res = await rpc(
         'up',
-        { cwd, holder, holderPid, hygiene: hygiene(), ttlMs, services: positional, callerEnv, presets },
+        { cwd, holder, holderPid, hygiene: hygiene(), ttlMs, services: positional, callerEnv, presets, rebuild: flags.has('--rebuild') },
         progress,
       );
       endProgress();
+      // The skipped builds are named even without a progress stream (decision 0038).
+      if (res.ok && !json && !showProgress) {
+        const builds = (res.data as { bindDiagnostics?: { builds?: Array<{ service: string; reason: string }> } }).bindDiagnostics?.builds ?? [];
+        for (const b of builds) if (b.reason === 'when-unchanged') console.error(`build ${b.service}: skipped (when: unchanged)`);
+      }
       break;
     }
     case 'down':
@@ -441,6 +485,17 @@ async function main(): Promise<void> {
         if (d.previewNotice) console.error(`runly: ${d.previewNotice}`);
         return;
       }
+      break;
+    case 'plan':
+      res = await rpc('plan', { cwd, holder, services: positional, rebuild: flags.has('--rebuild') });
+      if (res.ok && !json) {
+        for (const line of planLines(res.data as PlanData)) console.log(line);
+        return;
+      }
+      break;
+    case 'destroy':
+      res = await rpc('destroy', { cwd }, progress);
+      endProgress();
       break;
     case 'ps':
       res = await rpc('ps', { cwd, all: flags.has('--all') });
@@ -557,24 +612,48 @@ async function main(): Promise<void> {
       break;
     }
     case 'logs': {
-      const service = positional[0];
-      if (!service) {
-        console.error('runly logs: which service?');
-        process.exit(64);
-      }
       const rawLines = flagValue('--lines');
-      const lines = rawLines === undefined ? 40 : Number(rawLines);
+      const lines = rawLines === undefined ? undefined : Number(rawLines);
       // NaN reached the daemon as slice(-NaN) and quietly returned the WHOLE
       // log — the opposite of what a bounded --lines asks for.
-      if (!Number.isInteger(lines) || lines <= 0) {
+      if (lines !== undefined && (!Number.isInteger(lines) || lines <= 0)) {
         console.error(`runly logs: --lines expects a positive integer, got '${rawLines}'`);
         process.exit(64);
       }
-      res = await rpc('logs', { cwd, holder, service, lines });
-      if (res.ok && !json) {
-        console.log((res.data as { lines: string }).lines);
-        return;
+      const since = flagValue('--since');
+      if (since !== undefined && !parseSince(since)) {
+        console.error(`runly logs: --since expects 'up' or a duration (90s, 10m, 2h), got '${since}'`);
+        process.exit(64);
       }
+      const regex = (flag: string): RegExp | undefined => {
+        const v = flagValue(flag);
+        if (v === undefined) return undefined;
+        try {
+          return new RegExp(v);
+        } catch (e) {
+          console.error(`runly logs: ${flag} is not a valid regular expression: ${(e as Error).message}`);
+          return process.exit(64);
+        }
+      };
+      const grep = regex('--grep');
+      const until = regex('--until');
+      const rawTimeout = flagValue('--timeout');
+      const timeoutMs = rawTimeout === undefined ? undefined : parseDuration(rawTimeout);
+      if (rawTimeout !== undefined && (timeoutMs === undefined || !Number.isFinite(timeoutMs) || timeoutMs <= 0)) {
+        console.error(`runly logs: --timeout expects seconds or a duration (30, 90s, 5m), got '${rawTimeout}'`);
+        process.exit(64);
+      }
+      const follow = flags.has('--follow') || until !== undefined;
+      if (timeoutMs !== undefined && !follow) {
+        console.error('runly logs: --timeout bounds -f/--until; without them there is nothing to wait for');
+        process.exit(64);
+      }
+      res = await rpc('logs-spec', { cwd, holder, services: positional, build: flags.has('--build') });
+      if (!res.ok) break;
+      const spec = res.data as LogsSpec;
+      const code = await showLogs(spec, { lines, since, grep, follow, until, timeoutMs, json, prefix: spec.files.length !== 1 });
+      if (code === 124) console.error(`runly logs: --until /${until?.source ?? ''}/ did not match within ${rawTimeout ?? ''}${/^\d+$/.test(rawTimeout ?? '') ? 's' : ''}`);
+      process.exit(code);
       break;
     }
     case 'reset-data':
@@ -671,9 +750,14 @@ async function main(): Promise<void> {
       }
       else if (sub === 'reconcile') res = await rpc('pool-reconcile', {});
       else if (sub === 'gc') res = await rpc('pool-gc', {});
-      else if (sub === 'doctor') res = await rpc('doctor', { cliVersion: VERSION });
-      else {
-        console.error(`runly pool: unknown subcommand '${sub}' (ls | recycle | reconcile | gc | doctor)`);
+      else if (sub === 'doctor') {
+        res = await rpc('pool-doctor', { cwd, fix: flags.has('--fix') });
+        if (res.ok && !json) {
+          for (const line of doctorLines(res.data as PoolDoctorData)) console.log(line);
+          return;
+        }
+      } else {
+        console.error(`runly pool: unknown subcommand '${sub}' (ls | recycle | reconcile | gc | doctor [--fix])`);
         process.exit(64);
       }
       break;
@@ -866,8 +950,53 @@ interface DbCopy {
 
 interface PsData {
   scope: string;
-  services: Array<{ env: string; service: string; state: string; publicPort: number | null; internalPort: number | null; pid: number | null; idleMs: number | null; rssBytes: number | null }>;
+  services: Array<{ env: string; service: string; state: string; publicPort: number | null; internalPort: number | null; pid: number | null; idleMs: number | null; idleStopInMs?: number | null; rssBytes: number | null }>;
   databases: DbCopy[];
+  budget?: { enabled: boolean; memoryBytes: number; cpu: number; committedMemoryBytes: number; committedCpu: number; waiting: number };
+}
+
+interface PlanData {
+  stack: string;
+  envId: string | null;
+  items: Array<{ kind: string; name: string; memoryBytes: number; cpu: number; declared: boolean; skipped: string | null }>;
+  need: { memoryBytes: number; cpu: number };
+  machine: { totalBytes: number; availableBytes: number | null; load1: number; cores: number };
+  budget: { enabled: boolean; memoryBytes: number; cpu: number; reserveBytes: number; loadPerCore: number; waitMs: number };
+  committed: { memoryBytes: number; cpu: number; items: Array<{ what: string; memoryBytes: number; cpu: number }> };
+  queue: number;
+  startsNow: boolean;
+  verdict: string;
+  defaultsAssumed: string[];
+}
+
+interface PoolDoctorData {
+  fix: boolean;
+  clean: boolean;
+  findings: Array<{ kind: string; what: string; detail: string; fixed?: boolean; error?: string }>;
+}
+
+function planLines(p: PlanData): string[] {
+  const out: string[] = [];
+  out.push(`${p.stack}: ${p.verdict}`);
+  if (p.items.length === 0) out.push('  nothing to build or start — everything named already runs');
+  for (const it of p.items) {
+    const cost = it.skipped ? `skipped (${it.skipped})` : `${formatSize(it.memoryBytes)}, ${it.cpu} cpu${it.declared ? '' : ' (default — not declared in resources:)'}`;
+    out.push(`  ${it.kind.padEnd(9)} ${it.name.padEnd(20)} ${cost}`);
+  }
+  out.push(`  needs ${formatSize(p.need.memoryBytes)}, ${Math.round(p.need.cpu * 10) / 10} cpu (starts summed, the largest build on top)`);
+  if (p.budget.enabled) {
+    out.push(`  budget ${formatSize(p.budget.memoryBytes)}, ${p.budget.cpu} cpu — runly has committed ${formatSize(p.committed.memoryBytes)}, ${Math.round(p.committed.cpu * 10) / 10} cpu; ${p.queue} waiting`);
+  } else out.push('  budget off (BACKLOT_BUDGET=off)');
+  out.push(`  box: ${p.machine.availableBytes === null ? '' : `${formatSize(p.machine.availableBytes)} of `}${formatSize(p.machine.totalBytes)} available, load ${p.machine.load1.toFixed(1)} on ${p.machine.cores} cores; a wait gives up after ${formatDuration(p.budget.waitMs)}`);
+  if (p.defaultsAssumed.length) out.push(`  note: ${p.defaultsAssumed.length} cost(s) are the conservative default — declare resources: in runly.yml for an exact plan`);
+  return out;
+}
+
+function doctorLines(d: PoolDoctorData): string[] {
+  if (d.findings.length === 0) return ['pool doctor: nothing left behind'];
+  const out = d.findings.map((f) => `${f.fixed ? 'removed' : f.error ? 'FAILED ' : d.fix && f.kind !== 'foreign-namespace' ? 'kept   ' : 'found  '} ${f.kind.padEnd(17)} ${f.what} — ${f.detail}${f.error ? ` (${f.error})` : ''}`);
+  if (!d.fix && !d.clean) out.push(`dry run — 'runly pool doctor --fix' removes what is listed (never foreign-namespace)`);
+  return out;
 }
 
 /**
@@ -925,10 +1054,14 @@ function psLines(d: PsData): string[] {
   const out: string[] = [];
   out.push(...(d.services.length === 0
     ? ['no environment for this worktree']
-    : table(['ENV', 'SERVICE', 'STATE', 'PORT', 'INTERNAL', 'PID', 'IDLE', 'RSS'], d.services.map((s) => [
+    : table(['ENV', 'SERVICE', 'STATE', 'PORT', 'INTERNAL', 'PID', 'IDLE', 'STOPS IN', 'RSS'], d.services.map((s) => [
       s.env, s.service, s.state, s.publicPort === null ? '' : String(s.publicPort), s.internalPort === null ? '' : String(s.internalPort),
-      s.pid === null ? '' : String(s.pid), ago(s.idleMs), mb(s.rssBytes),
+      s.pid === null ? '' : String(s.pid), ago(s.idleMs), s.idleStopInMs === null || s.idleStopInMs === undefined ? '' : ago(s.idleStopInMs), mb(s.rssBytes),
     ]))));
+  if (d.budget?.enabled) {
+    out.push('');
+    out.push(`budget: ${formatSize(d.budget.committedMemoryBytes)} of ${formatSize(d.budget.memoryBytes)}, ${Math.round(d.budget.committedCpu * 10) / 10} of ${d.budget.cpu} cpu committed${d.budget.waiting ? `; ${d.budget.waiting} waiting` : ''}`);
+  }
   out.push('');
   out.push(...dbLines(d.databases));
   return out;

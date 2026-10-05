@@ -11,6 +11,7 @@ import { Journal } from '../src/core/journal.js';
 import { retireBakedTemplates } from '../src/drivers/datastores.js';
 import { pruneTemplates } from '../src/core/retention.js';
 import type { Policy } from '../src/core/policy.js';
+import { disposeStateSync } from './support/leaks.js';
 
 const CLI = join(import.meta.dirname, '..', 'dist/cli/index.js');
 type Context = { datastores: Record<string, { url: string }>; envId: string; urls: Record<string, string>; error?: { message: string }; lease: { id: string } };
@@ -58,7 +59,7 @@ function fixture(sweepMs = 60000, name = 'identity') {
   };
   const at = (verb: string, cwd: string, holder?: string) => cli([verb, ...(holder === undefined ? [] : ['--holder', holder])], cwd);
   return { root, wt, alias, state, cli, at, env, name, cleanup: async () => {
-    await cli(['pool', 'recycle', '--force']); await cli(['daemon', 'stop']); rmSync(root, { recursive: true, force: true });
+    await cli(['pool', 'recycle', '--force']); await cli(['daemon', 'stop']); disposeStateSync(root);
   } };
 }
 
@@ -394,7 +395,7 @@ it('ordinary retention preserves retired markers and all cleanup records beyond 
     expect(existsSync(dropped)).toBe(false);
     expect(readdirSync(dir).sort()).toEqual(Object.keys(records).sort());
     for (const [file, content] of Object.entries(records)) expect(readFileSync(join(dir, file), 'utf8')).toBe(content);
-  } finally { rmSync(root, { recursive: true, force: true }); }
+  } finally { disposeStateSync(root); }
 });
 
 it('retirement preserves a live template shared by long canonical and legacy stack names', async () => {

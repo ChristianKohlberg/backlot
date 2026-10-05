@@ -18,8 +18,8 @@
  *   so they never count.
  *
  * It holds no policy. The engine says when a target is starting, up (on which
- * internal port) or down; an optional wake hook lets a later change start a
- * stopped environment on the first connection.
+ * internal port) or down; the wake hook (decision 0035) lets the engine start
+ * a stopped service on the first connection, which is held meanwhile.
  */
 import { createServer, connect, type Server, type Socket } from 'node:net';
 import { logEvent } from '../core/events.js';
@@ -48,10 +48,10 @@ export interface ProxyStats {
 
 /**
  * Called when a connection arrives for a target that is DOWN. Returning true
- * means "a start has been requested" — the engine must then move the target to
- * `starting` and later `up`; the connection is held meanwhile. Returning false
- * (the default) closes it at once, which is what a client saw before the proxy
- * existed: nothing listening.
+ * means "a start has been requested" — the connection is held (bounded by
+ * BACKLOT_PROXY_HOLD_MS) until the engine calls `up` (forwarded) or `down`
+ * (closed). Returning false closes it at once, which is what a client saw
+ * before the proxy existed: nothing listening.
  */
 export type WakeHook = (envId: string, key: string) => boolean;
 
@@ -150,12 +150,14 @@ class Target {
     }
   }
 
-  private forward(client: Socket, internalPort: number): void {
-    this.open.add(client);
-    client.once('close', () => this.open.delete(client));
+  private forward(client: Socket, internalPort: number, deadline?: number): void {
+    if (!this.open.has(client)) {
+      this.open.add(client);
+      client.once('close', () => this.open.delete(client));
+    }
     connectInternal(internalPort, (err, upstream) => {
       if (err || !upstream) {
-        client.destroy();
+        this.refused(client, deadline ?? Date.now() + HOLD_MS());
         return;
       }
       if (client.destroyed) {
@@ -180,6 +182,35 @@ class Target {
       });
       client.resume();
     });
+  }
+
+  /**
+   * The service did not accept: it may have just crashed, with the
+   * supervisor about to relaunch it (the self-restart gap, decision 0035).
+   * The connection is held — retried while the target still says `up`, held
+   * while it is `starting`, woken when it went `down` — until the hold
+   * deadline; only then is it closed.
+   */
+  private refused(client: Socket, deadline: number): void {
+    if (client.destroyed) return;
+    if (Date.now() >= deadline) {
+      client.destroy();
+      return;
+    }
+    if (this.state === 'starting') {
+      this.hold(client);
+      return;
+    }
+    if (this.state === 'down') {
+      if (this.hub.wake(this.envId, this.key)) this.hold(client);
+      else client.destroy();
+      return;
+    }
+    setTimeout(() => {
+      if (client.destroyed) return;
+      if (this.state === 'up' && this.internalPort !== undefined) this.forward(client, this.internalPort, deadline);
+      else this.refused(client, deadline);
+    }, 200).unref();
   }
 
   close(): void {
@@ -249,7 +280,7 @@ export class ProxyHub {
     return `${envId}\u0000${key}`;
   }
 
-  /** Step 6 installs this: start a stopped environment on its first connection. */
+  /** The engine installs this (decision 0035): start a stopped service on its first connection. */
   setWakeHook(hook: WakeHook | undefined): void {
     this.wakeHook = hook;
   }
@@ -269,6 +300,29 @@ export class ProxyHub {
 
   noteActivity(envId: string, key: string): void {
     this.activityHook?.(envId, key);
+  }
+
+  /** Where the service behind env/key listens, also while it restarts (decision 0035). */
+  internalPortOf(envId: string, key: string): number | undefined {
+    return this.targets.get(this.id(envId, key))?.internalPort;
+  }
+
+  /** Start a target's activity clock from the journal, so a daemon restart keeps it (decision 0035). */
+  seedActivity(envId: string, key: string, at: number): void {
+    const t = this.targets.get(this.id(envId, key));
+    if (t && (t.lastActivityAt === null || t.lastActivityAt < at)) t.lastActivityAt = at;
+  }
+
+  /** The last client byte per port key of an environment (null = none yet). */
+  activity(envId: string): Record<string, number | null> {
+    const out: Record<string, number | null> = {};
+    for (const t of this.targets.values()) if (t.envId === envId) out[t.key] = t.lastActivityAt;
+    return out;
+  }
+
+  /** Every env id with a listener (doctor's stale-listener check, decision 0037). */
+  envIds(): Set<string> {
+    return new Set([...this.targets.values()].map((t) => t.envId));
   }
 
   /** Is the public listener for this env/key currently held, on this port? */

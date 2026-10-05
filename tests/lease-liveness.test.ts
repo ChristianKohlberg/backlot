@@ -13,6 +13,7 @@ import { mkdtempSync, rmSync, writeFileSync, readFileSync, existsSync } from 'no
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Journal } from '../src/core/journal.js';
+import { disposeStateSync } from './support/leaks.js';
 
 const repo = join(import.meta.dirname, '..');
 const CLI = join(repo, 'dist', 'cli', 'index.js');
@@ -20,12 +21,8 @@ const dirs: string[] = [];
 
 afterAll(() => {
   for (const d of dirs) {
-    try {
-      process.kill(Number(readFileSync(join(d, 'daemon.pid'), 'utf8')), 'SIGKILL');
-    } catch {
-      /* not a state dir */
-    }
-    rmSync(d, { recursive: true, force: true });
+    // SIGKILLing the daemon first left its services running (decision 0037).
+    disposeStateSync(d);
   }
 });
 
@@ -66,9 +63,10 @@ async function waitFor(pred: () => boolean, timeoutMs = 20_000): Promise<boolean
   return pred();
 }
 
-describe('a lease tied to a dead process is released immediately', () => {
+describe('a lease tied to a dead process is torn down after the grace (decision 0035)', () => {
   it('does not hold the environment for the rest of its TTL', async () => {
-    const { cli, journal } = ctx();
+    // Grace 0 stands in for the 1-minute default.
+    const { cli, journal } = ctx({ BACKLOT_TETHER_GRACE_MS: '0' });
     // A stand-in for the agent: a real process that will die. Its pid is what
     // the lease is pinned to.
     const agent = spawn('sh', ['-c', 'sleep 600'], { detached: true, stdio: 'ignore' });
@@ -85,8 +83,24 @@ describe('a lease tied to a dead process is released immediately', () => {
 
     process.kill(-agent.pid!, 'SIGKILL'); // the agent crashes
 
-    const released = await waitFor(() => journal().allLeases().length === 0);
-    expect(released, 'the lease outlived its holder').toBe(true);
+    const released = await waitFor(() => journal().allLeases().length === 0 && journal().allEnvs().length === 0);
+    // Since 0.16 the agent being gone means EVERYTHING goes: not just the
+    // lease, the environment with its services, data and ports.
+    expect(released, 'the lease or the environment outlived its holder').toBe(true);
+  }, 120_000);
+
+  it('waits out the grace before tearing down — a dead pid seen once is not believed', async () => {
+    const { cli, journal } = ctx({ BACKLOT_TETHER_GRACE_MS: '4000' });
+    const agent = spawn('sh', ['-c', 'sleep 600'], { detached: true, stdio: 'ignore' });
+    agent.unref();
+    await cli(['up', '--holder-pid', String(agent.pid), '--json']);
+    process.kill(-agent.pid!, 'SIGKILL');
+    const killedAt = Date.now();
+    await settle(2000);
+    expect(journal().allEnvs().length, 'torn down inside the grace').toBe(1);
+    const gone = await waitFor(() => journal().allEnvs().length === 0, 20_000);
+    expect(gone).toBe(true);
+    expect(Date.now() - killedAt).toBeGreaterThanOrEqual(4000);
   }, 120_000);
 
   it('leaves a lease alone while its holder is alive', async () => {
@@ -129,10 +143,10 @@ describe('a lease tied to a dead process is released immediately', () => {
   }, 60_000);
 });
 
-describe('a leased environment still gives up its heat when nothing uses it', () => {
-  it('quiesces to warm while KEEPING the lease', async () => {
-    // 1s leased-idle threshold stands in for the 60-minute default.
-    const { cli, journal } = ctx({ BACKLOT_LEASED_IDLE_TTL_MS: '1000', BACKLOT_IDLE_TTL_MS: '1000' });
+describe('a leased environment still gives up its services when nothing uses it (decision 0035)', () => {
+  it('stops each idle service while KEEPING the lease', async () => {
+    // A 1s service idle stands in for the 10-minute default.
+    const { cli, journal } = ctx({ BACKLOT_SERVICE_IDLE_MS: '1000' });
     const up = await cli(['up', '--json']);
     expect(up.json?.state).toBe('hot');
     const envId = String(up.json?.envId);
@@ -152,7 +166,7 @@ describe('a leased environment still gives up its heat when nothing uses it', ()
   }, 120_000);
 
   it('does not quiesce an environment that is being used', async () => {
-    const { cli, journal } = ctx({ BACKLOT_LEASED_IDLE_TTL_MS: '2500', BACKLOT_IDLE_TTL_MS: '2500' });
+    const { cli, journal } = ctx({ BACKLOT_SERVICE_IDLE_MS: '2500' });
     const up = await cli(['up', '--json']);
     const envId = String(up.json?.envId);
 
@@ -201,7 +215,7 @@ describe('a quiesce is never published as a teardown (decision 0021)', () => {
     // a crash inside that window escalated a routine heat reclaim into total
     // destruction of a live agent's environment. A TERM-ignoring service
     // stretches the stop window to observable length.
-    const c = ctx({ BACKLOT_LEASED_IDLE_TTL_MS: '1000', BACKLOT_LEASE_TTL_MS: '600000' });
+    const c = ctx({ BACKLOT_SERVICE_IDLE_MS: '1000', BACKLOT_LEASE_TTL_MS: '600000' });
     writeFileSync(
       join(c.wt, 'stack.yaml'),
       `name: lease\nservices:\n  web: { run: "trap '' TERM; echo ready; sleep 300", ready: { log: ready, timeout: 20 } }\n`,

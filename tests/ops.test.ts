@@ -23,7 +23,7 @@ describe('pool policy precedence (unit)', () => {
 
     const h = poolMaxHeuristic();
     expect(h).toBeGreaterThanOrEqual(1);
-    expect(h).toBeLessThanOrEqual(8);
+    expect(h).toBeLessThanOrEqual(64); // 2 x cores with the load budget on (decision 0036)
     expect(policy().poolMaxTotal).toBe(h); // heuristic default
 
     writeFileSync(join(dir, 'config.json'), JSON.stringify({ poolMaxTotal: 5, idleTtlMs: 123 }));
@@ -88,12 +88,13 @@ describe('retention sweep (unit)', () => {
     expect(pruneArtifacts()).toBe(1);
     expect(existsSync(join(dir, 'artifacts'))).toBe(false);
 
-    // A fat log keeps only its tail.
+    // A fat log is rotated once (decision 0038): it becomes web.log.1.
     const logs = join(dir, 'envs', 'env1', 'logs');
     mkdirSync(logs, { recursive: true });
     writeFileSync(join(logs, 'web.log'), 'x'.repeat(5000));
     expect(truncateLogs(p)).toBe(1);
-    expect(statSync(join(logs, 'web.log')).size).toBeLessThan(1000);
+    expect(existsSync(join(logs, 'web.log'))).toBe(false);
+    expect(statSync(join(logs, 'web.log.1')).size).toBe(5000);
 
     // 4 templates, keep the 2 newest.
     const tpl = join(dir, 'templates', 'stack1');
@@ -148,7 +149,7 @@ describe('template pruning honors the bake lock', () => {
     let release!: () => void;
     const held = new Promise<void>((r) => (release = r));
     const bake = withBakeLock('stk', () => held); // an in-flight bake/restore
-    const prune = pruneTemplates({ ...policy(), templatesKeep: 0 }, root);
+    const prune = pruneTemplates({ ...policy(), templatesKeep: 0, templateGraceMs: 0 }, root);
     await new Promise((r) => setTimeout(r, 400));
     expect(existsSync(tpl), 'template deleted out from under the in-flight bake').toBe(true);
     release();

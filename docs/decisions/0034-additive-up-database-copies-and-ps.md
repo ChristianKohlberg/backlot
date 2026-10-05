@@ -1,6 +1,6 @@
 # 0034. `up` is additive and `down` stops what it names; a preset reloads one datastore; a database alone is a `runly db` copy; `runly ps` shows both
 
-- Status: Accepted
+- Status: Accepted — amended by [0035](0035-services-idle-on-their-own-clock-and-wake-on-demand.md): a holder is believed dead after a 1-minute grace and its death tears its environment down (copies are dropped as before); `ps` gains the `idle` state
 - Date: 2026-10
 - Supersedes: [0023](0023-data-only-leases.md) (`up --data-only`) and
   [0025](0025-data-only-environments-are-priced-separately.md) (the data-only

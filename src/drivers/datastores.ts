@@ -63,6 +63,17 @@ export interface DsDriver {
   dropCommand(h: DsHandle): string | null;
   /** True when the namespace is a local file (sqlite), false for a server database. */
   readonly fileBased: boolean;
+  /**
+   * How to drop this namespace later without the manifest (decision 0037):
+   * the templated command and where to run it, or the file to delete.
+   */
+  dropRecipe(h: DsHandle): { cmd?: string; cwd?: string; path?: string };
+  /**
+   * The template a restore at `preset` uses, as `<stack>/<marker file>` under
+   * the templates root, or null when this datastore bakes none. Retention
+   * keeps a template while a row references it (decision 0037).
+   */
+  templateRef(preset: string): string | null;
   /** @rebake-template: invalidate baked templates (and drop their server-side DBs). */
   rebake(cwd?: string): void | Promise<void>;
 }
@@ -284,10 +295,22 @@ class SqliteDs implements DsDriver {
     /* in-process — nothing external */
   }
 
+  private tplName(preset: string): string {
+    return `${this.name}-${preset}@${this.contentKey().slice(0, 12)}.db`;
+  }
+
   private tplPath(preset: string): string {
     const dir = join(templatesRoot(), this.stackId);
     mkdirSync(dir, { recursive: true });
-    return join(dir, `${this.name}-${preset}@${this.contentKey().slice(0, 12)}.db`);
+    return join(dir, this.tplName(preset));
+  }
+
+  templateRef(preset: string): string | null {
+    return this.spec.template === true ? `${this.stackId}/${this.tplName(preset)}` : null;
+  }
+
+  dropRecipe(h: DsHandle): { path: string } {
+    return { path: this.ns(h) };
   }
 
   private async runCreate(cwd: string, ns: string, preset: string): Promise<void> {
@@ -430,10 +453,22 @@ class CommandDs implements DsDriver {
     const suffix = `_${hash}`;
     return raw.slice(0, LIMIT - suffix.length) + suffix;
   }
+  private markerName(preset: string): string {
+    return `${this.name}-${preset}@${this.contentKey().slice(0, 12)}.baked`;
+  }
+
   private bakedMarker(preset: string): string {
     const dir = join(templatesRoot(), this.stackId);
     mkdirSync(dir, { recursive: true });
-    return join(dir, `${this.name}-${preset}@${this.contentKey().slice(0, 12)}.baked`);
+    return join(dir, this.markerName(preset));
+  }
+
+  templateRef(preset: string): string | null {
+    return this.spec.template_restore && !this.spec.ephemeral ? `${this.stackId}/${this.markerName(preset)}` : null;
+  }
+
+  dropRecipe(h: DsHandle): { cmd?: string; cwd?: string } {
+    return this.spec.drop ? { cmd: template(this.spec.drop, { ns: this.ns(h) }), cwd: h.cwd } : {};
   }
 
   async ensure(h: DsHandle, preset: string, force: boolean, exists: boolean): Promise<void> {

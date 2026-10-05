@@ -4,6 +4,7 @@ import { mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, writeFile
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { redactStream, validateCallerEnv } from '../src/core/caller-env.js';
+import { disposeStateSync } from './support/leaks.js';
 
 const CLI = join(import.meta.dirname, '../dist/cli/index.js');
 const cleanups: Array<() => Promise<void>> = [];
@@ -47,7 +48,7 @@ services:
   cleanups.push(async () => {
     await cli(['pool', 'recycle', '--force']);
     await cli(['daemon', 'stop']);
-    rmSync(root, { recursive: true, force: true });
+    disposeStateSync(root);
   });
   const response = async (context: any) => {
     const url = context.urls.web.replace('localhost', '127.0.0.1');

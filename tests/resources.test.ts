@@ -2,18 +2,19 @@
  * Fleet review, ports and resource-exhaustion cluster.
  */
 import { describe, it, expect, afterAll } from 'vitest';
-import { mkdtempSync, rmSync, writeFileSync, statSync, readFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync, statSync, readFileSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { truncateLogs } from '../src/core/retention.js';
+import { disposeStateSync } from './support/leaks.js';
 
 const dirs: string[] = [];
 afterAll(() => {
-  for (const d of dirs) rmSync(d, { recursive: true, force: true });
+  for (const d of dirs) disposeStateSync(d);
 });
 
-describe('log truncation survives a very large log', () => {
-  it('trims by reading the tail, not the whole file as one string', () => {
+describe('log rotation survives a very large log (decision 0038)', () => {
+  it('rotates by renaming, never reading the file as one string', () => {
     const root = mkdtempSync(join(tmpdir(), 'runly-logs-'));
     dirs.push(root);
     const logDir = join(root, 'env-1', 'logs');
@@ -33,12 +34,11 @@ describe('log truncation survives a very large log', () => {
     const n = truncateLogs(policy, root);
 
     expect(n).toBe(1);
-    const after = readFileSync(full, 'utf8');
-    expect(statSync(full).size).toBeLessThan(policy.logCapBytes);
-    expect(after).toContain('truncated by retention sweep');
-    // The TAIL is what matters — the recent lines are the useful ones.
-    expect(after).toContain('TAIL-MARKER');
-    expect(after).not.toContain('HEAD-MARKER');
+    // The live file starts afresh; the old one is the single rotation.
+    expect(existsSync(full)).toBe(false);
+    const rotated = readFileSync(`${full}.1`, 'utf8');
+    expect(rotated).toContain('HEAD-MARKER');
+    expect(rotated).toContain('TAIL-MARKER');
   });
 
   it('leaves a log under the cap untouched', () => {

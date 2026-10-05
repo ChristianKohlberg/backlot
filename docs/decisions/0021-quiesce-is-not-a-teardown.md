@@ -1,6 +1,6 @@
 # 0021. A quiesce runs under the environment lock, not as a borrowed teardown
 
-- Status: Accepted
+- Status: Accepted — amended by [0035](0035-services-idle-on-their-own-clock-and-wake-on-demand.md): the leased-idle whole-environment quiesce is replaced by a per-service idle stop, which keeps this decision's rule (environment lock, never `recycling`)
 - Date: 2026-07
 - Context: the lease-liveness work (leased-but-idle environments quiesce to warm,
   keeping their lease) implemented the stop by claiming the environment through

@@ -172,15 +172,71 @@
           "description": "The supervised process. Daemon is its parent. Executes under `sh` (dash on Ubuntu, bash-as-sh on macOS) \u2014 write POSIX sh, no bashisms."
         },
         "build": {
-          "type": "string",
-          "description": "Run on every `up` that starts this service, and on every `runly warm` \u2014 runly keeps no build cache; the build tool decides what is current (decision 0032). Executes under `sh` (dash on Ubuntu, bash-as-sh on macOS) \u2014 write POSIX sh, no bashisms."
+          "oneOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "object",
+              "required": [
+                "run"
+              ],
+              "additionalProperties": false,
+              "properties": {
+                "run": {
+                  "type": "string",
+                  "description": "The build command."
+                },
+                "when": {
+                  "type": "array",
+                  "minItems": 1,
+                  "items": {
+                    "type": "string"
+                  },
+                  "description": "Globs (relative to the stack root, git-listed, minus caches:) of what the build reads. When none of the matched files changed (path, size, mtime) since the last SUCCESSFUL build of this service in this worktree, the build is skipped and `up` says so; `up --rebuild` forces it (decision 0038)."
+                }
+              }
+            }
+          ],
+          "description": "String form: run on every `up` that starts or keeps this service, and on every `runly warm` \u2014 runly keeps no build cache; the build tool decides what is current (decision 0032). Object form `{run, when}`: skipped while its `when:` files are unchanged since the last successful build (decision 0038). Executes under `sh` (dash on Ubuntu, bash-as-sh on macOS) \u2014 write POSIX sh, no bashisms."
         },
         "outputs": {
-          "type": "array",
-          "items": {
-            "type": "string"
-          },
-          "description": "Globs (relative to the stack root) of what `build:` produces, e.g. `backend/host/Fid.Host/bin/**` or `dist/web-audit`. Every `up` snapshots them (path, size, mtime) around the build and restarts this service only when they changed. Without it, a service with a build is restarted after every build (decision 0032)."
+          "oneOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            {
+              "type": "object",
+              "required": [
+                "paths"
+              ],
+              "additionalProperties": false,
+              "properties": {
+                "paths": {
+                  "type": "array",
+                  "minItems": 1,
+                  "items": {
+                    "type": "string"
+                  }
+                },
+                "compare": {
+                  "enum": [
+                    "stat",
+                    "content"
+                  ],
+                  "default": "stat",
+                  "description": "stat: path, size and mtime (default). content: hash the files, so a build that rewrites identical files does not restart the service."
+                }
+              }
+            }
+          ],
+          "description": "Globs (relative to the stack root) of what `build:` produces, e.g. `backend/host/Fid.Host/bin/**` or `dist/web-audit`. Every `up` snapshots them around the build and restarts this service only when they changed. Without it, a service with a build is restarted after every build (decision 0032). The object form chooses how they are compared (decision 0038)."
         },
         "watch_run": {
           "type": "string",
@@ -232,6 +288,22 @@
         "hot_reload": {
           "type": "boolean",
           "description": "Accepted and ignored since decision 0032 (`sync` was removed). Whether an `up` restarts a running service is decided by its build `outputs:`; a service without a build keeps running."
+        },
+        "idle": {
+          "oneOf": [
+            {
+              "type": "string",
+              "pattern": "^(never|off|[0-9]+(\\.[0-9]+)?\\s*(ms|s|m|h))$"
+            },
+            {
+              "type": "number",
+              "minimum": 0
+            }
+          ],
+          "description": "How long this service may go without client bytes through its public port and without a runly verb on its environment before it is stopped; the next connection starts it again (decision 0035). A duration (90s, 10m, 2h), seconds as a number, or `never`. Default BACKLOT_SERVICE_IDLE_MS (10 minutes)."
+        },
+        "resources": {
+          "$ref": "#/$defs/resources"
         }
       }
     },
@@ -332,6 +404,10 @@
           "type": "boolean",
           "default": false,
           "description": "No presets; reset-data = flush (Redis-class)."
+        },
+        "list": {
+          "type": "string",
+          "description": "Repo command printing the namespaces ({{ns}} values) of this datastore that exist on its server, one per line. Read only by `runly pool doctor`: a listed name in runly's naming (backlot_...) that no journal row or template marker references is an orphan, which `--fix` drops with `drop:` (decision 0037)."
         }
       }
     },
@@ -385,6 +461,53 @@
           "type": "number",
           "default": 60,
           "description": "Seconds to wait after start for probe (and ready:) to pass before infra-error."
+        },
+        "resources": {
+          "$ref": "#/$defs/resources",
+          "description": "What the appliance costs while running; counted against the load budget when an `up` would start it (decision 0036). Its build: entry is ignored."
+        }
+      }
+    },
+    "size": {
+      "oneOf": [
+        {
+          "type": "string",
+          "pattern": "^[0-9]+(\\.[0-9]+)?\\s*([KMGT]i?B?|[kmgt]i?b?)?$"
+        },
+        {
+          "type": "number",
+          "minimum": 0
+        }
+      ],
+      "description": "A size: bytes as a number, or a string with a K/M/G/T suffix (600M, 2G, 1.5GiB)."
+    },
+    "resources": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "What this costs the box, for the server-wide load budget (decision 0036). Left out = a conservative default (run 512M / 0.5 cpu; build 1G / 1 cpu), which `runly plan` says it assumed.",
+      "properties": {
+        "memory": {
+          "$ref": "#/$defs/size",
+          "description": "Resident memory while running."
+        },
+        "cpu": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "description": "Cores while running."
+        },
+        "build": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "What its `build:` costs while it runs; held only while building.",
+          "properties": {
+            "memory": {
+              "$ref": "#/$defs/size"
+            },
+            "cpu": {
+              "type": "number",
+              "exclusiveMinimum": 0
+            }
+          }
         }
       }
     }

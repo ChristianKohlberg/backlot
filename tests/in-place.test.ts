@@ -9,6 +9,7 @@ import { execFile, execFileSync, spawn } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { disposeStateSync } from './support/leaks.js';
 
 const CLI = join(import.meta.dirname, '..', 'dist', 'cli', 'index.js');
 
@@ -40,7 +41,7 @@ function makeContext(extraEnv: Record<string, string> = {}) {
     } catch {
       /* gone */
     }
-    rmSync(stateDir, { recursive: true, force: true });
+    disposeStateSync(stateDir);
   };
   return { stateDir, env, cli, cleanup };
 }

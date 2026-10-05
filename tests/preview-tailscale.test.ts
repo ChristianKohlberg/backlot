@@ -18,6 +18,7 @@ import { tmpdir, userInfo } from 'node:os';
 import { join } from 'node:path';
 import { scanTagged } from '../src/core/procscan.js';
 import { deriveTailnetPort, tailnetPortsInUse } from '../src/drivers/preview.js';
+import { disposeStateSync } from './support/leaks.js';
 
 const repo = join(import.meta.dirname, '..');
 const CLI = join(repo, 'dist', 'cli', 'index.js');
@@ -153,7 +154,7 @@ function ctx(stackExtra: string, extraEnv: Record<string, string> = {}) {
     } catch {
       /* never started */
     }
-    rmSync(stateDir, { recursive: true, force: true });
+    disposeStateSync(stateDir);
     rmSync(wt, { recursive: true, force: true });
   };
   cleanups.push(cleanup);

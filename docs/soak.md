@@ -40,10 +40,19 @@ fixture stacks in a dedicated temp `BACKLOT_STATE_DIR`, cycling continuously:
   command's code and leave no copy behind (decision 0034). Convergence fails
   on any `db_copies` row left after shutdown.
 - **Capacity churn** — a second stack whose one environment (decision 0032) is
-  held by a short-TTL holder while a second holder queues on its expiry, plus a quiesce cycle under a
-  short `BACKLOT_LEASED_IDLE_TTL_MS`: leased-idle env goes warm, `exec` refuses
-  with the rebind hint, `up` brings the same env back hot. The sweeper
+  held by a short-TTL holder while a second holder queues on its expiry, plus an
+  idle cycle (decision 0035): the stack's web declares `idle: 8s`, so left
+  alone it must be stopped (`ps` says `idle`) while lease, data and port stay,
+  and a request to its URL must be held, wake it and be answered. The sweeper
   (`BACKLOT_SWEEP_MS=1000`) must keep reclaiming all of it, all run long.
+- **Load budget** (decision 0036) — two worktrees of a stack declaring
+  `resources: { memory: 2100M }` against a 4G budget
+  (`BACKLOT_BUDGET_MEMORY=4G`, machine gates opened): `plan` for the second must
+  say it would wait, its `up` must show up in the budget queue (`status`), report
+  `position 1` and start once the first is downed.
+- **Logs** (decision 0038) — after every session `up`, `logs web --since up -f
+  --until '<ready line>' --timeout 20` must exit 0 on the ready line, and a
+  pattern that never comes must exit 124 at `--timeout 1`.
 - **Chaos ticks (~every 2 min)** — `SIGKILL` the daemon (the next verb must
   auto-respawn and recover), `SIGSTOP`/`SIGCONT` for 60–90 s, and deleting a
   worktree mid-lease (the stale-root reap must remove the env row *and* its
@@ -53,7 +62,8 @@ Throughout: **every** verb invocation must emit one parseable JSON object on
 stdout with an exit code derivable from that body (the decision-0010 contract);
 daemon RSS is sampled via `ps` and fails the run if it grows past 3× its
 5-minute baseline; and the run ends with a **convergence audit** — daemon down,
-no process anywhere still carrying `BACKLOT_STATE_ROOT` for the soak state dir,
+`runly pool doctor` finding nothing left behind (decision 0037), no process
+anywhere still carrying `BACKLOT_STATE_ROOT` for the soak state dir,
 no env dir on disk without a journal row, no journal lease pointing at an env
 that doesn't exist.
 

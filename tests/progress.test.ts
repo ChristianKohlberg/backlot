@@ -8,6 +8,7 @@ import { execFile, execFileSync } from 'node:child_process';
 import { mkdtempSync, rmSync, writeFileSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { disposeStateSync } from './support/leaks.js';
 
 const repo = join(import.meta.dirname, '..');
 const CLI = join(repo, 'dist', 'cli', 'index.js');
@@ -49,7 +50,7 @@ afterAll(() => {
   } catch {
     /* gone */
   }
-  rmSync(stateDir, { recursive: true, force: true });
+  disposeStateSync(stateDir);
   rmSync(wt, { recursive: true, force: true });
 });
 

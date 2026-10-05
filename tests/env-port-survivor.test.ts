@@ -25,6 +25,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Journal } from '../src/core/journal.js';
 import { procScanSupported, scanTagged, startTime } from '../src/core/procscan.js';
+import { disposeStateSync } from './support/leaks.js';
 
 const repo = join(import.meta.dirname, '..');
 const CLI = join(repo, 'dist', 'cli', 'index.js');
@@ -61,7 +62,7 @@ function makeContext(extra: Record<string, string> = {}) {
         /* gone */
       }
     }
-    rmSync(stateDir, { recursive: true, force: true });
+    disposeStateSync(stateDir);
   };
   return { stateDir, env, cli, cleanup, daemonPid };
 }
@@ -132,7 +133,7 @@ const ctxList: Array<() => void> = [];
 const dirList: string[] = [];
 afterAll(() => {
   for (const c of ctxList) c();
-  for (const d of dirList) rmSync(d, { recursive: true, force: true });
+  for (const d of dirList) disposeStateSync(d);
 });
 
 describe('env port-survivor: bind reaps tagged escapees instead of blocking', () => {

@@ -9,6 +9,7 @@ import { mkdtempSync, rmSync, writeFileSync, readFileSync, statSync } from 'node
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { safeJoin } from '../src/core/util.js';
+import { disposeStateSync } from './support/leaks.js';
 
 const repo = join(import.meta.dirname, '..');
 const CLI = join(repo, 'dist', 'cli', 'index.js');
@@ -34,7 +35,7 @@ function makeContext() {
     } catch {
       /* gone */
     }
-    rmSync(stateDir, { recursive: true, force: true });
+    disposeStateSync(stateDir);
   };
   return { stateDir, cli, cleanup };
 }

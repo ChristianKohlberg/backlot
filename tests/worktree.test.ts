@@ -13,10 +13,11 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { enumerateSource, snapshotOutputs } from '../src/core/worktree.js';
 import { triggerFiles, triggerHash, triggerSet } from '../src/core/upkeep.js';
+import { disposeStateSync } from './support/leaks.js';
 
 const dirs: string[] = [];
 afterAll(() => {
-  for (const d of dirs) rmSync(d, { recursive: true, force: true });
+  for (const d of dirs) disposeStateSync(d);
 });
 
 const manifest = { name: 'wt', services: {} } as never;

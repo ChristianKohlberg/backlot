@@ -33,8 +33,13 @@
  *       propagates its command's exit code and drops its copy (decision 0034)
  *   (d) capacity churn — a second stack whose one environment (decision
  *       0032) is held by a short-TTL holder while another queues on its
- *       expiry, lease expiries, and a quiesce/rebind cycle under a
- *       short BACKLOT_LEASED_IDLE_TTL_MS — the sweeper must keep reclaiming
+ *       expiry, lease expiries, and an idle stop -> wake-by-request cycle
+ *       (`idle: 8s`, decision 0035) — the sweeper must keep reclaiming
+ *   (d2) load budget — a second worktree of a stack declaring more than
+ *       half the budget queues (plan says so, status shows it) and starts
+ *       once the first is downed (decision 0036); logs -f --until exits 0 on
+ *       the ready line and 124 on timeout (decision 0038); pool doctor finds
+ *       nothing at the end (decision 0037)
  *   (e) chaos ticks every ~2 min — SIGKILL the daemon (next verb must
  *       recover), SIGSTOP/SIGCONT (starvation-shaped; a true lid-close sleep
  *       pardon needs a human — see docs/soak.md), and a worktree deleted
@@ -117,7 +122,15 @@ Object.assign(daemonEnv, {
   BACKLOT_SWEEP_MS: '1000', // expiries/quiesces/reaps within seconds, not minutes
   BACKLOT_GC_MS: '15000',
   BACKLOT_IDLE_TTL_MS: '45000',
-  BACKLOT_LEASED_IDLE_TTL_MS: '12000', // leased quiesce cycles inside one phase
+  // Idle stops (decision 0035) come from stack B's own `idle: 8s`; stack A keeps
+  // the 10-minute default so its restart assertions are not raced by them.
+  BACKLOT_TETHER: 'off', // the soak runs its own holders; never tie to a CLAUDE_PID it inherited
+  // A small load budget (decision 0036) so the budget phase queues for real;
+  // the machine gates are opened — a shared box's load must not decide the run.
+  BACKLOT_BUDGET_MEMORY: '4G',
+  BACKLOT_BUDGET_CPU: '64',
+  BACKLOT_BUDGET_RESERVE: '0',
+  BACKLOT_BUDGET_LOAD_PER_CORE: '1000',
   BACKLOT_WAIT_MS: '30000',
   BACKLOT_RPC_TIMEOUT_MS: '120000',
 });
@@ -168,6 +181,10 @@ const stats = {
   queuedAcquires: 0,
   leaseExpiries: 0,
   quiesceRebinds: 0,
+  idleWakes: 0,
+  budgetQueued: 0,
+  logsUntil: 0,
+  doctorClean: 0,
   staleReaps: 0,
   chaosKills: 0,
   chaosStops: 0,
@@ -366,7 +383,7 @@ console.log('upkeep ran');
 }
 
 /** Stack B/C: the smallest bindable stack — capacity churn needs cheap binds. */
-function writeStackMin(dir, name) {
+function writeStackMin(dir, name, extra = '') {
   mkdirSync(dir, { recursive: true });
   writeFileSync(join(dir, 'runly.yml'), `name: ${name}
 services:
@@ -375,7 +392,7 @@ services:
     port: web
     env: { PORT: "{{ports.web}}" }
     ready: { http: /health, timeout: 20 }
-`);
+${extra}`);
   writeFileSync(join(dir, 'srv.mjs'), `import { createServer } from 'node:http';
 createServer((req, res) => {
   if (req.url === '/health') { res.writeHead(200); res.end('ok'); return; }
@@ -396,7 +413,15 @@ function gitInit(dir) {
 const stackA = join(stacksDir, 'a');
 const stackB = join(stacksDir, 'b');
 writeStackA(stackA);
-writeStackMin(stackB, 'soak-b');
+writeStackMin(stackB, 'soak-b', '    idle: 8s\n');
+// Two worktrees of a stack that declares more than half the soak's budget: the
+// second `up` must queue behind the first (decision 0036).
+const stackH1 = join(stacksDir, 'h1');
+const stackH2 = join(stacksDir, 'h2');
+for (const d of [stackH1, stackH2]) {
+  writeStackMin(d, 'soak-h', '    resources: { memory: 2100M, cpu: 1 }\n');
+  gitInit(d);
+}
 gitInit(stackA);
 gitInit(stackB);
 
@@ -434,6 +459,39 @@ async function upA(extra = []) {
   return r.body;
 }
 
+/**
+ * `runly logs -f --until` (decision 0038): the service's ready line is found
+ * (exit 0, the matching line printed last), and a line that never comes runs
+ * into --timeout (exit 124). Raw spawn: a followed log is lines, not one JSON
+ * object.
+ */
+function rawCli(args, cwd, timeoutMs = 60_000) {
+  return new Promise((resolveP) => {
+    const child = spawn(process.execPath, [CLI, ...args], { cwd, env: daemonEnv, stdio: ['ignore', 'pipe', 'pipe'] });
+    let stdout = '';
+    let stderr = '';
+    child.stdout.on('data', (d) => (stdout += d));
+    child.stderr.on('data', (d) => (stderr += d));
+    const timer = setTimeout(() => child.kill('SIGKILL'), timeoutMs);
+    timer.unref();
+    child.on('exit', (code) => {
+      clearTimeout(timer);
+      resolveP({ code, stdout, stderr });
+    });
+  });
+}
+
+async function logsUntil() {
+  const t0 = Date.now();
+  const hit = await rawCli(['logs', 'web', '--since', 'up', '-f', '--until', 'soak-a listening on', '--timeout', '20'], stackA);
+  const last = hit.stdout.trim().split('\n').pop() ?? '';
+  must(hit.code === 0 && last.includes('soak-a listening on'), 'logs', `logs -f --until did not exit 0 on the ready line (exit ${hit.code})`, hit.stdout.slice(-300) + hit.stderr.slice(-300));
+  const miss = await rawCli(['logs', '-f', '--until', 'this line is never printed', '--timeout', '1'], stackA);
+  must(miss.code === 124, 'logs', `logs -f --until with no match must exit 124 at --timeout (got ${miss.code})`, miss.stderr.slice(-300));
+  if (hit.code === 0 && miss.code === 124) stats.logsUntil++;
+  log(`  logs --until: match + timeout in ${Date.now() - t0}ms`);
+}
+
 async function healthPid(url) {
   const h = await fetchJson(url + '/health');
   return h.pid;
@@ -446,6 +504,7 @@ async function phaseSession() {
   if (!ctx) return;
   const alive = await until(5000, 300, () => fetchJson(ctx.urls.web + '/health'));
   must(alive && alive.ok === true, 'session', 'service url does not answer /health after up', ctx.urls.web);
+  await logsUntil();
   const iterations = randInt(2, 4);
   for (let i = 0; i < iterations && timeLeft() > 20_000; i++) {
     const changed = churnFiles(randInt(1, 5));
@@ -626,28 +685,72 @@ async function phaseCapacity() {
   });
   if (must(cleared, 'capacity', 'expired stack-B leases were never swept')) stats.leaseExpiries += 1;
 
-  // Quiesce cycle: a leased-but-idle env must lose its heat (services stop,
-  // lease kept), refuse exec with a rebind hint, and come back hot on `up`.
+  // Idle stop → wake by request (decision 0035): stack B's web declares
+  // `idle: 8s`. Left alone it is stopped while lease, data and port stay; a
+  // request to its URL is held while it starts again and is answered.
   if (timeLeft() > 60_000) {
     const q = await cli(['up', '--holder', 'soak-hq'], { cwd: stackB });
-    if (must(q.body?.state === 'hot', 'capacity', 'quiesce-probe holder failed to bind', q.stdout.slice(0, 200))) {
+    if (must(q.body?.state === 'hot', 'capacity', 'idle-probe holder failed to bind', q.stdout.slice(0, 200))) {
       const envId = q.body.envId;
-      const wentWarm = await until(30_000, 1000, async () => {
+      const url = q.body.urls.web;
+      // Watched through `status`, which is server-wide and touches no
+      // environment: `ps` here is a runly verb on stack B, and every verb is
+      // activity — polling it would keep the service alive (decision 0035).
+      const idle = await until(40_000, 1000, async () => {
         const e = (await statusEnvs()).find((x) => x.id === envId);
-        return e && e.state === 'warm' && e.lease ? e : false;
+        return e && e.state === 'warm' ? e : false;
       });
-      must(wentWarm, 'capacity', `leased idle env never quiesced (BACKLOT_LEASED_IDLE_TTL_MS=${daemonEnv.BACKLOT_LEASED_IDLE_TTL_MS})`);
-      if (wentWarm) {
-        const ex = await cli(['exec', '--holder', 'soak-hq', 'pwd'], { cwd: stackB });
-        must(ex.body?.ok === false && ex.body?.error?.class === 'env-error', 'capacity',
-          'exec against a quiesced env must be env-error with a rebind hint', ex.stdout);
-        const re = await cli(['up', '--holder', 'soak-hq'], { cwd: stackB });
-        if (must(re.body?.state === 'hot' && re.body?.envId === envId, 'capacity',
-          'rebind after quiesce did not return the same env hot', re.stdout.slice(0, 300))) stats.quiesceRebinds++;
+      must(idle, 'capacity', 'stack B web (idle: 8s) was never idle-stopped');
+      if (idle) {
+        must(idle.lease, 'capacity', 'an idle stop must keep the lease', JSON.stringify(idle).slice(0, 300));
+        const ps0 = await cli(['ps'], { cwd: stackB, quiet: true });
+        must(ps0.body?.services?.find((x) => x.env === envId && x.service === 'web')?.state === 'idle', 'capacity',
+          'ps must report an idle-stopped service as idle', JSON.stringify(ps0.body?.services ?? null).slice(0, 300));
+        let answered = false;
+        try {
+          const r = await fetch(url, { signal: AbortSignal.timeout(60_000) });
+          answered = r.status === 200 && (await r.text()) === 'soak-b';
+        } catch (err) {
+          fail('error', 'capacity', `a request to an idle-stopped service was not answered: ${err.message}`, url);
+        }
+        const ps = await cli(['ps'], { cwd: stackB, quiet: true });
+        const running = ps.body?.services?.find((x) => x.env === envId && x.service === 'web')?.state === 'running';
+        if (must(answered && running, 'capacity', 'wake by request did not bring stack B web back running', JSON.stringify(ps.body?.services ?? null).slice(0, 300))) stats.idleWakes++;
       }
       await cli(['release', '--holder', 'soak-hq'], { cwd: stackB });
     }
   }
+}
+
+/**
+ * (e) The load budget (decision 0036): two worktrees of a stack declaring
+ * 2100M against a 4G budget. The second `up` must queue — `plan` says it would
+ * wait, `status` shows a waiter — and start once the first is downed.
+ */
+async function phaseBudget() {
+  log(`phase budget (cycle ${cycle})`);
+  const first = await cli(['up', '--holder', 'soak-b1'], { cwd: stackH1 });
+  if (!must(first.body?.state === 'hot', 'budget', 'the first budget stack failed to bind', first.stdout.slice(0, 300))) return;
+  const plan = await cli(['plan', '--holder', 'soak-b2'], { cwd: stackH2, quiet: true });
+  must(plan.body?.startsNow === false && /^would wait for/.test(plan.body?.verdict ?? ''), 'budget',
+    'plan for the second budget stack should say it would wait', plan.stdout.slice(0, 400));
+  const t0 = Date.now();
+  const second = cli(['up', '--holder', 'soak-b2', '--progress'], { cwd: stackH2, timeoutMs: 120_000 });
+  const queued = await until(20_000, 300, async () => {
+    const st = await cli(['status'], { cwd: stackA, quiet: true });
+    return (st.body?.budget?.waiting ?? 0) >= 1;
+  });
+  must(queued, 'budget', 'the second budget stack never showed up in the budget queue');
+  await cli(['down', '--holder', 'soak-b1'], { cwd: stackH1 });
+  const r = await second;
+  if (must(r.body?.state === 'hot', 'budget', 'the queued up did not start once capacity was freed', r.stdout.slice(0, 300) + r.stderr.slice(-300))) {
+    must(/waiting for the load budget: position 1/.test(r.stderr), 'budget', 'the queued up never reported its queue position', r.stderr.slice(-300));
+    stats.budgetQueued++;
+    log(`  queued up admitted after ${Date.now() - t0}ms`);
+  }
+  await cli(['down', '--holder', 'soak-b2'], { cwd: stackH2 });
+  await cli(['release', '--holder', 'soak-b2'], { cwd: stackH2 });
+  await cli(['release', '--holder', 'soak-b1'], { cwd: stackH1 });
 }
 
 // ---------------------------------------------------------------- chaos
@@ -839,6 +942,8 @@ async function convergence() {
     [['release'], stackA],
     [['release', '--holder', 'soak-h1'], stackB],
     [['release', '--holder', 'soak-hq'], stackB],
+    [['release', '--holder', 'soak-b1'], stackH1],
+    [['release', '--holder', 'soak-b2'], stackH2],
   ]) {
     try {
       await cli(args, { cwd, quiet: true, timeoutMs: 30_000 });
@@ -846,6 +951,10 @@ async function convergence() {
       /* best-effort — an unreleasable lease shows up in the audit below */
     }
   }
+
+  // Nothing may be left behind by a run that went right (decision 0037).
+  const doc = await cli(['pool', 'doctor'], { cwd: stackA, timeoutMs: 60_000 });
+  if (must(doc.body?.clean === true, 'convergence', `pool doctor found leftovers after the run`, JSON.stringify(doc.body?.findings ?? doc.stdout).slice(0, 600))) stats.doctorClean++;
 
   const pid = daemonPid();
   try {
@@ -947,7 +1056,10 @@ function printStats() {
   lines.push(`  db with runs           ${stats.dbWithRuns}`);
   lines.push(`  queued acquires        ${stats.queuedAcquires}`);
   lines.push(`  lease expiries swept   ${stats.leaseExpiries}`);
-  lines.push(`  quiesce -> rebind      ${stats.quiesceRebinds}`);
+  lines.push(`  idle stop -> wake      ${stats.idleWakes}`);
+  lines.push(`  budget queue waits     ${stats.budgetQueued}`);
+  lines.push(`  logs --until (0/124)   ${stats.logsUntil}`);
+  lines.push(`  pool doctor clean      ${stats.doctorClean}`);
   lines.push(`  stale-root reaps       ${stats.staleReaps}`);
   lines.push(`  chaos kills / stops    ${stats.chaosKills} / ${stats.chaosStops} (${stats.recoveries} recoveries)`);
   lines.push(`  daemon max RSS         ${stats.maxRssKb} KB over ${stats.rssSamples} samples`);
@@ -1020,6 +1132,7 @@ async function main() {
       await phaseDownAndDb(); // additive up / down + db copies on that lease
       if (timeLeft() < 45_000) break;
       await phaseCapacity();
+      if (timeLeft() > 60_000) await phaseBudget();
       await cli(['release'], { cwd: stackA, quiet: true });
       await maybeChaos();
     }

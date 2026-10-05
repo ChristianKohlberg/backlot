@@ -10,6 +10,7 @@ import { mkdtempSync, rmSync, writeFileSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Journal } from '../src/core/journal.js';
+import { disposeStateSync } from './support/leaks.js';
 
 const repo = join(import.meta.dirname, '..');
 const CLI = join(repo, 'dist', 'cli', 'index.js');
@@ -35,7 +36,7 @@ function makeContext(extra: Record<string, string> = {}) {
     } catch {
       /* gone */
     }
-    rmSync(stateDir, { recursive: true, force: true });
+    disposeStateSync(stateDir);
   };
   return { stateDir, env, cli, cleanup };
 }

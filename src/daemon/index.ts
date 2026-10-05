@@ -41,6 +41,7 @@ async function dispatch(verb: string, args: Record<string, unknown>, emit: (phas
         services: Array.isArray(args.services) ? (args.services as unknown[]).map(String) : [],
         // Removed by decision 0034; refused by the engine if a client sends it.
         dataOnly: Boolean(args.dataOnly),
+        rebuild: Boolean(args.rebuild),
         onProgress: emit,
       });
     case 'down':
@@ -70,6 +71,14 @@ async function dispatch(verb: string, args: Record<string, unknown>, emit: (phas
       return engine.exec(cwd, String(args.cmd), holder);
     case 'logs':
       return engine.logs(cwd, String(args.service), Number(args.lines ?? 40), holder);
+    case 'logs-spec':
+      return engine.logsSpec(cwd, Array.isArray(args.services) ? (args.services as unknown[]).map(String) : [], Boolean(args.build), holder);
+    case 'plan':
+      return engine.plan(cwd, Array.isArray(args.services) ? (args.services as unknown[]).map(String) : [], Boolean(args.rebuild), holder);
+    case 'destroy':
+      return engine.destroy(cwd);
+    case 'pool-doctor':
+      return engine.poolDoctor(cwd, Boolean(args.fix));
     case 'token':
       return engine.token(cwd, String(args.role ?? 'admin'), holder);
     case 'warm':
