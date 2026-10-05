@@ -113,7 +113,7 @@ export class EnvSupervisor {
         clearTimeout(previous.restartTimer);
         previous.restartTimer = null;
       }
-      if (previous.proc?.pid && previous.proc.exitCode === null) {
+      if (previous.proc?.pid && previous.proc.exitCode === null && previous.proc.signalCode === null) {
         // Still running (a caller that should have stopped it first): its
         // whole group goes, rather than run on beside the new one.
         try {
