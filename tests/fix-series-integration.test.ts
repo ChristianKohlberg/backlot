@@ -18,7 +18,7 @@ function fixture() {
   mkdirSync(tree); symlinkSync(tree, alias, 'dir');
   const manifest = {
     name: 'fix-series',
-    services: { web: { run: 'node server.mjs', port: 'web', hot_reload: true, env: { PORT: '{{ports.web}}' }, ready: { http: '/', timeout: 10 } } },
+    services: { web: { run: 'node server.mjs', port: 'web', env: { PORT: '{{ports.web}}' }, ready: { http: '/', timeout: 10 } } },
     datastores: { main: { driver: 'sqlite', create: 'node seed.mjs "{{ns}}" "{{preset}}"', template: true, presets: ['dev', 'alternate'] } },
     preview: { forbidden: false },
   };
@@ -61,20 +61,22 @@ it('composes canonical ownership, selected preset, preview group and preserved d
   const f = fixture();
   try {
     const first = await f.cli(['up', '--ttl', '480m', '--preset', 'alternate']); expect(first.code, first.output).toBe(0);
+    let deadline = first.data.lease.expiresAt;
     const check = (r: Awaited<ReturnType<typeof f.cli>>) => {
       expect(r.code, r.output).toBe(0); expect(r.data.envId).toBe(first.data.envId);
-      expect(r.data.lease.id).toBe(first.data.lease.id); expect(r.data.lease.expiresAt).toBe(first.data.lease.expiresAt);
+      expect(r.data.lease.id).toBe(first.data.lease.id); expect(r.data.lease.expiresAt).toBe(deadline);
       expect(r.data.datastores.main.preset).toBe('alternate'); expect(f.value(r.data)).toBe('alternate');
     };
     check(await f.cli(['ctx'], f.alias));
     const published = await f.cli(['preview', 'web'], f.alias); expect(published.code, published.output).toBe(0);
     const members = f.pids(); expect(members.every(alive)).toBe(true);
     writeFileSync(join(f.tree, 'edit.txt'), 'projection');
-    const projected = await f.cli(['sync'], f.alias); check(projected); expect(projected.data.bindDiagnostics.reuse).toBe('projected');
+    // A repeated up sets a new deadline (it is a fresh request for time);
+    // nothing changed, so it keeps the services and the preview.
+    const projected = await f.cli(['up', '--ttl', '480m'], f.alias);
+    expect(projected.data.lease.expiresAt).toBeGreaterThanOrEqual(deadline); deadline = projected.data.lease.expiresAt;
+    check(projected); expect(projected.data.bindDiagnostics.reuse).toBe('reused');
     expect(members.every(alive)).toBe(true); expect(projected.data.previewUrls.web).toBe(publicUrl);
-    f.manifest.services.web.hot_reload = false; f.save();
-    const full = await f.cli(['sync'], f.alias); check(full); expect(full.data.bindDiagnostics.reuse).not.toBe('projected');
-    expect(members.every(alive)).toBe(true);
     check(await f.cli(['reset-data'], f.alias)); expect(members.every(alive)).toBe(true);
     const stop = await f.cli(['daemon', 'stop']); expect(stop.code, stop.output).toBe(0); await stopped(members);
     check(await f.cli(['reset-data'], f.alias));

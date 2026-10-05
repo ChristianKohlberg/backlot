@@ -67,7 +67,7 @@ db.close();
       (withStore
         ? `datastores:\n  main:\n    driver: sqlite\n    create: node seed.mjs {{ns}} {{preset}}\n    presets: [dev, empty]\n    default_preset: { session: dev, run: empty }\n    template: true\n`
         : '') +
-      `checks:\n  ok: { run: "true" }\n`,
+      ``,
   );
   execFileSync('git', ['init', '-q'], { cwd: wt });
   const env = { ...process.env, BACKLOT_STATE_DIR: stateDir, BACKLOT_SWEEP_MS: '400' };
@@ -196,12 +196,17 @@ describe('a data-only lease hands over a seeded store and nothing else', () => {
     expect(notes(url)).toEqual(['one', 'two', 'three']);
   }, 120_000);
 
-  it('gives two holders two separate stores — a database per consumer', async () => {
+  it('gives two worktrees two separate stores — a database per consumer', async () => {
     // This is the actual ask: a per-run database on the pooled server rather
-    // than a container per test collection.
-    const { cli, journal } = ctx();
+    // than a container per test collection. A worktree has exactly one
+    // environment (decision 0032), so the consumer unit is the worktree.
+    const { cli, journal, wt } = ctx();
+    const wt2 = mkdtempSync(join(tmpdir(), 'runly-dataonly-wt2-'));
+    cleanups.push(() => rmSync(wt2, { recursive: true, force: true }));
+    for (const f of ['srv.mjs', 'seed.mjs', 'stack.yaml']) writeFileSync(join(wt2, f), readFileSync(join(wt, f)));
+    execFileSync('git', ['init', '-q'], { cwd: wt2 });
     const a = await cli(['up', '--data-only', '--json']);
-    const b = await cli(['up', '--data-only', '--holder', 'lane-2', '--json']);
+    const b = await cli(['up', '--data-only', '--json'], wt2);
     expect(a.code, a.stderr).toBe(0);
     expect(b.code, b.stderr).toBe(0);
     expect(a.json?.envId).not.toBe(b.json?.envId);
@@ -279,12 +284,5 @@ describe('a data-only request that cannot mean anything is refused', () => {
     const res = await cli(['up', '--data-only', '--json']);
     expect(res.code).toBe(1);
     expect(JSON.stringify(res.json)).toMatch(/needs at least one datastore/);
-  }, 60_000);
-
-  it('refuses --watch under --data-only, which has nothing to reload', async () => {
-    const { cli } = ctx();
-    const res = await cli(['up', '--data-only', '--watch', '--json']);
-    expect(res.code).toBe(64);
-    expect(res.stderr).toMatch(/nothing to do/);
   }, 60_000);
 });

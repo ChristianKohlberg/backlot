@@ -1,12 +1,12 @@
-// The `smoke` check for hello-multi: proves the full topology — web renders what
-// api serves, and the portless worker drains the job queue. Writes a report file
-// so the manifest's `artifacts:` collection has something real to collect.
+// hello-multi's smoke test: proves the full topology — web renders what api
+// serves, and the portless worker drains the job queue. Writes smoke-report.json.
+//   eval "$(runly ctx --env)" && node smoke.test.mjs
 import { writeFileSync } from 'node:fs';
 
-const api = process.env.API_URL;
-const web = process.env.WEB_URL;
+const api = process.env.RUNLY_URL_API ?? process.env.API_URL;
+const web = process.env.RUNLY_URL_WEB ?? process.env.WEB_URL;
 if (!api || !web) {
-  console.error('API_URL / WEB_URL not set — run through `runly run smoke`');
+  console.error('RUNLY_URL_API / RUNLY_URL_WEB not set — run: eval "$(runly ctx --env)" && node smoke.test.mjs');
   process.exit(2);
 }
 

@@ -2,7 +2,7 @@
 
 The vitest suite proves runly's invariants in seconds-long fixture runs. What
 no fixture run can prove is **longevity**: a daemon that is still correct after
-hours of editor-realistic watch traffic, pool churn, capacity pressure, and the
+hours of editor-realistic rebind traffic, pool churn, capacity pressure, and the
 occasional violent death. Leaks, journal drift, and unbounded growth are
 properties of *duration* — so `scripts/soak.mjs` buys duration, and holds
 everything it does to the same contract the suite does.
@@ -22,18 +22,16 @@ is not a soak.
 The harness drives the **real CLI** (`dist/cli/index.js`) against generated
 fixture stacks in a dedicated temp `BACKLOT_STATE_DIR`, cycling continuously:
 
-- **Session loop** — `up --watch`, sync with real file churn, `exec` reading the
-  projection back, `logs`, `ctx`, `release`.
-- **Watch traffic** — plain saves, atomic-rename saves (`tmp` + `mv`, the way
-  editors actually save), deletions, burst storms of 30–80 writes, and an
-  upkeep-trigger touch (`deps.lock`) that must produce the documented fallback
-  restart: the upkeep marker appears in the env tree *and* the service comes
-  back on the same URL with a new pid.
-- **Run loop** — `run pass` / `run fail` / `run --detach` + `job` polling /
-  unknown check, each with its verdict asserted exactly (a `fail` check must be
-  `work-error`; anything else is the silently-wrong-verdict bug).
-- **Capacity churn** — a second stack pinned at `BACKLOT_POOL_MAX=2` with a
-  third holder queueing on short-TTL expiries, plus a quiesce cycle under a
+- **Session loop** — `up`, repeated `up` with real file churn, `exec` reading the
+  worktree back, `logs`, `ctx`, `release`.
+- **Restart traffic** (decision 0032) — a source edit + `up` must keep a
+  service that has no `build:` (same pid), and an upkeep-trigger touch
+  (`deps.lock`) + `up` must take the full bind: the upkeep marker appears in
+  the worktree *and* the service comes back on the same URL with a new pid.
+- **Env export** — `runly ctx --env` must print parseable `RUNLY_*=value`
+  lines, and the stack's own check, run with them outside runly, must pass.
+- **Capacity churn** — a second stack whose one environment (decision 0032) is
+  held by a short-TTL holder while a second holder queues on its expiry, plus a quiesce cycle under a
   short `BACKLOT_LEASED_IDLE_TTL_MS`: leased-idle env goes warm, `exec` refuses
   with the rebind hint, `up` brings the same env back hot. The sweeper
   (`BACKLOT_SWEEP_MS=1000`) must keep reclaiming all of it, all run long.
@@ -67,13 +65,13 @@ tails) to the soak log; the temp dir is kept for inspection.
   and resumption, not a pardon. The pure parsing/decision halves are
   unit-tested (tests/sleep-pardon.test.ts), but the end-to-end proof remains
   a genuine lid-close test: a human and a laptop.
-- **Real repos.** The fixtures are honest (git-enumerated sync, sqlite
+- **Real repos.** The fixtures are honest (git worktrees, sqlite
   datastore, upkeep rules, readiness gates) but tiny; multi-gigabyte trees and
   minutes-long builds are a different experiment.
 - **Docker-backed datastores** (postgres/mssql) — covered by their own suites;
   the soak stays runnable on a bare runner.
-- **Verdict semantics beyond the contract.** The soak asserts classes and exit
-  codes, not your app's behavior — that's what checks are for.
+- **App behaviour beyond the contract.** The soak asserts classes and exit
+  codes, not your app's behaviour — that is what your own tests are for.
 
 ## Reproducing a failure
 

@@ -1,6 +1,6 @@
 # 0025. A data-only environment answers to its own ceiling — and changing an environment's shape is a capacity event
 
-- Status: Accepted — amended 2026-09: a conversion to data-only keeps its application charge until the old services are stopped, and a shape change waits for an in-flight operation (see Rationale)
+- Status: Accepted — amended 2026-09: a conversion to data-only keeps its application charge until the old services are stopped, and a shape change waits for an in-flight operation (see Rationale); amended by [0032](0032-environments-run-in-the-callers-worktree.md): a worktree has one environment, so there is no per-stack application ceiling left
 - Date: 2026-07
 - Context: `up --data-only` ([0023](0023-data-only-leases.md)) removed the *weight*
   of an application environment but kept the *slot competition*: it was charged

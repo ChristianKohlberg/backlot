@@ -48,7 +48,8 @@ export class EnvSupervisor {
 
   constructor(
     readonly envId: string,
-    private readonly envTree: string,
+    /** The caller's worktree — services run in place there (decision 0032). */
+    private readonly root: string,
     private readonly logDir: string,
     /** Fired when a service flaps past its restart budget (decision 0007/0010). */
     private readonly onDegraded?: (service: string) => void,
@@ -85,12 +86,13 @@ export class EnvSupervisor {
     return [...this.services.values()].every((r) => r.proc.exitCode === null);
   }
 
-  start(name: string, spec: ServiceSpec, env: NodeJS.ProcessEnv, watchMode: boolean, secrets: string[] = []): void {
-    const cmd = watchMode && spec.watch_run ? spec.watch_run : spec.run;
+  start(name: string, spec: ServiceSpec, env: NodeJS.ProcessEnv, secrets: string[] = []): void {
+    const cmd = spec.run;
     // A repo can already run arbitrary shell here, so this is not a privilege
     // boundary — it makes an ACCIDENT loud. `cwd: ../sibling` silently ran the
-    // service outside its environment tree, against files runly never synced.
-    const cwd = spec.cwd ? safeJoin(this.envTree, spec.cwd, `service '${name}' cwd`) : this.envTree;
+    // service outside the worktree it is bound to, against files runly never
+    // fingerprinted.
+    const cwd = spec.cwd ? safeJoin(this.root, spec.cwd, `service '${name}' cwd`) : this.root;
     const running: Running = { proc: null as unknown as ChildProcess, buf: '', probeBuf: '', restarts: 0, expectedExit: false, restartTimer: null, startedAt: now() };
     const launch = () => {
       running.restartTimer = null;
@@ -239,7 +241,7 @@ export class EnvSupervisor {
         // Bounded by what remains of the readiness budget: a probe command
         // that itself hangs used to block this loop long past ready.timeout.
         const remainingS = Math.max(1, Math.ceil((timeoutMs - (Date.now() - start)) / 1000));
-        const r = await runBounded(ready.cmd, this.envTree, remainingS, { ...process.env, ...env });
+        const r = await runBounded(ready.cmd, this.root, remainingS, { ...process.env, ...env });
         if (r.code === 0 && !r.timedOut) return;
       }
       if (Date.now() - start > timeoutMs) {
@@ -251,8 +253,19 @@ export class EnvSupervisor {
 
   /** Stop every service; returns any that refused to die (empty is the norm). */
   async stopAll(): Promise<Record<string, ServicePid>> {
+    return this.stopSome([...this.services.keys()]);
+  }
+
+  /**
+   * Stop just these services (an `up` restarting only the ones whose build
+   * output changed, decision 0032); the rest keep running. Same contract as
+   * stopAll: survivors are returned so the caller can reap and record them.
+   */
+  async stopSome(names: string[]): Promise<Record<string, ServicePid>> {
     const survivors: Record<string, ServicePid> = {};
-    for (const [name, r] of this.services) {
+    for (const name of names) {
+      const r = this.services.get(name);
+      if (!r) continue;
       r.expectedExit = true;
       // Cancel any pending restart BEFORE it can fire — otherwise launch()
       // respawns an untracked process that squats the port after teardown.
@@ -275,8 +288,8 @@ export class EnvSupervisor {
         }
       }
       this.note(name, survivors[name] ? 'stop failed' : 'stopped');
+      this.services.delete(name);
     }
-    this.services.clear();
     return survivors;
   }
 }

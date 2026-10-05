@@ -70,9 +70,6 @@ datastores:
     drop: docker exec ${CONTAINER} dropdb --if-exists -U postgres {{ns}}
     template_restore: docker exec ${CONTAINER} createdb -U postgres -T {{template}} {{ns}}
     presets: [dev]
-checks:
-  rows:
-    run: docker exec ${CONTAINER} psql -U postgres -d {{datastores.main.ns}} -tAc "select count(*) from items" | grep -qx 3
 `,
     );
     execFileSync('git', ['init', '-q'], { cwd: wt });
@@ -117,10 +114,11 @@ checks:
     expect(pg(`psql -U postgres -d ${ns} -tAc "select count(*) from items"`).trim()).toBe('3');
   });
 
-  it('the check templates {{datastores.main.ns}} and passes against live data', async () => {
-    const res = await cli(['run', 'rows', '--json']);
-    expect(res.exitCode, `stdout: ${res.stdout ?? ''}\nstderr: ${res.stderr ?? ''}`).toBe(0);
-    expect(res.json!.ok).toBe(true);
+  it('ctx --env exports the datastore connection string for the repo\'s own checks', async () => {
+    const res = await cli(['ctx', '--env']);
+    expect(res.exitCode, `stdout: ${res.stdout ?? ''}
+stderr: ${res.stderr ?? ''}`).toBe(0);
+    expect(String(res.stdout)).toMatch(/^RUNLY_DATASTORE_MAIN_URL=.+/m);
   });
 
   it('recycle drops the server-side namespace', async () => {

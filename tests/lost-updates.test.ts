@@ -37,7 +37,7 @@ function ctx(serviceRun: string, extraEnv: Record<string, string> = {}) {
   dirs.push(stateDir, wt);
   writeFileSync(
     join(wt, 'stack.yaml'),
-    `name: lu\nservices:\n  web: { run: "${serviceRun}", ready: { log: "ready", timeout: 8 } }\nchecks:\n  ok: { run: "true" }\n`,
+    `name: lu\nservices:\n  web: { run: "${serviceRun}", ready: { log: "ready", timeout: 8 } }\n`,
   );
   execFileSync('git', ['init', '-q'], { cwd: wt });
   const env = { ...process.env, BACKLOT_STATE_DIR: stateDir, BACKLOT_SWEEP_MS: '400', ...extraEnv };
@@ -120,7 +120,7 @@ describe('recycled environments are not operated on', () => {
     dirs.push(stateDir, wt);
     writeFileSync(
       join(wt, 'stack.yaml'),
-      `name: lu2\nservices:\n  web: { run: "echo ready; sleep 300", ready: { log: "ready", timeout: 8 } }\nauth:\n  token: "echo tok-{{role}}"\nchecks:\n  ok: { run: "true" }\n`,
+      `name: lu2\nservices:\n  web: { run: "echo ready; sleep 300", ready: { log: "ready", timeout: 8 } }\nauth:\n  token: "echo tok-{{role}}"\n`,
     );
     execFileSync('git', ['init', '-q'], { cwd: wt });
     const env = { ...process.env, BACKLOT_STATE_DIR: stateDir, BACKLOT_SWEEP_MS: '400' };
@@ -172,77 +172,5 @@ describe('the sweeper does not run before recovery finishes', () => {
     // downgrades) and never a resurrected ghost.
     for (const e of envs) expect(['warm', 'degraded', 'recycling']).toContain(e.state);
   }, 90_000);
-});
-
-describe('a detached run interrupted by a daemon crash is resolved, not left pending', () => {
-  it('reports a lost job as done with a failed verdict after recovery', async () => {
-    const stateDir = mkdtempSync(join(tmpdir(), 'runly-job-'));
-    const wt = mkdtempSync(join(tmpdir(), 'runly-job-wt-'));
-    dirs.push(stateDir, wt);
-    writeFileSync(
-      join(wt, 'stack.yaml'),
-      `name: job\nservices:\n  web: { run: "echo ready; sleep 300", ready: { log: "ready", timeout: 10 } }\nchecks:\n  slow: { run: "sleep 60" }\n`,
-    );
-    execFileSync('git', ['init', '-q'], { cwd: wt });
-    const env = { ...process.env, BACKLOT_STATE_DIR: stateDir, BACKLOT_SWEEP_MS: '400' };
-    const cli = (args: string[]) =>
-      new Promise<Record<string, unknown> | undefined>((resolve) => {
-        execFile(process.execPath, [CLI, ...args], { cwd: wt, env, maxBuffer: 8 * 1024 * 1024 }, (_e, out) => {
-          try {
-            resolve(JSON.parse(String(out)));
-          } catch {
-            resolve(undefined);
-          }
-        });
-      });
-
-    await cli(['up', '--json']);
-    const submitted = await cli(['run', 'slow', '--detach', '--json']);
-    const jobId = String(submitted?.jobId ?? '');
-    expect(jobId).not.toBe('');
-
-    // Kill the daemon mid-run. The job can never finish, so leaving it
-    // 'running' would make a polling agent wait forever. Recovery must resolve
-    // it — and this asserts recovery DOES it, not merely that the Journal has
-    // a method which would.
-    process.kill(Number(readFileSync(join(stateDir, 'daemon.pid'), 'utf8')), 'SIGKILL');
-    await new Promise((r) => setTimeout(r, 300));
-
-    const job = await cli(['job', jobId, '--json']);
-    expect(job?.state).toBe('done');
-    expect((job?.verdict as { ok?: boolean } | null)?.ok).toBe(false);
-  }, 120_000);
-});
-
-describe('a check that fails because the environment died is not blamed on the code', () => {
-  it('classifies the verdict env-error, not work-error', async () => {
-    const stateDir = mkdtempSync(join(tmpdir(), 'runly-verdict-'));
-    const wt = mkdtempSync(join(tmpdir(), 'runly-verdict-wt-'));
-    dirs.push(stateDir, wt);
-    // The service reports ready, then dies. The check then fails against a
-    // dead dependency — which is the environment failing, not the repo's code.
-    writeFileSync(
-      join(wt, 'stack.yaml'),
-      `name: vd\nservices:\n  web: { run: "echo ready; sleep 1; exit 1", ready: { log: ready, timeout: 10 } }\nchecks:\n  probe: { run: "sleep 3; exit 4" }\n`,
-    );
-    execFileSync('git', ['init', '-q'], { cwd: wt });
-    const env = { ...process.env, BACKLOT_STATE_DIR: stateDir, BACKLOT_SWEEP_MS: '30000' };
-    const run = await new Promise<Record<string, unknown> | undefined>((resolve) => {
-      execFile(process.execPath, [CLI, 'run', 'probe', '--json'], { cwd: wt, env, maxBuffer: 8 * 1024 * 1024 }, (_e, out) => {
-        try {
-          resolve(JSON.parse(String(out)));
-        } catch {
-          resolve(undefined);
-        }
-      });
-    });
-
-    const failure = run?.failure as { class?: string; message?: string } | null;
-    expect(run?.ok).toBe(false);
-    // An agent branches on this mechanically: work-error tells it to go and
-    // edit code, which cannot fix a dev-server that fell over.
-    expect(failure?.class).toBe('env-error');
-    expect(failure?.message).toMatch(/environment failed/);
-  }, 120_000);
 });
 

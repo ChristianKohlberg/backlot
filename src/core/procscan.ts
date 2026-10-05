@@ -234,8 +234,11 @@ function hasControllingTty(pid: number): boolean {
  *
  * The tag scan above misses a descendant that scrubbed its environment (a
  * process launched through `env -i`, a re-exec that rebuilds environ, some
- * language runtimes' worker pools). Those still have to live SOMEWHERE, and for
- * a service runly started that somewhere is the environment tree.
+ * language runtimes' worker pools). Those still have to live SOMEWHERE. Under
+ * the old projection that somewhere was the environment's own tree; since
+ * decision 0032 services run in the caller's worktree, where cwd proves
+ * nothing, so the engine only ever points this at an environment's PRIVATE
+ * directory (see Engine.reapEnvTree).
  *
  * Linux keeps the cwd link readable after the directory is unlinked, appending
  * " (deleted)" to the target — which is precisely the shape of the leak this
@@ -251,9 +254,9 @@ function hasControllingTty(pid: number): boolean {
  * signalling a stranger's process is not. A runly service can never be
  * excluded by it, because it never has a terminal to begin with.
  *
- * Even so, deliberately NOT used on the quiesce path: a warm environment's tree
- * stays on disk and may legitimately be occupied. Only teardown, which is about
- * to delete the tree anyway, may reap by cwd.
+ * Even so, deliberately NOT used on the quiesce path, and never on a worktree:
+ * only teardown, which is about to delete the environment's private directory
+ * anyway, may reap by cwd — and only inside that directory.
  */
 export function scanByCwd(prefix: string): Array<{ pid: number; startTime: number; cwd: string }> {
   if (!procScanSupported()) return [];

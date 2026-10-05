@@ -41,7 +41,7 @@
       "items": {
         "type": "string"
       },
-      "description": "Paths (globs allowed) preserved by the bind-time reset: node_modules, **/obj, .angular, ..."
+      "description": "Build and install output inside the worktree (node_modules, **/obj, .angular, ...). Environments run in the worktree (decision 0032), so this is what is NOT source: an upkeep `when:` glob never matches it. runly never deletes it."
     },
     "sync": {
       "type": "object",
@@ -52,14 +52,14 @@
           "items": {
             "type": "string"
           },
-          "description": "Generated files preserved across binds even though tracked/derived."
+          "description": "Accepted for compatibility and ignored: since decision 0032 there is no environment-side reset for it to protect files from."
         },
         "include": {
           "type": "array",
           "items": {
             "type": "string"
           },
-          "description": "Git-ignored files that must ride along with a binding (.env.local)."
+          "description": "Git-ignored files that still count as source (.env.local), so an upkeep `when:` glob can match them."
         }
       }
     },
@@ -68,7 +68,7 @@
       "items": {
         "type": "string"
       },
-      "description": "Artifacts produced env-side but owned worktree-side (lockfiles, generated clients). Reported as outputs_changed; copied back only by explicit `runly pull`."
+      "description": "Accepted and ignored since decision 0032: it listed files `runly run` reported as changed, and `runly run` was removed. Build outputs that decide a restart are declared per service (`services.<name>.outputs`)."
     },
     "upkeep": {
       "type": "array",
@@ -104,10 +104,7 @@
     },
     "checks": {
       "type": "object",
-      "additionalProperties": {
-        "$ref": "#/$defs/check"
-      },
-      "description": "Named runnable proofs (e2e, smoke). `runly run <name>`."
+      "description": "Accepted and ignored since decision 0032: `runly run` was removed. A manifest that still declares checks loads, with a one-line deprecation warning; repo scripts read the environment from `runly ctx --env` instead."
     },
     "preview": {
       "type": "object",
@@ -176,11 +173,18 @@
         },
         "build": {
           "type": "string",
-          "description": "Run at bind when fingerprints demand; never during serve. Executes under `sh` (dash on Ubuntu, bash-as-sh on macOS) \u2014 write POSIX sh, no bashisms."
+          "description": "Run on every `up` that starts this service, and on every `runly warm` \u2014 runly keeps no build cache; the build tool decides what is current (decision 0032). Executes under `sh` (dash on Ubuntu, bash-as-sh on macOS) \u2014 write POSIX sh, no bashisms."
+        },
+        "outputs": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Globs (relative to the stack root) of what `build:` produces, e.g. `backend/host/Fid.Host/bin/**` or `dist/web-audit`. Every `up` snapshots them (path, size, mtime) around the build and restarts this service only when they changed. Without it, a service with a build is restarted after every build (decision 0032)."
         },
         "watch_run": {
           "type": "string",
-          "description": "Hot-reload alternative to run:, used only by --watch session leases."
+          "description": "Accepted and ignored since decision 0032 (`--watch` was removed); the service always runs `run:`."
         },
         "cwd": {
           "type": "string",
@@ -209,7 +213,7 @@
               "optional"
             ]
           },
-          "description": "Allowlisted caller environment inputs. up/run refresh values from their caller; sync/reset retain lease inputs. A supplied value overrides a same-named env entry; a missing optional input keeps an explicit env default, otherwise masks the daemon value. Memory only: re-run up after a daemon restart."
+          "description": "Allowlisted caller environment inputs. `up` refreshes values from its caller; reset-data retains the lease's inputs. A supplied value overrides a same-named env entry; a missing optional input keeps an explicit env default, otherwise masks the daemon value. Memory only: re-run up after a daemon restart."
         },
         "ready": {
           "$ref": "#/$defs/readiness"
@@ -227,7 +231,7 @@
         },
         "hot_reload": {
           "type": "boolean",
-          "description": "This service's run: command watches its own tree and reloads changed files itself (ng serve, dotnet watch, vite). When EVERY service declares it, `runly sync` projects changed files without restarting services; any service without it forces the full rebind, because projecting under a non-watching process silently serves stale code."
+          "description": "Accepted and ignored since decision 0032 (`sync` was removed). Whether an `up` restarts a running service is decided by its build `outputs:`; a service without a build keeps running."
         }
       }
     },
@@ -286,7 +290,7 @@
         },
         "url": {
           "type": "string",
-          "description": "Connection-string template handed to services/checks; {{ns}} available. Required for server drivers; ignored for sqlite (the ns IS the file path)."
+          "description": "Connection-string template handed to services and `runly ctx --env`; {{ns}} available. Required for server drivers; ignored for sqlite (the ns IS the file path)."
         },
         "create": {
           "type": "string",
@@ -351,40 +355,6 @@
           "type": "number",
           "exclusiveMinimum": 0,
           "description": "Command deadline in seconds (default 300). BACKLOT_CMD_TIMEOUT_S overrides this value."
-        }
-      }
-    },
-    "check": {
-      "type": "object",
-      "required": [
-        "run"
-      ],
-      "additionalProperties": false,
-      "properties": {
-        "run": {
-          "type": "string",
-          "description": "The check command. Executes under `sh` (dash on Ubuntu, bash-as-sh on macOS) \u2014 write POSIX sh, no bashisms."
-        },
-        "cwd": {
-          "type": "string"
-        },
-        "env": {
-          "type": "object",
-          "additionalProperties": {
-            "type": "string"
-          }
-        },
-        "artifacts": {
-          "type": "array",
-          "items": {
-            "type": "string"
-          },
-          "description": "Globs collected into the verdict's artifacts dir."
-        },
-        "timeout": {
-          "type": "number",
-          "default": 600,
-          "description": "Seconds before the check's whole process group is killed \u2014 a hung check must never hold its environment forever."
         }
       }
     },

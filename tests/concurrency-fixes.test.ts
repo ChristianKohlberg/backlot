@@ -1,7 +1,8 @@
 /**
  * Regressions for the concurrency review's confirmed criticals (#17-21):
- * env-id never reused after reap, daemon singleton, run-holder isolation,
- * doctor/reconcile surface, and stale-job recovery.
+ * env-id never reused after reap, daemon singleton and the doctor/reconcile
+ * surface. (Run-holder isolation and stale-job recovery went with `runly run`,
+ * decision 0032.)
  */
 import { describe, it, expect, afterAll } from 'vitest';
 import { execFile, execFileSync, spawn } from 'node:child_process';
@@ -51,8 +52,6 @@ function makeWt(name: string, extra = ''): string {
     `name: ${name}
 services:
   web: { run: node server.mjs, port: web, env: { PORT: "{{ports.web}}" }, ready: { http: /, timeout: 20 } }
-checks:
-  ok: { run: "true" }
 ${extra}`,
   );
   execFileSync('git', ['init', '-q'], { cwd: dir });
@@ -98,29 +97,6 @@ describe('#19 daemon singleton — a second daemon defers to the live one', () =
   }, 30_000);
 });
 
-describe('#21d run with a shared --holder does not destroy the session', () => {
-  const ctx = makeContext();
-  const wt = makeWt('holder');
-  afterAll(() => {
-    ctx.cleanup();
-    rmSync(wt, { recursive: true, force: true });
-  });
-
-  it('after `run` the session lease still exists and its data is intact', async () => {
-    const up = await ctx.cli(['up', '--json', '--holder', 'shared'], wt);
-    expect(up.exitCode, `stdout: ${up.stdout ?? ''}\nstderr: ${up.stderr ?? ''}`).toBe(0);
-    const envId = up.json!.envId;
-
-    await ctx.cli(['run', 'ok', '--json', '--holder', 'shared'], wt);
-
-    // The session's ctx still resolves (lease alive) and points at the same env.
-    const ctxRes = await ctx.cli(['ctx', '--json', '--holder', 'shared'], wt);
-    expect(ctxRes.exitCode, `stdout: ${ctxRes.stdout ?? ''}\nstderr: ${ctxRes.stderr ?? ''}`).toBe(0);
-    expect(ctxRes.json!.envId).toBe(envId);
-    expect((ctxRes.json!.lease as unknown)).not.toBeNull();
-  }, 30_000);
-});
-
 describe('#23 doctor + reconcile surface', () => {
   const ctx = makeContext();
   const wt = makeWt('doc');
@@ -144,17 +120,4 @@ describe('#23 doctor + reconcile surface', () => {
     expect(rec.exitCode, `stdout: ${rec.stdout ?? ''}\nstderr: ${rec.stderr ?? ''}`).toBe(0);
     expect(Array.isArray(rec.json!.reaped)).toBe(true);
   }, 30_000);
-});
-
-describe('stale-job recovery (#9)', () => {
-  it('a job left running by a dead daemon is failed on recovery', () => {
-    const dir = mkdtempSync(join(tmpdir(), 'runly-job-'));
-    const j = new Journal(join(dir, 'j.db'));
-    j.saveJob({ id: 'job-x', stackCwd: '/x', check: 'e2e', state: 'running' });
-    expect(j.failStaleJobs()).toBe(1);
-    const job = j.getJob('job-x')!;
-    expect(job.state).toBe('done');
-    expect((job.verdict as { ok: boolean }).ok).toBe(false);
-    rmSync(dir, { recursive: true, force: true });
-  });
 });

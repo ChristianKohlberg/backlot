@@ -1,6 +1,6 @@
 # 0012. Services are commands, not containers; backing infra is external and probed
 
-- Status: Accepted
+- Status: Accepted — amended by [0032](0032-environments-run-in-the-callers-worktree.md): `watch_run` and `hot_reload` are accepted and ignored (`--watch` is gone); a service's `build:` runs on every `up`, and its `outputs:` decide whether it restarts
 
 ## Decision
 

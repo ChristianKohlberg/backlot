@@ -11,35 +11,45 @@ import { stateRoot } from '../core/paths.js';
 import { BUILD, VERSION, rebuiltSince, versionSkew } from '../core/version.js';
 import { installKind } from './install.js';
 import { collectCallerEnv } from '../core/caller-env.js';
-import { loadStack } from '../core/manifest.js';
+import { loadStack, manifestDeprecations } from '../core/manifest.js';
 import { parsePresetArgs } from '../core/presets.js';
 import { BrokerError } from '../core/util.js';
 
 const USAGE = `runly — puts a working instance of a web application in front of you.
 
 Usage:
-  runly up [service...] [--watch] [--reset-data|--pristine] [--ttl <minutes>] [--holder-pid <pid>]
+  runly up [service...] [--reset-data|--pristine] [--ttl <minutes>] [--holder-pid <pid>]
                           (no service = whole app; named services start only that
                            slice plus its depends_on closure)
-                          session lease: sync, upkeep, start services, print context
+                          session lease on THIS worktree's one environment. Every
+                          up applies the worktree as it is now: the due upkeep
+                          rules, then every build: of the services it starts.
+                          A running service whose build OUTPUT changed (its
+                          outputs: globs; none declared = always) is restarted;
+                          one whose output is unchanged, or that has no build:,
+                          keeps running. Dependents are not restarted.
   runly up --data-only  lease the DATASTORES alone — a seeded database, no
                           services, no builds. For test lanes that need a
                           database per run rather than a whole application.
                           Connection strings arrive in the same ctx blob.
-  runly run <check> [--pristine] [--pull] [--detach]
-                          run lease: bind -> execute the check -> verdict -> release
-                          --detach: submit-and-poll — returns a jobId immediately
-  runly job <jobId>     poll a detached run (pending|running|done + verdict)
-  runly ctx             the consumer context blob (URLs, logins, conn strings)
-  runly sync            project the worktree state into the current lease
-  runly exec <cmd...>   run a command inside the leased environment
+  runly ctx [--env]     the consumer context blob (URLs, logins, conn strings).
+                          --env prints shell-exportable KEY=value lines instead:
+                          RUNLY_ENV_ID, RUNLY_PORT_<PORT>, RUNLY_URL_<SERVICE>,
+                          RUNLY_DATASTORE_<NAME>_URL, RUNLY_LOGIN_USER and
+                          RUNLY_LOGIN_PASSWORD (names uppercased, any other
+                          character as _). Run your checks with them:
+                          eval "$(runly ctx --env)" && npm test
+  runly warm            run this worktree's due upkeep rules and its service
+                          builds now — no lease, no services. For an idle worktree
+                          just moved to a new commit
+  runly exec <cmd...>   run a command in the worktree with the lease's ports,
+                          URLs and connection strings in its environment
   runly logs <service> [--lines N]
   runly reset-data      restore the data template on the current lease
   runly token --role <r> [--raw]
                           mint an auth token via the stack's auth.token hook.
                           Default output is JSON ({token, role}); --raw prints the
                           bare token, which is what an Authorization header wants
-  runly pull            copy declared outputs back into the worktree
   runly release         release the current lease (environment stays warm)
   runly preview <service> [--ttl ...] [--https-port N]
                           publish a service from your lease on a public quick
@@ -87,12 +97,15 @@ already exited. Such a lease would be reclaimable the instant it was created —
 environment would be handed to the next caller while you were still using it — so
 runly refuses the bind instead. Use --ttl.
 
-up, run and reset-data accept --preset NAME (one datastore), or repeatable
+up and reset-data accept --preset NAME (one datastore), or repeatable
 --preset DATASTORE=NAME. ctx reports each datastore's selected preset.
 
-Every verb accepts --json. Long verbs (up/run/sync/bind/reset-data) show live progress
+Every verb accepts --json. Long verbs (up/warm/reset-data) show live progress
 on a terminal (stderr); force with --progress, silence with --quiet. stdout stays clean.
-Exit codes: 0 ok · 1 work-error · 2 env-error · 3 infra-error · 64 usage.`;
+Exit codes: 0 ok · 1 work-error · 2 env-error · 3 infra-error · 64 usage.
+
+Removed in 0.13 (decision 0032; each now exits 64 naming its replacement):
+sync, bind, pull, run, job, --watch, --detach, --pull, --ref.`;
 
 const rawArgv = process.argv.slice(2);
 const verb = rawArgv[0];
@@ -102,7 +115,7 @@ const verb = rawArgv[0];
 // flags survive) — the F1 class of argv bugs. Everything after a lone `--`, and
 // EVERYTHING for `exec`, is treated as a raw passthrough command.
 const VALUE_FLAGS = new Set(['--holder', '--holder-pid', '--ttl', '--role', '--lines', '--ref', '--spec', '--preset', '--https-port']);
-const BOOL_FLAGS = new Set(['--json', '--watch', '--reset-data', '--pristine', '--pull', '--detach', '--all', '--force', '--raw', '--data-only', '--progress', '--quiet', '--check']);
+const BOOL_FLAGS = new Set(['--json', '--env', '--watch', '--reset-data', '--pristine', '--pull', '--detach', '--all', '--force', '--raw', '--data-only', '--progress', '--quiet', '--check']);
 
 const flagVals = new Map<string, string>();
 const presetArgs: string[] = [];
@@ -203,8 +216,8 @@ function hygiene(): string | undefined {
 }
 
 async function main(): Promise<void> {
-  if (presetArgs.length > 0 && !['up', 'run', 'reset-data'].includes(verb ?? '')) {
-    console.error('runly: --preset is supported by up, run and reset-data');
+  if (presetArgs.length > 0 && !['up', 'reset-data'].includes(verb ?? '')) {
+    console.error('runly: --preset is supported by up and reset-data');
     process.exit(64);
   }
   if (!verb || verb === 'help' || verb === '--help' || verb === '-h') {
@@ -223,7 +236,34 @@ async function main(): Promise<void> {
     return;
   }
 
-  const known = ['up', 'run', 'job', 'ctx', 'sync', 'bind', 'exec', 'logs', 'token', 'reset-data', 'pull', 'release', 'preview', 'status', 'doctor', 'appliance', 'pool', 'daemon', 'update'];
+  // Removed by decision 0032. Named, not merely unknown, so a script that used
+  // them learns what replaced them. Answered before the daemon is contacted.
+  const D = '(decision 0032)';
+  const removed: Record<string, string> = {
+    pull: `'runly pull' was removed ${D}: environments run in your worktree, so outputs are written in place`,
+    sync: `'runly sync' was removed ${D}: 'runly up' runs the due upkeep and every build, and restarts the services whose build output changed`,
+    bind: `'runly bind' was removed ${D}: use 'runly up', which applies the worktree as it is now; a ref is bound by checking it out ('git checkout <ref>', or a separate worktree)`,
+    run: `'runly run' was removed ${D}: run your checks yourself against the environment — 'runly ctx --env' prints its ports, URLs, connection strings and login as KEY=value lines`,
+    job: `'runly job' was removed with 'runly run' ${D}`,
+  };
+  if (removed[verb]) {
+    console.error(`runly: ${removed[verb]}`);
+    process.exit(64);
+  }
+  const removedFlags: Record<string, string> = {
+    '--pull': `--pull was removed ${D}: outputs are written in place`,
+    '--detach': `--detach was removed with 'runly run' ${D}`,
+    '--watch': `--watch was removed ${D}: re-run 'runly up' after a change; it runs the due upkeep and the builds, and restarts what changed`,
+    '--ref': `--ref was removed ${D}: environments run in your worktree; check the ref out ('git checkout <ref>', or a separate worktree) and run 'runly up'`,
+  };
+  for (const [flag, msg] of Object.entries(removedFlags)) {
+    if (flags.has(flag)) {
+      console.error(`runly: ${msg}`);
+      process.exit(64);
+    }
+  }
+
+  const known = ['up', 'ctx', 'warm', 'exec', 'logs', 'token', 'reset-data', 'release', 'preview', 'status', 'doctor', 'appliance', 'pool', 'daemon', 'update'];
   if (!known.includes(verb)) {
     console.error(`runly: unknown verb '${verb}'\n\n${USAGE}`);
     process.exit(64);
@@ -231,7 +271,16 @@ async function main(): Promise<void> {
 
   // Collect before autospawn: a malformed binding manifest must not start a
   // shared daemon with input values in its inherited environment.
-  const callerEnv = ['up', 'run'].includes(verb) ? collectCallerEnv(process.cwd()) : undefined;
+  const callerEnv = verb === 'up' ? collectCallerEnv(process.cwd()) : undefined;
+  // A manifest section runly accepts but no longer acts on (`checks:`) loads
+  // with a one-line warning on stderr; stdout stays clean for --json.
+  if (!['status', 'doctor', 'daemon', 'update', 'pool'].includes(verb)) {
+    try {
+      for (const w of manifestDeprecations(loadStack(process.cwd()).manifest)) console.error(`runly: warning: ${w}`);
+    } catch {
+      /* no manifest here, or an invalid one — the verb itself reports that */
+    }
+  }
   let presets: Record<string, string> | undefined;
   if (presetArgs.length > 0) {
     const manifest = loadStack(process.cwd()).manifest;
@@ -310,85 +359,57 @@ async function main(): Promise<void> {
         }
       }
       const dataOnly = flags.has('--data-only');
-      if (dataOnly && flags.has('--watch')) {
-        // Nothing runs, so there is nothing for a watcher to reload.
-        console.error('runly up: --watch has nothing to do under --data-only (no services run)');
-        process.exit(64);
-      }
       res = await rpc(
         'up',
-        { cwd, holder, holderPid, hygiene: hygiene(), watch: flags.has('--watch'), ttlMs, services: positional, dataOnly, callerEnv, presets },
+        { cwd, holder, holderPid, hygiene: hygiene(), ttlMs, services: positional, dataOnly, callerEnv, presets },
         progress,
       );
       endProgress();
       break;
     }
-    case 'run': {
-      const check = positional[0];
-      if (!check) {
-        console.error(`runly run: which check? (usage: runly run <check>)`);
-        process.exit(64);
-      }
-      if (flags.has('--detach')) {
-        res = await rpc('run-detach', { cwd, holder, check, hygiene: hygiene(), pull: flags.has('--pull'), callerEnv, presets });
-        if (res.ok) {
-          out(res.data);
-          return;
-        }
-      } else {
-        res = await rpc('run', { cwd, holder, check, hygiene: hygiene(), pull: flags.has('--pull'), callerEnv, presets }, progress);
-        endProgress();
-
-      }
-      break;
-    }
-    case 'job': {
-      const jobId = positional[0];
-      if (!jobId) {
-        console.error('runly job: which job? (usage: runly job <jobId> | runly job ls)');
-        process.exit(64);
-      }
-      res = jobId === 'ls' ? await rpc('job-ls', {}) : await rpc('job', { jobId });
-      // Symmetry with synchronous `run`: a finished job with a failed verdict
-      // exits 1. Without this an agent polling a detached run could not branch
-      // on the exit code at all, only by parsing the body.
-      if (jobId !== 'ls' && res.ok) {
-        const job = res.data as { state?: string; verdict?: { ok?: boolean } | null };
-        if (job.state === 'done' && job.verdict && job.verdict.ok === false) {
-          out(res.data);
-          process.exit(1);
-        }
-      }
-      break;
-    }
     case 'ctx':
       res = await rpc('ctx', { cwd, holder });
-      break;
-    case 'sync':
-      res = await rpc('sync', { cwd, holder }, progress);
-      endProgress();
-      break;
-    case 'bind': {
-      const ref = flagValue('--ref');
-      const ttl = flagValue('--ttl');
-      let ttlMs: number | undefined;
-      if (ttl !== undefined) {
-        ttlMs = parseTtlMinutes(ttl);
-        if (ttlMs === undefined) {
-          console.error(`runly: --ttl expects minutes (a positive number), got '${ttl}'`);
+      if (res.ok && flags.has('--env')) {
+        if (flags.has('--json')) {
+          console.error('runly ctx: --env and --json are alternatives — pick one');
           process.exit(64);
         }
-        if (!ref) {
-          // Plain `bind` (sync) has no ttl to set — accepting --ttl here would
-          // silently drop it and mislead the caller into thinking the lease was
-          // extended.
-          console.error('runly: --ttl requires --ref (plain `bind` projects the worktree and keeps the current lease clock)');
-          process.exit(64);
+        // Shell-exportable KEY=value lines — the interface a repo's own scripts
+        // (its tests, its smoke checks) read instead of `runly run`.
+        for (const line of envLines(res.data as CtxForEnv)) console.log(line);
+        return;
+      }
+      break;
+    case 'warm': {
+      res = await rpc('warm', { cwd }, progress);
+      endProgress();
+      if (!res.ok) break;
+      const w = res.data as {
+        ok: boolean;
+        root: string;
+        durationMs: number;
+        steps: Array<{ kind: string; index?: number; when?: string; service?: string; status: string; durationMs: number; reason?: string }>;
+        failure: RpcError | null;
+      };
+      if (json) console.log(JSON.stringify(w));
+      else {
+        // One line per step: what it was, what happened, how long it took. The
+        // upkeep COMMAND is never printed — commands may carry credentials —
+        // only the rule's position and its trigger glob.
+        const secs = (ms: number) => `${(ms / 1000).toFixed(1)}s`;
+        console.log(`warming ${w.root}`);
+        for (const st of w.steps) {
+          const what = st.kind === 'upkeep' ? `upkeep rule ${st.index} (${st.when})` : `build '${st.service}'`;
+          console.log(`  ${what}: ${st.status}${st.status === 'ran' || st.status === 'failed' ? ` in ${secs(st.durationMs)}` : ''}${st.reason ? ` — ${st.reason}` : ''}`);
+        }
+        console.log(`${w.ok ? 'warm' : 'failed'} after ${secs(w.durationMs)}`);
+        if (w.failure) {
+          console.error(`runly: [${w.failure.class}] ${w.failure.message}${w.failure.source ? ` (${w.failure.source})` : ''}`);
+          if (w.failure.logExcerpt) console.error(`--- log excerpt ---\n${w.failure.logExcerpt}`);
         }
       }
-      res = ref ? await rpc('bind-ref', { cwd, holder, ref, ttlMs }, progress) : await rpc('sync', { cwd, holder }, progress);
-      endProgress();
-      break;
+      process.exitCode = w.ok ? 0 : 1;
+      return;
     }
     case 'exec': {
       // The whole passthrough is the command, verbatim — its own --flags intact.
@@ -454,9 +475,6 @@ async function main(): Promise<void> {
       }
       break;
     }
-    case 'pull':
-      res = await rpc('pull', { cwd, holder });
-      break;
     case 'release':
       res = await rpc('release', { cwd, holder });
       break;
@@ -702,12 +720,37 @@ async function main(): Promise<void> {
     errExit(res.error);
     return;
   }
-  if (verb === 'run') {
-    const v = res.data as { ok: boolean; exitCode: number };
-    out(res.data);
-    process.exit(v.ok ? 0 : 1);
-  }
   out(res.data);
+}
+
+interface CtxForEnv {
+  envId: string;
+  ports?: Record<string, number>;
+  urls?: Record<string, string>;
+  datastores?: Record<string, { url: string }>;
+  logins?: { user: string; password: string } | null;
+}
+
+/** `web-audit` -> `WEB_AUDIT`: a valid, stable shell variable suffix. */
+const envName = (s: string): string => s.toUpperCase().replace(/[^A-Z0-9]/g, '_');
+/** Quoted only when it has to be, so plain values stay plain `KEY=value`. */
+const shellValue = (v: string): string => (/^[A-Za-z0-9_./:@%+,=-]*$/.test(v) ? v : `'${v.replace(/'/g, `'\\''`)}'`);
+
+/**
+ * `runly ctx --env` (decision 0032). Names are stable and documented:
+ * RUNLY_ENV_ID, RUNLY_PORT_<PORT>, RUNLY_URL_<SERVICE>,
+ * RUNLY_DATASTORE_<NAME>_URL, RUNLY_LOGIN_USER, RUNLY_LOGIN_PASSWORD.
+ */
+function envLines(c: CtxForEnv): string[] {
+  const lines = [`RUNLY_ENV_ID=${shellValue(c.envId)}`];
+  for (const [k, v] of Object.entries(c.ports ?? {}).sort()) lines.push(`RUNLY_PORT_${envName(k)}=${v}`);
+  for (const [k, v] of Object.entries(c.urls ?? {}).sort()) lines.push(`RUNLY_URL_${envName(k)}=${shellValue(v)}`);
+  for (const [k, v] of Object.entries(c.datastores ?? {}).sort()) lines.push(`RUNLY_DATASTORE_${envName(k)}_URL=${shellValue(v.url)}`);
+  if (c.logins) {
+    lines.push(`RUNLY_LOGIN_USER=${shellValue(c.logins.user)}`);
+    lines.push(`RUNLY_LOGIN_PASSWORD=${shellValue(c.logins.password)}`);
+  }
+  return lines;
 }
 
 main().catch((err) => {

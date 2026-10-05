@@ -3,6 +3,9 @@ name: hello-web
 
 services:
   web:
+    # A syntax check as the build. It declares no `outputs:`, so every
+    # `runly up` restarts web and an edit to server.mjs is served.
+    build: node --check server.mjs
     run: node server.mjs
     port: web
     env:
@@ -19,7 +22,4 @@ datastores:
     default_preset: { run: dev, session: dev }
     template: true # sqlite templating = file copy
 
-checks:
-  smoke:
-    run: node smoke.test.mjs
-    env: { BASE_URL: "{{services.web.url}}" }
+# The smoke test is the repo's own: eval "$(runly ctx --env)" && node smoke.test.mjs

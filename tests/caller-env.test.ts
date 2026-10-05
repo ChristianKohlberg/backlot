@@ -33,10 +33,8 @@ services:
     env: { PORT: '{{ports.web}}' }
     env_from: { TEST_CALLER_KEY: ${mode} }
     ready: { ${logReady ? 'log: ready' : 'http: /'}, timeout: 10 }
-checks:
-  ok: { run: 'true' }
 `);
-  const base: NodeJS.ProcessEnv = { ...process.env, BACKLOT_STATE_DIR: state, BACKLOT_POOL_MAX: '2', BACKLOT_POOL_MAX_TOTAL: '2' };
+  const base: NodeJS.ProcessEnv = { ...process.env, BACKLOT_STATE_DIR: state, BACKLOT_POOL_MAX_TOTAL: '2' };
   delete base.TEST_CALLER_KEY;
   delete base.TEST_UNDECLARED;
   const cli = (args: string[], vars: NodeJS.ProcessEnv = {}, cwd = tree) => new Promise<{ code: number; json: any; stdout: string; stderr: string }>((resolve) => {
@@ -71,7 +69,7 @@ checks:
 }
 
 describe('caller environment inputs', () => {
-  it('refreshes explicitly, retains through sync/reset, isolates holders, and never persists values', async () => {
+  it('refreshes explicitly, retains through reset-data, isolates holders, and never persists values', async () => {
     const f = fixture();
     const secret = 'caller-sensitive-value-123';
     const nextSecret = 'caller-sensitive-value-456';
@@ -83,22 +81,27 @@ describe('caller environment inputs', () => {
     expect(original).toMatchObject({ value: secret, extra: null });
     const same = await f.cli(['up', '--holder', 'a'], { TEST_CALLER_KEY: secret });
     expect((await f.response(same.json)).pid).toBe(original.pid);
-    const synced = await f.cli(['sync', '--holder', 'a']);
-    expect((await f.response(synced.json)).value).toBe(secret);
     const reset = await f.cli(['reset-data', '--holder', 'a']);
     expect(reset.code, reset.stderr + reset.stdout).toBe(0);
     expect((await f.response(reset.json)).value).toBe(secret);
     const changed = await f.cli(['up', '--holder', 'a'], { TEST_CALLER_KEY: nextSecret });
     expect((await f.response(changed.json)).value).toBe(nextSecret);
     expect(changed.json.bindDiagnostics.reasons).toContain('environment-inputs-changed');
-    const second = await f.cli(['up', '--holder', 'b']);
-    expect((await f.response(second.json)).value).toBeNull();
-    expect((await f.response(changed.json)).value).toBe(nextSecret);
+    // Omitting the input on a continuing lease clears it.
     const cleared = await f.cli(['up', '--holder', 'a']);
     expect((await f.response(cleared.json)).value).toBeNull();
-    const views = await Promise.all([f.cli(['status']), f.cli(['ctx', '--holder', 'a']), f.cli(['logs', 'web', '--holder', 'a'])]);
+    const again = await f.cli(['up', '--holder', 'a'], { TEST_CALLER_KEY: nextSecret });
+    expect((await f.response(again.json)).value).toBe(nextSecret);
+    // One environment per worktree (decision 0032): holder b gets the SAME
+    // environment once a lets go — and none of a's inputs with it.
+    expect((await f.cli(['release', '--holder', 'a'])).code).toBe(0);
+    const second = await f.cli(['up', '--holder', 'b']);
+    expect(second.code, second.stderr + second.stdout).toBe(0);
+    expect(second.json.envId).toBe(first.json.envId);
+    expect((await f.response(second.json)).value).toBeNull();
+    const views = await Promise.all([f.cli(['status']), f.cli(['ctx', '--holder', 'b']), f.cli(['logs', 'web', '--holder', 'b'])]);
     for (const value of [secret, nextSecret]) {
-      expect(JSON.stringify([first, same, synced, reset, changed, ...views])).not.toContain(value);
+      expect(JSON.stringify([first, same, reset, changed, cleared, again, second, ...views])).not.toContain(value);
       const checkFiles = (dir: string) => {
         for (const item of readdirSync(dir, { withFileTypes: true })) {
           const path = join(dir, item.name);
@@ -131,29 +134,16 @@ describe('caller environment inputs', () => {
     const first = await f.cli(['up'], { TEST_CALLER_KEY: 'restart-sensitive-key' });
     expect(first.code).toBe(0);
     await f.restartDaemon();
-    const sync = await f.cli(['sync']);
-    expect(sync.code).toBe(1);
-    expect(sync.json.error.message).toContain('daemon restarts');
+    // reset-data keeps the lease's inputs, and they did not survive the restart.
+    const reset = await f.cli(['reset-data']);
+    expect(reset.code).toBe(1);
+    expect(reset.json.error.message).toContain('daemon restarts');
     const restored = await f.cli(['up'], { TEST_CALLER_KEY: 'fresh-key' });
     expect(restored.json.lease.id).toBe(first.json.lease.id);
     expect((await f.response(restored.json)).value).toBe('fresh-key');
   });
 
-  it('passes fresh inputs to isolated synchronous and detached check leases', async () => {
-    const f = fixture('required');
-    expect((await f.cli(['run', 'ok'], { TEST_CALLER_KEY: 'run-private-key' })).json.ok).toBe(true);
-    const submitted = await f.cli(['run', 'ok', '--detach'], { TEST_CALLER_KEY: 'detached-private-key' });
-    expect(submitted.code).toBe(0);
-    let job;
-    for (let i = 0; i < 50; i++) {
-      job = await f.cli(['job', submitted.json.jobId]);
-      if (job.json.state === 'done') break;
-      await new Promise((resolve) => setTimeout(resolve, 50));
-    }
-    expect(job?.json.verdict.ok).toBe(true);
-  });
-
-  it('clears optional inputs across restart and declaration removal/readdition on sync', async () => {
+  it('clears optional inputs across restart and declaration removal/readdition on reset-data', async () => {
     const f = fixture();
     // Removal restores ordinary daemon inheritance, so boot without this name.
     expect((await f.cli(['status'])).code).toBe(0);
@@ -161,15 +151,15 @@ describe('caller environment inputs', () => {
     expect(first.code).toBe(0);
     const manifest = readFileSync(join(f.tree, 'backlot.yml'), 'utf8');
     writeFileSync(join(f.tree, 'backlot.yml'), manifest.replace('    env_from: { TEST_CALLER_KEY: optional }\n', ''));
-    const removed = await f.cli(['sync']);
+    const removed = await f.cli(['reset-data']);
     expect(removed.code, removed.stderr + removed.stdout).toBe(0);
     expect((await f.response(removed.json)).value).toBeNull();
     writeFileSync(join(f.tree, 'backlot.yml'), manifest);
-    const restored = await f.cli(['sync']);
+    const restored = await f.cli(['reset-data']);
     expect((await f.response(restored.json)).value).toBeNull();
     expect((await f.cli(['up'], { TEST_CALLER_KEY: 'optional-secret' })).code).toBe(0);
     await f.restartDaemon();
-    const restarted = await f.cli(['sync']);
+    const restarted = await f.cli(['reset-data']);
     expect((await f.response(restarted.json)).value).toBeNull();
   });
 
@@ -201,22 +191,21 @@ describe('caller environment inputs', () => {
 
   it('binds a preserved slice whose service left the manifest instead of refusing before the claim', async () => {
     const f = fixture();
-    // No hot_reload: sync must take the full bind, which is where the pre-claim check runs.
-    const manifest = readFileSync(join(f.tree, 'backlot.yml'), 'utf8').replace('    hot_reload: true\n', '').replace('checks:\n', [
+    const manifest = readFileSync(join(f.tree, 'backlot.yml'), 'utf8').replace('    hot_reload: true\n', '') + [
       '  worker:',
       '    run: node server.mjs',
       '    port: worker',
       "    env: { PORT: '{{ports.worker}}' }",
       '    ready: { http: /, timeout: 10 }',
-      'checks:',
       '',
-    ].join('\n'));
+    ].join('\n');
     writeFileSync(join(f.tree, 'backlot.yml'), manifest);
     const slice = await f.cli(['up', 'worker']);
     expect(slice.code, slice.stderr + slice.stdout).toBe(0);
     expect(Object.keys(slice.json.urls)).toEqual(['worker']);
     writeFileSync(join(f.tree, 'backlot.yml'), manifest.replace(/  worker:\n(    .*\n)+/, ''));
-    const synced = await f.cli(['sync']);
+    // reset-data keeps the lease's slice, so it is the verb that meets the stale one.
+    const synced = await f.cli(['reset-data']);
     expect(synced.code, synced.stderr + synced.stdout).toBe(0);
     expect(Object.keys(synced.json.urls)).toEqual(['web']);
     const explicit = await f.cli(['up', 'worker']);
@@ -247,7 +236,7 @@ describe('caller environment inputs', () => {
     expect(logs.stdout).toContain('[redacted]');
   });
 
-  it('keeps cold-start caller inputs out of shared daemon, exec, checks and unconfigured services', async () => {
+  it('keeps cold-start caller inputs out of shared daemon, exec and unconfigured services', async () => {
     const f = fixture();
     const plainService = [
       '  plain:',
@@ -257,9 +246,7 @@ describe('caller environment inputs', () => {
       '    ready: { http: /, timeout: 10 }',
       '',
     ].join('\n');
-    const manifest = readFileSync(join(f.tree, 'backlot.yml'), 'utf8')
-      .replace('checks:\n', plainService + 'checks:\n')
-      .replace("ok: { run: 'true' }", "ok: { run: 'node assert-clean.mjs' }");
+    const manifest = readFileSync(join(f.tree, 'backlot.yml'), 'utf8') + plainService;
     writeFileSync(join(f.tree, 'backlot.yml'), manifest);
     writeFileSync(join(f.tree, 'assert-clean.mjs'), "if(process.env.TEST_CALLER_KEY !== undefined) process.exit(12);console.log('clean');\n");
     // No status/prewarm: this command must create the actual shared daemon.
@@ -270,9 +257,6 @@ describe('caller environment inputs', () => {
     const exec = await f.cli(['exec', '--json', 'node assert-clean.mjs']);
     expect(exec.json.exitCode, exec.stdout + exec.stderr).toBe(0);
     expect(exec.json.stdout.trim()).toBe('clean');
-    const run = await f.cli(['run', 'ok'], { TEST_CALLER_KEY: 'second-caller-secret' });
-    expect(run.json.ok, run.stdout + run.stderr).toBe(true);
-    expect(run.json.output).toContain('clean');
     expect((await f.cli(['status'], {}, f.root)).code).toBe(0);
     expect((await f.cli(['doctor'], {}, f.root)).code).toBe(0);
   });

@@ -5,7 +5,7 @@
  * The vitest suite proves invariants in seconds-long runs: every property it
  * checks is real, and every run is over before the daemon has drawn breath.
  * What no fixture run can prove is LONGEVITY — a daemon that stays correct
- * after an hour of editor-realistic watch traffic, pool churn, capacity
+ * after an hour of editor-realistic rebind traffic, pool churn, capacity
  * pressure, quiesce/rebind cycles, and the occasional SIGKILL. Leaks, drift,
  * and unbounded growth are properties of duration, so duration is what this
  * script buys, with everything else held to the same standards as the suite:
@@ -21,13 +21,16 @@
  *     grown past a generous bound.
  *
  * Phases, cycled until the clock runs out (SOAK_MINUTES, default 10):
- *   (a) session loop — up --watch, sync with real file churn, exec, logs, release
- *   (b) watch traffic — plain saves, atomic-rename saves (tmp+mv), deletions,
- *       burst storms, and an upkeep-trigger touch that MUST produce the
- *       documented fallback restart (new service pid + upkeep marker)
- *   (c) run loop — checks with verdict assertions (pass, fail, detach, unknown)
- *   (d) capacity churn — a second stack at POOL_MAX with extra holders
- *       queueing, short-TTL lease expiries, and a quiesce/rebind cycle under a
+ *   (a) session loop — up, repeated up with real file churn, exec, logs, release
+ *   (b) restart traffic — a source edit + up must keep a service that has no
+ *       build (same pid), and an upkeep-trigger touch + up MUST produce the
+ *       full-bind restart (new service pid + upkeep marker)
+ *   (c) env export — `ctx --env` must parse as KEY=value lines, and the
+ *       stack's own check run with them must pass (decision 0032: runly no
+ *       longer runs checks)
+ *   (d) capacity churn — a second stack whose one environment (decision
+ *       0032) is held by a short-TTL holder while another queues on its
+ *       expiry, lease expiries, and a quiesce/rebind cycle under a
  *       short BACKLOT_LEASED_IDLE_TTL_MS — the sweeper must keep reclaiming
  *   (e) chaos ticks every ~2 min — SIGKILL the daemon (next verb must
  *       recover), SIGSTOP/SIGCONT (starvation-shaped; a true lid-close sleep
@@ -41,7 +44,7 @@
 import { spawn, execFile, execFileSync } from 'node:child_process';
 import {
   mkdtempSync, mkdirSync, writeFileSync, appendFileSync, readFileSync,
-  rmSync, renameSync, existsSync, readdirSync,
+  rmSync, existsSync, readdirSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve, dirname } from 'node:path';
@@ -107,8 +110,7 @@ mkdirSync(stacksDir, { recursive: true });
 const daemonEnv = Object.fromEntries(Object.entries(process.env).filter(([k]) => !k.startsWith('BACKLOT_')));
 Object.assign(daemonEnv, {
   BACKLOT_STATE_DIR: stateDir,
-  BACKLOT_POOL_MAX: '2', // per stack: session + run, the documented core loop
-  BACKLOT_POOL_MAX_TOTAL: '6', // A(2) + B(2) + one chaos stack, with headroom
+  BACKLOT_POOL_MAX_TOTAL: '6', // A + B + one chaos stack (one environment each, decision 0032), with headroom
   BACKLOT_SWEEP_MS: '1000', // expiries/quiesces/reaps within seconds, not minutes
   BACKLOT_GC_MS: '15000',
   BACKLOT_IDLE_TTL_MS: '45000',
@@ -151,11 +153,9 @@ function must(cond, phase, what, evidence) {
 const stats = {
   verbs: new Map(), // verb -> { n, failed }
   binds: 0,
-  watchProjections: 0,
+  keptServices: 0,
   fallbackRestarts: 0,
-  runsPass: 0,
-  runsFail: 0,
-  jobsPolled: 0,
+  envChecks: 0,
   queuedAcquires: 0,
   leaseExpiries: 0,
   quiesceRebinds: 0,
@@ -181,14 +181,7 @@ function expectedExit(args, body) {
     return c === 'work-error' ? 1 : c === 'infra-error' ? 3 : 2;
   }
   const verb = args[0];
-  if (verb === 'run') {
-    if (args.includes('--detach')) return 0; // detach returns { jobId } immediately
-    return body.ok ? 0 : 1;
-  }
   if (verb === 'exec') return body.exitCode === 0 ? 0 : 1;
-  if (verb === 'job' && args[1] !== 'ls') {
-    return body.state === 'done' && body.verdict && body.verdict.ok === false ? 1 : 0;
-  }
   return 0;
 }
 
@@ -277,9 +270,9 @@ async function fetchJson(url, timeoutMs = 3000) {
 /**
  * Stack A: the editor-realistic stack — an HTTP service over sqlite (the same
  * shape as examples/hello-web), a tree of source files to churn, an upkeep rule
- * on deps.lock so a watch save can be forced down the fallback-restart path,
- * and one passing + one failing check for verdict assertions. /health reports
- * the service PID so a restart is observable from outside.
+ * on deps.lock so an up can be forced down the full-bind restart path, and a
+ * check of its own that reads `runly ctx --env`. /health reports the service
+ * PID so a restart is observable from outside.
  */
 function writeStackA(dir) {
   mkdirSync(join(dir, 'src'), { recursive: true });
@@ -305,15 +298,6 @@ datastores:
 
 upkeep:
   - { when: deps.lock, run: node upkeep-mark.mjs }
-
-checks:
-  pass:
-    run: node check-pass.mjs
-    env: { BASE_URL: "{{services.web.url}}" }
-    timeout: 60
-  fail:
-    run: node check-fail.mjs
-    timeout: 30
 `);
   writeFileSync(join(dir, 'server.mjs'), `import { createServer } from 'node:http';
 import { DatabaseSync } from 'node:sqlite';
@@ -347,7 +331,7 @@ const ins = db.prepare('INSERT INTO items (label) VALUES (?)');
 for (const l of rows) ins.run(l);
 console.log('seeded ' + dbPath + ' (' + preset + ', ' + rows.length + ' rows)');
 `);
-  writeFileSync(join(dir, 'check-pass.mjs'), `const base = process.env.BASE_URL;
+  writeFileSync(join(dir, 'check-pass.mjs'), `const base = process.env.RUNLY_URL_WEB;
 for (let i = 0; ; i++) {
   try {
     const h = await (await fetch(base + '/health')).json();
@@ -361,9 +345,6 @@ for (let i = 0; ; i++) {
     await new Promise((r) => setTimeout(r, 500));
   }
 }
-`);
-  writeFileSync(join(dir, 'check-fail.mjs'), `console.error('deliberately failing — the soak asserts this exact verdict');
-process.exit(1);
 `);
   writeFileSync(join(dir, 'upkeep-mark.mjs'), `import { appendFileSync } from 'node:fs';
 appendFileSync('.upkeep-ran', Date.now() + '\\n');
@@ -385,8 +366,6 @@ services:
     port: web
     env: { PORT: "{{ports.web}}" }
     ready: { http: /health, timeout: 20 }
-checks:
-  ok: { run: "true" }
 `);
   writeFileSync(join(dir, 'srv.mjs'), `import { createServer } from 'node:http';
 createServer((req, res) => {
@@ -397,12 +376,11 @@ createServer((req, res) => {
 }
 
 function gitInit(dir) {
-  // Sync enumerates via git ls-files when a repo exists (untracked included),
-  // which is the realistic path; without git the walk-all fallback still works.
+  // A worktree is a git repo in real use; runly works without one too.
   try {
     execFileSync('git', ['init', '-q'], { cwd: dir, stdio: 'ignore' });
   } catch {
-    /* no git on PATH — sync's walkAll path takes over */
+    /* no git on PATH — the stack is identified by its directory alone */
   }
 }
 
@@ -413,7 +391,6 @@ writeStackMin(stackB, 'soak-b');
 gitInit(stackA);
 gitInit(stackB);
 
-const envTreeOf = (envId) => join(stateDir, 'envs', envId, 'tree');
 let srcRev = 0;
 function churnFiles(n) {
   // Keyed by path — the same file can be drawn twice in one batch, and any
@@ -456,7 +433,7 @@ async function healthPid(url) {
 /** (a) The session loop: the documented human/agent workflow, end to end. */
 async function phaseSession() {
   log(`phase session (cycle ${cycle})`);
-  const ctx = await upA(['--watch']);
+  const ctx = await upA();
   if (!ctx) return;
   const alive = await until(5000, 300, () => fetchJson(ctx.urls.web + '/health'));
   must(alive && alive.ok === true, 'session', 'service url does not answer /health after up', ctx.urls.web);
@@ -464,13 +441,14 @@ async function phaseSession() {
   for (let i = 0; i < iterations && timeLeft() > 20_000; i++) {
     const changed = churnFiles(randInt(1, 5));
     await sleep(randInt(100, 500));
-    const s = await cli(['sync'], { cwd: stackA });
-    must(s.body?.state === 'hot', 'session', 'sync did not return a hot context', s.stdout);
-    // The projection must be REAL: read a changed file back from inside the env.
+    const s = await cli(['up'], { cwd: stackA });
+    must(s.body?.state === 'hot', 'session', 'a repeated up did not return a hot context', s.stdout);
+    must(s.body?.envId === ctx.envId, 'session', 'a repeated up switched environments', `${s.body?.envId} != ${ctx.envId}`);
+    // The environment must see the worktree: read a changed file back through exec.
     const probe = pick(changed);
     const ex = await cli(['exec', `cat ${probe.rel}`], { cwd: stackA });
     must(ex.body?.exitCode === 0 && ex.body?.stdout === probe.content, 'session',
-      'exec read back different content than sync projected', `wanted:\n${probe.content}\ngot:\n${ex.body?.stdout}`);
+      'exec read back different content than the worktree holds', `wanted:\n${probe.content}\ngot:\n${ex.body?.stdout}`);
     const lg = await cli(['logs', 'web', '--lines', '20'], { cwd: stackA });
     must(typeof lg.body?.lines === 'string', 'session', 'logs returned no lines field', lg.stdout);
     await sleep(randInt(100, 600));
@@ -481,126 +459,59 @@ async function phaseSession() {
   must(rel.body?.released === true, 'session', 'release reported nothing released', rel.stdout);
 }
 
-/** Wait for one file's env-tree copy to converge to `content` (null = deleted). */
-function converged(envId, rel, content) {
-  return until(12_000, 200, () => {
-    const p = join(envTreeOf(envId), rel);
-    if (content === null) return !existsSync(p);
-    try {
-      return readFileSync(p, 'utf8') === content;
-    } catch {
-      return false;
-    }
-  });
-}
-
-/** (b) Watch traffic: what a human with an editor actually generates. */
-async function phaseWatch() {
-  log(`phase watch (cycle ${cycle})`);
-  const ctx = await upA(['--watch']);
+/**
+ * (b) Restart traffic: what `up` restarts (decision 0032). Stack A's web has no
+ * build, so a source edit + up keeps its process; a deps.lock touch makes the
+ * upkeep rule due, and up takes the full bind: rule runs, services restart.
+ * Both halves observed from outside — the pid on the stable URL, the marker.
+ */
+async function phaseRestart() {
+  log(`phase restart (cycle ${cycle})`);
+  const ctx = await upA();
   if (!ctx) return;
-  const envId = ctx.envId;
+  const pidBefore = await until(5000, 250, () => healthPid(ctx.urls.web));
+  churnFiles(randInt(1, 5));
+  const kept = await cli(['up'], { cwd: stackA });
+  const pidKept = await until(5000, 250, () => healthPid(ctx.urls.web));
+  if (must(kept.body?.bindDiagnostics?.reuse === 'reused' && pidKept === pidBefore, 'restart',
+    'a source edit + up restarted a service that has no build', `reuse=${kept.body?.bindDiagnostics?.reuse} pid ${pidBefore} -> ${pidKept}`)) stats.keptServices++;
 
-  // Plain saves.
-  for (const c of churnFiles(randInt(1, 3))) {
-    if (must(await converged(envId, c.rel, c.content), 'watch', `plain save never projected (${c.rel})`)) stats.watchProjections++;
+  const markerPath = join(stackA, '.upkeep-ran');
+  const markerBefore = existsSync(markerPath) ? readFileSync(markerPath, 'utf8') : '';
+  appendFileSync(join(stackA, 'deps.lock'), `bump ${cycle} ${Math.floor(rand() * 1e9)}\n`);
+  const full = await cli(['up'], { cwd: stackA });
+  const marker = existsSync(markerPath) ? readFileSync(markerPath, 'utf8') : '';
+  const pidAfter = await until(10_000, 250, () => healthPid(ctx.urls.web));
+  if (must(full.body?.bindDiagnostics?.reuse === 'rebound' && marker.length > markerBefore.length && pidAfter && pidAfter !== pidKept, 'restart',
+    'upkeep-trigger touch + up never produced the full-bind restart',
+    `reuse=${full.body?.bindDiagnostics?.reuse}; pid ${pidKept} -> ${pidAfter}; marker before: ${markerBefore.split('\n').length - 1} line(s)`)) {
+    stats.fallbackRestarts++;
+    log(`  full-bind restart observed: pid ${pidKept} -> ${pidAfter}`);
   }
-
-  // Atomic-rename save — how VS Code, vim, and every safe-write editor saves.
-  {
-    const rel = `src/mod_${String(randInt(0, 23)).padStart(2, '0')}.txt`;
-    const content = `atomic save ${++srcRev} tag ${Math.floor(rand() * 1e9)}\n`;
-    const tmp = join(stackA, `${rel}.tmp-${srcRev}`);
-    writeFileSync(tmp, content);
-    renameSync(tmp, join(stackA, rel));
-    if (must(await converged(envId, rel, content), 'watch', `atomic-rename save never projected (${rel})`)) stats.watchProjections++;
-  }
-
-  // Deletion: create, converge, delete, converge-to-absent.
-  {
-    const rel = `src/ephemeral_${cycle}.txt`;
-    const content = `short-lived ${srcRev}\n`;
-    writeFileSync(join(stackA, rel), content);
-    await converged(envId, rel, content);
-    rmSync(join(stackA, rel));
-    if (must(await converged(envId, rel, null), 'watch', `deletion never mirrored (${rel})`)) stats.watchProjections++;
-  }
-
-  // Burst storm: a rebase / branch switch / format-on-save-all. Many writes
-  // inside the debounce window; the only honest assertion is convergence of a
-  // sentinel written LAST, plus spot-checked storm files.
-  if (timeLeft() > 40_000) {
-    const n = randInt(30, 80);
-    mkdirSync(join(stackA, 'src', 'storm'), { recursive: true });
-    let lastRel = '';
-    let lastContent = '';
-    for (let i = 0; i < n; i++) {
-      lastRel = `src/storm/f_${i % randInt(8, 20)}.txt`;
-      lastContent = `storm ${cycle}:${i} tag ${Math.floor(rand() * 1e9)}\n`;
-      writeFileSync(join(stackA, lastRel), lastContent);
-      if (rand() < 0.2) await sleep(randInt(5, 40));
-    }
-    const sentinelRel = 'src/storm/sentinel.txt';
-    const sentinel = `storm-sentinel ${cycle} ${Math.floor(rand() * 1e9)}\n`;
-    writeFileSync(join(stackA, sentinelRel), sentinel);
-    const okStorm =
-      (await converged(envId, sentinelRel, sentinel)) && (await converged(envId, lastRel, lastContent));
-    if (must(okStorm, 'watch', `burst storm (${n} writes) never converged`)) stats.watchProjections++;
-  }
-
-  // The upkeep-trigger touch. A save that changes what an upkeep rule
-  // fingerprints CANNOT be served by projection — the engine documents a
-  // deliberate fallback to the full bind path: rule runs, services restart.
-  // Observe both halves from outside: the marker the rule writes, and a new
-  // service pid on the same (stable) URL.
-  {
-    const pidBefore = await until(5000, 250, () => healthPid(ctx.urls.web));
-    const markerPath = join(envTreeOf(envId), '.upkeep-ran');
-    const markerBefore = existsSync(markerPath) ? readFileSync(markerPath, 'utf8') : '';
-    appendFileSync(join(stackA, 'deps.lock'), `bump ${cycle} ${Math.floor(rand() * 1e9)}\n`);
-    const restarted = await until(45_000, 500, async () => {
-      const marker = existsSync(markerPath) ? readFileSync(markerPath, 'utf8') : '';
-      if (marker.length <= markerBefore.length) return false;
-      const pid = await healthPid(ctx.urls.web);
-      return pid !== pidBefore ? pid : false;
-    });
-    if (must(restarted, 'watch', 'upkeep-trigger touch never produced the fallback restart',
-      `pid before: ${pidBefore}; marker before: ${markerBefore.split('\n').length - 1} line(s)`)) {
-      stats.fallbackRestarts++;
-      log(`  fallback restart observed: pid ${pidBefore} -> ${restarted}`);
-    }
-  }
-  // The lease stays up: phase (c) runs against a pool that also holds a session.
+  // The lease stays up: phase (c) reads this session's environment.
 }
 
-/** (c) The run loop: verdicts an agent would branch on, asserted exactly. */
-async function phaseRuns() {
-  log(`phase runs (cycle ${cycle})`);
-  const r1 = await cli(['run', 'pass'], { cwd: stackA });
-  if (must(r1.body?.ok === true && r1.body?.exitCode === 0 && r1.body?.failure === null, 'run',
-    "run pass did not yield { ok: true, exitCode: 0, failure: null }", r1.stdout.slice(0, 400))) stats.runsPass++;
-
-  const r2 = await cli(['run', 'fail'], { cwd: stackA });
-  if (must(r2.body?.ok === false && r2.body?.failure?.class === 'work-error', 'run',
-    'run fail must verdict work-error (env-error here would be the silently-wrong-verdict bug)', r2.stdout.slice(0, 400))) stats.runsFail++;
-
-  if (rand() < 0.5 && timeLeft() > 60_000) {
-    const d = await cli(['run', 'pass', '--detach'], { cwd: stackA });
-    if (must(typeof d.body?.jobId === 'string', 'run', 'run --detach returned no jobId', d.stdout)) {
-      const done = await until(90_000, 1000, async () => {
-        const j = await cli(['job', d.body.jobId], { cwd: stackA, quiet: true });
-        stats.jobsPolled++;
-        return j.body?.state === 'done' ? j.body : false;
-      });
-      must(done && done.verdict?.ok === true, 'run', 'detached run never reached a passing verdict', JSON.stringify(done).slice(0, 400));
-    }
+/** (c) Env export: a repo's own check, fed by `runly ctx --env`. */
+async function phaseEnvExport() {
+  log(`phase env export (cycle ${cycle})`);
+  const out = await new Promise((resolveOut) => {
+    execFile(process.execPath, [CLI, 'ctx', '--env'], { cwd: stackA, env: daemonEnv, timeout: 30_000 }, (err, stdout, stderr) =>
+      resolveOut({ code: err ? (err.code ?? 1) : 0, stdout: String(stdout), stderr: String(stderr) }));
+  });
+  const vars = {};
+  const bad = [];
+  for (const line of out.stdout.split('\n').filter(Boolean)) {
+    const m = /^(RUNLY_[A-Z0-9_]+)=(.*)$/.exec(line);
+    if (!m) bad.push(line);
+    else vars[m[1]] = m[2].replace(/^'(.*)'$/, '$1');
   }
-
-  if (rand() < 0.4) {
-    const r3 = await cli(['run', 'no-such-check'], { cwd: stackA });
-    must(r3.body?.ok === false && r3.body?.error?.class === 'work-error', 'run',
-      'unknown check must be a work-error naming the checks that exist', r3.stdout);
-  }
+  if (!must(out.code === 0 && bad.length === 0 && vars.RUNLY_URL_WEB && vars.RUNLY_DATASTORE_MAIN_URL, 'env',
+    'ctx --env did not print the expected KEY=value lines', `${out.code} ${out.stdout}${out.stderr}`.slice(0, 400))) return;
+  const check = await new Promise((resolveCheck) => {
+    execFile(process.execPath, ['check-pass.mjs'], { cwd: stackA, env: { ...process.env, ...vars }, timeout: 60_000 }, (err, stdout, stderr) =>
+      resolveCheck({ code: err ? (err.code ?? 1) : 0, out: String(stdout) + String(stderr) }));
+  });
+  if (must(check.code === 0, 'env', "the stack's own check failed against ctx --env", check.out.slice(0, 400))) stats.envChecks++;
 }
 
 async function statusEnvs() {
@@ -611,13 +522,13 @@ async function statusEnvs() {
 /** (d) Capacity churn on stack B: queueing, expiries, quiesce — the sweeper's beat. */
 async function phaseCapacity() {
   log(`phase capacity (cycle ${cycle})`);
-  // Two short-TTL holders occupy POOL_MAX=2; a third queues on the expiry.
-  const h1 = await cli(['up', '--holder', 'soak-h1', '--ttl', '0.12'], { cwd: stackB }); // ~7s
-  const h2 = await cli(['up', '--holder', 'soak-h2', '--ttl', '0.07'], { cwd: stackB }); // ~4s
-  must(h1.body?.state === 'hot' && h2.body?.state === 'hot', 'capacity', 'stack B holders failed to bind', `${h1.stdout.slice(0, 200)} ${h2.stdout.slice(0, 200)}`);
+  // A short-TTL holder holds stack B's one environment (decision 0032); a
+  // second holder queues on its expiry.
+  const h1 = await cli(['up', '--holder', 'soak-h1', '--ttl', '0.07'], { cwd: stackB }); // ~4s
+  must(h1.body?.state === 'hot', 'capacity', 'stack B holder failed to bind', h1.stdout.slice(0, 200));
   const t0 = Date.now();
   const h3 = await cli(['up', '--holder', 'soak-h3'], { cwd: stackB, timeoutMs: 90_000 });
-  if (must(h3.body?.state === 'hot', 'capacity', 'queued holder never acquired at POOL_MAX (waited past the expiry window)', h3.stdout.slice(0, 300))) {
+  if (must(h3.body?.state === 'hot', 'capacity', 'queued holder never acquired the worktree\'s environment (waited past the expiry window)', h3.stdout.slice(0, 300))) {
     stats.queuedAcquires++;
     log(`  queued acquire served after ${Date.now() - t0}ms`);
   }
@@ -628,7 +539,7 @@ async function phaseCapacity() {
     const envs = await statusEnvs();
     return envs.filter((e) => e.stack.startsWith('soak-b') && e.lease).length === 0;
   });
-  if (must(cleared, 'capacity', 'expired stack-B leases were never swept')) stats.leaseExpiries += 2;
+  if (must(cleared, 'capacity', 'expired stack-B leases were never swept')) stats.leaseExpiries += 1;
 
   // Quiesce cycle: a leased-but-idle env must lose its heat (services stop,
   // lease kept), refuse exec with a rebind hint, and come back hot on `up`.
@@ -842,7 +753,6 @@ async function convergence() {
   for (const [args, cwd] of [
     [['release'], stackA],
     [['release', '--holder', 'soak-h1'], stackB],
-    [['release', '--holder', 'soak-h2'], stackB],
     [['release', '--holder', 'soak-hq'], stackB],
   ]) {
     try {
@@ -940,10 +850,9 @@ function printStats() {
   }
   lines.push('');
   lines.push(`  binds (hot ups)        ${stats.binds}`);
-  lines.push(`  watch projections      ${stats.watchProjections}`);
-  lines.push(`  fallback restarts      ${stats.fallbackRestarts}`);
-  lines.push(`  runs pass / fail       ${stats.runsPass} / ${stats.runsFail}`);
-  lines.push(`  detached polls         ${stats.jobsPolled}`);
+  lines.push(`  services kept on up    ${stats.keptServices}`);
+  lines.push(`  full-bind restarts     ${stats.fallbackRestarts}`);
+  lines.push(`  env-export checks      ${stats.envChecks}`);
   lines.push(`  queued acquires        ${stats.queuedAcquires}`);
   lines.push(`  lease expiries swept   ${stats.leaseExpiries}`);
   lines.push(`  quiesce -> rebind      ${stats.quiesceRebinds}`);
@@ -1011,10 +920,10 @@ async function main() {
       await phaseSession();
       await maybeChaos();
       if (timeLeft() < 30_000) break;
-      await phaseWatch(); // leaves the session lease up, deliberately
+      await phaseRestart(); // leaves the session lease up, deliberately
       await maybeChaos();
       if (timeLeft() < 30_000) break;
-      await phaseRuns(); // a run next to a live session needs the 2nd env
+      await phaseEnvExport(); // reads that session's environment
       if (timeLeft() < 45_000) break;
       await phaseCapacity();
       await cli(['release'], { cwd: stackA, quiet: true });

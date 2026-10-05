@@ -36,9 +36,9 @@ Coding agents (and the humans supervising them) need three things from a web
 application under development, constantly:
 
 1. **Inspect** — a running, seeded, logged-in instance to look at and drive.
-2. **Prove** — system-level tests (e2e) against a deterministic environment, with a
-   machine-readable verdict.
-3. **Iterate** — the fix-sync-retest loop, in seconds, against real running services —
+2. **Prove** — system-level tests (e2e) against a deterministic environment — the
+   repo's own tests, fed the environment by `runly ctx --env`.
+3. **Iterate** — the fix-rebind-retest loop, in seconds, against real running services —
    *before* committing and long before CI.
 
 CI cannot serve this: CI proves *committed* state to *the team*; agents need to prove
@@ -59,26 +59,28 @@ These are where tools like this die of scope creep. runly:
 - **Is never a build system.** It *invokes* the repo's commands; it never understands
   them. There is no plugin that knows what Angular is.
 - **Is never CI.** CI may call runly; never the reverse.
-- **Is never the agent.** No LLM calls, no browser driving, no test authoring. runly
-  guarantees URLs, credentials, data states, and verdicts; what the consumer does with
+- **Is never the agent, nor the test runner.** No LLM calls, no browser driving, no
+  test authoring, no verdicts (decision 0032). runly guarantees URLs, credentials and
+  data states; what the consumer does with
   them is its business.
 
 **Scope (v1):** web applications — N HTTP-ish services + M datastores, with a browser
 as the primary consumer. Portless workers and multi-datastore stacks are in scope;
 Kubernetes, Windows, secrets management, and dashboards are not.
 
-## 3. The model — five nouns and a verb
+## 3. The model — five nouns
 
 | Noun | What it is |
 | --- | --- |
-| **Stack** | What a repo declares in `runly.yml`: services, datastores, seed presets, upkeep rules, checks. The only repo-specific artifact. |
+| **Stack** | What a repo declares in `runly.yml`: services, datastores, seed presets, upkeep rules. The only repo-specific artifact. |
 | **Substrate** | Where environments physically live, behind a driver: `local` (supervised processes in a directory), later `docker`, `morph`, `sprites`, `ssh`. |
-| **Environment** | A pooled slot on a substrate: its own copy of the tree, warm caches, running services, allocated ports, a datastore namespace. Durable; belongs to the pool, never to a person or task. A lease may cover a **subset** of it — a service slice (`up <service>`), or the datastores alone (`up --data-only`, [decision 0023](decisions/0023-data-only-leases.md)) for a test lane that needs a seeded database rather than an application. |
-| **Binding** | A source state (ref + dirty diff) plus a data state (preset, at a hygiene level) attached to an environment. An immutable snapshot. |
+| **Environment** | A pooled slot on a substrate: running services, allocated ports, a datastore namespace, its logs — running **in the caller's worktree**, whose caches it shares ([decision 0032](decisions/0032-environments-run-in-the-callers-worktree.md)). Durable; belongs to the pool, never to a person or task. A lease may cover a **subset** of it — a service slice (`up <service>`), or the datastores alone (`up --data-only`, [decision 0023](decisions/0023-data-only-leases.md)) for a test lane that needs a seeded database rather than an application. |
+| **Binding** | A source state (the caller's worktree, as it is) plus a data state (preset, at a hygiene level) attached to the worktree's one environment. Since decision 0032 it is not a frozen snapshot: the services read the live worktree, and runly records no identity of it. |
 | **Lease** | Temporary ownership of an environment; see [lease deadlines and renewal](../README.md#how-long-you-hold-it---ttl-for-agents---holder-pid-for-shells). Expiry returns the environment to the pool **warm** — nothing is torn down. |
 
-Plus one verb-noun: a **Run** — a named check executed against a binding, producing an
-exit code, a JSON verdict, and collected artifacts.
+There used to be a sixth, verb-noun: a **Run**, a named check executed against a
+binding with a JSON verdict. Decision 0032 removed it: a repo runs its own tests
+against `runly ctx --env`.
 
 ### The two inversions everything follows from
 
@@ -87,11 +89,16 @@ structurally, not by reaping harder: when a lease lapses (agent crashed, human f
 the environment returns to the pool with all its heat intact. There is never anything
 running *for nobody* — the pool is a fixed, intentional set.
 
-**Watchers never move; bindings move.** An environment's dev servers watch the
-*environment's own tree*, forever. Pointing them at different work means syncing
-different work into that tree. Source worktrees visit environments; environments never
-visit worktrees. Consequences: caches survive rebinds, ports (and therefore URLs) are
-stable for an environment's lifetime, and the consumer's worktree is never touched.
+**Environments run in the worktree; ports never move.** This used to read "watchers
+never move; bindings move": each environment kept its own projected copy of the
+worktree, and its dev servers watched that copy. Measured on the founding monorepo,
+the copy cost a full source copy plus a second, cold set of caches per environment
+(.NET and pnpm caches embed absolute paths, so they never transfer between
+paths) while the agent's persistent worktree already held warm ones. Since
+[decision 0032](decisions/0032-environments-run-in-the-callers-worktree.md) the
+services build and run in the caller's worktree; what stays the environment's
+own is its ports (and therefore URLs, stable for its lifetime), its datastore
+namespace and its logs.
 
 ### Physical stack identity
 
@@ -136,11 +143,13 @@ records.
 
 ### The safety invariant
 
-**An environment never holds the only copy of anything.** The consumer's worktree
-remains the sole source of truth; the environment's tree is a disposable projection;
-templates are rebuildable by definition. Every reclaim decision — lease expiry, recycle,
-teardown, even losing the machine — is therefore safe by construction. (Contrast with
-worktree-hosted harnesses, where teardown must agonize over unlanded work.)
+**An environment's private state never holds the only copy of anything, and runly
+never deletes the worktree.** The consumer's worktree remains the sole source of truth
+and is where the environment runs; the environment's own directory (data, logs) is
+disposable; templates are rebuildable by definition. Every reclaim decision — lease
+expiry, recycle, teardown, even losing the machine — deletes only that private
+directory, and teardown checks that it lies under the state root and does not contain
+the worktree before it does (decision 0032).
 
 ## 4. Convergence, not checkpointing
 
@@ -181,11 +190,10 @@ Local pools are convergence all the way down. Same verbs above the driver line.
   should still warm the daemon with a cheap `runly status` before parallelizing.
 - **Concurrency lives at the environment boundary**: a short pool lock serializes
   claim/release bookkeeping; one lock per environment serializes bind/exec/reset on it.
-  Different environments (and different stacks) bind in parallel — with the caveat
-  that sync hashing, file copying and the `git` calls are synchronous, so a very
-  large bind still blocks the daemon's event loop and delays others while it runs;
-  the sweeper never
-  expires or quiesces an environment with an operation in flight.
+  A third, per-worktree lock serializes what writes into a worktree (upkeep, builds)
+  between its one environment and `runly warm`, which can run with none;
+  environment locks are always taken first. Different stacks bind in parallel; the
+  sweeper never expires or quiesces an environment with an operation in flight.
 - **Local even when compute is remote.** A Morph environment is a pool entry whose
   driver executes over SSH. The consumer's machine is the brain; substrates are muscles.
 - **Disk is truth; daemon memory is a cache.** After a daemon crash or reboot, the next
@@ -200,10 +208,10 @@ Local pools are convergence all the way down. Same verbs above the driver line.
 recycled (`pristine` rebuild). Rebind from hot ≈ seconds; from warm ≈ start + ready-wait;
 pristine ≈ full provision (bounded by templates and shared caches, below).
 
-**Two caps, and eviction between them.** `poolMax` is per stack; `poolMaxTotal` is
-machine-wide, because the heuristic behind both is derived from this host's cores and
-memory and three projects would otherwise each spend the whole budget. Both gate
-environment **creation** only — rebinding an existing environment is never
+**One environment per worktree, a machine-wide cap, and eviction.** A stack (one
+worktree) has exactly one environment since decision 0032, so the old per-stack
+`poolMax` bounds nothing; `poolMaxTotal` is machine-wide, derived from this host's
+cores and memory. It gates environment **creation** only — rebinding an existing environment is never
 capacity-checked — so the row count is what bounds worst-case concurrent load.
 
 That made a cold environment permanently expensive: idle reclamation quiesces *heat*,
@@ -239,75 +247,89 @@ cheap ceiling into application capacity, since reuse is never capacity-checked
 (decision 0025). Eviction is bucketed for the same reason: a data-only request can
 only give up a cold data-only environment.
 
-## 6. Sync — "verbs sync, watch streams"
+## 6. In place — "verbs converge, watch observes"
 
-Nothing observes the consumer's worktree by default. Every action verb (`run`, `up`,
-`sync`, `bind`) begins by capturing the worktree — the file set from `git ls-files`
-(tracked + untracked-unignored, plus `sync.include`) — and projecting it into the
-environment with **stat-gated, hash-verified copies**: a warm rebind stats instead of
-re-hashing, only changed files copy (CoW clone where the filesystem supports it), and
-deletions are mirrored from the previous binding. (The `git fetch` + patch transport is
-the planned *remote-substrate* path for 0.3, where the sync boundary becomes the
-local/remote abstraction; the local substrate is enumerate-and-copy.)
+(The heading keeps its old anchor; there is no watcher any more.)
 
-- **Bindings are immutable snapshots.** A running check executes against the revision
-  synced at start; edits mid-run cannot contaminate the verdict. New sync = new binding
-  revision.
-- `runly sync` takes the same source-only projection as a watch save — services
-  kept, the dev servers' own watchers reload — when EVERY service declares
-  `hot_reload: true` (its `run:` watches its own tree), the parsed manifest matches
-  the last successful full bind, and the save fires no upkeep rule. The memory-only
-  `appliedManifests` ledger in `engine.ts` records that configuration only after a
-  successful full bind; both projection and ordinary reuse must match it even if
-  `@source` already advanced. Missing ledger entries require a full bind too. See
-  `tests/projection-config-and-detached-pull.test.ts` for regression coverage.
-  Any undeclared service forces the full rebind: projecting under
-  a non-watching process silently serves stale code, the failure class this
-  broker exists to prevent (owner decision, 2026-07-20).
-- `--watch` sessions opt into a daemon-side debounced worktree watcher that auto-syncs
-  on save — the **two-stage reload**: stage 1 projects the changed files into the env
-  tree source-only (same sync implementation as every verb, under the env lock, never
-  sweeping untracked env files), updating the sync cache, the `@source` fingerprint and
-  `lastUsedAt`; stage 2 belongs to the services' own dev watchers (`watch_run`), which
-  pick the projected change up. Services are NOT stopped or restarted on an ordinary
-  save meeting the projection conditions above. **Caveat (deliberate):** a save
-  that changes what an upkeep rule or
-  `@rebake-template` fingerprints — a lockfile, a migration — falls back to the full
-  bind path, which runs the rule and restarts services; skipping the rule silently
-  would hand out an environment the manifest says is stale. Stopped on
-  release/expiry/quiesce/recycle. See [lease renewal](../README.md#how-long-you-hold-it---ttl-for-agents---holder-pid-for-shells) for watch activity.
-- The environment-side reset restores tracked files hard on every bind. A **clean-slate**
-  bind (`--reset-data` or `--pristine`) additionally removes untracked env-side files —
-  droppings left by a check, service, or `exec` — **except** declared `caches:`
-  (node_modules, obj/, …) and `sync.keep` paths. A plain `reuse` bind keeps them, so an
-  undeclared build artifact is not destroyed on every bind; declare expensive output
-  under `caches:` and a poisoned env tree then self-heals on the next clean-slate bind.
-- Git-ignored-but-needed files (`.env.local`) are declarable via `sync.include`.
-- Oversized/binary diffs fall back to file copy past a threshold.
+Since [decision 0032](decisions/0032-environments-run-in-the-callers-worktree.md) an
+environment runs in the caller's worktree — exactly one environment per worktree — so
+nothing is copied. Nothing observes the worktree either, and runly keeps no identity of
+its source and no build cache: it reads only the files the upkeep rules' `when:` globs
+match (§7), and a service's `build:` runs on every `up` that starts it, leaving
+incrementality to the build tool.
 
-### Outputs — the one sanctioned write-back
+- **One environment per worktree.** A bind for a worktree always lands on its
+  environment; a second holder waits for it (refused at once, naming the holder, when
+  the lease outlasts the wait). The sweep recycles surplus environments an older
+  journal left for one worktree.
+- **`up` is the only bind verb, and restarts what a build changed.** Every `up` runs
+  the due upkeep rules and the `build:` of every service it starts. The full
+  stop/data/build/start path is taken when the parsed manifest differs from the last
+  successful full bind (the memory-only `appliedManifests` ledger in `engine.ts`;
+  missing entries count as different), caller inputs or presets changed, an upkeep
+  rule ran, the hygiene is `reset-data`/`pristine`, the environment is not hot and
+  healthy, or the requested shape differs from what runs. Otherwise each active
+  service's build runs between two snapshots of its declared `outputs:` (path, size,
+  mtime — `snapshotOutputs` in `worktree.ts`), and only the services whose snapshot
+  differs — or that declare no outputs — are stopped and started again
+  (`stopServicesForRestart`, then `startSlice` over just those, with the rest counted
+  as already started for `depends_on`). A service with no `build:` keeps running.
+  Dependents of a restarted service are not restarted: its port is stable. See
+  `tests/in-place.test.ts`, `tests/bind-diagnostics.test.ts` and
+  `tests/startup-config.test.ts`.
+- **Tests see the live worktree.** There is no frozen snapshot any more: an edit made
+  while the repo's tests run is visible to the services. runly runs no checks; the
+  tests read the environment from `runly ctx --env` (`RUNLY_PORT_<PORT>`,
+  `RUNLY_URL_<SERVICE>`, `RUNLY_DATASTORE_<NAME>_URL`, `RUNLY_LOGIN_USER`,
+  `RUNLY_LOGIN_PASSWORD`, `RUNLY_ENV_ID`).
+- `sync`, `bind`, `--watch`, `run`, `--detach` and `job` are removed; the CLI answers
+  each with a usage error naming 0032. `watch_run` and `hot_reload` are accepted and
+  ignored.
+- Nothing in the worktree is ever deleted by runly. `reset-data` restores data only;
+  `pristine` clears the worktree's upkeep ledger so every upkeep rule re-runs in
+  place (§8).
+- Git-ignored-but-needed files (`.env.local`) declared under `sync.include` can be
+  matched by an upkeep `when:` glob.
+- `runly warm` runs an idle worktree's due command upkeep rules and its service
+  builds — no lease, no services — writing the same upkeep ledger a bind reads (§7).
 
-Some artifacts are produced env-side but owned worktree-side (a regenerated lockfile, a
-generated API client). Default remains "never touch the worktree"; the exception is
-explicit: manifest-declared `outputs:` are reported in the verdict
-(`outputs_changed: [...]`) and copied back **only** by `runly pull` (or `--pull`).
-The environment may *offer* artifacts; it never silently writes.
+### Outputs — in place
+
+Some files are regenerated by the repo's own commands but owned by the worktree (a
+lockfile, a generated API client). Those commands run in the worktree, so they write
+them where they belong. The former explicit write-back (`runly pull`, `--pull`) is gone
+with the copy it pulled from, and the manifest's top-level `outputs:` (which `run`
+reported on) is ignored. A *service's* `outputs:` is a different thing: what its build
+produces, which decides whether `up` restarts it.
 
 ## 7. Upkeep — the fingerprint ledger
 
 Dependencies, generated code, and toolchain drift are handled by a **closed list** of
-`(fingerprint → action)` rules in the manifest, executed at bind time, after sync,
-before build/start:
+`(fingerprint → action)` rules in the manifest, executed at bind time, before
+build/start:
 
-- Each environment keeps a ledger: the hash of each trigger *as last applied in this
-  env*. The incoming binding's hashes are compared against **that environment's**
-  ledger — **direction-agnostic**, so binding *older* work also converges correctly.
-  Environments don't upgrade; they converge to the binding they serve.
-- **Pool divergence is normal and harmless.** Idle environments are never touched;
-  staleness is bounded by one upkeep pass at next use. Machine-global package stores
+- A rule's fingerprint is the content of exactly the files its `when:` glob matches
+  (git's file list filtered by the globs before anything is stat'ed). Those files'
+  hashes are cached — stat-gated, racily clean — in `worktrees/<stack>/triggers.json`
+  in the state root; the cache holds trigger files and nothing else.
+- The ledger records the hash of each trigger *as last applied*. Since decision 0032
+  command rules are facts about the **worktree** (`worktrees/<stack>/ledger.json`,
+  shared by its environment and by `runly warm`, written under the worktree lock);
+  `@` built-ins describe an **environment** and stay on its row. Comparison stays
+  **direction-agnostic**, so binding *older* work also converges correctly. A rule
+  drops its entry before it runs, so one that fails half-way is never vouched for.
+- Builds are not part of the ledger. A service's `build:` runs on every bind that
+  starts it and on every `warm`; MSBuild, pnpm or the Angular CLI decide what is
+  current.
+- The ledger cannot see what happens to the worktree outside runly: a `node_modules`
+  deleted by hand is still "applied". `--pristine` clears the worktree ledger.
+- **Pool divergence is normal and harmless.** Idle worktrees are never touched by
+  the daemon on its own initiative; staleness is bounded by one upkeep pass at next
+  use, or by an explicit `runly warm`. Machine-global package stores
   (pnpm store, NuGet cache) make the Nth environment's install mostly hard-linking.
 - **No background mutation of environments** (v1): lazy is predictable, and
-  predictability is what agents need.
+  predictability is what agents need. `runly warm` is the manual, explicit form;
+  scheduling it is deferred.
 - **Data templates are keyed by the `create:` command string, not by seed *content***
   (v1's honest limitation): editing a seed script does not auto-invalidate the template.
   Declare an `@rebake-template <datastore>` upkeep rule triggered on the seed files to
@@ -331,8 +353,8 @@ first bind; no presets or templates).
 | Level | Meaning | Typical consumer |
 | --- | --- | --- |
 | `reuse` | retain compatible state; see [preset selection](../README.md#choosing-datastore-presets) | human inspect loop |
-| `reset-data` | restore data template, keep all build caches | agent verify loops (default for runs) |
-| `pristine` | fresh environment | merge-grade verdicts; auto-escalation |
+| `reset-data` | restore data template, keep all build caches | agent verify loops (`up --reset-data` before the tests) |
+| `pristine` | fresh private state; every upkeep rule re-runs in the worktree (nothing there is deleted; builds run on every `up` anyway) | merge-grade proofs; auto-escalation |
 
 Two consecutive bind failures on the same warm environment auto-escalate the next bind
 to `pristine` (a per-env `failStreak` in the journal, cleared by any successful bind) —
@@ -351,13 +373,13 @@ instant and authoritative; no PID-reparenting guesswork, no port-health inferenc
 Readiness is probed (`http`, `log`, or command); declared `fatal_logs` markers fail a
 boot in seconds instead of polling a dead port to timeout. Session services restart
 with bounded backoff; flapping marks the environment degraded → recycled on release.
-A crash mid-run fails the run explicitly — never a silently wrong verdict.
+A crash mid-bind fails the bind explicitly — never a silently wrong answer.
 
 Every failure is classified — the field an agent branches on mechanically:
 
 | Class | Meaning | Who acts |
 | --- | --- | --- |
-| `work-error` | the synced code is at fault (compile error, failing upkeep triggered by your change, test failure) | the consumer fixes and re-syncs |
+| `work-error` | the worktree's code is at fault (compile error, failing upkeep triggered by your change, a service that will not start) | the consumer fixes and runs `up` again |
 | `env-error` | the environment is at fault (stale cache, missing toolchain, flapping service) | runly auto-remediates by recycling |
 | `infra-error` | something external (backing DB down, registry unreachable) | actionable message; nobody's code is blamed |
 
@@ -380,8 +402,8 @@ Every failure is classified — the field an agent branches on mechanically:
   **This makes it a form for callers that outlive the command, and `--ttl` the form for
   agents.** A bind naming an ALREADY-dead pid is refused outright (exit 64), because such a
   lease is released by the next sweep: the environment would go back in the pool while its
-  caller was still using it, and the next bind — a `run` defaulting to the `empty` preset, or
-  another agent — would hand that caller a different, unseeded store through the same URL.
+  caller was still using it, and the next bind — another agent, perhaps on a different
+  preset — would hand that caller a different, unseeded store through the same URL.
   The pattern that produced this in the field was `BACKLOT_HOLDER_PID=$$ runly up` from an
   agent harness, where every command gets a fresh shell, so `$$` is already gone. It presented
   as a stale seed template and cost hours in the wrong subsystem; refusing at bind time is
@@ -390,17 +412,17 @@ Every failure is classified — the field an agent branches on mechanically:
   services (and their memory) alive for the full TTL even if nothing had touched the
   environment since the bind. Now a leased env that goes untouched past `leasedIdleTtlMs`
   quiesces to warm: the lease survives, only the services stop, and the next verb rebinds.
-  "Untouched" counts real use — `exec`, `ctx`, `logs`, `pull` — not just binds, so an actively
+  "Untouched" counts real use — `exec`, `ctx`, `logs` — not just binds, so an actively
   worked environment is never quiesced underneath its agent.
 - **Leases need no heartbeat daemon** because losing a lease is designed to be
-  worthless: an explicit `up` refreshes the TTL (content and read-only verbs deliberately do not,
+  worthless: an explicit `up` refreshes the TTL (`reset-data` and read-only verbs deliberately do not,
   so an idle agent that only polls `ctx` does not hold an environment forever);
   expiry returns the env warm; the source
   of truth never left the worktree. Agents that vanish cost nothing.
 - **Remote is the mirror image**: the world keeps running (and billing) while the lid
   is shut. Therefore remote environments always carry **provider-side TTLs** as the
-  backstop, and **remote runs are submit-and-poll, never a held SSH pipe** — a check
-  executes detached on the box, journaled; the CLI reattaches. Orphan discovery:
+  backstop, and a long remote operation must be submit-and-poll, never a held SSH
+  pipe (decision 0015's remote half; its local `run --detach` was removed in 0032). Orphan discovery:
   drivers tag instances so `pool reconcile` can adopt or reap what the journal forgot.
   Local orphans cost RAM; remote orphans cost money — the asymmetry drives the design.
 - **Locally, the same tagging rule applies to service processes.** Every supervised
@@ -420,15 +442,13 @@ Every failure is classified — the field an agent branches on mechanically:
 The CLI **is** the API: every verb takes `--json`; stdout is data, stderr is human.
 
 ```
-runly up [--watch] [--reset-data|--pristine] [--ttl <minutes>]  # session lease
-runly run <check> [--pristine] [--pull] [--detach]   # run lease → verdict → release
-runly job <id> | job ls                        # poll / list detached runs
-runly ctx                                      # the context blob (below)
-runly sync | bind --ref <sha>                  # project worktree | a committed ref
-runly exec <cmd...>                            # run anything inside the leased env
+runly up [--reset-data|--pristine] [--ttl <minutes>]  # lease; upkeep + builds, restart what changed
+runly ctx [--env]                              # the context blob (below); --env: RUNLY_* lines
+runly warm                                     # due upkeep + builds in this worktree, no lease
+runly exec <cmd...>                            # run anything in the worktree, with the lease's env
 runly logs <service> [--lines N]               # supervised service logs
 runly token --role <r>                         # mint a token via auth.token
-runly reset-data | pull | release
+runly reset-data | release
 runly preview <service> [--ttl <minutes>] | preview stop   # publish one service publicly (below)
 runly status | doctor                          # pool state | active health check
 runly pool ls|recycle [--all]|reconcile|gc|doctor
@@ -451,7 +471,7 @@ pre-0.9.0 daemon boots the whole application and reports success, which is issue
 build. **Leases survive**: services stop, environments go `warm`, and each holder's
 next verb rebinds — the same transition the idle quiesce already performs (decision
 0021), which is why a live lease is reported rather than refused. What *is* refused
-is an in-flight operation (`busy` — the caller is waiting on a verdict over this
+is an in-flight operation (`busy` — the caller is waiting on it over this
 socket) and a downgrade (an older CLI restarting a newer daemon, the direction that
 can strand journal state); `--force` overrides either. runly never installs
 itself — it prints the upgrade command for the detected install.
@@ -460,13 +480,14 @@ The journal stamps `PRAGMA user_version`, and a daemon **refuses to open a state
 root stamped newer than it understands** rather than reading a default where the
 newer build stored meaning.
 
-Every verb accepts `--json`. Exit codes: `0` ok · `1` work-error / failed check ·
+Every verb accepts `--json`. Exit codes: `0` ok · `1` work-error ·
 `2` env-error · `3` infra-error · `64` usage. On a failure the `--json` body is
-`{ok:false, error:{class,message,…}}`; a failed *check* under `run` is
-`{ok:false, exitCode, failure:{class,…}}`.
+`{ok:false, error:{class,message,…}}`. The verbs and flags decision 0032 removed
+(`sync`, `bind`, `pull`, `run`, `job`, `--watch`, `--detach`, `--pull`, `--ref`) exit
+64 naming it, before the daemon is contacted.
 
-**Progress.** The long verbs (`up`, `run`, `sync`, `bind`, `reset-data`) stream bind
-phases (acquire → sync → upkeep → datastore → build → start-and-ready, with an elapsed
+**Progress.** The long verbs (`up`, `warm`, `reset-data`) stream bind
+phases (acquire → upkeep → datastore → build → start-and-ready, with an elapsed
 counter on upkeep rules, builds and readiness waits). The daemon sends these as
 newline-delimited `{type:"progress"}` frames ahead of the single `{type:"result"}` frame;
 the CLI renders them **to stderr**, so the `--json` stdout stays one clean object. Shown
@@ -476,15 +497,19 @@ after the fact by the bind's own result, not by progress: see "Understanding a s
 bind" in the README for `bindDiagnostics`.
 
 `ctx` returns one blob with everything a consumer needs: service URLs (stable per
-environment), login credentials, a token-mint hook, datastore connection strings,
-artifact directory, hygiene state, and recent service events. An agent holding this
-blob needs nothing else from runly.
+environment), allocated ports, login credentials, a token-mint hook, datastore
+connection strings, hygiene state, and recent service events. An agent holding this
+blob needs nothing else from runly. `ctx --env` prints the part a test command needs as
+shell-exportable lines with stable names: `RUNLY_ENV_ID`, `RUNLY_PORT_<PORT>`,
+`RUNLY_URL_<SERVICE>`, `RUNLY_DATASTORE_<NAME>_URL`, `RUNLY_LOGIN_USER`,
+`RUNLY_LOGIN_PASSWORD` (names upper-cased, other characters as `_`; a value is
+single-quoted only when a shell needs it) — `eval "$(runly ctx --env)" && pnpm e2e`.
 
 **Public preview (decision 0027).** `runly preview <service>` publishes one leased
 service through a preview **publisher** adapter (default: a Cloudflare quick tunnel via
 `cloudflared`, an env-error when absent) and reports the URL in `ctx.previewUrls`;
 `runly preview stop` ends it. It is opt-in per invocation and **scoped to the lease,
-not to the service incarnation** — a `sync`, a rebind or an idle quiesce leaves the
+not to the service incarnation** — a restarting `up`, a rebind or an idle quiesce leaves the
 tunnel up, while `release`, TTL lapse, teardown, `shutdown` and crash recovery all reap
 it. Exceptions and `previewNotice` reporting are defined by
 [preview reconciliation](decisions/0027-lease-scoped-public-preview.md).
@@ -501,20 +526,19 @@ for the removal decision.
 ### Configuration
 
 Policy lives in the engine, never the manifest. Precedence per knob: environment
-variable > `$STATE_DIR/config.json` > built-in default.
+variable > `$STATE_DIR/config.json` > built-in default. The per-stack ceiling
+(`BACKLOT_POOL_MAX` / `poolMax`) and the run, artifact and job knobs were removed by
+decision 0032; a leftover setting is ignored.
 
 | Env var | config.json key | Default |
 | --- | --- | --- |
 | `BACKLOT_STATE_DIR` | — | `$XDG_STATE_HOME/backlot` (the per-machine root; 0700) |
 | `BACKLOT_LEASED_IDLE_TTL_MS` | `leasedIdleTtlMs` | `2 x idleTtlMs` — a LEASED but untouched env stops its services (keeps the lease) |
-| `BACKLOT_POOL_MAX` | `poolMax` | `min(cores/2, memGB/4)`, clamped **[2,8]** — the floor is 2 because `up` + `run` needs two envs |
-| `BACKLOT_POOL_MAX_TOTAL` | `poolMaxTotal` | same heuristic, **machine-wide across every stack**, application envs only. When this is what binds, a cold unleased env is evicted rather than the caller refused |
+| `BACKLOT_POOL_MAX_TOTAL` | `poolMaxTotal` | `min(cores/2, memGB/4)`, clamped **[2,8]**, **machine-wide across every stack**, application envs only. When this is what binds, a cold unleased env is evicted rather than the caller refused |
 | `BACKLOT_POOL_MAX_DATA_ONLY` | `poolMaxDataOnly` | `max(4, 2 x heuristic)` — data-only envs, machine-wide, counted against neither application cap (decision 0025) |
-| `BACKLOT_LEASE_TTL_MS` | `sessionTtlMs` / `runTtlMs` | 30 min / 10 min |
+| `BACKLOT_LEASE_TTL_MS` | `sessionTtlMs` | 30 min |
 | `BACKLOT_IDLE_TTL_MS` | `idleTtlMs` | 30 min |
 | `BACKLOT_WAIT_MS` | `waitMs` | 60 s (queue-at-capacity timeout; also bounds a shape change waiting on an operation in flight on the holder's own environment) |
-| `BACKLOT_ARTIFACT_DAYS` | `artifactDays` | 7 |
-| `BACKLOT_JOB_DAYS` | `jobDays` | 7 |
 | `BACKLOT_LOG_CAP_BYTES` | `logCapBytes` | 5 MB |
 | `BACKLOT_TEMPLATES_KEEP` | `templatesKeep` | 4 per stack |
 | `BACKLOT_SWEEP_MS` | — | 15 s (lease/idle sweep cadence) |
@@ -542,7 +566,7 @@ injected by the engine — symbolic ports, datastore URLs, service URLs — whic
 makes environments relocatable across substrates. Services are **commands, not
 containers**; backing infrastructure (a DB server) is externally run and probed.
 
-Every command in the manifest — service `run:`/`build:`, check `run:`, upkeep,
+Every command in the manifest — service `run:`/`build:`, upkeep,
 datastore hooks — executes under `sh`, which is **dash on Ubuntu and
 bash-running-as-sh on macOS**, the two platforms runly tests. Write POSIX sh
 only: a bashism (`[[`, arrays, `set -o pipefail`) can pass on one leg and fail
@@ -553,6 +577,7 @@ name: myapp
 services:
   api:
     build: dotnet build backend/Host
+    outputs: [backend/Host/bin/**]        # `up` restarts api only when its build changed these
     run:   dotnet run --no-build --project backend/Host
     port:  api
     env:
@@ -562,13 +587,12 @@ services:
     fatal_logs: 'Unhandled exception|Build FAILED'
   web:
     build: pnpm exec ng build myapp
+    outputs: [dist/myapp]                 # a directory: everything under it
     run:   npx serve-dist dist/myapp --proxy /api={{services.api.url}}
-    watch_run: pnpm exec ng serve myapp --port {{ports.web}}
-    hot_reload: true                      # projection eligibility: see §6
     port:  web
     ready: { http: / }
   worker:
-    run:   bundle exec sidekiq            # portless: readiness by log marker
+    run:   bundle exec sidekiq            # portless; no build:, so `up` keeps it running
     ready: { log: "Booted" }
 datastores:
   main:
@@ -581,11 +605,9 @@ datastores:
   cache:
     driver: redis
     ephemeral: true                       # reset-data = flush
-caches: [node_modules, "**/obj", .angular]
+caches: [node_modules, "**/obj", .angular]   # output, not source; never an upkeep trigger
 sync:
-  keep: [src/api-client.generated.ts]
-  include: [.env.local]
-outputs: [pnpm-lock.yaml, src/api-client.generated.ts]
+  include: [.env.local]                   # git-ignored, but an upkeep trigger may name it
 upkeep:
   - { when: pnpm-lock.yaml, run: pnpm install --frozen-lockfile }
   - { when: "glob(db/migrate/**)", run: bin/rails db:migrate }
@@ -594,11 +616,7 @@ auth:
     - { user: qa-admin,    password: Demo!1234, role: admin, description: "all rights, all branches" }
     - { user: qa-readonly, password: Demo!1234, description: "read-only, proves a denied write" }
   token:  scripts/mint-token --role {{role}} --json
-checks:
-  e2e:
-    run: pnpm e2e
-    env: { API_PORT: "{{ports.api}}", SPA_PORT: "{{ports.web}}" }
-    artifacts: [test-results/**]
+# no checks: — the repo's tests run themselves: eval "$(runly ctx --env)" && pnpm e2e
 preview:
   publisher: cloudflare-quick             # which adapter `runly preview` publishes through
   # forbidden: true                       # ...or refuse public preview outright (work-error)
@@ -653,12 +671,13 @@ buy the substrate, declare the stack, broker the environments.
    MSSQL vertical (seeded per-env database on the shared server, built host, real
    login, real seeded domain data over an authenticated API) came up through
    `runly up` in ~50 s; `runly run` provisioned a second full environment in
-   ~48 s. The consumer's Playwright system-e2e suite now runs as an runly check
+   ~48 s. The consumer's Playwright system-e2e suite ran as a runly check
    (`runly run e2e`, ~58 s incl. provisioning via PLAYWRIGHT_REUSE against the
    runly-provisioned servers) with verdict parity against the incumbent harness —
    identical pass/fail results on the same suite.
 3. **0.3 — remote. ◐ PARTIAL.** Detached submit-and-poll runs shipped (`run
-   --detach` → jobId; the verdict outlives the client, journaled). Driver spec
+   --detach` → jobId; the verdict outlives the client, journaled — removed again in
+   0.13 with `run` itself, decision 0032). Driver spec
    stable. NOT yet: a live remote substrate driver (morph/ssh) — that requires
    threading the fs/exec seam through sync/supervision (the honest remaining work
    package) and is the one unshipped piece of the roadmap.

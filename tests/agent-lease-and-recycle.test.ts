@@ -46,7 +46,7 @@ function ctx(extraEnv: Record<string, string> = {}) {
   );
   writeFileSync(
     join(wt, 'stack.yaml'),
-    `name: agentlease\nservices:\n  web: { run: node srv.mjs, port: web, env: { PORT: "{{ports.web}}" }, ready: { log: ready, timeout: 20 } }\nchecks:\n  ok: { run: "true" }\n`,
+    `name: agentlease\nservices:\n  web: { run: node srv.mjs, port: web, env: { PORT: "{{ports.web}}" }, ready: { log: ready, timeout: 20 } }\n`,
   );
   execFileSync('git', ['init', '-q'], { cwd: wt });
   const env = { ...process.env, BACKLOT_STATE_DIR: stateDir, BACKLOT_SWEEP_MS: '300', ...extraEnv };
@@ -160,13 +160,16 @@ describe('a bind whose holder is already dead is refused, not silently accepted 
 
 describe('pool recycle honours the environment it was given (#40)', () => {
   it('recycles exactly the named environment and leaves the others alone', async () => {
-    const { cli, journal } = ctx({ BACKLOT_LEASE_TTL_MS: '2000' });
-    // Two environments, sequentially, by letting the first lease lapse. Each
-    // `up` from the same worktree refreshes one lease, so a second env needs a
-    // second holder.
+    const { cli, journal, wt } = ctx({ BACKLOT_LEASE_TTL_MS: '2000' });
+    // Two environments need two worktrees: a worktree has exactly one
+    // (decision 0032).
+    const wt2 = mkdtempSync(join(tmpdir(), 'runly-agentlease-wt2-'));
+    cleanups.push(() => rmSync(wt2, { recursive: true, force: true }));
+    for (const f of ['srv.mjs', 'stack.yaml']) writeFileSync(join(wt2, f), readFileSync(join(wt, f)));
+    execFileSync('git', ['init', '-q'], { cwd: wt2 });
     const a = await cli(['up', '--json']);
     expect(a.code).toBe(0);
-    const b = await cli(['up', '--holder', 'other-agent', '--json']);
+    const b = await cli(['up', '--json'], wt2);
     expect(b.code).toBe(0);
     const idA = String(a.json?.envId);
     const idB = String(b.json?.envId);
@@ -175,7 +178,7 @@ describe('pool recycle honours the environment it was given (#40)', () => {
     // Release both so neither is lease-protected — the scope bug has to fail
     // for scope reasons, not because a lease happened to save the sibling.
     await cli(['release', '--json']);
-    await cli(['release', '--holder', 'other-agent', '--json']);
+    await cli(['release', '--json'], wt2);
     await waitFor(() => journal().allLeases().length === 0);
 
     const res = await cli(['pool', 'recycle', idA, '--json']);
@@ -306,7 +309,7 @@ describe('token --raw prints what an Authorization header wants (#41, #39)', () 
     writeFileSync(
       join(wt, 'stack.yaml'),
       `name: agentlease\nservices:\n  web: { run: node srv.mjs, port: web, env: { PORT: "{{ports.web}}" }, ready: { log: ready, timeout: 20 } }\n` +
-        `auth:\n  token: "printf tk_{{role}}"\nchecks:\n  ok: { run: "true" }\n`,
+        `auth:\n  token: "printf tk_{{role}}"\n`,
     );
     expect((await cli(['up', '--json'])).code).toBe(0);
 
@@ -481,50 +484,6 @@ describe.runIf(procScanSupported())('teardown and quiesce reap what escaped the 
     }
     // Teardown of both stand-ins is registered above, so it runs even if an
     // assertion here throws.
-  }, 120_000);
-
-  it('a stopping daemon does not reap the in-flight check it is still owed a verdict for', async () => {
-    // The eager shutdown reap must respect `busy`, the invariant every other
-    // reclaim path already keeps ("an in-flight operation is NEVER interrupted —
-    // not even by --force"). A check runs DETACHED precisely so it can outlive
-    // the daemon, and it carries its environment's tag — so an unguarded tag
-    // scan on shutdown kills the very process a caller is polling for.
-    const { cli, wt, stateDir, journal } = ctx();
-    writeFileSync(
-      join(wt, 'stack.yaml'),
-      `name: agentlease\nservices:\n  web: { run: node srv.mjs, port: web, env: { PORT: "{{ports.web}}" }, ready: { log: ready, timeout: 20 } }\n` +
-        `checks:\n  slow: { run: "sleep 45" }\n`,
-    );
-    expect((await cli(['up', '--json'])).code).toBe(0);
-
-    const submitted = await cli(['run', 'slow', '--detach', '--json']);
-    expect(String(submitted.json?.jobId ?? '')).not.toBe('');
-
-    // Wait until the check's own tagged process is actually up, so the assertion
-    // below is about the reap and not about a race with the spawn.
-    const checkUp = await waitFor(() => scanTagged(stateDir).some((p) => p.service.startsWith('check:')), 20_000);
-    expect(checkUp, 'the detached check never started').toBe(true);
-    const checkPids = scanTagged(stateDir)
-      .filter((p) => p.service.startsWith('check:'))
-      .map((p) => p.pid);
-
-    const envId = journal().allEnvs()[0]!.id;
-    expect(journal().getEnv(envId)).toBeTruthy();
-
-    // A graceful stop, which is where the new eager reap runs.
-    expect((await cli(['daemon', 'stop', '--json'])).code).toBe(0);
-    await settle(1500);
-
-    for (const pid of checkPids) {
-      expect(alive(pid), `daemon stop killed in-flight check pid ${pid}`).toBe(true);
-    }
-    for (const pid of checkPids) {
-      try {
-        process.kill(-pid, 'SIGKILL');
-      } catch {
-        /* gone */
-      }
-    }
   }, 120_000);
 
   it('quiesce reaps escapees rather than deferring to a bind that may never come', async () => {

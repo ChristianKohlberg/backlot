@@ -101,9 +101,6 @@ datastores:
     drop: docker exec ${CONTAINER} ${SQLCMD} -Q "IF DB_ID('{{ns}}') IS NOT NULL BEGIN ALTER DATABASE [{{ns}}] SET SINGLE_USER WITH ROLLBACK IMMEDIATE; DROP DATABASE [{{ns}}]; END"
     template_restore: docker exec ${CONTAINER} ${SQLCMD} -Q "BACKUP DATABASE [{{template}}] TO DISK='/var/opt/mssql/data/{{template}}.bak' WITH INIT" && docker exec ${CONTAINER} ${SQLCMD} -Q "RESTORE DATABASE [{{ns}}] FROM DISK='/var/opt/mssql/data/{{template}}.bak' WITH MOVE '{{template}}' TO '/var/opt/mssql/data/{{ns}}.mdf', MOVE '{{template}}_log' TO '/var/opt/mssql/data/{{ns}}_log.ldf'"
     presets: [dev]
-checks:
-  rows:
-    run: docker exec ${CONTAINER} ${SQLCMD} -d {{datastores.main.ns}} -h -1 -Q "SET NOCOUNT ON; SELECT COUNT(*) FROM items" | tr -d '[:space:]' | grep -qx 3
 `,
     );
     execFileSync('git', ['init', '-q'], { cwd: wt });
@@ -148,10 +145,11 @@ checks:
     expect(count(ns)).toBe('3');
   }, T);
 
-  it('the check templates {{datastores.main.ns}} and passes against live data', async () => {
-    const res = await cli(['run', 'rows', '--json']);
-    expect(res.exitCode, `stdout: ${res.stdout ?? ''}\nstderr: ${res.stderr ?? ''}`).toBe(0);
-    expect(res.json!.ok).toBe(true);
+  it('ctx --env exports the datastore connection string for the repo\'s own checks', async () => {
+    const res = await cli(['ctx', '--env']);
+    expect(res.exitCode, `stdout: ${res.stdout ?? ''}
+stderr: ${res.stderr ?? ''}`).toBe(0);
+    expect(String(res.stdout)).toMatch(/^RUNLY_DATASTORE_MAIN_URL=.+/m);
   }, T);
 
   it('recycle drops the server-side namespace', async () => {

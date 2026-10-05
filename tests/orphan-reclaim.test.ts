@@ -76,8 +76,6 @@ function makeWt(name: string, body: string): string {
     `name: ${name}
 services:
   web: { run: node server.mjs, port: web, env: { PORT: "{{ports.web}}" }, ready: { http: /, timeout: 20 } }
-checks:
-  ok: { run: "true" }
 `,
   );
   execFileSync('git', ['init', '-q'], { cwd: dir });

@@ -1,6 +1,6 @@
 # 0016. Data states, not seeds: three baselines, scenarios in tests, snapshots for the expensive middle
 
-- Status: Accepted — doctrine in force; mechanisms deferred by [0022](0022-data-state-mechanisms-deferred.md)
+- Status: Accepted — doctrine in force; mechanisms deferred by [0022](0022-data-state-mechanisms-deferred.md); §4 (a check declares its state) lapsed with `checks:` in [0032](0032-environments-run-in-the-callers-worktree.md) — a repo's own check selects its data with `up --preset` / `reset-data --preset`
 
 ## Context
 

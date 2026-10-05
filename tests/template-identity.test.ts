@@ -111,7 +111,7 @@ describe('template identity in datastore drivers', () => {
     template_restore: 'echo restore {{template}} {{ns}}',
   } as unknown as DatastoreSpec;
 
-  const handle = (envId: string): DsHandle => ({ envId, envTree: tree.dir, dataDir: tree.dir });
+  const handle = (envId: string): DsHandle => ({ envId, cwd: tree.dir, dataDir: tree.dir });
 
   const markerDirFor = (stackId: string): string =>
     join(state.dir, 'templates', stackId);

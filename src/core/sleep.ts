@@ -14,7 +14,7 @@
  *   { sec = 1784499830, usec = 654321 } Sun Jul 20 00:23:50 2026
  *
  * The parsing and the pardon decision are pure exported functions (the
- * policy()/pendingUpkeep() pattern) because a real lid close cannot be
+ * policy() pattern) because a real lid close cannot be
  * automated and this repo forbids test-only interleaving hooks — the unit
  * tests in tests/sleep-pardon.test.ts encode the confirmed scenario; the
  * end-to-end proof remains the manual lid-close protocol (docs/soak.md).

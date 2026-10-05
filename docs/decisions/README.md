@@ -9,7 +9,7 @@ supersedes it and update this index — never edit a decision in place.
 | [0002](0002-core-nouns.md) | Core nouns: Stack, Substrate, Environment, Binding, Lease, Run |
 | [0003](0003-durable-environments-disposable-leases.md) | Environments are durable; leases are disposable |
 | [0004](0004-watchers-never-move-bindings-move.md) | Watchers never move; bindings move |
-| [0005](0005-git-sync-immutable-bindings.md) | Git sync transport; immutable bindings; verbs sync, watch streams |
+| [0005](0005-git-sync-immutable-bindings.md) | Git sync transport; immutable bindings; verbs sync, watch streams (superseded by 0032) |
 | [0006](0006-convergence-over-checkpointing.md) | Convergence over checkpointing |
 | [0007](0007-hygiene-levels.md) | Hygiene levels: reuse / reset-data / pristine + auto-escalation |
 | [0008](0008-lazy-upkeep-fingerprint-ledger.md) | Lazy upkeep via a per-environment fingerprint ledger |
@@ -19,7 +19,7 @@ supersedes it and update this index — never edit a decision in place.
 | [0012](0012-commands-first-services.md) | Services are commands, not containers; backing infra external + probed |
 | [0013](0013-typescript-node-npm-apache2.md) | TypeScript on Node ≥ 22, one npm package, Apache-2.0 |
 | [0014](0014-cli-json-api-mcp-later.md) | CLI with --json is the v1 agent API; MCP later |
-| [0015](0015-remote-submit-and-poll.md) | Remote runs are submit-and-poll; provider TTLs mandatory |
+| [0015](0015-remote-submit-and-poll.md) | Remote runs are submit-and-poll; provider TTLs mandatory (local half superseded by 0032) |
 | [0016](0016-data-states-not-seeds-three-baselines-scenarios-in-tests.md) | Data states not seeds: three baselines, scenarios in tests, snapshots for the expensive middle |
 | [0017](0017-rename-infront-to-backlot.md) | Rename: infront → backlot — the standing-sets metaphor, collision-free, real word |
 | [0018](0018-appliances-ensured-not-owned.md) | Appliances are ensured, not owned: backlot starts shared backing servers but never stops them implicitly |
@@ -36,3 +36,4 @@ supersedes it and update this index — never edit a decision in place.
 | [0029](0029-cli-only-agent-interface.md) | Agents use the CLI; remove the MCP adapter |
 | [0030](0030-rename-backlot-to-runly.md) | Rename Backlot to Runly while preserving existing state, namespaces and the CLI alias |
 | [0031](0031-tailscale-preview-publisher.md) | A preview may publish on the tailnet, through a foreground `tailscale serve` |
+| [0032](0032-environments-run-in-the-callers-worktree.md) | Environments run in the caller's worktree, one per worktree; `up` is the only bind verb and restarts only services whose build output changed; runly runs no checks (`ctx --env` instead of `run`/`job`/`checks:`); no per-stack ceiling; runly caches no builds; `runly warm` prepares an idle worktree |

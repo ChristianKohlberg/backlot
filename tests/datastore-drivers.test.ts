@@ -23,7 +23,7 @@ afterAll(() => {
 
 function handle(envId = 'ds-e1'): DsHandle {
   const root = mk('runly-ds-');
-  return { envId, envTree: root, dataDir: join(root, 'data') };
+  return { envId, cwd: root, dataDir: join(root, 'data') };
 }
 
 describe('sqlite: WAL sidecars must not survive a template restore', () => {
@@ -277,7 +277,7 @@ describe('command-datastore namespaces obey the 63-byte identifier limit', () =>
     const spec = { driver: 'postgres', server: 'external', create: 'true', url: 'postgres://x/{{ns}}' } as never;
     const h: DsHandle = {
       envId: 'analytics-platform-backend-Ab3dEf9h-e12',
-      envTree: '/tmp/x',
+      cwd: '/tmp/x',
       dataDir: '/tmp/x/data',
     };
     const a = makeDatastore('reporting_readmodel', spec, 'stk').ns(h);

@@ -4,7 +4,7 @@ import { dirname, join, resolve } from 'node:path';
 import { parse } from 'yaml';
 import Ajv2020 from 'ajv/dist/2020.js';
 import { fileURLToPath } from 'node:url';
-import { BrokerError } from './util.js';
+import { BrokerError, safeJoin } from './util.js';
 
 export interface ReadySpec {
   http?: string;
@@ -16,9 +16,17 @@ export interface ReadySpec {
 export interface ServiceSpec {
   run: string;
   build?: string;
+  /** Accepted and ignored since decision 0032 (`--watch` was removed). */
   watch_run?: string;
-  /** run: self-reloads on file changes — lets `sync` project without a restart. */
+  /** Accepted and ignored since decision 0032: a service without `build:` keeps running on `up` anyway. */
   hot_reload?: boolean;
+  /**
+   * Globs (relative to the stack root) of what this service's `build:`
+   * produces. Snapshotted (path, size, mtime) around the build on every `up`;
+   * the service is restarted only when they changed. Without it, a service
+   * with a build is restarted after every build (decision 0032).
+   */
+  outputs?: string[];
   cwd?: string;
   port?: string;
   env?: Record<string, string>;
@@ -53,15 +61,6 @@ export interface ApplianceSpec {
   /** Optional readiness gate polled after TCP accepts (exit 0 = ready). */
   ready?: string;
   /** Seconds to wait after start for probe+ready. Default 60. */
-  timeout?: number;
-}
-
-export interface CheckSpec {
-  run: string;
-  cwd?: string;
-  env?: Record<string, string>;
-  artifacts?: string[];
-  /** Hard kill (whole process group) after this many seconds. Default 600. */
   timeout?: number;
 }
 
@@ -148,17 +147,37 @@ export interface Manifest {
   preview?: PreviewSpec;
   appliances?: Record<string, ApplianceSpec>;
   datastores?: Record<string, DatastoreSpec>;
+  /** Build/install output in the worktree: never an upkeep trigger (decision 0032). */
   caches?: string[];
+  /** `include`: git-ignored files an upkeep `when:` glob may still match. `keep` is accepted and ignored (decision 0032). */
   sync?: { keep?: string[]; include?: string[] };
+  /** Accepted and ignored since decision 0032 (it served `runly run`). */
   outputs?: string[];
   upkeep?: UpkeepRule[];
   auth?: { logins?: LoginsSpec; token?: string };
-  checks?: Record<string, CheckSpec>;
+  /**
+   * Accepted and ignored since decision 0032: `runly run` was removed. Repo
+   * scripts read `runly ctx --env` instead. A manifest that still declares it
+   * loads, with a one-line deprecation warning (`manifestDeprecations`).
+   */
+  checks?: Record<string, unknown>;
+}
+
+/**
+ * One-line warnings for manifest sections runly accepts but no longer acts on.
+ * The CLI prints them to stderr; the manifest still loads.
+ */
+export function manifestDeprecations(manifest: Manifest): string[] {
+  const out: string[] = [];
+  if (manifest.checks !== undefined) {
+    out.push(`runly.yml declares 'checks:', which is ignored since 'runly run' was removed (decision 0032) — run your checks yourself, with 'runly ctx --env' for the environment`);
+  }
+  return out;
 }
 
 export interface Stack {
   manifest: Manifest;
-  /** Directory containing the manifest — the sync source root. */
+  /** Directory containing the manifest — the worktree environments run in (decision 0032). */
   root: string;
   /** Stable identity: pools are keyed by this. */
   id: string;
@@ -229,6 +248,9 @@ export function loadStack(from: string): Stack {
   if (!file) throw new BrokerError('work-error', `no runly.yml (or backlot.yml / stack.yaml) in ${root}`, 'manifest');
   const manifest = parse(readFileSync(file, 'utf8')) as Manifest;
   validate(manifest);
+  // A path that escapes the worktree is refused at load, whether or not an
+  // upkeep rule ever makes runly read it: it is never a legitimate source file.
+  for (const inc of manifest.sync?.include ?? []) safeJoin(root, inc, 'sync.include');
   // Identity = absolute root + declared name; filesystem-safe. Hash the WHOLE
   // path: slicing base64url(root) kept only the last ~6 bytes, so sibling
   // worktrees like agent-1/myapp and agent-2/myapp collided into one pool.

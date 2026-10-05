@@ -1,6 +1,6 @@
 # 0004. Watchers never move; bindings move
 
-- Status: Accepted
+- Status: Superseded by [0032](0032-environments-run-in-the-callers-worktree.md) — environments run in the caller's worktree; ports stay stable for an environment's lifetime
 
 ## Decision
 

@@ -18,7 +18,4 @@ datastores:
     presets: [dev, empty]
     template: true
 
-checks:
-  smoke:
-    run: python3 smoke.py
-    env: { BASE_URL: "{{services.web.url}}" }
+# The smoke test is the repo's own: eval "$(runly ctx --env)" && python3 smoke.py

@@ -24,7 +24,19 @@ Services are spawned detached (`detached: true` in `spawn`) so they outlive the 
 
 Consequence: a group kill (`killGroupVerified`) is not sufficient teardown — a service that called `setsid()` or spawned a detached grandchild escapes the `-pgid` signal and can keep holding its port. `stopAll()` must therefore always be followed by a reap of journal-recorded pids plus a tag scan before trusting any port-free check. **Every `stopAll()` call site is bound by this** — `bindAndStart`, `teardownClaimed`, the quiesce path, and `shutdown()`. Deferring the reap to "the next bind will handle it" is the bug (#34): a quiesced env can sit cold for hours, and a stopping daemon has no next anything. `reapEnvProcesses` in `src/daemon/engine.ts` owns this invariant (see its doc comment for the failure modes and the survivor-preservation contract); `tests/env-port-survivor.test.ts` and `tests/agent-lease-and-recycle.test.ts` are the regression tests. Crash recovery follows the same rule: `recover()` reaps recorded pids for every journaled env and re-runs `teardownClaimed` for `state='recycling'` rows.
 
-Supervision initially records top-level service pids; reclamation also records discovered survivors. `reapPids` in `src/daemon/supervisor.ts` owns their identity and group-preservation contract. For anything that also scrubbed the tag, `reapEnvTree` reaps by cwd (`scanByCwd`, which matches a `(deleted)` cwd too). That path is **teardown-only**: a quiesced env keeps its tree on disk and someone's shell may legitimately be sitting in it.
+Supervision initially records top-level service pids; reclamation also records discovered survivors. `reapPids` in `src/daemon/supervisor.ts` owns their identity and group-preservation contract. For anything that also scrubbed the tag, `reapEnvTree` reaps by cwd (`scanByCwd`, which matches a `(deleted)` cwd too) — but only inside the env's PRIVATE directory and only at teardown. Services run in the caller's worktree (decision 0032), and cwd there is never ownership: the agent's shells and builds sit in it. Never point a cwd scan at a worktree.
+
+## Environments run in the caller's worktree — one per worktree, `up` only, no build cache, no checks
+
+Decision 0032 removed the projection: services, builds, upkeep, `exec` and `auth.token` all run in the stack root. It also removed `sync`/`bind`, `--watch`, `run`/`--detach`/`job` (with the jobs journal and verdict artifacts), the manifest's `checks:` and the per-stack `BACKLOT_POOL_MAX`; the CLI answers each with exit 64 naming 0032 before the daemon is contacted. Sharp edges:
+
+- **Never delete in the worktree.** Teardown removes only `env.root`, and `isPrivateEnvDir` checks it is under `envs/` and does not contain `env.stackRoot` first. `reset-data` touches data only; `pristine` clears the worktree's upkeep LEDGER (re-run every rule), never files.
+- **One environment per worktree.** `tryClaim` creates an environment only when the stack has none; a second holder queues for it, and `worktreeHold` makes the refusal structural (fail fast, naming the holder) when the lease outlasts the wait. Never reintroduce a second environment for a stack; `drainSurplusEnvs` recycles the ones an older journal left.
+- **runly caches no builds, and `up` restarts only what a build changed.** There is no `@source`, no source fingerprint, no build stamp: a `build:` runs on every `up` that starts its service (and on every `warm`). When nothing forces the full path (manifest, inputs, presets, upkeep that ran, hygiene, health, shape), `bindAndStart` builds each active service between two `snapshotOutputs` calls (`src/core/worktree.ts`: path, size, mtime of the service's `outputs:` globs) and restarts only those whose snapshot differs — or which declare no outputs — via `stopServicesForRestart` + `startSlice(only)`. A service without `build:` is never restarted there, and dependents of a restarted service are not either. `bindDiagnostics.reuse` is `reused` | `restarted` | `rebound`.
+- **Upkeep reads only its trigger files.** `triggerSet` (`src/core/upkeep.ts`) lists the files the `when:` globs match and hashes them, stat-gated, with a small cache in `worktrees/<stack>/triggers.json`. Keep it scoped to trigger files — a whole-worktree hash is exactly what was removed.
+- **The upkeep ledger is the worktree's.** Command rules live in `worktrees/<stack>/ledger.json` (`src/core/tree-ledger.ts`); `@` built-ins stay on the env row. `warm` writes the same ledger a bind reads.
+- **Lock order: env lock first, then the worktree lock (`treeLocked`).** Binds take the env lock then the worktree lock around upkeep and builds; `warm` takes the stack's env lock(s) (`envsLocked`) then the worktree lock — it can run before any env exists, which is why the worktree lock is still needed. Taking them the other way round deadlocks against a bind.
+- `tests/in-place.test.ts` (no copy, teardown leaves the worktree, warm, one env per worktree, output-based restarts, surplus drain) and `tests/worktree.test.ts` (trigger enumeration and hashing) are the regression tests.
 
 ## Publishers own their dialect — the engine must not learn one
 
@@ -67,7 +79,7 @@ tailscale operator must be the daemon's user (`tailscale set --operator=…`);
 `runly preview` journals its tunnel on the **lease row** (`preview_*`), not in
 `env.servicePids` — so none of the service-reap machinery above owns it, and the
 lifetime rule is deliberately different ([decision 0027](docs/decisions/0027-lease-scoped-public-preview.md)).
-A rebind, a `sync` or an idle quiesce restarts or stops services while the lease
+A rebind, a restarting `up` or an idle quiesce restarts or stops services while the lease
 continues, and the tunnel **survives all of them**; ports are stable for an
 environment's lifetime, so it is aimed at the same place when the services return.
 It is reaped only when the lease ends (`release`, TTL lapse, dead holder, the
@@ -87,11 +99,11 @@ label, and `setsid` descendants are outside it — the contract is in
 [decision 0027](docs/decisions/0027-lease-scoped-public-preview.md) and
 `tests/preview-process-group.test.ts` is the regression test.
 
-`reconcilePreviewForBind` owns what a bind **and a `sync`/`--watch` projection**
+`reconcilePreviewForBind` owns what a bind **and a reusing `up`**
 do to a live tunnel: it tears it
 down when `preview.forbidden` appears, when the previewed service leaves the
 running set (a narrowed slice or `--data-only` — nothing brings it back this
-lease), or when its local port moves (a bind only — a projection allocates
+lease), or when its local port moves (a full bind only — a reuse allocates
 nothing, and it judges the slice by the env's durable shape, not by live pids);
 the slice and port causes are reconciled at the bind's **epilogue**, once the
 shape they judge against is committed, while `forbidden` is enforced up front so
@@ -105,9 +117,9 @@ delete (it cannot take the env lock — `tryClaim` calls it under the pool lock)
 so no stale snapshot can forget a tunnel someone else just published. `tests/preview-tunnel.test.ts`
 covers all of it.
 
-For the successful-bind configuration ledger and projection/reuse eligibility, see
-[sync and bindings](docs/architecture.md#6-sync--verbs-sync-watch-streams) and
-`tests/projection-config-and-detached-pull.test.ts`.
+For the successful-bind configuration ledger and refresh/reuse eligibility, see
+[in place](docs/architecture.md#6-in-place--verbs-converge-watch-observes) and
+`tests/startup-config.test.ts`.
 
 ## Physical stack identity
 
@@ -182,7 +194,7 @@ survivor group ownership and old-reader refusal;
 ## Caller environment inputs
 
 `services.*.env_from` allowlists caller variables (`required`/`optional`). Explicit
-`up` and `run` refresh them; `sync`, watch, reset and ref binds preserve the lease's
+`up` refreshes them; `reset-data` preserves the lease's
 memory-only inputs. A supplied value overrides a same-named `env` entry; an omitted
 optional value keeps the service's explicit `env` default, and without one it masks
 the same-named daemon variable. Only caller-supplied values are redacted from logs.
@@ -193,7 +205,7 @@ inputs. Declaration changes also invalidate the process configuration. See
 `src/core/caller-env.ts` and `tests/caller-env.test.ts`.
 CLI autospawn must use the target stack's cwd and strip declared input names
 from the daemon environment; otherwise the first caller contaminates every later
-check/exec/unconfigured service despite correct per-lease service masking.
+exec/unconfigured service despite correct per-lease service masking.
 
 Supervisor probe matching uses a raw, memory-only buffer; logs and error excerpts
 use the redacted buffer. Combining them breaks readiness when a declared value

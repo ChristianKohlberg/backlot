@@ -48,7 +48,7 @@ function ctx(extraEnv: Record<string, string> = {}) {
   dirs.push(stateDir, wt);
   writeFileSync(
     join(wt, 'stack.yaml'),
-    `name: atom\nservices:\n  web: { run: "echo ready; sleep 300", ready: { log: ready, timeout: 20 } }\nchecks:\n  ok: { run: "true" }\n`,
+    `name: atom\nservices:\n  web: { run: "echo ready; sleep 300", ready: { log: ready, timeout: 20 } }\n`,
   );
   execFileSync('git', ['init', '-q'], { cwd: wt });
   const env = { ...process.env, BACKLOT_STATE_DIR: stateDir, BACKLOT_SWEEP_MS: '300', ...extraEnv };
@@ -113,7 +113,7 @@ describe('a dangling lease (its env row is gone) is pruned by the sweeper', () =
   it('never blocks acquisition or capacity math while it exists', async () => {
     // Sweeps effectively off: the dangling lease STAYS on disk for the whole
     // test, so every assertion below runs against the un-repaired half-state.
-    const c = ctx({ BACKLOT_SWEEP_MS: '600000', BACKLOT_POOL_MAX: '1' });
+    const c = ctx({ BACKLOT_SWEEP_MS: '600000' });
     // Fabricate before the daemon ever runs — the journal is just a file.
     c.journal().saveLease({
       id: 'l-dangling',
@@ -141,7 +141,7 @@ describe('a dangling lease (its env row is gone) is pruned by the sweeper', () =
 
 describe('an env row with no lease (crash between saveEnv and saveLease) stays claimable', () => {
   it('is handed to the next up instead of leaking or wedging capacity', async () => {
-    const c = ctx({ BACKLOT_POOL_MAX: '1' });
+    const c = ctx();
     const up1 = await c.cli(['up', '--json']);
     expect(up1.json?.state).toBe('hot');
     const envId = String(up1.json?.envId);

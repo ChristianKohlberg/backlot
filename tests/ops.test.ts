@@ -1,161 +1,49 @@
 /**
- * The operational batch: check timeouts (process-group kill), bind --ref,
- * job ls, pool-policy precedence, and the retention sweep.
+ * The operational batch: pool-policy precedence and the retention sweep.
  */
 import { describe, it, expect, afterAll, afterEach } from 'vitest';
-import { execFile, execFileSync } from 'node:child_process';
-import { mkdtempSync, rmSync, writeFileSync, readFileSync, mkdirSync, utimesSync, statSync, existsSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync, mkdirSync, utimesSync, statSync, existsSync, readdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-const repo = join(import.meta.dirname, '..');
-const CLI = join(repo, 'dist', 'cli', 'index.js');
-
-function makeContext() {
-  const stateDir = mkdtempSync(join(tmpdir(), 'runly-ops-'));
-  const env = { ...process.env, BACKLOT_STATE_DIR: stateDir, BACKLOT_SWEEP_MS: '500' };
-  const cli = (args: string[], cwd: string): Promise<{ exitCode: number; json?: Record<string, unknown> }> =>
-    new Promise((resolve) => {
-      execFile(process.execPath, [CLI, ...args], { cwd, env, maxBuffer: 16 * 1024 * 1024 }, (err, stdout, stderr) => {
-        let json;
-        try {
-          json = JSON.parse(String(stdout));
-        } catch {
-          /* non-json */
-        }
-        resolve({ exitCode: err ? ((err as { code?: number }).code ?? 1) : 0, json, stdout: String(stdout), stderr: String(stderr) });
-      });
-    });
-  const cleanup = () => {
-    try {
-      process.kill(Number(readFileSync(join(stateDir, 'daemon.pid'), 'utf8')));
-    } catch {
-      /* gone */
-    }
-    rmSync(stateDir, { recursive: true, force: true });
-  };
-  return { stateDir, cli, cleanup };
-}
-
-const SERVE = `import { createServer } from 'node:http';
-import { readFileSync } from 'node:fs';
-createServer((q, s) => s.end(readFileSync('./message.txt', 'utf8'))).listen(Number(process.env.PORT), '127.0.0.1');
-`;
-
-const STACK = `name: opsy
-services:
-  web: { run: node server.mjs, port: web, env: { PORT: "{{ports.web}}" }, ready: { http: /, timeout: 20 } }
-checks:
-  hang: { run: "sh -c 'sleep 300 & echo $! > hung-child.pid; wait'", timeout: 2 }
-  quick: { run: "true" }
-`;
-
-describe('check timeouts and job ls', () => {
-  const ctx = makeContext();
-  const wt = mkdtempSync(join(tmpdir(), 'runly-ops-wt-'));
-  afterAll(() => {
-    ctx.cleanup();
-    rmSync(wt, { recursive: true, force: true });
-  });
-
-  it('a hung check is group-killed at its timeout with an explanatory verdict', async () => {
-    writeFileSync(join(wt, 'server.mjs'), SERVE);
-    writeFileSync(join(wt, 'message.txt'), 'v1');
-    writeFileSync(join(wt, 'stack.yaml'), STACK);
-    execFileSync('git', ['init', '-q'], { cwd: wt });
-
-    const start = Date.now();
-    const res = await ctx.cli(['run', 'hang', '--json'], wt);
-    expect(Date.now() - start).toBeLessThan(30_000); // 2s timeout + bind, nowhere near 300s
-    expect(res.exitCode, `stdout: ${res.stdout ?? ''}\nstderr: ${res.stderr ?? ''}`).toBe(1);
-    const v = res.json!;
-    expect(v.ok).toBe(false);
-    expect((v.failure as { message: string }).message).toContain('timed out after 2s');
-
-    // The verdict text alone proved nothing about the PROCESS TABLE: a
-    // regression from group-kill back to killing only the sh wrapper would
-    // still produce this message while leaking the real child. The fixture
-    // forks deliberately and records the grandchild's pid, so this asserts the
-    // thing the test is named for.
-    const envs = (await ctx.cli(['pool', 'ls', '--json'], wt)).json!.envs as Array<{ id: string }>;
-    let childPid: number | undefined;
-    for (const e of envs) {
-      const f = join(ctx.stateDir, 'envs', e.id, 'tree', 'hung-child.pid');
-      if (existsSync(f)) childPid = Number(readFileSync(f, 'utf8').trim());
-    }
-    expect(childPid, 'the hang fixture should have recorded its child pid').toBeGreaterThan(0);
-    const alive = (pid: number) => {
-      try {
-        process.kill(pid, 0);
-        return true;
-      } catch {
-        return false;
-      }
-    };
-    // Give the group kill a moment to land, then require the grandchild gone.
-    for (let i = 0; i < 40 && alive(childPid!); i++) await new Promise((r) => setTimeout(r, 100));
-    expect(alive(childPid!), `grandchild ${childPid} outlived the group kill`).toBe(false);
-  }, 60_000);
-
-  it('job ls lists detached runs newest-first with their outcome', async () => {
-    const submit = await ctx.cli(['run', 'quick', '--detach', '--json'], wt);
-    const jobId = submit.json!.jobId as string;
-    let done = false;
-    for (let i = 0; i < 60 && !done; i++) {
-      const j = (await ctx.cli(['job', jobId, '--json'], wt)).json!;
-      done = j.state === 'done';
-      if (!done) await new Promise((r) => setTimeout(r, 300));
-    }
-    const ls = await ctx.cli(['job', 'ls', '--json'], wt);
-    const jobs = ls.json!.jobs as Array<{ id: string; state: string; ok: boolean | null }>;
-    expect(jobs[0]!.id).toBe(jobId);
-    expect(jobs[0]!.ok).toBe(true);
-  }, 60_000);
-
-  it('bind --ref serves the committed state; sync returns to the worktree state', async () => {
-    execFileSync('git', ['add', '-A'], { cwd: wt });
-    execFileSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-qm', 'v1'], { cwd: wt });
-    writeFileSync(join(wt, 'message.txt'), 'v2-dirty');
-
-    const bound = await ctx.cli(['bind', '--ref', 'HEAD', '--json'], wt);
-    expect(bound.exitCode, `stdout: ${bound.stdout ?? ''}\nstderr: ${bound.stderr ?? ''}`).toBe(0);
-    const url = (bound.json!.urls as Record<string, string>).web!;
-    expect(await (await fetch(url)).text()).toBe('v1'); // the COMMIT, not the dirty tree
-
-    await ctx.cli(['sync'], wt);
-    expect(await (await fetch(url)).text()).toBe('v2-dirty'); // back to worktree state
-
-    const bad = await ctx.cli(['bind', '--ref', 'nope-branch', '--json'], wt);
-    expect(bad.exitCode, `stdout: ${bad.stdout ?? ''}\nstderr: ${bad.stderr ?? ''}`).toBe(1); // work-error: not a commit
-  }, 60_000);
-});
-
 describe('pool policy precedence (unit)', () => {
   const dir = mkdtempSync(join(tmpdir(), 'runly-pol-'));
-  const saved = { state: process.env.BACKLOT_STATE_DIR, pool: process.env.BACKLOT_POOL_MAX };
+  const saved = { state: process.env.BACKLOT_STATE_DIR, pool: process.env.BACKLOT_POOL_MAX_TOTAL };
   afterEach(() => {
     process.env.BACKLOT_STATE_DIR = saved.state;
-    if (saved.pool === undefined) delete process.env.BACKLOT_POOL_MAX;
-    else process.env.BACKLOT_POOL_MAX = saved.pool;
+    if (saved.pool === undefined) delete process.env.BACKLOT_POOL_MAX_TOTAL;
+    else process.env.BACKLOT_POOL_MAX_TOTAL = saved.pool;
   });
   afterAll(() => rmSync(dir, { recursive: true, force: true }));
 
   it('env var > config.json > heuristic', async () => {
     process.env.BACKLOT_STATE_DIR = dir;
-    delete process.env.BACKLOT_POOL_MAX;
+    delete process.env.BACKLOT_POOL_MAX_TOTAL;
     const { policy, poolMaxHeuristic } = await import('../src/core/policy.js');
 
     const h = poolMaxHeuristic();
     expect(h).toBeGreaterThanOrEqual(1);
     expect(h).toBeLessThanOrEqual(8);
-    expect(policy().poolMax).toBe(h); // heuristic default
+    expect(policy().poolMaxTotal).toBe(h); // heuristic default
 
-    writeFileSync(join(dir, 'config.json'), JSON.stringify({ poolMax: 5, idleTtlMs: 123 }));
-    expect(policy().poolMax).toBe(5); // config file wins over heuristic
+    writeFileSync(join(dir, 'config.json'), JSON.stringify({ poolMaxTotal: 5, idleTtlMs: 123 }));
+    expect(policy().poolMaxTotal).toBe(5); // config file wins over heuristic
     expect(policy().idleTtlMs).toBe(123);
 
-    process.env.BACKLOT_POOL_MAX = '2';
-    expect(policy().poolMax).toBe(2); // env var wins over config
+    process.env.BACKLOT_POOL_MAX_TOTAL = '2';
+    expect(policy().poolMaxTotal).toBe(2); // env var wins over config
+  });
+
+  it('a leftover per-stack poolMax / BACKLOT_POOL_MAX is ignored (removed in decision 0032)', async () => {
+    process.env.BACKLOT_STATE_DIR = dir;
+    process.env.BACKLOT_POOL_MAX = '1';
+    try {
+      writeFileSync(join(dir, 'config.json'), JSON.stringify({ poolMax: 1 }));
+      const { policy } = await import('../src/core/policy.js');
+      expect(Object.keys(policy())).not.toContain('poolMax');
+    } finally {
+      delete process.env.BACKLOT_POOL_MAX;
+    }
   });
 
   it('leasedIdleTtlMs defaults to 2 x the CONFIGURED idleTtlMs, not a constant', async () => {
@@ -187,20 +75,18 @@ describe('pool policy precedence (unit)', () => {
 });
 
 describe('retention sweep (unit)', () => {
-  it('prunes old artifacts, truncates fat logs, keeps newest templates', async () => {
+  it('removes the legacy artifacts dir, truncates fat logs, keeps newest templates', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'runly-ret-'));
     process.env.BACKLOT_STATE_DIR = dir;
     const { pruneArtifacts, truncateLogs, pruneTemplates } = await import('../src/core/retention.js');
     const { policy } = await import('../src/core/policy.js');
-    const p = { ...policy(), artifactDays: 1, logCapBytes: 1000, templatesKeep: 2 };
+    const p = { ...policy(), logCapBytes: 1000, templatesKeep: 2 };
 
-    // Old + fresh artifacts.
-    const art = join(dir, 'artifacts', 'env1');
-    mkdirSync(join(art, 'old'), { recursive: true });
-    mkdirSync(join(art, 'fresh'), { recursive: true });
-    const past = new Date(Date.now() - 3 * 24 * 3600 * 1000);
-    utimesSync(join(art, 'old'), past, past);
-    expect(pruneArtifacts(p)).toBe(1);
+    // Verdict artifacts went with `runly run` (decision 0032): whatever an
+    // older daemon left behind is removed whole.
+    mkdirSync(join(dir, 'artifacts', 'env1', 'job-1'), { recursive: true });
+    expect(pruneArtifacts()).toBe(1);
+    expect(existsSync(join(dir, 'artifacts'))).toBe(false);
 
     // A fat log keeps only its tail.
     const logs = join(dir, 'envs', 'env1', 'logs');
@@ -219,6 +105,28 @@ describe('retention sweep (unit)', () => {
     }
     expect(await pruneTemplates(p)).toBe(2);
     rmSync(dir, { recursive: true, force: true });
+  });
+});
+
+describe('per-worktree state outlives environments, not its worktree (decision 0032)', () => {
+  it('prunes a worktree record only once the worktree is gone and no environment names it', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'runly-wtret-'));
+    const { pruneWorktreeState } = await import('../src/core/retention.js');
+    const live = mkdtempSync(join(tmpdir(), 'runly-wtret-live-'));
+    const record = (id: string, root: string, file = 'ledger.json') => {
+      mkdirSync(join(dir, id), { recursive: true });
+      writeFileSync(join(dir, id, file), JSON.stringify({ root, fingerprints: {} }));
+    };
+    record('gone-stack', join(dir, 'no-such-worktree'));
+    record('gone-triggers-only', join(dir, 'also-gone'), 'triggers.json');
+    record('live-stack', live);
+    record('gone-but-leased', join(dir, 'gone-too'));
+    mkdirSync(join(dir, 'unreadable'));
+    const journal = { envsForStack: (id: string) => (id === 'gone-but-leased' ? [{}] : []) } as never;
+    expect(pruneWorktreeState(journal, dir)).toBe(2);
+    expect(readdirSync(dir).sort()).toEqual(['gone-but-leased', 'live-stack', 'unreadable']);
+    rmSync(dir, { recursive: true, force: true });
+    rmSync(live, { recursive: true, force: true });
   });
 });
 

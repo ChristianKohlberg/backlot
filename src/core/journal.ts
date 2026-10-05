@@ -167,10 +167,6 @@ export class Journal {
         holder TEXT NOT NULL, hygiene TEXT NOT NULL, expires_at INTEGER NOT NULL,
         holder_pid INTEGER, holder_start INTEGER
       );
-      CREATE TABLE IF NOT EXISTS jobs (
-        id TEXT PRIMARY KEY, stack_cwd TEXT NOT NULL, check_name TEXT NOT NULL,
-        state TEXT NOT NULL, verdict TEXT, created_at INTEGER NOT NULL, finished_at INTEGER
-      );
       CREATE TABLE IF NOT EXISTS counters (
         stack TEXT PRIMARY KEY, next_env INTEGER NOT NULL DEFAULT 1
       );
@@ -461,58 +457,6 @@ export class Journal {
 
   deleteLease(id: string): void {
     this.db.prepare('DELETE FROM leases WHERE id = ?').run(id);
-  }
-
-  saveJob(job: { id: string; stackCwd: string; check: string; state: string; verdict?: unknown; finishedAt?: number }): void {
-    this.db
-      .prepare(
-        `INSERT INTO jobs (id, stack_cwd, check_name, state, verdict, created_at, finished_at) VALUES (?,?,?,?,?,?,?)
-         ON CONFLICT(id) DO UPDATE SET state=excluded.state, verdict=excluded.verdict, finished_at=excluded.finished_at`,
-      )
-      .run(job.id, job.stackCwd, job.check, job.state, job.verdict ? JSON.stringify(job.verdict) : null, Date.now(), job.finishedAt ?? null);
-  }
-
-  getJob(id: string): { id: string; check: string; state: string; verdict: unknown; createdAt: number; finishedAt: number | null } | undefined {
-    const r = this.db.prepare('SELECT * FROM jobs WHERE id = ?').get(id) as Record<string, unknown> | undefined;
-    if (!r) return undefined;
-    return {
-      id: r.id as string,
-      check: r.check_name as string,
-      state: r.state as string,
-      verdict: r.verdict ? JSON.parse(r.verdict as string) : null,
-      createdAt: r.created_at as number,
-      finishedAt: (r.finished_at as number) ?? null,
-    };
-  }
-
-  listJobs(limit = 20): Array<{ id: string; check: string; state: string; ok: boolean | null; createdAt: number; finishedAt: number | null }> {
-    return (this.db.prepare('SELECT * FROM jobs ORDER BY created_at DESC LIMIT ?').all(limit) as Record<string, unknown>[]).map((r) => ({
-      id: r.id as string,
-      check: r.check_name as string,
-      state: r.state as string,
-      ok: r.verdict ? Boolean((JSON.parse(r.verdict as string) as { ok?: boolean }).ok) : null,
-      createdAt: r.created_at as number,
-      finishedAt: (r.finished_at as number) ?? null,
-    }));
-  }
-
-  /** Recovery: a job left 'running'/'pending' by a dead daemon can never finish. */
-  failStaleJobs(): number {
-    const stale = this.db.prepare("SELECT id, check_name, stack_cwd FROM jobs WHERE state != 'done'").all() as Array<{ id: string; check_name: string; stack_cwd: string }>;
-    for (const j of stale) {
-      this.saveJob({
-        id: j.id, stackCwd: j.stack_cwd, check: j.check_name, state: 'done',
-        verdict: { check: j.check_name, ok: false, exitCode: -1, failure: { class: 'env-error', message: 'daemon restarted while this run was in flight — result lost' } },
-        finishedAt: Date.now(),
-      });
-    }
-    return stale.length;
-  }
-
-  /** Retention: done jobs finished before the cutoff leave the journal. */
-  pruneJobs(cutoffMs: number): number {
-    const res = this.db.prepare("DELETE FROM jobs WHERE state = 'done' AND finished_at IS NOT NULL AND finished_at < ?").run(cutoffMs);
-    return Number(res.changes ?? 0);
   }
 
   /** Shift every deadline by `ms` — the sleep pardon (decision 0009). */
