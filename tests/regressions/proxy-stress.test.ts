@@ -48,8 +48,14 @@ describe('proxy', () => {
     const pub = await freePort();
     await hub.listen('e2', 'web', pub);
     hub.starting('e2', 'web', 'web');
-    const all = Array.from({ length: 400 }, (_, i) => roundTrip(pub, Buffer.from(`req-${i}`)));
-    await new Promise((r) => setTimeout(r, 500));
+    // Connect in bursts of 100: macOS caps the listen backlog at 128
+    // (kern.ipc.somaxconn) and resets a burst beyond it before Node accepts.
+    const all: Array<Promise<string>> = [];
+    for (let b = 0; b < 4; b++) {
+      for (let i = 0; i < 100; i++) all.push(roundTrip(pub, Buffer.from(`req-${b * 100 + i}`)));
+      for (let t = 0; t < 50 && hub.stats('e2').web!.held < all.length; t++) await new Promise((r) => setTimeout(r, 20));
+    }
+    await new Promise((r) => setTimeout(r, 300));
     expect(hub.stats('e2').web!.held).toBe(400);
     hub.up('e2', 'web', internal, 'web');
     const res = await Promise.all(all);
