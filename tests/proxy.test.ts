@@ -334,7 +334,9 @@ describe('the proxy in front of a real environment', () => {
   }, 60_000);
 
   it('never hands the same public port to two stacks, and re-binds them after a daemon restart', async () => {
-    const d = track(daemonCtx({ BACKLOT_PORT_RANGE: '27100-27103' }));
+    // A machine-wide cap above three, so the third stack fails on ports, not capacity
+    // (a small CI runner's heuristic cap is 2).
+    const d = track(daemonCtx({ BACKLOT_PORT_RANGE: '27100-27103', BACKLOT_POOL_MAX_TOTAL: '8' }));
     const a = trackDir(makeWorktree('alloc-a', { web: 'server.mjs', api: 'server.mjs' }));
     const b = trackDir(makeWorktree('alloc-b', { web: 'server.mjs', api: 'server.mjs' }));
     const [ua, ub] = await Promise.all([d.cli(['up', '--json'], a), d.cli(['up', '--json'], b)]);
