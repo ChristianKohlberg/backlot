@@ -54,6 +54,15 @@ export interface DsDriver {
   ensure(h: DsHandle, preset: string, force: boolean, exists: boolean): Promise<void>;
   /** Best-effort removal (recycle). */
   drop(h: DsHandle): Promise<void>;
+  /**
+   * The drop as data, for a row that must be reapable without the manifest
+   * (a `runly db` copy, decision 0034): the already-templated command for a
+   * server datastore, or null when the namespace is a file under the state
+   * root (sqlite) — removing that is the engine's to do.
+   */
+  dropCommand(h: DsHandle): string | null;
+  /** True when the namespace is a local file (sqlite), false for a server database. */
+  readonly fileBased: boolean;
   /** @rebake-template: invalidate baked templates (and drop their server-side DBs). */
   rebake(cwd?: string): void | Promise<void>;
 }
@@ -245,6 +254,7 @@ export async function retireBakedTemplates(dir: string, cwd: string, force = fal
 // ---------------------------------------------------------------- sqlite
 
 class SqliteDs implements DsDriver {
+  readonly fileBased = true;
   constructor(
     readonly name: string,
     private readonly spec: DatastoreSpec,
@@ -312,6 +322,10 @@ class SqliteDs implements DsDriver {
     }
   }
 
+  dropCommand(_h: DsHandle): string | null {
+    return null;
+  }
+
   async drop(h: DsHandle): Promise<void> {
     const db = this.ns(h);
     rmSync(db, { force: true });
@@ -341,6 +355,7 @@ function dropSidecars(dbPath: string): void {
 // ---------------------------------------------------------------- command family
 
 class CommandDs implements DsDriver {
+  readonly fileBased = false;
   constructor(
     readonly name: string,
     private readonly spec: DatastoreSpec,
@@ -485,6 +500,10 @@ class CommandDs implements DsDriver {
     } else {
       await sh(template(this.spec.create, { ns, preset }), h.cwd, `seed failed for '${this.name}' preset '${preset}'`);
     }
+  }
+
+  dropCommand(h: DsHandle): string | null {
+    return this.spec.drop ? template(this.spec.drop, { ns: this.ns(h) }) : null;
   }
 
   async drop(h: DsHandle): Promise<void> {

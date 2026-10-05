@@ -33,6 +33,12 @@ fixture stacks in a dedicated temp `BACKLOT_STATE_DIR`, cycling continuously:
   and the URL's port must stay inside the public block 20000–29999.
 - **Env export** — `runly ctx --env` must print parseable `RUNLY_*=value`
   lines, and the stack's own check, run with them outside runly, must pass.
+- **Down and database copies** — `down web` must keep the lease, the URL and
+  report the service `down`, and `up web` must bring it back on the same URL;
+  two parallel `db new` copies must be distinct, listed and dropped, and `db
+  with` must hand its command `RUNLY_DB_URL`/`RUNLY_DB_NAME`, exit with the
+  command's code and leave no copy behind (decision 0034). Convergence fails
+  on any `db_copies` row left after shutdown.
 - **Capacity churn** — a second stack whose one environment (decision 0032) is
   held by a short-TTL holder while a second holder queues on its expiry, plus a quiesce cycle under a
   short `BACKLOT_LEASED_IDLE_TTL_MS`: leased-idle env goes warm, `exec` refuses

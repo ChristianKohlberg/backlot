@@ -59,6 +59,8 @@ export const journalPath = (): string => join(stateRoot(), 'journal.db');
 export const envsRoot = (): string => join(stateRoot(), 'envs');
 export const templatesRoot = (): string => join(stateRoot(), 'templates');
 export const retiredTemplatesRoot = (): string => join(stateRoot(), 'retired-templates');
+/** Private directories of `runly db` copies whose namespace is a file (sqlite), one per copy (decision 0034). */
+export const dbCopiesRoot = (): string => join(stateRoot(), 'dbs');
 /** Where an older runly kept `run` artifacts; retention deletes it (decision 0032). */
 export const artifactsRoot = (): string => join(stateRoot(), 'artifacts');
 /**

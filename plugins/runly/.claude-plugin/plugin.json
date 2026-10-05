@@ -1,7 +1,7 @@
 {
   "name": "runly",
-  "version": "0.10.0",
-  "description": "Teaches an agent to drive runly \u2014 the repo-aware environment broker \u2014 against any repo's runly.yml: lease a warm, seeded, authenticated env that runs in your worktree, run classified checks, partial/per-service up, then ctx/release. CLI-only, no MCP server; bundles the stack-agnostic runly skill.",
+  "version": "0.11.0",
+  "description": "Teaches an agent to drive runly \u2014 the repo-aware environment broker \u2014 against any repo's runly.yml: lease a warm, seeded, authenticated env that runs in your worktree, run classified checks, additive per-service up/down, database copies (runly db), ps, then ctx/release. CLI-only, no MCP server; bundles the stack-agnostic runly skill.",
   "author": {
     "name": "ChristianKohlberg"
   },

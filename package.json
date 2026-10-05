@@ -1,6 +1,6 @@
 {
   "name": "runly",
-  "version": "0.14.0",
+  "version": "0.15.0",
   "description": "The repo-aware environment broker: puts a working, seeded, provable instance of your web application in front of coding agents and humans \u2014 warm pools, leases, bind-by-sync. Brokers environments; never provides them.",
   "keywords": [
     "environment",

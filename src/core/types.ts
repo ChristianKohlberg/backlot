@@ -97,8 +97,6 @@ export interface Context {
    * same public URL serving new content.
    */
   previewNotice?: string;
-  /** True when the lease is over the datastores alone, so `urls` is empty by design. */
-  dataOnly?: boolean;
   /**
    * The PRIMARY login — the first one the manifest declares. Kept singular so a
    * consumer written against the one-login form keeps reading `logins.user`

@@ -1,31 +1,63 @@
-import { defaultPreset, type Manifest } from './manifest.js';
+import { defaultPreset, type DatastoreSpec, type Manifest } from './manifest.js';
 import { BrokerError } from './util.js';
-import type { LeaseKind } from './types.js';
 
-/** Resolve selections before acquiring an environment or changing its data. */
-export function selectPresets(manifest: Manifest, kind: LeaseKind, requested?: unknown, previous?: Record<string, string>): Record<string, string> {
+/** The presets a datastore offers. A manifest without a catalog keeps its historical default choices. */
+export function presetCatalog(spec: DatastoreSpec): string[] {
+  return spec.presets?.length ? spec.presets : [...new Set(['default', ...Object.values(spec.default_preset ?? {})])];
+}
+
+/** A datastore's default preset, validated against its catalog. */
+export function defaultPresetFor(name: string, spec: DatastoreSpec): string {
+  const catalog = presetCatalog(spec);
+  for (const value of Object.values(spec.default_preset ?? {})) {
+    if (!catalog.includes(value)) throw new BrokerError('work-error', `default preset '${value}' for '${name}' is not declared in presets`, 'manifest');
+  }
+  const value = defaultPreset(spec, 'session');
+  if (!catalog.includes(value)) {
+    throw new BrokerError('work-error', `no preset '${value}' for datastore '${name}' (have: ${catalog.join(', ') || 'none'})`, 'manifest');
+  }
+  return value;
+}
+
+/**
+ * Validate an explicit `--preset` request (decision 0034) and every declared
+ * default, before anything is claimed or changed. Returns ONLY the datastores
+ * the caller named: an explicit preset reloads that datastore from its
+ * template, and a datastore nobody named keeps whatever it holds.
+ */
+export function validatePresetRequest(manifest: Manifest, requested?: unknown): Record<string, string> {
   const stores = manifest.datastores ?? {};
   if (requested !== undefined && (requested === null || typeof requested !== 'object' || Array.isArray(requested))) {
     throw new BrokerError('work-error', 'presets must map datastore names to preset names', 'manifest');
   }
   const choices = (requested ?? {}) as Record<string, unknown>;
   for (const [name, value] of Object.entries(choices)) {
-    if (!Object.hasOwn(stores, name)) throw new BrokerError('work-error', `no datastore '${name}' in backlot.yml`, 'manifest');
+    if (!Object.hasOwn(stores, name)) throw new BrokerError('work-error', `no datastore '${name}' in runly.yml`, 'manifest');
     if (typeof value !== 'string' || !value) throw new BrokerError('work-error', `preset for '${name}' must be a nonempty name`, 'manifest');
   }
-  return Object.fromEntries(Object.entries(stores).map(([name, spec]) => {
-    // A manifest without a catalog retains its historical default choices.
-    const catalog = spec.presets?.length ? spec.presets : [...new Set(['default', ...Object.values(spec.default_preset ?? {})])];
-    for (const value of Object.values(spec.default_preset ?? {})) {
-      if (!catalog.includes(value)) throw new BrokerError('work-error', `default preset '${value}' for '${name}' is not declared in presets`, 'manifest');
+  const out: Record<string, string> = {};
+  for (const [name, spec] of Object.entries(stores)) {
+    defaultPresetFor(name, spec);
+    if (!Object.hasOwn(choices, name)) continue;
+    const value = choices[name] as string;
+    const catalog = presetCatalog(spec);
+    if (!catalog.includes(value)) {
+      throw new BrokerError('work-error', `no preset '${value}' for datastore '${name}' (have: ${catalog.join(', ') || 'none'})`, 'manifest');
     }
-    const inherited = previous?.[name];
-    const value = (Object.hasOwn(choices, name) ? choices[name] : undefined) ?? (inherited && catalog.includes(inherited) ? inherited : defaultPreset(spec, kind));
-    if (typeof value !== 'string' || !catalog.includes(value)) {
-      throw new BrokerError('work-error', `no preset '${String(value)}' for datastore '${name}' (have: ${catalog.join(', ') || 'none'})`, 'manifest');
-    }
-    return [name, value];
-  }));
+    out[name] = value;
+  }
+  return out;
+}
+
+/**
+ * The preset a datastore is (re)created with when the caller named none: the
+ * one it holds, while the catalog still offers it, else the default. A store
+ * that is merely KEPT is never touched — this only decides what a restore that
+ * happens anyway (a reset, a first creation) restores.
+ */
+export function presetToRestore(name: string, spec: DatastoreSpec, held: string | undefined): string {
+  if (held !== undefined && presetCatalog(spec).includes(held)) return held;
+  return defaultPresetFor(name, spec);
 }
 
 /** CLI shorthand is only unambiguous for a single datastore. */

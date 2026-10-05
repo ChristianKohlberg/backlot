@@ -32,7 +32,7 @@ Decision 0032 removed the projection: services, builds, upkeep, `exec` and `auth
 
 - **Never delete in the worktree.** Teardown removes only `env.root`, and `isPrivateEnvDir` checks it is under `envs/` and does not contain `env.stackRoot` first. `reset-data` touches data only; `pristine` clears the worktree's upkeep LEDGER (re-run every rule), never files.
 - **One environment per worktree.** `tryClaim` creates an environment only when the stack has none; a second holder queues for it, and `worktreeHold` makes the refusal structural (fail fast, naming the holder) when the lease outlasts the wait. Never reintroduce a second environment for a stack; `drainSurplusEnvs` recycles the ones an older journal left.
-- **runly caches no builds, and `up` restarts only what a build changed.** There is no `@source`, no source fingerprint, no build stamp: a `build:` runs on every `up` that starts its service (and on every `warm`). When nothing forces the full path (manifest, inputs, presets, upkeep that ran, hygiene, health, shape), `bindAndStart` builds each active service between two `snapshotOutputs` calls (`src/core/worktree.ts`: path, size, mtime of the service's `outputs:` globs) and restarts only those whose snapshot differs — or which declare no outputs — via `stopServicesForRestart` + `startSlice(only)`. A service without `build:` is never restarted there, and dependents of a restarted service are not either. `bindDiagnostics.reuse` is `reused` | `restarted` | `rebound`.
+- **runly caches no builds, and `up` restarts only what a build changed.** There is no `@source`, no source fingerprint, no build stamp: a `build:` runs on every `up` that starts its service (and on every `warm`). When nothing forces the full path (manifest, inputs, upkeep that ran, hygiene, health, a moved port), `bindAndStart` builds each running service between two `snapshotOutputs` calls (`src/core/worktree.ts`: path, size, mtime of the service's `outputs:` globs) and restarts only those whose snapshot differs — or which declare no outputs — via `stopServicesForRestart` + `startSlice(only)`. A service without `build:` is never restarted there, and dependents of a restarted service are not either. `bindDiagnostics.reuse` is `reused` | `restarted` | `rebound`.
 - **Upkeep reads only its trigger files.** `triggerSet` (`src/core/upkeep.ts`) lists the files the `when:` globs match and hashes them, stat-gated, with a small cache in `worktrees/<stack>/triggers.json`. Keep it scoped to trigger files — a whole-worktree hash is exactly what was removed.
 - **The upkeep ledger is the worktree's.** Command rules live in `worktrees/<stack>/ledger.json` (`src/core/tree-ledger.ts`); `@` built-ins stay on the env row. `warm` writes the same ledger a bind reads.
 - **Lock order: env lock first, then the worktree lock (`treeLocked`).** Binds take the env lock then the worktree lock around upkeep and builds; `warm` takes the stack's env lock(s) (`envsLocked`) then the worktree lock — it can run before any env exists, which is why the worktree lock is still needed. Taking them the other way round deadlocks against a bind.
@@ -111,8 +111,7 @@ label, and `setsid` descendants are outside it — the contract is in
 `reconcilePreviewForBind` owns what a bind **and a reusing `up`**
 do to a live tunnel: it tears it
 down when `preview.forbidden` appears, when the previewed service leaves the
-running set (a narrowed slice or `--data-only` — nothing brings it back this
-lease), or when its local port moves (a full bind only — a reuse allocates
+running set (a `runly down` — nothing brings it back this lease), or when its local port moves (a full bind only — a reuse allocates
 nothing, and it judges the slice by the env's durable shape, not by live pids);
 the slice and port causes are reconciled at the bind's **epilogue**, once the
 shape they judge against is committed, while `forbidden` is enforced up front so
@@ -142,11 +141,15 @@ data preservation, deferred migration, and retirement (including old retention).
 
 `--holder-pid` / `BACKLOT_HOLDER_PID` frees the environment the moment the named process exits, which only helps a caller that outlives the command. `BACKLOT_HOLDER_PID=$$` from an agent harness names an already-exited shell, so the lease is reclaimable on arrival: the sweeper's dead-holder rule frees the env, the next binder takes it, and the first caller is left looking at a different, unseeded store through the same URL. It presents as a stale seed template — the wrong subsystem entirely. Binds naming a dead pid are now refused (exit 64). See the lease bullet in `docs/architecture.md`.
 
-## Data-only leases
+## `up` is additive; a preset reloads one datastore; a database alone is a `runly db` copy
 
-`up --data-only` binds an ordinary pooled environment's **datastores only** — no services, no builds — for test lanes that need a seeded database rather than an application ([decision 0023](docs/decisions/0023-data-only-leases.md)). The sharp edge: `activeServices: []` cannot express "no services", because an empty *selection* has always meant "the whole app" in `resolveServiceClosure`. The durable flag is `EnvRow.dataOnly`, and it follows the slice's inheritance rule — explicit request wins, a fresh claim never inherits, a continuing lease preserves. Such an environment is published `warm` (nothing is running, which is what warm means), so `assertUsable` must not read warm as "the daemon restarted and lost your services". `tests/data-only-lease.test.ts` covers it.
+Decision 0034. Sharp edges:
 
-Pool commands are shared-box operations: `pool recycle` with no id targets **every** environment, and `--force` is the only thing that takes one out from under a live lease. In `status`, `heat: 'cold'` means quiesced-and-free, not stuck; the `available` and `summary` fields say so outright because reading 'cold' as 'broken' is what caused #40.
+- **`EnvRow.activeServices` is what the lease WANTS**, not what runs: undefined = every service, `[]` = none (`down` with no names). `desiredServices` falls back to every service only when a non-empty list has lost all its members to the manifest. A bind runs `running ∪ wanted ∪ closure(request)` for a continuing lease and `running ∪ closure(request)` for a fresh claim — it never stops a running service. `up`'s RPC sends `[]` for "the default set"; only reset-data passes `undefined` (adds nothing). `startSlice` counts a dependency that is not wanted as satisfied (the lease took it `down`).
+- **A preset is a one-off reload, not lease intent.** `validatePresetRequest` returns only the named stores; everything else keeps its data (`env.presets` = what the store holds; `presetToRestore` decides what a reset or a first creation restores). `pristine` keeps `env.presets`. On the incremental path the running services that template `{{datastores.<name>.…}}` are stopped around the reload (`datastoreUsers`; `null` = nobody references it = restart all). `leases.presets` is no longer read.
+- **Copies are `db_copies` rows** written `creating` before the restore, with the drop recorded (command + cwd, or a dir under `<state>/dbs` checked by `isPrivateDbDir`). `dbBusy` guards in-flight creates/drops from the reaper; `reapDbCopies` runs in every sweep and (not awaited) at the end of `recover()`. `holderGone` is the one liveness check for lease holders and copy holders — step 6's grace belongs there. A failed drop keeps the row (`dropping`) with a backoff; never delete a row whose drop did not confirm.
+- **`--data-only` is gone**: the CLI exits 64 before the daemon, the engine refuses `dataOnly` from any RPC client (`DATA_ONLY_REMOVED`), and `recover()` migrates `data_only=1` rows (leased → `activeServices: []`, unleased → recycled). The column stays for that read only.
+- `tests/additive-up-and-db.test.ts` covers additive up/down, preset reloads, copies and their reaping (holder death, worktree removal, daemon restart), `ps` and the data-only migration; `tests/survivor-ownership.test.ts` drives the survivor-retention cases through `down`.
 
 ## Two pool caps, and why the machine-wide one evicts
 
@@ -154,10 +157,7 @@ Pool commands are shared-box operations: `pool recycle` with no id targets **eve
 
 The consequence worth remembering: **waiting can never clear a machine-wide block**, because a release leaves the row behind. `structuralCapacityBlock` therefore treats it as structural unless something is evictable or transient — the old code explicitly assumed the opposite ("another stack will release") and burned the full window (#47). `tests/pool-machine-capacity.test.ts` covers all of it.
 
-The data-only ceiling and shape-conversion accounting are defined in
-[decision 0025](docs/decisions/0025-data-only-environments-are-priced-separately.md).
-`stopForBind`, `pendingBinds` and `tryClaim` enforce the transition;
-`tests/conversion-capacity.test.ts` and `tests/data-only-lease.test.ts` cover it.
+There is no data-only ceiling any more (decision 0034); every environment counts against `poolMaxTotal`.
 
 ## Version skew is a first-class failure, and the daemon outlives the install
 
@@ -193,12 +193,12 @@ user_version`; a daemon refuses to open a journal stamped newer than it understa
 Bump it only when a change makes an older daemon **misread** this journal — the
 additive `ALTER TABLE` migrations are not bumps.
 
-For preset intent versus completed restores and its compatibility barrier, see
-the `JOURNAL_SCHEMA_VERSION` comment in `src/core/journal.ts`.
+For what `env.presets` means (the preset each datastore holds) and why schema 4
+refuses older daemons, see the `JOURNAL_SCHEMA_VERSION` comment in `src/core/journal.ts`.
 
 See [journal upgrade barrier](docs/architecture.md#journal-upgrade-barrier) for
 survivor group ownership and old-reader refusal;
-`tests/conversion-capacity.test.ts` covers failed eviction and group retry.
+`tests/survivor-ownership.test.ts` covers failed eviction and group retry.
 
 ## Caller environment inputs
 

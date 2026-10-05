@@ -4,16 +4,16 @@
  */
 import { mkdirSync, rmSync, readdirSync, existsSync, readFileSync, writeFileSync, renameSync } from 'node:fs';
 import { isAbsolute, join, relative, sep } from 'node:path';
-import { Journal, JOURNAL_SCHEMA_VERSION, type EnvRow, type LeaseRow } from '../core/journal.js';
+import { Journal, JOURNAL_SCHEMA_VERSION, type DbCopyRow, type EnvRow, type LeaseRow } from '../core/journal.js';
 import { BUILD, VERSION, compareVersions, versionSkew } from '../core/version.js';
 import { canonicalDirectory, stackIdentity, retiredStackIdentity, loadStack, normalizeLogins, type Stack } from '../core/manifest.js';
 import { snapshotOutputs } from '../core/worktree.js';
 import { clearTreeLedger, pickEnvKeys, pickTreeKeys, readTreeLedger, worktreeStateDir, writeTreeLedger } from '../core/tree-ledger.js';
-import { selectPresets } from '../core/presets.js';
+import { defaultPresetFor, presetToRestore, validatePresetRequest } from '../core/presets.js';
 import { runUpkeep, templateBakeKeys, triggerSet, type UpkeepStep } from '../core/upkeep.js';
 import { allocateInBlock, blockConflicts, ephemeralRange, inBlock, internalBlock, publicBlock, tunnelBlock } from '../core/ports.js';
 import { PortInUse, ProxyHub } from './proxy.js';
-import { envsRoot, stateRoot, templatesRoot, retiredTemplatesRoot } from '../core/paths.js';
+import { dbCopiesRoot, envsRoot, stateRoot, templatesRoot, retiredTemplatesRoot } from '../core/paths.js';
 import { BrokerError, template, templateEnv, now, shortId } from '../core/util.js';
 import { callerEnvSpec, requireCallerEnv, selectCallerEnv, serviceCallerEnv, validateCallerEnv } from '../core/caller-env.js';
 import { cmdTimeoutS, runBounded, runBoundedIO, LONG_CMD_TIMEOUT_S } from '../core/exec.js';
@@ -30,7 +30,6 @@ import { BindTrace, type BindDiagnostics } from '../core/diagnostics.js';
 import type { Hygiene, LeaseKind, ServicePid } from '../core/types.js';
 
 const POOL_MAX_TOTAL = () => policy().poolMaxTotal;
-const POOL_MAX_DATA_ONLY = () => policy().poolMaxDataOnly;
 const LEASE_TTL = (_kind: LeaseKind) => policy().sessionTtlMs;
 const IDLE_TTL = () => policy().idleTtlMs;
 const LEASED_IDLE_TTL = () => policy().leasedIdleTtlMs;
@@ -39,15 +38,19 @@ const WAIT_MS = () => policy().waitMs;
 /** Streamed bind phases → human progress on stderr (never on the --json stdout). */
 export type Progress = (phase: string) => void;
 
-/**
- * What one claim attempt found: an environment to bind, a deferral because the
- * holder's own environment has an operation in flight that its shape change
- * must wait for, or nothing (capacity, or not this caller's turn).
- */
-type ClaimOutcome = { env: EnvRow; fresh: boolean } | { deferred: EnvRow; op: string } | null;
+/** What one claim attempt found: an environment to bind, or nothing (capacity, or not this caller's turn). */
+type ClaimOutcome = { env: EnvRow; fresh: boolean } | null;
+
+/** The answer to `up --data-only` from any client that still sends it (the CLI exits 64 before the daemon). */
+export const DATA_ONLY_REMOVED =
+  `'up --data-only' was removed (decision 0034): a database without an environment is 'runly db new <datastore>' ` +
+  `(or 'runly db with <datastore> -- <cmd>', which drops it when the command exits); an environment with no services running is 'runly down'`;
 
 export interface UpOptions {
-  /** Explicit datastore-to-preset overrides; continuing leases retain unmentioned choices. */
+  /**
+   * Datastores to RELOAD from their template, each with the preset to load
+   * (decision 0034). A datastore not named here keeps whatever it holds.
+   */
   presets?: unknown;
   cwd: string;
   /** Explicit refresh envelope; absent means retain this lease's in-memory inputs. */
@@ -57,29 +60,14 @@ export interface UpOptions {
   kind?: LeaseKind;
   ttlMs?: number;
   /**
-   * Bring up only these services (plus their transitive depends_on closure)
-   * instead of the whole app — `runly up sherlock audit`. An empty array is
-   * the explicit "whole app" the `up` verb always sends. Undefined is DISTINCT:
-   * it means "keep the lease's current shape" and is what the internal
-   * reset-data rebinds pass, so a slice survives a rebind rather than
-   * silently re-expanding to the full app.
+   * Services to START, plus their transitive depends_on closure — ADDED to
+   * what the environment already runs (decision 0034: `up` is additive and
+   * never stops a running service). Empty or omitted is the manifest's default
+   * set, which is every service. (Only the internal reset-data rebind adds
+   * nothing; it does not come through `up`.)
    */
   services?: string[];
-  /**
-   * Lease the DATASTORES ONLY — no services, no builds. `runly up --data-only`.
-   *
-   * The unit a test lane actually needs is "a warm, seeded database, leased per
-   * consumer, reset on release", which is a strict subset of an environment. Without
-   * this the only options were leasing a whole application environment (heavier than
-   * a test lane needs, and it competes with the interactive leases people use to look
-   * at the app) or building the same thing from scratch with Testcontainers — which
-   * is what everybody did, at the cost of a container start plus a full restore per
-   * test collection.
-   *
-   * Distinct from `services: []`, which has always meant "the whole app": an empty
-   * SELECTION is not the same statement as an empty SHAPE. Undefined here means
-   * "keep the lease's current shape", exactly as for `services`.
-   */
+  /** Removed by decision 0034; a request that still sets it is refused with DATA_ONLY_REMOVED. */
   dataOnly?: boolean;
   /**
    * The CALLER's process, so its lease can be released when it dies.
@@ -141,15 +129,6 @@ export class Engine {
   readonly busy = new Set<string>();
   /** What is in flight on a busy env, so a deferral can name it. */
   private busyOp = new Map<string, string>();
-  /**
-   * Claims handed out but whose bind has not yet taken the environment lock.
-   * The lock marks `busy` only once its callback runs, several microtasks after
-   * the claim resolved — a shape conversion chained right behind that claim
-   * would otherwise rewrite the reservation of an environment about to start
-   * services. Counted under the pool lock, released by `up` once its bind
-   * holds the lock (or could not reach it).
-   */
-  private pendingBinds = new Map<string, number>();
   /** Never persisted or returned. Lease IDs prevent reuse from inheriting another caller's inputs. */
   private leaseInputs = new Map<string, { values: Record<string, string>; revision: string }>();
   /** Opaque in-memory revisions only; no secret values or hashes in the journal. */
@@ -303,6 +282,28 @@ export class Engine {
       kind: 'recover',
       detail: `reconciled ${envs} env(s)${stranded ? `, ${stranded} service(s) survived the reap` : ''}`,
     });
+    // Data-only environments are gone (decision 0034). A leased one becomes
+    // what it always was underneath — an environment whose lease wants no
+    // services — so its holder keeps the lease and the data. An unleased one is
+    // a test lane nobody holds any more; it is recycled, giving its datastores
+    // back, rather than taking a machine-wide slot it was never charged for.
+    for (const env of this.journal.allEnvs()) {
+      if (!env.dataOnly || env.state === 'recycling') continue;
+      env.dataOnly = false;
+      env.activeServices = [];
+      if (env.state === 'hot') env.state = 'warm';
+      if (this.journal.leaseForEnv(env.id)) {
+        this.journal.saveEnv(env);
+        logEvent({ level: 'info', kind: 'migrate', envId: env.id, detail: 'a data-only environment from an older runly is now an environment with no services wanted; its lease and data are kept (decision 0034)' });
+        continue;
+      }
+      env.state = 'recycling';
+      this.journal.saveEnv(env);
+      logEvent({ level: 'info', kind: 'migrate', envId: env.id, detail: 'an unleased data-only environment from an older runly is recycled (decision 0034: a database alone is a runly db copy)' });
+      void this.teardownClaimed(env).catch((err) =>
+        logEvent({ level: 'error', kind: 'teardown', envId: env.id, detail: `recycling a data-only environment failed: ${String((err as Error).message ?? err)}` }),
+      );
+    }
     // Anything the journal never knew about — the owner died before the pids
     // were ever written, or the env row is long gone — is only findable by tag.
     const gc = await this.poolGc(false);
@@ -323,6 +324,11 @@ export class Engine {
         logEvent({ level: 'warn', kind: 'proxy', envId: env.id, detail: `could not hold its public ports at startup (the next bind retries): ${String((err as Error).message ?? err)}` });
       }
     }
+    // Database copies outlive the daemon, and so does the reason to drop one:
+    // a holder that died while no daemon was looking, a worktree removed
+    // meanwhile, a restore cut short by the stop. Not awaited — drops run
+    // external commands, and requests should not queue behind them.
+    void this.reapDbCopies().catch((err) => logEvent({ level: 'error', kind: 'db', detail: `reaping database copies at startup failed: ${String((err as Error).message ?? err)}` }));
   }
 
   /**
@@ -402,14 +408,7 @@ export class Engine {
     return { root, data: join(root, 'data'), logs: join(root, 'logs'), legacyTree: join(root, 'tree') };
   }
 
-  /**
-   * `dataOnly` is fixed HERE, for the environment's whole life (decision 0025).
-   * Making it a per-claim property is what let the separate data-only ceiling be
-   * bypassed: the two shapes answer to different caps, and reuse is never
-   * capacity-checked, so a claim that changed the shape moved the environment
-   * between ceilings unmetered.
-   */
-  private async createEnv(stack: Stack, dataOnly: boolean): Promise<EnvRow> {
+  private async createEnv(stack: Stack): Promise<EnvRow> {
     // Monotonic, never-reused sequence — a reaped env's id can never collide
     // with a live one (the old length+1 scheme did, deterministically).
     const n = this.journal.nextEnvSeq(stack.id);
@@ -428,7 +427,6 @@ export class Engine {
       id, stack: stack.id, stackRoot: stack.root, state: 'warm', root: dirs.root,
       ports, datastoreNs: {}, fingerprints: {}, presets: {},
       bindCount: 0, createdAt: now(), lastUsedAt: now(), servicePids: {}, failStreak: 0,
-      dataOnly,
     };
     this.journal.saveEnv(env);
     return env;
@@ -517,31 +515,8 @@ export class Engine {
     return moved;
   }
 
-  /** The operation in flight on an environment, or null when nothing owns it. */
-  private inFlightOn(envId: string): string | null {
-    if (this.busy.has(envId)) return this.busyOp.get(envId) ?? 'an operation';
-    if ((this.pendingBinds.get(envId) ?? 0) > 0) return 'a bind that has been claimed and is about to start';
-    return null;
-  }
-
-  private reserveBind(envId: string): void {
-    this.pendingBinds.set(envId, (this.pendingBinds.get(envId) ?? 0) + 1);
-  }
-
-  private releaseBind(envId: string): void {
-    const n = (this.pendingBinds.get(envId) ?? 0) - 1;
-    if (n > 0) this.pendingBinds.set(envId, n);
-    else this.pendingBinds.delete(envId);
-  }
-
-  /**
-   * One atomic claim attempt — MUST run under the pool lock. `deferred` is not
-   * a capacity shortfall: the holder's own environment is mid-operation and its
-   * shape may not be rewritten until that finishes. Callers wait for it without
-   * evicting or judging capacity, and every returned claim carries a bind
-   * reservation that `up` must release.
-   */
-  private async tryClaim(stack: Stack, holder: string, kind: LeaseKind, hygiene: Hygiene, ttlMs: number, dataOnly: boolean, holderPid?: number, onlyMine = false): Promise<ClaimOutcome> {
+  /** One atomic claim attempt — MUST run under the pool lock. */
+  private async tryClaim(stack: Stack, holder: string, kind: LeaseKind, hygiene: Hygiene, ttlMs: number, holderPid?: number, onlyMine = false): Promise<ClaimOutcome> {
     // A holder keeps its env: rebinding your own lease is the normal loop —
     // unless that env is being torn down or has flapped, in which case drop the
     // stale lease and fall through to a fresh claim.
@@ -553,31 +528,9 @@ export class Engine {
     if (mine && !(onlyMine && mine.expiresAt <= now())) {
       const env = this.journal.getEnv(mine.envId);
       if (env && env.state !== 'recycling' && env.state !== 'degraded') {
-        // Switching your own lease between shapes stays supported (decision
-        // 0023) — but it is now a CAPACITY EVENT, because the two shapes answer
-        // to different ceilings. Converting moves this environment from one
-        // bucket to the other, and reuse is otherwise never capacity-checked, so
-        // an unmetered conversion is exactly how the cheap data-only ceiling
-        // could be spent as application capacity: take N catalog-priced
-        // environments, then turn them into full stacks for free (decision 0025).
-        // A queued bind may still start the previous shape. Do not rewrite its
-        // reservation while that operation owns the environment lock.
-        if ((env.dataOnly === true) !== dataOnly) {
-          const op = this.inFlightOn(env.id);
-          if (op !== null) return { deferred: env, op };
-        }
-        if ((env.dataOnly === true) !== dataOnly && !this.convertShape(env, dataOnly)) {
-          throw new BrokerError(
-            'env-error',
-            this.capacityRefusal(stack, dataOnly, this.capacityBinding(stack.id, dataOnly) ?? 'machine', null) +
-              ` (your lease on ${env.id} would have to change shape to ${dataOnly ? 'data-only' : 'an application environment'}, which is what needs the room.)`,
-            'pool',
-          );
-        }
         this.journal.saveLease({ ...mine, hygiene, expiresAt: now() + ttlMs, ...holderIdentity(holderPid) });
-        // A continuing lease keeps its shape: bindAndStart's undefined-request
-        // path preserves env.activeServices for this same holder.
-        this.reserveBind(env.id);
+        // A continuing lease keeps the services it wants: bindAndStart adds
+        // the request to env.activeServices (decision 0034).
         return { env, fresh: false };
       }
       // Awaited: endLease became async when it grew a tunnel reap, and the
@@ -592,112 +545,39 @@ export class Engine {
     if (onlyMine) return null;
     const envs = this.journal.envsForStack(stack.id);
     const free = envs
-      .filter((e) => !this.journal.leaseForEnv(e.id) && e.state !== 'degraded' && e.state !== 'recycling' &&
-        ((e.dataOnly === true) === dataOnly || this.inFlightOn(e.id) === null))
-      // Matching SHAPE first, then heat. A data-only row handed to an ordinary
-      // `up` is not wrong — it is a conversion, and conversions have to be paid
-      // for (below) — but reaching for one while a matching environment sits free
-      // would spend capacity for nothing.
-      .sort(
-        (a, b) =>
-          (((a.dataOnly === true) === dataOnly ? 0 : 1) - ((b.dataOnly === true) === dataOnly ? 0 : 1)) ||
-          ((a.state === 'hot' ? -1 : 1) - (b.state === 'hot' ? -1 : 1)),
-      );
+      .filter((e) => !this.journal.leaseForEnv(e.id) && e.state !== 'degraded' && e.state !== 'recycling')
+      .sort((a, b) => (a.state === 'hot' ? -1 : 1) - (b.state === 'hot' ? -1 : 1));
     let env = free[0];
-    // A free environment of the OTHER shape may only be taken if the shape it
-    // would move into has room — otherwise the conversion is unmetered capacity.
-    if (env && (env.dataOnly === true) !== dataOnly && !this.convertShape(env, dataOnly)) env = undefined;
     // ONE environment per worktree (decision 0032). A stack is one physical
     // worktree, and every environment of it would run its services, builds and
     // exec over the same files — a rebuild by one replacing bin/ under the
     // other's running services. So a second environment is never created: a
     // claim on a stack that already has one waits for it (acquireQueued).
-    if (!env && envs.length === 0 && this.capacityBinding(stack.id, dataOnly) === null) env = await this.createEnv(stack, dataOnly);
+    if (!env && envs.length === 0 && this.capacityBinding() === null) env = await this.createEnv(stack);
     if (env) {
       this.journal.saveLease({
         id: `l-${shortId()}`, envId: env.id, kind, holder, hygiene, expiresAt: now() + ttlMs,
-        presets: selectPresets(stack.manifest, kind),
         ...holderIdentity(holderPid),
       });
       // fresh: true — a NEW owner. It must not inherit a previous holder's
-      // leftover activeServices, so bindAndStart treats an unspecified request
-      // on a fresh claim as the whole app. We do NOT rewrite activeServices
-      // here: it may only change AFTER the bind reconciles reality (fast path /
-      // epilogue), so an early bind failure can't strand the journal asserting
-      // a shape that isn't running.
-      this.reserveBind(env.id);
+      // wanted services (bindAndStart starts from what is RUNNING instead), and
+      // activeServices is not rewritten here: it may only change AFTER the bind
+      // reconciles reality, so an early bind failure can't strand the journal
+      // asserting a shape that isn't running.
       return { env, fresh: true };
     }
     return null;
   }
 
   /**
-   * Which ceiling refuses a NEW environment for this stack right now?
-   *
-   * Named explicitly because the two caps have different remedies and every
-   * refusal used to quote the per-stack one: a caller told "raise
-   * BACKLOT_POOL_MAX" while the machine-wide cap was what bound followed that
-   * advice, saw nothing change, and could not have (#47). MUST run under the
-   * pool lock.
+   * Does the machine-wide ceiling refuse a NEW environment right now? Named
+   * explicitly because a refusal must quote the cap that bound (#47). There
+   * is no per-stack cap (one environment per worktree, decision 0032) and no
+   * data-only cap (decision 0034: a database without an application is a
+   * `runly db` copy, which is not an environment). MUST run under the pool lock.
    */
-  private capacityBinding(stackId: string, dataOnly: boolean): 'machine' | 'data-only' | null {
-    // Data-only environments are counted against their OWN machine-wide ceiling
-    // and against neither application cap (decision 0025). poolMaxTotal is
-    // derived from cores and memory because they bound running services; a
-    // data-only environment starts none, so charging it a stack-sized slot made a
-    // test lane compete with the interactive leases people use to look at the app
-    // — the contention `up --data-only` existed to remove (#48). There is no
-    // per-stack data-only cap: a lane per agent on one stack is the normal case.
-    if (dataOnly) {
-      return this.dataOnlyEnvs().length >= POOL_MAX_DATA_ONLY() ? 'data-only' : null;
-    }
-    // No per-stack cap: a stack never has more than one environment (decision
-    // 0032), and BACKLOT_POOL_MAX was removed with it.
-    void stackId;
-    if (this.appEnvs().length >= POOL_MAX_TOTAL()) return 'machine';
-    return null;
-  }
-
-  /**
-   * Move an environment between the application and data-only buckets, if the
-   * destination has room. Returns false — changing nothing — when it does not.
-   *
-   * Reserve the destination at claim time so concurrent claims see it. An
-   * app-to-data conversion retains its application charge until services are
-   * stopped: upkeep can fail before teardown. No rollback may release a slot
-   * while another operation is still using it. MUST run under the pool lock.
-   */
-  private convertShape(env: EnvRow, dataOnly: boolean): boolean {
-    if ((env.dataOnly === true) === dataOnly) return true;
-    // An unfinished conversion already holds its application slot. Returning
-    // to the application shape must not demand a second slot for the same row.
-    if ((dataOnly || !this.usesApplicationCapacity(env)) && this.capacityBinding(env.stack, dataOnly) !== null) return false;
-    env.dataOnly = dataOnly;
-    const row = this.journal.getEnv(env.id);
-    if (row) this.journal.saveEnv({ ...row, dataOnly });
-    logEvent({
-      level: 'info',
-      kind: 'pool-shape',
-      envId: env.id,
-      detail: `reserved ${dataOnly ? 'data-only' : 'an application environment'} — counts against ${dataOnly ? 'BACKLOT_POOL_MAX_DATA_ONLY; application capacity remains reserved until services stop' : 'BACKLOT_POOL_MAX_TOTAL'}`,
-    });
-    return true;
-  }
-
-  /** Durable shape reserves capacity; running reality can retain it too. */
-  private usesApplicationCapacity(env: EnvRow): boolean {
-    return env.dataOnly !== true || env.state === 'hot' || Object.keys(env.servicePids).length > 0;
-  }
-
-  /** Application reservations, including unfinished conversions to data-only. */
-  private appEnvs(stackId?: string): EnvRow[] {
-    const rows = stackId === undefined ? this.journal.allEnvs() : this.journal.envsForStack(stackId);
-    return rows.filter((e) => this.usesApplicationCapacity(e));
-  }
-
-  /** Data-only environments, machine-wide (they have no per-stack ceiling). */
-  private dataOnlyEnvs(): EnvRow[] {
-    return this.journal.allEnvs().filter((e) => e.dataOnly === true);
+  private capacityBinding(): 'machine' | null {
+    return this.journal.allEnvs().length >= POOL_MAX_TOTAL() ? 'machine' : null;
   }
 
   /**
@@ -726,15 +606,12 @@ export class Engine {
    * condemned `hot` environment is the same trade one step further, and
    * recycleOne stops its services through the ordinary teardown.
    */
-  private evictionCandidates(dataOnly: boolean): EnvRow[] {
+  private evictionCandidates(): EnvRow[] {
     const floor = IDLE_TTL();
     return this.journal
       .allEnvs()
       .filter(
         (e) =>
-          // An unfinished conversion can hold both reservations. Evicting it
-          // releases whichever ceiling is currently binding.
-          (dataOnly ? e.dataOnly === true : this.usesApplicationCapacity(e)) &&
           // 'provisioning' is mid-creation, 'recycling' is already going, and
           // 'degraded' is the sweeper's own to reap.
           (e.state === 'warm' || e.state === 'hot') &&
@@ -755,14 +632,11 @@ export class Engine {
    * leased or busy, so a candidate chosen here and leased in the gap is declined
    * rather than taken — never take an environment somebody else is holding (#40).
    */
-  private async evictForMachineCapacity(stack: Stack, dataOnly: boolean): Promise<string | null> {
-    // Only a MACHINE-WIDE ceiling is worth evicting for. A per-stack block is
-    // this stack's own doing and giving up another stack's environment cannot
-    // help it; the data-only ceiling evicts on the same rule, inside its bucket.
-    const bound = await this.poolLocked(() => this.capacityBinding(stack.id, dataOnly));
-    if (bound !== 'machine' && bound !== 'data-only') return null;
-    const before = dataOnly ? `${this.dataOnlyEnvs().length}/${POOL_MAX_DATA_ONLY()} data-only` : `${this.appEnvs().length}/${POOL_MAX_TOTAL()} application`;
-    for (const cand of this.evictionCandidates(dataOnly)) {
+  private async evictForMachineCapacity(stack: Stack): Promise<string | null> {
+    const bound = await this.poolLocked(() => this.capacityBinding());
+    if (bound !== 'machine') return null;
+    const before = `${this.journal.allEnvs().length}/${POOL_MAX_TOTAL()}`;
+    for (const cand of this.evictionCandidates()) {
       const human = (ms: number) => (ms >= 60_000 ? `${Math.round(ms / 60_000)}m` : `${Math.max(1, Math.round(ms / 1000))}s`);
       const idleFor = human(now() - cand.lastUsedAt);
       const wasState = cand.state;
@@ -772,9 +646,9 @@ export class Engine {
         kind: 'pool-evict',
         envId: cand.id,
         detail:
-          `evicted to free a ${dataOnly ? 'data-only' : 'machine-wide'} pool slot for stack '${stack.id}' — ` +
+          `evicted to free a machine-wide pool slot for stack '${stack.id}' — ` +
           `unleased and idle ${idleFor} (${wasState}, past the ${human(IDLE_TTL())} idle TTL), ` +
-          `least recently used of ${this.evictionCandidates(dataOnly).length + 1} candidate(s); the pool held ${before}. ` +
+          `least recently used of ${this.evictionCandidates().length + 1} candidate(s); the pool held ${before}. ` +
           `Its next bind provisions cold.`,
       });
       return cand.id;
@@ -830,23 +704,15 @@ export class Engine {
    * If so, queueing cannot possibly succeed, and reporting "waited 60s" blames a
    * timing problem that does not exist. MUST run under the pool lock.
    */
-  private structuralCapacityBlock(stack: Stack, dataOnly: boolean, deadline: number): { scope: 'worktree' | 'machine' | 'data-only'; detail: string } | null {
+  private structuralCapacityBlock(stack: Stack, deadline: number): { scope: 'worktree' | 'machine'; detail: string } | null {
     const held = this.worktreeHold(stack, deadline);
     if (held !== undefined) return held === null ? null : { scope: 'worktree', detail: held };
-    const bound = this.capacityBinding(stack.id, dataOnly);
-    if (bound === null) return null; // room to grow
-    if (bound === 'data-only') {
-      // Same reasoning as the machine-wide case: this ceiling counts rows, so a
-      // release cannot lower it. Only an eviction or a recycle does.
-      const rows = this.dataOnlyEnvs();
-      if (this.transientlyUnclaimable(rows) || this.evictionCandidates(true).length > 0) return null;
-      return { scope: 'data-only', detail: rows.map((e) => `${e.id} (${this.notEvictableBecause(e)})`).join('; ') };
-    }
+    if (this.capacityBinding() === null) return null; // room to grow
     // The MACHINE-WIDE cap is what bound, and waiting cannot clear it: the
     // count is of env ROWS, and releasing a lease leaves the row behind. Only
     // an eviction, an orphan reap or a degraded reap ever lowers it (#47).
-    const all = this.appEnvs();
-    if (this.transientlyUnclaimable(all) || this.evictionCandidates(false).length > 0) return null;
+    const all = this.journal.allEnvs();
+    if (this.transientlyUnclaimable(all) || this.evictionCandidates().length > 0) return null;
     return { scope: 'machine', detail: all.map((e) => `${e.id} (${this.notEvictableBecause(e)})`).join('; ') };
   }
 
@@ -884,26 +750,17 @@ export class Engine {
    * not a count — so a stack with ZERO environments was told "pool at capacity
    * (6/6)" and pointed at the wrong knob (#47).
    */
-  private capacityRefusal(stack: Stack, dataOnly: boolean, scope: 'worktree' | 'machine' | 'data-only', blocking: string | null): string {
-    const total = this.appEnvs().length;
-    const counts = `the machine holds ${total}/${POOL_MAX_TOTAL()} application environments (BACKLOT_POOL_MAX_TOTAL)`;
+  private capacityRefusal(stack: Stack, scope: 'worktree' | 'machine', blocking: string | null): string {
+    const counts = `the machine holds ${this.journal.allEnvs().length}/${POOL_MAX_TOTAL()} environments (BACKLOT_POOL_MAX_TOTAL)`;
     const waited = blocking === null ? ` after waiting ${Math.round(WAIT_MS() / 1000)}s` : '';
-    if (scope === 'data-only') {
-      return (
-        `pool at capacity${waited}: the DATA-ONLY cap is what refused — ${this.dataOnlyEnvs().length}/${POOL_MAX_DATA_ONLY()} data-only environments machine-wide (BACKLOT_POOL_MAX_DATA_ONLY). ` +
-        `Data-only environments are counted separately from application ones, so ${counts} is not what stopped this. ` +
-        `Releasing a lease will not help — the count is of environments, not leases — and nothing data-only was cold enough to evict.` +
-        (blocking ? ` Holding: ${blocking}.` : '') +
-        ` Raise BACKLOT_POOL_MAX_DATA_ONLY (it bounds disk, not CPU), or 'runly pool recycle <env-id>' a lane you no longer need.`
-      );
-    }
     if (scope === 'machine') {
       return (
         `pool at capacity${waited}: the MACHINE-WIDE cap is what refused — ${counts}. ` +
         `Releasing a lease will not help, because the machine-wide count is of environments, not leases: the row survives a release. ` +
         `Every environment on this box is either leased or too recently used to evict, so runly had nothing cold to give up.` +
         (blocking ? ` Holding: ${blocking}.` : '') +
-        ` Raise BACKLOT_POOL_MAX_TOTAL if the host can take it, or 'runly pool recycle <env-id>' an environment you no longer need.`
+        ` Raise BACKLOT_POOL_MAX_TOTAL if the host can take it, or 'runly pool recycle <env-id>' an environment you no longer need.` +
+        ` A database alone needs no environment: 'runly db new <datastore>' (decision 0034).`
       );
     }
     // scope === 'worktree'
@@ -911,33 +768,18 @@ export class Engine {
       `this worktree's environment is held by another lease${waited}` +
       (blocking ? ` past the wait window: ${blocking}` : '') +
       `. A worktree has exactly one environment (decision 0032) — ${stack.root} — so a second holder waits for it instead of getting another. ` +
-      `Use the holder that owns it (--holder), release that lease, or bind from a separate worktree.`
-    );
-  }
-
-  /**
-   * A bounded wait on the holder's OWN environment ran out. This is not a
-   * capacity refusal — no ceiling bound, and no eviction could have helped —
-   * so it names the operation and the environment instead of a cap.
-   */
-  private busyRefusal(env: EnvRow, op: string, dataOnly: boolean): BrokerError {
-    return new BrokerError(
-      'env-error',
-      `environment ${env.id} is busy after waiting ${Math.round(WAIT_MS() / 1000)}s: ${op} is in flight on it, ` +
-        `and your lease would have to change shape to ${dataOnly ? 'data-only' : 'an application environment'}, ` +
-        `which cannot happen while that operation may still be using it as ${env.dataOnly === true ? 'data-only' : 'an application environment'}. ` +
-        `Retry once it completes, or raise BACKLOT_WAIT_MS to wait longer.`,
-      'pool',
+      `Use the holder that owns it (--holder), release that lease, or bind from a separate worktree. ` +
+      `A database for a parallel test lane needs no environment: 'runly db with <datastore> -- <cmd>' (decision 0034).`
     );
   }
 
   /** Queue at capacity WITHOUT holding the pool lock while sleeping. */
-  private async acquireEnv(stack: Stack, holder: string, kind: LeaseKind, hygiene: Hygiene, ttlMs: number, dataOnly: boolean, holderPid?: number): Promise<{ env: EnvRow; fresh: boolean }> {
+  private async acquireEnv(stack: Stack, holder: string, kind: LeaseKind, hygiene: Hygiene, ttlMs: number, holderPid?: number): Promise<{ env: EnvRow; fresh: boolean }> {
     const start = now();
     // A holder that already holds this stack's LIVE lease consumes no
     // capacity — rebinding only re-saves it (renewing the deadline for an
     // explicit `up`, preserving it for content operations). Sending it through
-    // the queue stalled the normal edit-sync-retest loop behind strangers waiting for
+    // the queue stalled the normal edit-up-retest loop behind strangers waiting for
     // expiry. Expiry is checked HERE, not just in the sweeper: a lapsed lease
     // survives in the journal until the next sweep, and refreshing that
     // corpse would jump a waiter queued on precisely its expiry. onlyMine
@@ -945,18 +787,8 @@ export class Engine {
     // nothing and joins the queue like everyone else.
     const live = this.journal.leaseForHolder(holder, stack.id);
     if (live && live.expiresAt > now()) {
-      // A deferral waits HERE, outside the queue: the holder consumes no
-      // capacity and is only waiting on its own environment, so parking it at
-      // the FIFO head would block every other claimant on this stack for
-      // nothing. If the lease lapses meanwhile, onlyMine returns null and the
-      // holder joins the queue like everyone else.
-      for (;;) {
-        const claimed = await this.poolLocked(() => this.tryClaim(stack, holder, kind, hygiene, ttlMs, dataOnly, holderPid, true));
-        if (claimed === null) break;
-        if ('env' in claimed) return claimed;
-        if (now() - start > WAIT_MS()) throw this.busyRefusal(claimed.deferred, claimed.op, dataOnly);
-        await new Promise((r) => setTimeout(r, 250));
-      }
+      const claimed = await this.poolLocked(() => this.tryClaim(stack, holder, kind, hygiene, ttlMs, holderPid, true));
+      if (claimed !== null) return claimed;
     }
     // FIFO ticket. Without ordering, every waiter polled independently and a
     // freed environment went to whoever happened to poll first — so an early
@@ -966,7 +798,7 @@ export class Engine {
     queue.push(ticket);
     this.waiting.set(stack.id, queue);
     try {
-      return await this.acquireQueued(stack, holder, kind, hygiene, ttlMs, dataOnly, start, ticket, holderPid);
+      return await this.acquireQueued(stack, holder, kind, hygiene, ttlMs, start, ticket, holderPid);
     } finally {
       const rest = (this.waiting.get(stack.id) ?? []).filter((t) => t !== ticket);
       if (rest.length > 0) this.waiting.set(stack.id, rest);
@@ -980,7 +812,6 @@ export class Engine {
     kind: LeaseKind,
     hygiene: Hygiene,
     ttlMs: number,
-    dataOnly: boolean,
     start: number,
     ticket: number,
     holderPid?: number,
@@ -989,34 +820,27 @@ export class Engine {
       // Only the head of THIS STACK's queue may claim; everyone else waits.
       const queue = this.waiting.get(stack.id);
       const myTurn = !queue || queue.length === 0 || queue[0] === ticket;
-      const claimed = myTurn ? await this.poolLocked(() => this.tryClaim(stack, holder, kind, hygiene, ttlMs, dataOnly, holderPid, false)) : null;
-      if (claimed && 'env' in claimed) return claimed;
-      if (claimed) {
-        // Deferred on the holder's own environment: no ceiling bound, so neither
-        // eviction nor the structural check has anything true to say.
-        if (now() - start > WAIT_MS()) throw this.busyRefusal(claimed.deferred, claimed.op, dataOnly);
-        await new Promise((r) => setTimeout(r, 250));
-        continue;
-      }
+      const claimed = myTurn ? await this.poolLocked(() => this.tryClaim(stack, holder, kind, hygiene, ttlMs, holderPid, false)) : null;
+      if (claimed) return claimed;
       // A machine-wide block never clears by waiting — the count is of env rows,
       // and a release leaves the row behind — so a host holding as many cold
       // worktrees as the heuristic allows locked out every new stack
       // indefinitely, while nothing was running (#46). Give up the
       // least-recently-used cold environment instead and claim its slot.
-      if (myTurn && (await this.evictForMachineCapacity(stack, dataOnly))) continue;
+      if (myTurn && (await this.evictForMachineCapacity(stack))) continue;
       // This worktree's one environment is dead (a service flapped past its
       // budget). It used to sit beside a freshly created second one until the
       // sweeper reaped it; with one environment per worktree, waiting for the
       // sweep would stall every bind here for a sweep interval. Reap it now.
       if (myTurn && (await this.reapDegradedOwn(stack))) continue;
       // Refuse to burn the full wait on something that provably cannot resolve.
-      const blocked = await this.poolLocked(() => this.structuralCapacityBlock(stack, dataOnly, now() + WAIT_MS()));
+      const blocked = await this.poolLocked(() => this.structuralCapacityBlock(stack, now() + WAIT_MS()));
       if (blocked) {
-        throw new BrokerError('env-error', this.capacityRefusal(stack, dataOnly, blocked.scope, blocked.detail), 'pool');
+        throw new BrokerError('env-error', this.capacityRefusal(stack, blocked.scope, blocked.detail), 'pool');
       }
       if (now() - start > WAIT_MS()) {
-        const scope = (await this.poolLocked(() => (this.worktreeHold(stack, now()) !== undefined ? 'worktree' as const : this.capacityBinding(stack.id, dataOnly)))) ?? 'worktree';
-        throw new BrokerError('env-error', this.capacityRefusal(stack, dataOnly, scope, null), 'pool');
+        const scope = (await this.poolLocked(() => (this.worktreeHold(stack, now()) !== undefined ? 'worktree' as const : this.capacityBinding()))) ?? 'worktree';
+        throw new BrokerError('env-error', this.capacityRefusal(stack, scope, null), 'pool');
       }
       await new Promise((r) => setTimeout(r, 500));
     }
@@ -1104,9 +928,92 @@ export class Engine {
     return closure;
   }
 
-  private async bindAndStart(stack: Stack, envSnapshot: EnvRow, hygiene: Hygiene, kind: LeaseKind, onProgress?: Progress, requestedServices?: string[], freshClaim = false, requestedDataOnly?: boolean, callerEnv?: unknown, requestedPresets?: unknown): Promise<{ env: EnvRow; previewNotice?: string; bindDiagnostics: BindDiagnostics }> {
+  /**
+   * The services `env`'s lease wants up (decision 0034): `up` adds to this set
+   * and `down` takes away. Undefined on the row means every declared service,
+   * so a service added to the manifest later is included.
+   */
+  private desiredServices(stack: Stack, env: EnvRow): Set<string> {
+    const declared = Object.keys(stack.manifest.services);
+    if (env.activeServices === undefined) return new Set(declared);
+    const kept = env.activeServices.filter((n) => n in stack.manifest.services);
+    // A list whose every service has left the manifest says nothing any more;
+    // it falls back to the default set rather than to none. Only an EMPTY list
+    // (what `down` with no names records) means "no services".
+    if (kept.length === 0 && env.activeServices.length > 0) return new Set(declared);
+    return new Set(kept);
+  }
+
+  /** How a wanted set is recorded: undefined for every declared service, else the list (possibly empty). */
+  private recordedShape(stack: Stack, wanted: Set<string>): string[] | undefined {
+    const declared = Object.keys(stack.manifest.services);
+    return declared.length > 0 && declared.every((n) => wanted.has(n)) ? undefined : [...wanted];
+  }
+
+  /**
+   * The services that use datastore `ds`, read from the manifest: a service
+   * uses it when its `run:`, `build:` or `env:` templates `{{datastores.<ds>.…}}`
+   * — that is how a service is handed a connection string. `null` when no
+   * service references it at all: then runly cannot tell who reads it (a
+   * connection string in a config file, a hard-coded path), and the caller
+   * must restart every running service to be safe (decision 0034).
+   */
+  private datastoreUsers(stack: Stack, ds: string): Set<string> | null {
+    const escaped = ds.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const ref = new RegExp(`\\{\\{\\s*datastores\\.${escaped}\\.`);
+    const users = new Set<string>();
+    for (const [name, spec] of Object.entries(stack.manifest.services)) {
+      const texts = [spec.run, spec.build ?? '', ...Object.values(spec.env ?? {})];
+      if (texts.some((t) => ref.test(t))) users.add(name);
+    }
+    return users.size > 0 ? users : null;
+  }
+
+  /**
+   * Create, keep or reload each datastore in `plan`, journalling every
+   * completed restore at once so a later failure still reports the earlier
+   * ones truthfully. A datastore not forced and already present is KEPT —
+   * whatever it holds, even a preset the catalog no longer offers (decision
+   * 0034: no preset means keep the data, never a silent reset to the default).
+   */
+  private async prepareDatastores(
+    stack: Stack,
+    env: EnvRow,
+    bakeKeys: Record<string, string>,
+    plan: Array<{ name: string; force: boolean; preset?: string }>,
+    say: Progress,
+  ): Promise<string[]> {
+    const dsHandle: DsHandle = { envId: env.id, cwd: stack.root, dataDir: this.envDirs(env.id).data };
+    const restored: string[] = [];
+    for (const step of plan) {
+      const spec = stack.manifest.datastores?.[step.name];
+      if (!spec) continue;
+      const ds = makeDatastore(step.name, spec, stack.id, bakeKeys[step.name]);
+      await ds.probe();
+      const held = env.presets[step.name];
+      const exists = Boolean(env.datastoreNs[step.name]);
+      const preset = step.preset ?? presetToRestore(step.name, spec, held);
+      const restores = step.force || !exists;
+      if (restores) say(`preparing datastore '${step.name}' (${preset})`);
+      await ds.ensure(dsHandle, preset, step.force, exists);
+      env.datastoreNs[step.name] = ds.ns(dsHandle);
+      // A kept store still holds what it held; only a restore changes that.
+      env.presets[step.name] = restores || held === undefined ? preset : held;
+      if (restores) restored.push(step.name);
+      // Merge into the live row so a supervisor update is not overwritten.
+      const current = this.journal.getEnv(env.id);
+      if (current) {
+        current.datastoreNs = { ...env.datastoreNs };
+        current.presets = { ...env.presets };
+        this.journal.saveEnv(current);
+      }
+    }
+    return restored;
+  }
+
+  private async bindAndStart(stack: Stack, envSnapshot: EnvRow, hygiene: Hygiene, onProgress?: Progress, requestedServices?: string[], freshClaim = false, callerEnv?: unknown, requestedPresets?: unknown): Promise<{ env: EnvRow; previewNotice?: string; bindDiagnostics: BindDiagnostics }> {
     try {
-      return await this.bindAndStartInner(stack, envSnapshot, hygiene, kind, onProgress, requestedServices, freshClaim, requestedDataOnly, callerEnv, requestedPresets);
+      return await this.bindAndStartInner(stack, envSnapshot, hygiene, onProgress, requestedServices, freshClaim, callerEnv, requestedPresets);
     } finally {
       // A public port marked `starting` whose service never became ready (a
       // failed build, a boot timeout) must not keep holding connections until
@@ -1115,7 +1022,7 @@ export class Engine {
     }
   }
 
-  private async bindAndStartInner(stack: Stack, envSnapshot: EnvRow, hygiene: Hygiene, kind: LeaseKind, onProgress?: Progress, requestedServices?: string[], freshClaim = false, requestedDataOnly?: boolean, callerEnv?: unknown, requestedPresets?: unknown): Promise<{ env: EnvRow; previewNotice?: string; bindDiagnostics: BindDiagnostics }> {
+  private async bindAndStartInner(stack: Stack, envSnapshot: EnvRow, hygiene: Hygiene, onProgress?: Progress, requestedServices?: string[], freshClaim = false, callerEnv?: unknown, requestedPresets?: unknown): Promise<{ env: EnvRow; previewNotice?: string; bindDiagnostics: BindDiagnostics }> {
     const say = onProgress ?? (() => undefined);
     const trace = new BindTrace();
     // Re-read under the env lock: the snapshot captured during acquire may be
@@ -1131,48 +1038,21 @@ export class Engine {
     // timed out. Every other reason to invalidate a tunnel depends on what this
     // bind commits, and is reconciled at the epilogue instead.
     const forbiddenNotice = await this.enforcePreviewForbidden(env, stack, say);
-    const presetLease = this.journal.leaseForEnv(env.id);
-    if (!presetLease) throw new BrokerError('env-error', 'lease ended before bind; run runly up again', 'lease');
-    const presets = selectPresets(stack.manifest, kind, requestedPresets, presetLease.presets ?? (freshClaim ? undefined : env.presets));
-    this.journal.saveLease({ ...presetLease, presets });
-    const presetsChanged = Object.entries(presets).some(([name, preset]) => env.presets[name] !== preset);
-    const presetSelectionChanged = Object.entries(presets).some(([name, preset]) => Object.hasOwn(env.presets, name) && env.presets[name] !== preset);
-    // Which services this bind brings up. An explicit list wins: `up` sends []
-    // (whole app) or a slice. An undefined request means "no
-    // caller preference": on a FRESH claim that is the whole app (a new owner
-    // never inherits the previous holder's slice), and on a continuing lease
-    // (reset-data on the same holder's env) it preserves the current
-    // shape. Because the shape is only ever read from the journal — never
-    // rewritten at claim time — an early bind failure leaves activeServices
-    // matching whatever is still running. resolveServiceClosure owns the
-    // empty->whole-app rule, so a preserved shape whose services were all removed
-    // from the manifest falls back to full rather than starting none.
-    const declaredServices = Object.keys(stack.manifest.services);
-    const requestedNames =
-      requestedServices !== undefined
-        ? requestedServices
-        : freshClaim
-          ? []
-          : env.activeServices?.filter((n) => n in stack.manifest.services) ?? [];
-    // A data-only bind is the one shape `requestedNames` cannot express, because
-    // an empty selection means the whole app — so it lives on the environment row.
-    //
-    // The ROW is now authoritative, not the request (decision 0025): the shape is
-    // fixed at createEnv and the claim only ever hands back an environment that
-    // already matches what was asked for (tryClaim filters by shape and refuses a
-    // holder trying to convert its own lease). Deriving it per-bind is what made
-    // the separate data-only ceiling bypassable, since the two shapes are counted
-    // against different caps and reuse is never capacity-checked. A request that
-    // disagrees with the row cannot reach here; asserting keeps it that way.
-    const dataOnly = env.dataOnly === true;
-    if (requestedDataOnly !== undefined && requestedDataOnly !== dataOnly) {
-      throw new BrokerError(
-        'infra-error',
-        `internal: environment ${env.id} is ${dataOnly ? 'data-only' : 'an application environment'} but the bind requested the other shape — the claim should have refused this`,
-        'pool',
-      );
-    }
-    const active = dataOnly ? new Set<string>() : this.resolveServiceClosure(stack, requestedNames);
+    if (!this.journal.leaseForEnv(env.id)) throw new BrokerError('env-error', 'lease ended before bind; run runly up again', 'lease');
+    // Only the datastores the caller NAMED are reloaded; every other one keeps
+    // what it holds (decision 0034).
+    const reloadPresets = validatePresetRequest(stack.manifest, requestedPresets);
+    // Which services this bind leaves running (decision 0034: `up` is
+    // ADDITIVE). It never stops a running service, so the base is everything
+    // running now; a continuing lease also brings back what it wants and is
+    // not running (after a quiesce or a daemon restart). A FRESH claim does
+    // not inherit the previous holder's wishes — only what still runs. The
+    // request adds the named services and their depends_on closure ([] = the
+    // default set, every service); undefined (reset-data) adds nothing.
+    const running = new Set(Object.keys(this.supervisor(env).pids()));
+    const base = freshClaim ? running : new Set([...this.desiredServices(stack, env), ...running]);
+    const added = requestedServices === undefined ? new Set<string>() : this.resolveServiceClosure(stack, requestedServices);
+    const active = new Set([...base, ...added].filter((n) => n in stack.manifest.services));
     const inputLease = this.journal.leaseForEnv(env.id);
     if (!inputLease) throw new BrokerError('env-error', 'lease ended before bind; run runly up again', 'lease');
     const previousInputs = this.leaseInputs.get(inputLease.id);
@@ -1214,15 +1094,15 @@ export class Engine {
       // is never deleted (decision 0032) — not its caches, not its build output.
       // What pristine can still honestly promise is that nothing is TRUSTED:
       // the worktree's upkeep ledger is cleared, so every upkeep rule runs
-      // again in place (builds run on every bind anyway).
+      // again in place (builds run on every bind anyway). The datastores'
+      // presets are KEPT: they say what each store is recreated with.
       rmSync(dirs.data, { recursive: true, force: true });
       rmSync(dirs.legacyTree, { recursive: true, force: true });
       mkdirSync(dirs.data, { recursive: true });
       env.fingerprints = {};
-      env.presets = {};
       // Persist the cleared ledger NOW, not at the end of the bind. Appliances
       // and upkeep run before the epilogue, and a crash in
-      // any of them used to leave the journal asserting fingerprints and presets
+      // any of them used to leave the journal asserting fingerprints
       // for state that no longer exists — so the next bind skipped work it had
       // to redo.
       this.journal.saveEnv(env);
@@ -1269,56 +1149,48 @@ export class Engine {
 
     // runly does not know whether the worktree's code changed (decision 0032:
     // no source identity, no build cache), so every `up` runs the build of
-    // every service it starts and lets the build tool decide what is current.
-    // What runly decides is only what to RESTART:
+    // every service it leaves running and lets the build tool decide what is
+    // current. What runly decides is only what to STOP:
     //
     // - Everything (stop, data, build, start) when the running services cannot
-    //   simply continue: not running or unhealthy, a different shape, changed
-    //   manifest/inputs/presets, an upkeep rule that ran, or a data hygiene.
-    // - Otherwise only the services whose build output changed: a service's
-    //   declared `outputs:` are snapshotted (path, size, mtime) around its
-    //   build. A service that declares none is restarted whenever it has a
-    //   build (safe default); one without a build keeps running.
-    const runningServices = new Set(Object.keys(this.supervisor(env).pids()));
-    const shapeMatches = runningServices.size === active.size && [...active].every((n) => runningServices.has(n));
+    //   simply continue: nothing running, a service unhealthy, changed
+    //   manifest/inputs, an upkeep rule that ran, a moved public port, or a
+    //   data hygiene.
+    // - Otherwise nothing that runs is stopped except what must be (decision
+    //   0034): a service whose declared `outputs:` changed across its build (or
+    //   that declares none — the safe default), and the running services that
+    //   use a datastore the caller asked to reload. Services the request adds
+    //   are built and started next to the rest.
+    //
+    // A different set of services and a different preset are no longer reasons
+    // for the full path: `up` is additive, and a preset reloads one datastore.
+    const missing = [...active].filter((n) => !running.has(n));
     if (upkeep.ran.length > 0) trace.result.reasons.push('upkeep-required');
     if (env.state !== 'hot') trace.result.reasons.push('environment-not-running');
     if (!this.supervisor(env).allHealthyPids()) trace.result.reasons.push('service-process-unhealthy');
-    if (!shapeMatches) trace.result.reasons.push('service-shape-changed');
     if (inputsChanged) trace.result.reasons.push('environment-inputs-changed');
     if (manifestChanged) trace.result.reasons.push('manifest-changed');
-    if (presetSelectionChanged) trace.result.reasons.push('datastore-preset-changed');
     if (hygiene !== 'reuse') trace.result.reasons.push(`hygiene-${hygiene}`);
     if (portsMoved.length > 0) trace.result.reasons.push('public-port-moved');
-    const keepRunning =
-      portsMoved.length === 0 &&
-      !manifestChanged &&
-      !inputsChanged &&
-      !presetsChanged &&
-      upkeep.ran.length === 0 &&
-      env.state === 'hot' &&
-      this.supervisor(env).allHealthyPids() &&
-      shapeMatches &&
-      hygiene === 'reuse';
+    const keepRunning = trace.result.reasons.length === 0;
     // The environment keeps only its own half of the ledger (`@` built-ins);
     // the worktree's half (command rules) was written under the worktree lock.
     env.fingerprints = pickEnvKeys(upkeep.fingerprints);
 
     // Start in dependency order, readiness-gated, fatal-log fast-fail. `only`
-    // is the whole slice on a full bind, or just the services whose build
-    // output changed; the slice's other members are already running, so they
-    // count as started for depends_on.
+    // is the whole set on a full bind, or just the services this `up` restarts
+    // or adds; the other members are already running, so they count as started
+    // for depends_on — and so does a dependency the lease took `down` on
+    // purpose (it is not wanted; the dependent reaches its stable public port).
     const startSlice = async (only: Set<string>): Promise<void> => {
     const sup = this.supervisor(env);
     const internalTaken = new Set<number>();
     const started = new Set<string>([...active].filter((n) => !only.has(n)));
-    // Only the requested slice (already a depends_on closure, so every dep of a
-    // member is also here and the topological order below still resolves).
     const entries = Object.entries(stack.manifest.services).filter(([n]) => only.has(n));
     for (;;) {
       const pending = entries.filter(([n]) => !started.has(n));
       if (pending.length === 0) break;
-      const ready = pending.filter(([, s]) => (s.depends_on ?? []).every((d) => started.has(d)));
+      const ready = pending.filter(([, s]) => (s.depends_on ?? []).every((d) => started.has(d) || !active.has(d)));
       if (ready.length === 0) throw new BrokerError('work-error', 'depends_on cycle in runly.yml', 'manifest');
       for (const [name, spec] of ready) {
         // The service listens on a fresh INTERNAL port (decision 0033); the
@@ -1376,16 +1248,23 @@ export class Engine {
     if (keepRunning) {
       trace.phase('build');
       const buildCtx = this.templateCtx(stack, env);
-      const toRestart: string[] = [];
+      const toRestart = new Set<string>();
       await this.treeLocked(stack.id, async () => {
         for (const [name, spec] of Object.entries(stack.manifest.services)) {
           if (!active.has(name) || !spec.build) continue;
+          // A service this `up` adds is built and started; nothing to compare.
+          if (!running.has(name)) {
+            const buildStart = performance.now();
+            await this.runServiceBuild(name, template(spec.build, buildCtx), stack.root, say);
+            trace.result.builds.push({ service: name, durationMs: performance.now() - buildStart, restart: false, reason: 'not-running' });
+            continue;
+          }
           const declared = spec.outputs ?? [];
           const before = declared.length > 0 ? snapshotOutputs(stack.root, declared) : null;
           const buildStart = performance.now();
           await this.runServiceBuild(name, template(spec.build, buildCtx), stack.root, say);
           const changed = before === null || snapshotOutputs(stack.root, declared) !== before;
-          if (changed) toRestart.push(name);
+          if (changed) toRestart.add(name);
           trace.result.builds.push({
             service: name,
             durationMs: performance.now() - buildStart,
@@ -1394,7 +1273,19 @@ export class Engine {
           });
         }
       }, waitTree);
-      if (toRestart.length === 0) {
+      // A reloaded datastore must not be held open across its restore: the
+      // running services that use it stop first and start again on the new
+      // data. Who uses it is read from the manifest; if nothing references it,
+      // nobody can tell, so every running service restarts.
+      const reloads = Object.keys(reloadPresets);
+      for (const ds of reloads) {
+        const users = this.datastoreUsers(stack, ds);
+        for (const name of running) if (users === null || users.has(name)) toRestart.add(name);
+      }
+      trace.result.started = [...missing];
+      trace.result.restarted = [...toRestart];
+      trace.result.reloaded = [...reloads];
+      if (toRestart.size === 0 && missing.length === 0 && reloads.length === 0) {
         trace.result.reuse = 'reused';
         trace.phase('finalize');
         env.lastUsedAt = now();
@@ -1403,14 +1294,7 @@ export class Engine {
         // the pre-bind snapshot back put dead pids there — which recovery would
         // later signal, missing the real process.
         env.servicePids = this.supervisor(env).pids();
-        // Record the shape here too. A fresh claim clears activeServices, but the
-        // fast path can still reuse an env whose running set already equals the
-        // request (up api -> release -> up api), so without this the journal would
-        // say "whole app" while only the slice runs — ctx/exec would then advertise
-        // a dead URL. shapeMatches guarantees active == the running set, so this is
-        // always truthful.
-        env.activeServices = active.size === declaredServices.length ? undefined : [...active];
-        env.dataOnly = dataOnly;
+        env.activeServices = this.recordedShape(stack, active);
         this.journal.saveEnv(env);
         return {
           env,
@@ -1418,57 +1302,47 @@ export class Engine {
           bindDiagnostics: trace.finish(),
         };
       }
-      trace.result.reuse = 'restarted';
-      trace.result.restarted = [...toRestart];
-      trace.phase('stop');
-      // Hold, don't refuse: a client arriving while these restart waits on the
-      // public port and is forwarded once the new process is ready.
-      this.markStarting(env, stack, toRestart);
-      await this.stopServicesForRestart(env, toRestart);
+      trace.result.reuse = toRestart.size > 0 ? 'restarted' : 'reused';
+      if (toRestart.size > 0) {
+        trace.phase('stop');
+        // Hold, don't refuse: a client arriving while these restart waits on the
+        // public port and is forwarded once the new process is ready.
+        this.markStarting(env, stack, [...toRestart]);
+        await this.stopServicesForRestart(env, [...toRestart]);
+      }
+      if (reloads.length > 0) {
+        trace.phase('data');
+        await this.prepareDatastores(stack, env, bakeKeys, reloads.map((name) => ({ name, force: true, preset: reloadPresets[name] })), say);
+      }
       trace.phase('ready');
-      await startSlice(new Set(toRestart));
+      await startSlice(new Set([...toRestart, ...missing]));
     } else {
     // Services must not hold open handles across a data restore or code change.
     trace.phase('stop');
     this.markStarting(env, stack, [...active]);
     await this.stopForBind(env);
 
-    // Data state: create-or-restore per hygiene (probe first — infra-error, not code blame).
+    // Data state: every datastore exists for the environment's whole life. A
+    // reset restores all of them (each with the preset it holds, unless the
+    // caller named another); a named preset reloads that one; the rest keep
+    // their data (probe first — infra-error, not code blame).
     trace.phase('data');
-    const dsHandle: DsHandle = { envId: env.id, cwd: stack.root, dataDir: dirs.data };
-    for (const [name, spec] of Object.entries(stack.manifest.datastores ?? {})) {
-      const ds = makeDatastore(name, spec, stack.id, bakeKeys[name]);
-      await ds.probe();
-      const preset = presets[name];
-      if (preset === undefined) {
-        throw new BrokerError('env-error', `missing resolved preset selection for datastore '${name}'`, name);
-      }
-      const exists = Boolean(env.datastoreNs[name]);
-      const force = env.presets[name] !== preset || hygiene !== 'reuse' || upkeep.rebakeTemplates.includes(name);
-      if (force || !exists) say(`preparing datastore '${name}' (${preset})`);
-      await ds.ensure(dsHandle, preset, force, exists);
-      env.datastoreNs[name] = ds.ns(dsHandle);
-      env.presets[name] = preset;
-      // Report each completed restore truthfully even if a later store fails.
-      // Merge into the live row so a supervisor update is not overwritten.
-      const current = this.journal.getEnv(env.id);
-      if (current) {
-        current.datastoreNs = { ...env.datastoreNs };
-        current.presets = { ...env.presets };
-        this.journal.saveEnv(current);
-      }
-    }
+    trace.result.reloaded = Object.keys(reloadPresets);
+    await this.prepareDatastores(stack, env, bakeKeys, Object.keys(stack.manifest.datastores ?? {}).map((name) => ({
+      name,
+      force: reloadPresets[name] !== undefined || hygiene !== 'reuse' || upkeep.rebakeTemplates.includes(name),
+      preset: reloadPresets[name],
+    })), say);
 
     // Builds: every service this bind starts that declares one, every time
     // (decision 0032). runly keeps no build cache — MSBuild, pnpm and the
-    // Angular CLI decide what is already up to date. A slice bind builds only
-    // its own services. Under the worktree lock: `runly warm` builds into the
-    // same output.
+    // Angular CLI decide what is already up to date. Under the worktree lock:
+    // `runly warm` builds into the same output.
     const ctx = this.templateCtx(stack, env);
     trace.phase('build');
     await this.treeLocked(stack.id, async () => {
       for (const [name, spec] of Object.entries(stack.manifest.services)) {
-        if (!active.has(name)) continue; // don't build a slice we won't start
+        if (!active.has(name)) continue; // don't build what we won't start
         if (!spec.build) continue;
         const buildStart = performance.now();
         await this.runServiceBuild(name, template(spec.build, ctx), stack.root, say);
@@ -1496,21 +1370,16 @@ export class Engine {
       env.state = 'degraded';
       // Record this bind's shape alongside its pids — writing back current's
       // pre-bind activeServices next to the just-started pids would let a reader
-      // in the degraded window filter URLs by the wrong slice.
-      const degradedShape = active.size === declaredServices.length ? undefined : [...active];
-      this.journal.saveEnv({ ...current, servicePids: sup.pids(), activeServices: degradedShape, dataOnly, lastUsedAt: now() });
+      // in the degraded window filter URLs by the wrong set.
+      this.journal.saveEnv({ ...current, servicePids: sup.pids(), activeServices: this.recordedShape(stack, active), lastUsedAt: now() });
       throw new BrokerError('env-error', `environment ${env.id} degraded during bind — a service flapped past its restart budget`, 'pool');
     }
-    // A data-only bind leaves nothing running, which is exactly what `warm`
-    // means — services stopped, tree and datastore namespace intact. Publishing
-    // it as `hot` would make the idle sweeper try to reclaim heat that was never
-    // taken, and would tell a reader that services are up when none are.
-    env.state = dataOnly ? 'warm' : 'hot';
+    // Nothing wanted means nothing running, which is exactly what `warm`
+    // means — services stopped, ports and data intact. Publishing it as `hot`
+    // would make the idle sweeper try to reclaim heat that was never taken.
+    env.state = active.size === 0 ? 'warm' : 'hot';
     env.servicePids = sup.pids();
-    // Remember the shape only when it is a genuine subset; a full app stays
-    // undefined so a later manifest addition isn't frozen out by a stale list.
-    env.activeServices = active.size === declaredServices.length ? undefined : [...active];
-    env.dataOnly = dataOnly;
+    env.activeServices = this.recordedShape(stack, active);
     env.bindCount += 1;
     env.lastUsedAt = now();
     this.appliedInputs.set(env.id, inputs.revision);
@@ -1676,36 +1545,19 @@ export class Engine {
 
   async up(opts: UpOptions) {
     const requestStarted = performance.now();
+    const services = opts.services ?? [];
     const stack = loadStack(opts.cwd);
     const holder = this.callerHolder(opts.cwd, opts.holder, stack);
     const forbiddenNotice = await this.enforceHolderPreviewForbidden(stack, holder, opts.onProgress);
-    selectPresets(stack.manifest, opts.kind ?? 'session', opts.presets);
+    // Removed by decision 0034; the CLI answers it with exit 64 before the daemon.
+    if (opts.dataOnly) throw new BrokerError('work-error', DATA_ONLY_REMOVED, 'manifest');
+    validatePresetRequest(stack.manifest, opts.presets);
     // Resolve a requested slice BEFORE acquiring an env: an unknown name is a
     // user typo, not a bind failure, so it must not reach bindAndStart's catch
     // (which bumps failStreak — two typos would escalate the next real bind to a
     // pristine data wipe) or churn a pooled env. bindAndStart resolves it again
     // authoritatively; this is just the early, side-effect-free guard.
-    if (opts.services && opts.services.length > 0) this.resolveServiceClosure(stack, opts.services);
-    if (opts.dataOnly) {
-      // Naming services and asking for none is a contradiction, not a precedence
-      // question — guess either way and the caller gets silently the other thing.
-      if (opts.services && opts.services.length > 0) {
-        throw new BrokerError(
-          'work-error',
-          `--data-only leases the datastores with no services, so it cannot be combined with a service list (${opts.services.join(', ')})`,
-          'manifest',
-        );
-      }
-      // Without a datastore there is nothing to lease, and the caller would get a
-      // lease over an empty tree while believing they had a database.
-      if (Object.keys(stack.manifest.datastores ?? {}).length === 0) {
-        throw new BrokerError(
-          'work-error',
-          `--data-only needs at least one datastore, and runly.yml declares none — there is nothing to lease`,
-          'manifest',
-        );
-      }
-    }
+    if (services.length > 0) this.resolveServiceClosure(stack, services);
     // A lease pinned to a dead pid is released by the very next sweep, so it
     // would hand this caller's environment — and its seeded database — to
     // whoever binds next while the caller is still using it. The CLI refuses
@@ -1722,32 +1574,28 @@ export class Engine {
     const suppliedInputs = opts.callerEnv === undefined ? undefined : validateCallerEnv(stack.manifest, opts.callerEnv);
     const existingLease = this.journal.leaseForHolder(holder, stack.id);
     const existingEnv = existingLease ? this.journal.getEnv(existingLease.envId) : undefined;
-    const selectedInputs = (opts.dataOnly ?? existingEnv?.dataOnly) === true
-      ? new Set<string>()
-      : this.resolveServiceClosure(stack, opts.services ?? existingEnv?.activeServices?.filter((n) => n in stack.manifest.services) ?? []);
+    // What this bind will (at least) run: the request, plus what the lease
+    // already wants (decision 0034: `up` is additive).
+    const selectedInputs = new Set([
+      ...this.resolveServiceClosure(stack, services),
+      ...(existingEnv ? this.desiredServices(stack, existingEnv) : []),
+    ]);
     requireCallerEnv(stack.manifest, selectedInputs, suppliedInputs ?? (existingLease ? this.leaseInputs.get(existingLease.id)?.values : undefined) ?? {});
     const kind = opts.kind ?? 'session';
     let hygiene = opts.hygiene ?? 'reuse';
-    opts.onProgress?.(`acquiring this worktree's environment (machine ${this.appEnvs().length}/${POOL_MAX_TOTAL()})`);
+    opts.onProgress?.(`acquiring this worktree's environment (machine ${this.journal.allEnvs().length}/${POOL_MAX_TOTAL()})`);
     const queueStarted = performance.now();
     let queueMs = 0;
-    const { env, fresh } = await this.acquireEnv(stack, holder, kind, hygiene, opts.ttlMs ?? LEASE_TTL(kind), opts.dataOnly === true, opts.holderPid);
+    const { env, fresh } = await this.acquireEnv(stack, holder, kind, hygiene, opts.ttlMs ?? LEASE_TTL(kind), opts.holderPid);
     // Auto-escalation (decision 0007): two consecutive bind failures on this
     // warm environment -> the next bind is pristine, whatever was asked.
     if (hygiene !== 'pristine' && env.failStreak >= 2) hygiene = 'pristine';
-    let reserved = true;
-    const bindStarted = () => {
-      if (!reserved) return;
-      reserved = false;
-      this.releaseBind(env.id);
-    };
     try {
       const { env: bound, previewNotice, bindDiagnostics } = await this.envLocked(
         env.id,
         () => {
-          bindStarted();
           queueMs = performance.now() - queueStarted;
-          return this.bindAndStart(stack, env, hygiene, kind, opts.onProgress, opts.services, fresh, opts.dataOnly, suppliedInputs, opts.presets);
+          return this.bindAndStart(stack, env, hygiene, opts.onProgress, services, fresh, suppliedInputs, opts.presets);
         },
         (s) => opts.onProgress?.(`waiting for another operation on this environment … ${s}s`),
         'a bind',
@@ -1762,8 +1610,6 @@ export class Engine {
         this.journal.saveEnv(fresh);
       }
       throw err;
-    } finally {
-      bindStarted();
     }
   }
 
@@ -1828,11 +1674,12 @@ export class Engine {
       proxy: this.proxy.stats(env.id),
       previewUrls,
       /**
-       * True when this lease is over the DATASTORES ONLY, so `urls` is empty by
-       * design rather than because a service failed to come up — a distinction a
-       * test fixture reading this blob otherwise cannot make.
+       * Every declared service and where it stands (decision 0034): `running`,
+       * `stopped` (wanted, but not running — a quiesce or a daemon restart; the
+       * next `up` starts it) or `down` (not wanted: never started, or taken
+       * down with `runly down`). `urls` lists the wanted ones.
        */
-      dataOnly: env.dataOnly === true,
+      services: this.serviceStates(stack, env),
       /**
        * `logins` stays the PRIMARY login even for a stack that declares a list, so
        * a consumer reading `ctx.logins.user` is unaffected by the manifest growing
@@ -1850,9 +1697,22 @@ export class Engine {
        */
       tokenCommand: stack.manifest.auth?.token ?? null,
       tokenVia: stack.manifest.auth?.token ? 'runly token --role <role> --raw' : null,
-      datastores: Object.fromEntries(Object.entries(ctx.datastores).map(([n, d]) => [n, { url: d.url, ns: d.ns, preset: env.presets[n] }])),
+      /**
+       * Every datastore exists for the environment's whole life (decision
+       * 0034). `preset` is what it holds now — the last preset restored into
+       * it — or null before its first restore. `runly ctx --env` exports it as
+       * RUNLY_DATASTORE_<NAME>_PRESET.
+       */
+      datastores: Object.fromEntries(Object.entries(ctx.datastores).map(([n, d]) => [n, { url: d.url, ns: d.ns, preset: env.datastoreNs[n] ? (env.presets[n] ?? null) : null }])),
       events: this.supervisors.get(env.id)?.events.slice(-20) ?? [],
     };
+  }
+
+  /** Where each declared service stands: running, stopped (wanted, not running) or down (not wanted). */
+  private serviceStates(stack: Stack, env: EnvRow): Record<string, 'running' | 'stopped' | 'down'> {
+    const running = new Set(Object.keys(this.supervisors.get(env.id)?.pids() ?? {}));
+    const wanted = this.desiredServices(stack, env);
+    return Object.fromEntries(Object.keys(stack.manifest.services).map((n) => [n, running.has(n) ? 'running' : wanted.has(n) ? 'stopped' : 'down']));
   }
 
   /**
@@ -1940,7 +1800,7 @@ export class Engine {
     const h = this.callerHolder(cwd, holder, stack);
     const noLease = () => new BrokerError('env-error', `no active lease — run 'runly up' first`, 'lease');
     const forbiddenNotice = await this.enforceHolderPreviewForbidden(stack, h, onProgress);
-    selectPresets(stack.manifest, 'session', presets);
+    validatePresetRequest(stack.manifest, presets);
     const lease = this.journal.leaseForHolder(h, stack.id);
     if (!lease || lease.expiresAt <= now()) throw noLease();
     const env = this.envForLease(lease);
@@ -1953,7 +1813,7 @@ export class Engine {
         const held = this.journal.leaseForHolder(h, stack.id);
         if (!held || held.id !== lease.id || held.expiresAt <= now()) throw noLease();
         this.journal.saveLease({ ...held, hygiene: 'reset-data' });
-        return this.bindAndStart(stack, env, 'reset-data', held.kind, onProgress, undefined, false, undefined, undefined, presets);
+        return this.bindAndStart(stack, env, 'reset-data', onProgress, undefined, false, undefined, presets);
       },
       (s) => onProgress?.(`waiting for another operation on this environment … ${s}s`),
       'a data reset',
@@ -1998,11 +1858,12 @@ export class Engine {
     // the services do not. exec/token then failed against a tree with nothing
     // running, and the command's own error ("connection refused") read as the
     // repo's fault with no hint that a rebind was all it needed.
-    // …but a DATA-ONLY environment is warm by design: no services were ever
-    // meant to run, and its tree and datastore namespace are exactly what the
-    // holder leased. Refusing it here would break `exec` on the one lease shape
+    // …but an environment whose lease wants NO services (`runly down`,
+    // decision 0034) is warm by design: its ports and datastores are exactly
+    // what the holder has. Refusing it here would break `exec` on the one shape
     // that has nothing else to offer.
-    if (fresh.state === 'warm' && !fresh.dataOnly) {
+    const wantsServices = fresh.activeServices === undefined || fresh.activeServices.length > 0;
+    if (fresh.state === 'warm' && wantsServices) {
       throw new BrokerError(
         'env-error',
         `environment ${envId} holds your lease but its services are not running (the daemon restarted) — run 'runly up' to rebind before exec/token`,
@@ -2277,9 +2138,6 @@ export class Engine {
    * a concurrent bind rewrites.
    */
   private previewTarget(env: EnvRow, stack: Stack, service: string): number {
-    if (env.dataOnly) {
-      throw new BrokerError('work-error', `preview has nothing to publish on a data-only lease — no services are running`, 'preview');
-    }
     const spec = stack.manifest.services[service];
     if (!spec) {
       throw new BrokerError('work-error', `no service '${service}' in runly.yml`, 'manifest');
@@ -2288,7 +2146,9 @@ export class Engine {
     if (activeSet && !activeSet.has(service)) {
       throw new BrokerError(
         'work-error',
-        `service '${service}' is not part of this lease's slice — only ${[...activeSet].map((s) => `'${s}'`).join(', ')} are up`,
+        activeSet.size === 0
+          ? `service '${service}' is down — this lease runs no services; 'runly up ${service}' first`
+          : `service '${service}' is not up on this lease — only ${[...activeSet].map((s) => `'${s}'`).join(', ')} are; 'runly up ${service}' adds it`,
         'preview',
       );
     }
@@ -2326,7 +2186,7 @@ export class Engine {
       }
       // …and the ENVIRONMENT with it. Everything that decides whether publishing
       // is legal — the lease's shape, its slice, its port ledger — is a field on
-      // a row an `up api` or `up --data-only` queued ahead of us has already
+      // a row a `down web` or a failed bind queued ahead of us has already
       // rewritten. Judging that from the pre-lock snapshot published a PUBLIC,
       // unauthenticated URL for a port nothing was listening on any more, and
       // nothing re-examines a lease-scoped tunnel until the next bind.
@@ -2459,6 +2319,338 @@ export class Engine {
     return { stopped: name };
   }
 
+  // ---------------------------------------------------------------- down
+
+  /**
+   * `runly down [service…]` (decision 0034): stop just these services — or,
+   * with no names, every service — and keep the lease, the data and the public
+   * ports. The proxy keeps listening; connections to a downed service are
+   * refused until an `up` brings it back. Dependents of a downed service are
+   * NOT stopped ("just those"); they are named in the answer, because they now
+   * talk to a port with nothing behind it.
+   */
+  async down(opts: { cwd: string; holder?: string; services: string[]; onProgress?: Progress }) {
+    const stack = loadStack(opts.cwd);
+    const h = this.callerHolder(opts.cwd, opts.holder, stack);
+    const say = opts.onProgress ?? (() => undefined);
+    for (const name of opts.services) {
+      if (!stack.manifest.services[name]) {
+        throw new BrokerError('work-error', `no service '${name}' in runly.yml (have: ${Object.keys(stack.manifest.services).join(', ') || 'none'}) — only services are named here; datastores stay for the environment's life (decision 0034)`, 'manifest');
+      }
+    }
+    const noLease = () => new BrokerError('env-error', `no active lease for this worktree — there is nothing to take down ('runly up' first)`, 'lease');
+    const lease = this.journal.leaseForHolder(h, stack.id);
+    if (!lease || lease.expiresAt <= now()) throw noLease();
+    const env = this.envForLease(lease);
+    const outcome = await this.envLocked(env.id, async () => {
+      const held = this.journal.leaseForHolder(h, stack.id);
+      if (!held || held.id !== lease.id || held.expiresAt <= now()) throw noLease();
+      const live = this.journal.getEnv(env.id);
+      if (!live || live.state === 'recycling') throw new BrokerError('env-error', `environment ${env.id} is being recycled — retry`, 'pool');
+      const wanted = this.desiredServices(stack, live);
+      const runningBefore = Object.keys(this.supervisor(live).pids());
+      const names = opts.services.length > 0 ? [...new Set(opts.services)] : [...new Set([...Object.keys(stack.manifest.services), ...runningBefore])];
+      const stopping = names.filter((n) => runningBefore.includes(n));
+      if (stopping.length > 0) say(`stopping ${stopping.map((n) => `'${n}'`).join(', ')}`);
+      if (opts.services.length === 0) await this.stopForBind(live);
+      else if (stopping.length > 0) await this.stopServicesForRestart(live, stopping);
+      const fresh = this.journal.getEnv(env.id);
+      if (!fresh) throw new BrokerError('env-error', `environment ${env.id} was recycled during down — retry`, 'pool');
+      const remaining = new Set([...wanted].filter((n) => !names.includes(n)));
+      fresh.activeServices = this.recordedShape(stack, remaining);
+      const stillRunning = Object.keys(this.supervisor(fresh).pids());
+      if (stillRunning.length === 0 && fresh.state === 'hot') fresh.state = 'warm';
+      fresh.lastUsedAt = now();
+      this.journal.saveEnv(fresh);
+      // A preview of a service that is now down would publish a port with
+      // nothing behind it for the rest of the lease.
+      const previewNotice = await this.reconcilePreviewForBind(fresh, stack, remaining, say, { hygiene: 'reuse', portsReallocated: false });
+      const dependents = stillRunning.filter((n) => (stack.manifest.services[n]?.depends_on ?? []).some((d) => names.includes(d)));
+      return { stopped: stopping, down: names.filter((n) => n in stack.manifest.services), dependentsStillRunning: dependents, previewNotice };
+    }, (s) => say(`waiting for another operation on this environment … ${s}s`), 'a down');
+    logEvent({ level: 'info', kind: 'down', envId: env.id, detail: `down ${outcome.down.join(', ') || '(nothing)'}; stopped ${outcome.stopped.length} running service(s); lease, data and ports kept` });
+    return { ...this.ctx(opts.cwd, h, env.id), ...outcome };
+  }
+
+  // ---------------------------------------------------------------- db copies
+
+  /** In-flight creations and drops of database copies; the reaper never touches these. */
+  private dbBusy = new Set<string>();
+
+  /** What `db new` / `db ls` / `ps` show for one copy. */
+  private dbCopyView(c: DbCopyRow) {
+    return {
+      name: c.name,
+      datastore: c.datastore,
+      preset: c.preset,
+      url: c.url,
+      ns: c.ns,
+      state: c.state,
+      worktree: c.stackRoot,
+      holder: c.holder,
+      holderPid: c.holderPid ?? null,
+      /** null = no agent tether was given: the copy lives until its worktree goes or it is dropped. */
+      holderAlive: c.holderPid === undefined ? null : !this.holderGone(c.holderPid, c.holderStart),
+      createdAt: c.createdAt,
+    };
+  }
+
+  /**
+   * Is a recorded holder process gone? One rule for leases and database copies
+   * alike (decision 0034: copies are reaped exactly like environments), so a
+   * grace period added here applies to both.
+   */
+  private holderGone(pid: number, start?: number): boolean {
+    return !sameProcess(pid, start);
+  }
+
+  /**
+   * `runly db new <datastore>` (decision 0034): a fresh copy of the datastore,
+   * restored from the SAME template the environments use (baked first if it is
+   * missing), outside any environment — no lease, no ports, no services. Many
+   * may exist at once. The row is journalled BEFORE the restore, as
+   * `creating`, so a daemon that dies mid-restore leaves a record the next one
+   * reaps.
+   */
+  async dbNew(opts: { cwd: string; datastore: string; preset?: string; holder?: string; holderPid?: number; onProgress?: Progress }) {
+    const say = opts.onProgress ?? (() => undefined);
+    const stack = loadStack(opts.cwd);
+    const stores = stack.manifest.datastores ?? {};
+    const spec = stores[opts.datastore];
+    if (!spec) {
+      throw new BrokerError('work-error', `no datastore '${opts.datastore}' in runly.yml (have: ${Object.keys(stores).join(', ') || 'none'})`, 'manifest');
+    }
+    const chosen = validatePresetRequest(stack.manifest, opts.preset === undefined ? undefined : { [opts.datastore]: opts.preset });
+    const preset = chosen[opts.datastore] ?? defaultPresetFor(opts.datastore, spec);
+    const holder = this.callerHolder(opts.cwd, opts.holder, stack);
+    if (opts.holderPid !== undefined && !isAlive(opts.holderPid)) {
+      throw new BrokerError('work-error', `holder pid ${opts.holderPid} is not a live process — the copy would be dropped the moment it is created`, 'lease');
+    }
+    let short = shortId();
+    while (this.journal.getDbCopy(`${opts.datastore}-${short}`)) short = shortId();
+    const name = `${opts.datastore}-${short}`;
+    // Templates are keyed by content (vetbill-1i49), so the bake key comes from
+    // the worktree's trigger files exactly as a bind computes it. The trigger
+    // cache is written atomically, so this needs no worktree lock — a copy
+    // never waits for a bind's builds.
+    const bakeKeys = templateBakeKeys(stack.manifest, stack.root, triggerSet(stack.root, stack.manifest, worktreeStateDir(stack.id)));
+    const ds = makeDatastore(opts.datastore, spec, stack.id, bakeKeys[opts.datastore]);
+    const dir = join(dbCopiesRoot(), name);
+    const h: DsHandle = { envId: `${stack.id}-db-${short}`, cwd: stack.root, dataDir: dir };
+    const dropCmd = ds.dropCommand(h);
+    if (!ds.fileBased && dropCmd === null) {
+      throw new BrokerError('work-error', `datastore '${opts.datastore}' declares no drop: command, so runly could never remove a copy of it — add one to runly.yml`, 'manifest');
+    }
+    const row: DbCopyRow = {
+      name, stack: stack.id, stackRoot: stack.root, datastore: opts.datastore, preset,
+      ns: ds.ns(h), url: ds.url(h), state: 'creating', holder, ...holderIdentity(opts.holderPid),
+      dropCmd: dropCmd ?? undefined, dropCwd: stack.root, dropPath: ds.fileBased ? dir : undefined,
+      createdAt: now(), dropAttempts: 0, nextDropAt: 0,
+    };
+    this.dbBusy.add(name);
+    this.journal.saveDbCopy(row);
+    try {
+      for (const [appliance, aspec] of Object.entries(stack.manifest.appliances ?? {})) {
+        const state = await ensureAppliance(appliance, aspec, stack.root, say);
+        if (state !== 'up') logEvent({ level: 'info', kind: 'appliance', detail: `'${appliance}' ${state} (${aspec.probe})` });
+      }
+      if (ds.fileBased) mkdirSync(dir, { recursive: true });
+      await ds.probe();
+      say(`restoring '${opts.datastore}' (${preset}) into ${name}`);
+      await ds.ensure(h, preset, true, false);
+      row.state = 'ready';
+      this.journal.saveDbCopy(row);
+      logEvent({ level: 'info', kind: 'db', detail: `created database copy ${name} of '${opts.datastore}' (${preset}) for ${holder}${row.holderPid ? ` (pid ${row.holderPid})` : ''}` });
+      return this.dbCopyView(row);
+    } catch (err) {
+      // Whatever the restore got as far as creating goes again. A drop that
+      // fails leaves the row for the reaper.
+      try {
+        await this.dropDbCopy(row, 'its creation failed');
+      } catch { /* the reaper retries */ }
+      throw err;
+    } finally {
+      this.dbBusy.delete(name);
+    }
+  }
+
+  /** Is `path` a copy's own directory under the state root (never anything else)? */
+  private isPrivateDbDir(path: string): boolean {
+    const rel = relative(dbCopiesRoot(), path);
+    return rel !== '' && !rel.startsWith('..') && !isAbsolute(rel) && !rel.includes(sep);
+  }
+
+  /**
+   * Drop one copy with what its row recorded — the command (run in the
+   * worktree, or the state root once that is gone) or its private directory.
+   * Needs neither the manifest nor the worktree. A failed drop keeps the row
+   * (`dropping`) with a backoff, so the reaper retries instead of forgetting a
+   * database nothing else can name. Callers hold `dbBusy` for the name.
+   */
+  private async dropDbCopy(row: DbCopyRow, reason: string): Promise<{ ok: boolean; output?: string }> {
+    const live = this.journal.getDbCopy(row.name);
+    if (!live) return { ok: true };
+    live.state = 'dropping';
+    this.journal.saveDbCopy(live);
+    let ok = true;
+    let output: string | undefined;
+    if (live.dropCmd) {
+      const cwd = live.dropCwd && existsSync(live.dropCwd) ? live.dropCwd : stateRoot();
+      const r = await runBounded(live.dropCmd, cwd, cmdTimeoutS());
+      if (r.timedOut || r.code !== 0) {
+        ok = false;
+        output = r.output.slice(-800);
+      }
+    }
+    if (ok && live.dropPath) {
+      if (this.isPrivateDbDir(live.dropPath)) rmSync(live.dropPath, { recursive: true, force: true });
+      else {
+        ok = false;
+        output = `refused to delete ${live.dropPath}: it is not a copy directory under ${dbCopiesRoot()}`;
+      }
+    }
+    if (ok) {
+      this.journal.deleteDbCopy(live.name);
+      logEvent({ level: 'info', kind: 'db', detail: `dropped database copy ${live.name} of '${live.datastore}' — ${reason}` });
+      return { ok: true };
+    }
+    live.dropAttempts += 1;
+    live.nextDropAt = now() + Math.min(3_600_000, 15_000 * 2 ** Math.min(live.dropAttempts - 1, 8));
+    this.journal.saveDbCopy(live);
+    logEvent({ level: 'error', kind: 'db', detail: `database copy ${live.name} (${live.ns}) was NOT dropped (${reason}; attempt ${live.dropAttempts}) — kept on record, retried by the sweeper; check the appliance` });
+    return { ok: false, output };
+  }
+
+  /** `runly db drop <name>`: drop one copy now, whoever made it. */
+  async dbDrop(name: string) {
+    const row = this.journal.getDbCopy(name);
+    if (!row) {
+      const known = this.journal.allDbCopies().map((c) => c.name);
+      throw new BrokerError('work-error', `no database copy '${name}'${known.length ? ` — known: ${known.join(', ')}` : ' — there are none'}`, 'db');
+    }
+    if (this.dbBusy.has(name)) throw new BrokerError('env-error', `database copy '${name}' is being created or dropped right now — retry in a moment`, 'db');
+    this.dbBusy.add(name);
+    try {
+      const r = await this.dropDbCopy(row, 'dropped on request');
+      if (!r.ok) {
+        throw new BrokerError('env-error', `the drop of '${name}' failed — the copy stays on record and the sweeper retries it; check the datastore's server`, 'db', r.output);
+      }
+      return { dropped: name };
+    } finally {
+      this.dbBusy.delete(name);
+    }
+  }
+
+  /** `runly db ls`: this worktree's copies, or every copy with `all`. */
+  dbLs(cwd: string, all: boolean) {
+    const root = all ? undefined : this.callerWorktree(cwd);
+    return { scope: root ?? 'server', copies: this.journal.allDbCopies().filter((c) => root === undefined || c.stackRoot === root).map((c) => this.dbCopyView(c)) };
+  }
+
+  /** The caller's worktree root, for the per-worktree views (`ps`, `db ls`). */
+  private callerWorktree(cwd: string): string {
+    try {
+      return loadStack(cwd).root;
+    } catch (err) {
+      throw new BrokerError('work-error', `${String((err as Error).message ?? err)} — pass --all for the whole server`, 'manifest');
+    }
+  }
+
+  /** Why a copy must go now, or null (decision 0034: reaped exactly like environments; no TTL). */
+  private dbCopyOrphanReason(c: DbCopyRow): string | null {
+    if (c.state === 'creating') return 'its creation never finished (the daemon stopped mid-restore)';
+    if (c.state === 'dropping') return 'an earlier drop did not complete';
+    if (c.holderPid !== undefined && this.holderGone(c.holderPid, c.holderStart)) return `its holder process ${c.holderPid} is gone`;
+    if (!existsSync(c.stackRoot)) return `its worktree ${c.stackRoot} is gone`;
+    try {
+      const current = loadStack(c.stackRoot);
+      if (current.id !== c.stack) return `its worktree ${c.stackRoot} now resolves to '${current.id}', not '${c.stack}'`;
+    } catch {
+      /* an unreadable manifest is not proof (someone may be mid-edit) */
+    }
+    return null;
+  }
+
+  /** Drop every copy whose holder or worktree is gone. Runs in every sweep and after recovery. */
+  private async reapDbCopies(): Promise<void> {
+    for (const c of this.journal.allDbCopies()) {
+      if (this.dbBusy.has(c.name) || c.nextDropAt > now()) continue;
+      const reason = this.dbCopyOrphanReason(c);
+      if (!reason) continue;
+      this.dbBusy.add(c.name);
+      try {
+        await this.dropDbCopy(c, reason);
+      } catch (err) {
+        logEvent({ level: 'error', kind: 'db', detail: `reaping database copy ${c.name} failed: ${String((err as Error).message ?? err)}` });
+      } finally {
+        this.dbBusy.delete(c.name);
+      }
+    }
+  }
+
+  // ---------------------------------------------------------------- ps
+
+  /** Resident memory per (env, service), summed over its tagged processes. Linux only; empty elsewhere. */
+  private rssByService(): Map<string, number> {
+    const out = new Map<string, number>();
+    if (!procScanSupported()) return out;
+    for (const proc of scanTagged(stateRoot())) {
+      if (!proc.service || proc.service.startsWith('preview')) continue;
+      try {
+        const kb = /VmRSS:\s+(\d+)\s+kB/.exec(readFileSync(`/proc/${proc.pid}/status`, 'utf8'))?.[1];
+        if (kb === undefined) continue;
+        const key = `${proc.envId}\0${proc.service}`;
+        out.set(key, (out.get(key) ?? 0) + Number(kb) * 1024);
+      } catch {
+        /* exited between the scan and the read */
+      }
+    }
+    return out;
+  }
+
+  /**
+   * `runly ps` (decision 0034): one view of what runs for the caller — the
+   * services of this worktree's environment and its database copies — or,
+   * with `all`, for the whole server.
+   */
+  ps(cwd: string, all: boolean) {
+    const root = all ? undefined : this.callerWorktree(cwd);
+    const rss = this.rssByService();
+    const services: Array<Record<string, unknown>> = [];
+    for (const env of this.journal.allEnvs()) {
+      if (root !== undefined && env.stackRoot !== root) continue;
+      let stack: Stack | undefined;
+      try { stack = loadStack(env.stackRoot); } catch { stack = undefined; }
+      const pids = this.supervisors.get(env.id)?.pids() ?? {};
+      const stats = this.proxy.stats(env.id);
+      const wanted = stack ? this.desiredServices(stack, env) : new Set(env.activeServices ?? Object.keys(env.servicePids));
+      const lease = this.journal.leaseForEnv(env.id);
+      const names = stack ? Object.keys(stack.manifest.services) : [...new Set([...Object.keys(env.servicePids), ...wanted])];
+      for (const name of names) {
+        const key = stack?.manifest.services[name]?.port;
+        const st = key ? stats[key] : undefined;
+        const pid = pids[name]?.pid;
+        const state = st?.state === 'starting' ? 'starting' : pid !== undefined ? 'running' : wanted.has(name) ? 'stopped' : 'down';
+        services.push({
+          env: env.id,
+          worktree: env.stackRoot,
+          service: name,
+          state,
+          publicPort: key ? env.ports[key] ?? null : null,
+          internalPort: st?.internalPort ?? null,
+          pid: pid ?? null,
+          lastActivityAt: st?.lastActivityAt ?? null,
+          idleMs: st?.lastActivityAt ? now() - st.lastActivityAt : null,
+          rssBytes: rss.get(`${env.id}\0${name}`) ?? null,
+          holder: lease?.holder ?? null,
+          busy: this.busy.has(env.id) ? (this.busyOp.get(env.id) ?? 'an operation') : null,
+        });
+      }
+    }
+    const databases = this.journal.allDbCopies().filter((c) => root === undefined || c.stackRoot === root).map((c) => this.dbCopyView(c));
+    return { scope: root ?? 'server', services, databases };
+  }
+
   status() {
     const envs = this.journal.allEnvs().map((e) => {
       const lease = this.journal.leaseForEnv(e.id) ?? null;
@@ -2474,7 +2666,7 @@ export class Engine {
         /** Where its services run: the caller's worktree (decision 0032). */
         worktree: e.stackRoot,
         lease,
-        /** null = the whole app; otherwise the service slice this env is running. */
+        /** null = every service (the default set); otherwise the services the lease wants up — [] after `runly down` (decision 0034). */
         activeServices: e.activeServices ?? null,
         idleMs: now() - e.lastUsedAt,
         /** null = the holder never identified itself, so liveness is unknowable. */
@@ -2491,11 +2683,9 @@ export class Engine {
          * with it. So state the conclusion instead of leaving it to be inferred.
          */
         available: !lease && e.state !== 'degraded' && e.state !== 'recycling',
-        /** Leased for its datastores only — no services were ever meant to run. */
-        dataOnly: e.dataOnly === true,
         /** Plain language for the two fields above, so no one has to infer it. */
         summary: lease
-          ? `leased by '${lease.holder}'${e.dataOnly ? ' (data only — no services)' : ''}${holderAlive === false ? ' (holder process is gone)' : ''}`
+          ? `leased by '${lease.holder}'${e.activeServices?.length === 0 ? ' (no services wanted)' : ''}${holderAlive === false ? ' (holder process is gone)' : ''}`
           : e.state === 'degraded'
             ? 'unusable — the next sweep reclaims it'
             : e.state === 'recycling'
@@ -2850,7 +3040,7 @@ export class Engine {
    * The tunnel outlives service restarts, so everything here is about what is
    * now BEHIND the unchanged public URL. Three outcomes invalidate it outright
    * and tear it down — the manifest started forbidding preview, the previewed
-   * service is no longer in the running slice, or it moved to a different local
+   * service is no longer wanted (`runly down`, decision 0034), or it moved to a different local
    * port (a renamed port key; existing keys are never reassigned, decision
    * 0004). A data reset does not: the tunnel keeps serving, which is precisely
    * why it has to be said out loud.
@@ -2863,7 +3053,7 @@ export class Engine {
    * is enforced early by `enforcePreviewForbidden`: it depends on the manifest,
    * not on the bind.
    *
-   * Never throws. The bind that narrowed the slice or wiped the data is a
+   * Never throws. The `down` that stopped the service or the bind that wiped the data is a
    * legitimate operation and failing it would strand the caller in a loop (and
    * bump failStreak into a pristine escalation); the classified message is the
    * report, and it rides back on the bind's own result.
@@ -2893,7 +3083,7 @@ export class Engine {
     const cause = stack.manifest.preview?.forbidden
       ? { klass: 'work-error', why: `runly.yml now sets preview.forbidden, and a stack that forbids preview must not stay published` }
       : !active.has(service)
-        ? { klass: 'env-error', why: `service '${service}' is not in this bind's running set${active.size ? ` (${[...active].map((n) => `'${n}'`).join(', ')})` : ' (this lease is data-only)'}, so its preview would publish a port with nothing behind it for the rest of the lease` }
+        ? { klass: 'env-error', why: `service '${service}' is not in this bind's running set${active.size ? ` (${[...active].map((n) => `'${n}'`).join(', ')})` : ' (this lease runs no services)'}, so its preview would publish a port with nothing behind it for the rest of the lease` }
         : opts.portsReallocated && port !== lease.previewPort
           ? { klass: 'env-error', why: `service '${service}' moved from port ${lease.previewPort} to ${port ?? 'no port at all'}, so its preview tunnel is aimed at a stale port` }
           : null;
@@ -3322,7 +3512,7 @@ export class Engine {
       // A holder that named its process and is now gone releases IMMEDIATELY.
       // Waiting out the TTL meant a crashed agent's environment stayed leased —
       // and therefore un-poolable — for up to half an hour.
-      if (lease.holderPid !== undefined && !sameProcess(lease.holderPid, lease.holderStart)) {
+      if (lease.holderPid !== undefined && this.holderGone(lease.holderPid, lease.holderStart)) {
         await this.endLease(lease);
         logEvent({
           level: 'info',
@@ -3336,6 +3526,9 @@ export class Engine {
         await this.endLease(lease);
       }
     }
+    // Database copies (decision 0034) go when their holder or worktree does —
+    // the same signals the leases above answer to, with no TTL.
+    await this.reapDbCopies();
     for (const env of this.journal.allEnvs()) {
       if (this.busy.has(env.id)) continue;
       // An environment whose STACK can never be bound again — the repo was

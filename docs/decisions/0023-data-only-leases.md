@@ -1,6 +1,6 @@
 # 0023. A lease may cover the datastores alone — the environment is unbundled downward, not split
 
-- Status: Accepted — amended by [0032](0032-environments-run-in-the-callers-worktree.md): a worktree has one environment, so the per-stack ceiling is gone and a database per consumer is a database per worktree
+- Status: Superseded by [0034](0034-additive-up-database-copies-and-ps.md) — `up --data-only` is removed; a database without an environment is a `runly db` copy. Earlier: amended by [0032](0032-environments-run-in-the-callers-worktree.md): a worktree has one environment, so the per-stack ceiling is gone and a database per consumer is a database per worktree
 - Date: 2026-07
 - Context: a consumer repo whose application environments backlot already brokers
   well ran its integration suites *outside* backlot, on Testcontainers, because
