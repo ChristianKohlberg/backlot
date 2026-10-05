@@ -16,6 +16,7 @@ import { killGroupVerified } from '../daemon/supervisor.js';
 import { serviceTag, startTime } from '../core/procscan.js';
 import { stateRoot } from '../core/paths.js';
 import type { ServicePid } from '../core/types.js';
+import { tunnelBlock } from '../core/ports.js';
 
 /** The manifest's `preview` block, as far as a publisher may read it. */
 export interface PreviewSettings {
@@ -410,9 +411,11 @@ class CloudflareNamedPublisher implements PreviewPublisher {
  */
 const TS_READY_RE = /Available within your tailnet|Available on the internet/;
 
-/** Auto-derived tailnet ports land here unless `preview.https_port` pins one. */
-const TS_PORT_BASE = 21000;
-const TS_PORT_SPAN = 1000;
+/**
+ * Auto-derived tailnet ports land in the TUNNEL block (decision 0033,
+ * 32000–32767 by default) unless `preview.https_port` or `--https-port` pins
+ * one. Until 0.14 they were 21000–21999, inside what is now the public block.
+ */
 
 function tailscaleBin(): string {
   const override = process.env.BACKLOT_TAILSCALE?.trim();
@@ -477,15 +480,17 @@ export function tailnetPortsInUse(serveStatus: Record<string, unknown>): Set<num
  * port inside the span; a full span is an env-error, not a silent reuse.
  */
 export function deriveTailnetPort(envId: string, service: string, inUse: Set<number>): number {
+  const { lo, hi } = tunnelBlock();
+  const span = hi - lo + 1;
   const h = createHash('sha256').update(`${envId}\0${service}`).digest().readUInt32BE(0);
-  const start = h % TS_PORT_SPAN;
-  for (let i = 0; i < TS_PORT_SPAN; i++) {
-    const port = TS_PORT_BASE + ((start + i) % TS_PORT_SPAN);
+  const start = h % span;
+  for (let i = 0; i < span; i++) {
+    const port = lo + ((start + i) % span);
     if (!inUse.has(port)) return port;
   }
   throw new BrokerError(
     'env-error',
-    `every tailnet port in ${TS_PORT_BASE}-${TS_PORT_BASE + TS_PORT_SPAN - 1} is already served on this machine — free some ('tailscale serve status') or pin preview.https_port`,
+    `every tailnet port in ${lo}-${hi} is already served on this machine — free some ('tailscale serve status') or pin preview.https_port`,
     'preview',
   );
 }

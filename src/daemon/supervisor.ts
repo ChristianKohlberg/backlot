@@ -57,6 +57,8 @@ export class EnvSupervisor {
      * stays truthful for recovery — a stale pid gets an innocent SIGTERM and
      * misses the real orphan holding the port. */
     private readonly onPidsChanged?: () => void,
+    /** Fired after a service was stopped on purpose — the proxy stops forwarding to it (decision 0033). */
+    private readonly onStopped?: (service: string) => void,
   ) {
     mkdirSync(logDir, { recursive: true });
   }
@@ -289,6 +291,7 @@ export class EnvSupervisor {
       }
       this.note(name, survivors[name] ? 'stop failed' : 'stopped');
       this.services.delete(name);
+      this.onStopped?.(name);
     }
     return survivors;
   }

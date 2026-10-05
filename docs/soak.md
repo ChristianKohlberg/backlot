@@ -28,6 +28,9 @@ fixture stacks in a dedicated temp `BACKLOT_STATE_DIR`, cycling continuously:
   service that has no `build:` (same pid), and an upkeep-trigger touch
   (`deps.lock`) + `up` must take the full bind: the upkeep marker appears in
   the worktree *and* the service comes back on the same URL with a new pid.
+  Requests sent to that URL throughout the restart must all be answered — the
+  daemon's proxy holds them until the new process is ready (decision 0033) —
+  and the URL's port must stay inside the public block 20000–29999.
 - **Env export** — `runly ctx --env` must print parseable `RUNLY_*=value`
   lines, and the stack's own check, run with them outside runly, must pass.
 - **Capacity churn** — a second stack whose one environment (decision 0032) is

@@ -187,7 +187,7 @@ describe('the tailscale preview publisher', () => {
     const first = await cli(['preview', 'web', '--json']);
     expect(first.code).toBe(0);
     const url = String(first.json?.url);
-    expect(url).toMatch(/^https:\/\/box\.tail1234\.ts\.net:2\d{4}$/);
+    expect(url).toMatch(/^https:\/\/box\.tail1234\.ts\.net:32\d{3}$/);
 
     // A re-publish on the same environment hands out the same address.
     expect((await cli(['preview', 'stop', '--json'])).code).toBe(0);
@@ -295,15 +295,17 @@ describe('tailnet port choice', () => {
   it('is deterministic per environment and service', () => {
     const a = deriveTailnetPort('stack-e1', 'web', new Set());
     expect(deriveTailnetPort('stack-e1', 'web', new Set())).toBe(a);
-    expect(a).toBeGreaterThanOrEqual(21000);
-    expect(a).toBeLessThan(22000);
+    // The tunnel block (decision 0033): disjoint from the public 20000–29999
+    // block and below every common ephemeral range.
+    expect(a).toBeGreaterThanOrEqual(32000);
+    expect(a).toBeLessThanOrEqual(32767);
   });
 
   it('walks past a port that is already served', () => {
     const a = deriveTailnetPort('stack-e1', 'web', new Set());
     const b = deriveTailnetPort('stack-e1', 'web', new Set([a]));
     expect(b).not.toBe(a);
-    expect(b).toBe(a === 21999 ? 21000 : a + 1);
+    expect(b).toBe(a === 32767 ? 32000 : a + 1);
   });
 
   it('reads busy ports from both the persistent config and live foreground sessions', () => {

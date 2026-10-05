@@ -155,6 +155,9 @@ const stats = {
   binds: 0,
   keptServices: 0,
   fallbackRestarts: 0,
+  /** Requests sent through the public port while `up` restarted the service (decision 0033). */
+  heldRequests: 0,
+  heldRequestFailures: 0,
   envChecks: 0,
   queuedAcquires: 0,
   leaseExpiries: 0,
@@ -479,7 +482,32 @@ async function phaseRestart() {
   const markerPath = join(stackA, '.upkeep-ran');
   const markerBefore = existsSync(markerPath) ? readFileSync(markerPath, 'utf8') : '';
   appendFileSync(join(stackA, 'deps.lock'), `bump ${cycle} ${Math.floor(rand() * 1e9)}\n`);
+  // Decision 0033: the public port is held across the restart, so traffic
+  // that keeps coming while `up` stops and starts the service must be held
+  // and answered, never refused.
+  let trafficOn = true;
+  let answered = 0;
+  let failed = 0;
+  const traffic = (async () => {
+    while (trafficOn) {
+      try {
+        await fetchJson(ctx.urls.web + '/health', 60_000);
+        answered++;
+      } catch {
+        failed++;
+      }
+      await sleep(150);
+    }
+  })();
   const full = await cli(['up'], { cwd: stackA });
+  trafficOn = false;
+  await traffic;
+  stats.heldRequests += answered;
+  stats.heldRequestFailures += failed;
+  must(failed === 0, 'restart', 'a request through the public port failed while up restarted the service (the proxy must hold it)', `${failed} of ${answered + failed} failed`);
+  const port = Number(new URL(String(full.body?.urls?.web ?? ctx.urls.web)).port);
+  must(full.body?.urls?.web === ctx.urls.web && port >= 20000 && port <= 29999, 'restart',
+    'the public URL moved across a restart, or lies outside the public block', `${ctx.urls.web} -> ${full.body?.urls?.web}`);
   const marker = existsSync(markerPath) ? readFileSync(markerPath, 'utf8') : '';
   const pidAfter = await until(10_000, 250, () => healthPid(ctx.urls.web));
   if (must(full.body?.bindDiagnostics?.reuse === 'rebound' && marker.length > markerBefore.length && pidAfter && pidAfter !== pidKept, 'restart',
@@ -852,6 +880,7 @@ function printStats() {
   lines.push(`  binds (hot ups)        ${stats.binds}`);
   lines.push(`  services kept on up    ${stats.keptServices}`);
   lines.push(`  full-bind restarts     ${stats.fallbackRestarts}`);
+  lines.push(`  requests held/failed   ${stats.heldRequests}/${stats.heldRequestFailures}`);
   lines.push(`  env-export checks      ${stats.envChecks}`);
   lines.push(`  queued acquires        ${stats.queuedAcquires}`);
   lines.push(`  lease expiries swept   ${stats.leaseExpiries}`);

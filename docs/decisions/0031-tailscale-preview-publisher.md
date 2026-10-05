@@ -1,6 +1,6 @@
 # 0031. A preview may publish on the tailnet, through a foreground `tailscale serve`
 
-- Status: Accepted
+- Status: Accepted; the derived-port block amended by [0033](0033-the-daemon-holds-public-ports-behind-an-l4-proxy.md) (now 32000–32767)
 - Date: 2026-10
 - Context: [0027](0027-lease-scoped-public-preview.md) and
   [0028](0028-named-preview-hostnames.md) give preview two Cloudflare

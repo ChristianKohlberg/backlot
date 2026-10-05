@@ -193,14 +193,14 @@
         "port": {
           "type": "string",
           "pattern": "^[a-z][a-z0-9-]*$",
-          "description": "Symbolic port name; the engine allocates the number and injects {{ports.<name>}}. Omit for portless services (workers)."
+          "description": "Symbolic port name; the engine allocates a public port (held by the daemon's proxy) and starts the service on an internal one. In this service's own run/env, {{ports.<name>}} is the internal port to listen on; everywhere else it is the public port ({{public_ports.<name>}} is always public). Omit for portless services (workers)."
         },
         "env": {
           "type": "object",
           "additionalProperties": {
             "type": "string"
           },
-          "description": "Injected environment; values may template {{ports.*}}, {{datastores.*.url}}, {{services.*.url}}."
+          "description": "Injected environment; values may template {{ports.*}}, {{public_ports.*}}, {{datastores.*.url}}, {{services.*.url}}."
         },
         "env_from": {
           "type": "object",

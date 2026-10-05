@@ -100,6 +100,16 @@ services build and run in the caller's worktree; what stays the environment's
 own is its ports (and therefore URLs, stable for its lifetime), its datastore
 namespace and its logs.
 
+Stable ports are held, not just recorded ([decision 0033](decisions/0033-the-daemon-holds-public-ports-behind-an-l4-proxy.md)):
+the daemon listens on each environment's **public** ports (20000–29999) for the
+environment's life and pipes TCP to the **internal** port (30000–31999) the service
+was started on, fresh at each start. A connection that arrives while its service
+restarts is held until it is ready; client bytes and the last activity time are
+counted per port (`proxy` in `ctx`/`status`), and readiness probes bypass the
+proxy. Derived tailnet ports use a third block (32000–32767); all three sit below
+the OS ephemeral range. `src/daemon/proxy.ts` owns the proxy, `ensureProxies` in
+the engine owns holding and (only when a port cannot be held) moving them.
+
 ### Physical stack identity
 
 Stack identity uses the physical project directory: symlink spellings refer to the
@@ -497,7 +507,7 @@ after the fact by the bind's own result, not by progress: see "Understanding a s
 bind" in the README for `bindDiagnostics`.
 
 `ctx` returns one blob with everything a consumer needs: service URLs (stable per
-environment), allocated ports, login credentials, a token-mint hook, datastore
+environment), public ports and the proxy's per-port counters, login credentials, a token-mint hook, datastore
 connection strings, hygiene state, and recent service events. An agent holding this
 blob needs nothing else from runly. `ctx --env` prints the part a test command needs as
 shell-exportable lines with stable names: `RUNLY_ENV_ID`, `RUNLY_PORT_<PORT>`,
