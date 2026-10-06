@@ -41,6 +41,15 @@ interface Running {
   log: LogWriter;
 }
 
+/** How a service that runly gave up on last ended (decision 0039). */
+export interface ServiceExit {
+  /** Exit code of the last process, null when a signal ended it or it never spawned. */
+  code: number | null;
+  signal: string | null;
+  /** `crash-loop`, `daemonized` or `spawn-failed`. */
+  reason: 'crash-loop' | 'daemonized' | 'spawn-failed';
+}
+
 /** What the engine learns about a service between starts (decision 0035). */
 export interface SupervisorHooks {
   /** It exited on its own and a restart is pending: hold its port's connections. */
@@ -63,8 +72,8 @@ export class EnvSupervisor {
     /** The caller's worktree — services run in place there (decision 0032). */
     private readonly root: string,
     private readonly logDir: string,
-    /** Fired when a service flaps past its restart budget (decision 0007/0010). */
-    private readonly onDegraded?: (service: string) => void,
+    /** Fired when a service flaps past its restart budget (decision 0007/0010), with how it last ended. */
+    private readonly onDegraded?: (service: string, exit: ServiceExit) => void,
     /** Fired whenever a service's pid changes (start/restart) so the journal
      * stays truthful for recovery — a stale pid gets an innocent SIGTERM and
      * misses the real orphan holding the port. */
@@ -200,12 +209,12 @@ export class EnvSupervisor {
           }, 500 * running.restarts);
           running.restartTimer.unref();
         } else {
-          this.note(name, 'spawn keeps failing — giving up (environment degraded)');
+          this.note(name, 'spawn keeps failing — giving up');
           this.hooks.onGaveUp?.(name);
-          this.onDegraded?.(name);
+          this.onDegraded?.(name, { code: null, signal: null, reason: 'spawn-failed' });
         }
       });
-      proc.on('exit', (code) => {
+      proc.on('exit', (code, signal) => {
         if (running.expectedExit) return;
         // A service that DAEMONIZES (forks and returns 0 immediately) is not a
         // supervised service: runly restarts it, each restart forks another
@@ -216,10 +225,10 @@ export class EnvSupervisor {
           this.note(name, 'exited 0 immediately — a service must stay in the FOREGROUND (it looks daemonized)');
           running.expectedExit = true;
           this.hooks.onGaveUp?.(name);
-          this.onDegraded?.(name);
+          this.onDegraded?.(name, { code, signal, reason: 'daemonized' });
           return;
         }
-        this.note(name, `exited (${code})`);
+        this.note(name, signal ? `exited (signal ${signal})` : `exited (${code})`);
         this.onPidsChanged?.(); // the dead pid must leave the journal
         // The budget is for FLAPPING — a tight crash loop — not for a service's
         // whole lifetime. Without this reset, three unrelated crashes hours
@@ -235,9 +244,9 @@ export class EnvSupervisor {
           running.restartTimer = setTimeout(launch, 500 * running.restarts);
           running.restartTimer.unref();
         } else {
-          this.note(name, 'flapping — giving up (environment degraded)');
+          this.note(name, 'flapping — giving up');
           this.hooks.onGaveUp?.(name);
-          this.onDegraded?.(name);
+          this.onDegraded?.(name, { code, signal, reason: 'crash-loop' });
         }
       });
     };
@@ -424,6 +433,38 @@ export async function killGroupVerified(
     if (gone()) return true;
   }
   return gone();
+}
+
+/**
+ * SIGTERM one process, then SIGKILL it after `graceMs` — never its group, and
+ * only while it is still the process recorded with `recordedStart`. For a
+ * process that shares a group with something runly does not own (`runly db
+ * with`'s command at a terminal, decision 0039). True once it is gone.
+ */
+export async function killPidVerified(pid: number, recordedStart?: number, graceMs = 2000): Promise<boolean> {
+  const ours = () => sameProcess(pid, recordedStart);
+  if (!ours()) return true;
+  try {
+    process.kill(pid, 'SIGTERM');
+  } catch {
+    return !ours();
+  }
+  const deadline = Date.now() + graceMs;
+  while (Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, 50));
+    if (!ours()) return true;
+  }
+  try {
+    process.kill(pid, 'SIGKILL');
+  } catch {
+    /* gone meanwhile */
+  }
+  const hard = Date.now() + 2000;
+  while (Date.now() < hard) {
+    await new Promise((r) => setTimeout(r, 50));
+    if (!ours()) return true;
+  }
+  return !ours();
 }
 
 /**

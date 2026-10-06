@@ -6,7 +6,7 @@ import { mkdirSync, rmSync, readdirSync, existsSync, readFileSync, writeFileSync
 import { isAbsolute, join, relative, sep } from 'node:path';
 import { Journal, JOURNAL_SCHEMA_VERSION, type DbCopyRow, type DropRecipe, type EnvRow, type LeaseRow } from '../core/journal.js';
 import { BUILD, VERSION, compareVersions, versionSkew } from '../core/version.js';
-import { buildOf, canonicalDirectory, outputsOf, stackIdentity, retiredStackIdentity, loadStack, normalizeLogins, manifestFileOf, type Manifest, type ServiceSpec, type Stack } from '../core/manifest.js';
+import { buildOf, canonicalDirectory, envDatastoreNames, outputsOf, stackIdentity, retiredStackIdentity, loadStack, normalizeLogins, manifestFileOf, type Manifest, type ServiceSpec, type Stack } from '../core/manifest.js';
 import { snapshotOutputs } from '../core/worktree.js';
 import { forgetNamespace, recordedNamespaces } from '../core/namespaces.js';
 import { runlyEnvVars } from '../core/env-vars.js';
@@ -27,8 +27,8 @@ import { cmdTimeoutS, runBounded, runBoundedIO, LONG_CMD_TIMEOUT_S } from '../co
 import { makeDatastore, parseBakedMarker, retireBakedTemplates, withBakeLock, tryWithBakeLock, type DsHandle } from '../drivers/datastores.js';
 import { ensureAppliance, stopAppliance, probeTcp } from '../drivers/appliances.js';
 import { DEFAULT_PREVIEW_PUBLISHER, resolvePreviewPublisher } from '../drivers/preview.js';
-import { EnvSupervisor, killGroupVerified, reapPids, mergeServicePids, serviceGroups } from './supervisor.js';
-import { groupAlive, isAlive, processGroup, procScanSupported, sameProcess, scanByCwd, scanTagged, serviceTag, startTime, type TaggedProc } from '../core/procscan.js';
+import { EnvSupervisor, killGroupVerified, killPidVerified, reapPids, mergeServicePids, serviceGroups, type ServiceExit } from './supervisor.js';
+import { groupAlive, isAlive, processGroup, procScanSupported, sameProcess, scanByCwd, scanDbCopy, scanTagged, serviceTag, startTime, type TaggedProc } from '../core/procscan.js';
 import { policy } from '../core/policy.js';
 import { kernelSleepGap, readKernelSleepRecord } from '../core/sleep.js';
 import { retentionSweep, templateRefs } from '../core/retention.js';
@@ -135,6 +135,14 @@ function acceptsOn(port: number, host: string): Promise<boolean> {
   });
 }
 
+/** "crash-looped (last exit 3)" — how a service runly gave up on ended, for events, ps and errors. */
+function describeExit(exit: ServiceExit): string {
+  const last = exit.signal ? `signal ${exit.signal}` : exit.code === null ? 'no process' : `exit ${exit.code}`;
+  if (exit.reason === 'daemonized') return `exited 0 at once — a service must stay in the foreground (last ${last})`;
+  if (exit.reason === 'spawn-failed') return 'could not be spawned after 3 attempts';
+  return `crash-looped past its restart budget (last ${last})`;
+}
+
 export class Engine {
   constructor(private readonly reapServiceGroup: typeof killGroupVerified = killGroupVerified) {
     // Start on demand (decision 0035): a connection to a stopped, wanted
@@ -197,6 +205,12 @@ export class Engine {
   private startedAt = new Map<string, number>();
   /** Services stopped for idleness (ps shows them as `idle`). */
   private idleStopped = new Set<string>();
+  /**
+   * Services of a LEASED environment that crash-looped and were stopped
+   * (decision 0039), by env + service: `ps` and `ctx` show them as `failed`
+   * with how they ended; a wake skips them; the next `up` starts them again.
+   */
+  private failedServices = new Map<string, ServiceExit & { at: number }>();
   /** In-flight wakes, by env + service, so a burst of connections starts a service once. */
   private waking = new Map<string, Promise<void>>();
   /** First time a tether was seen dead; it is believed only after the grace. */
@@ -966,6 +980,8 @@ export class Engine {
     const dirs = this.envDirs(env.id);
     const h: DsHandle = { envId: env.id, cwd: env.stackRoot, dataDir: dirs.data };
     for (const [name, spec] of Object.entries(stack.manifest.datastores ?? {})) {
+      // A copies_only datastore (decision 0039) has no namespace in an environment.
+      if (spec.copies_only === true) continue;
       const ds = makeDatastore(name, spec, stack.id);
       datastores[name] = { url: ds.url(h), ns: ds.ns(h) };
     }
@@ -978,15 +994,22 @@ export class Engine {
       const dirs = this.envDirs(env.id);
       sup = new EnvSupervisor(
         env.id, env.stackRoot, dirs.logs,
-        () => {
-          // Flapping service -> the environment is degraded: skipped by acquire,
-          // auto-reaped by the sweeper (decision 0007).
+        (service, exit) => {
           const fresh = this.journal.getEnv(env.id);
-          if (fresh && fresh.state !== 'recycling') {
-            fresh.state = 'degraded';
-            this.journal.saveEnv(fresh);
-            logEvent({ level: 'warn', kind: 'degraded', envId: env.id, detail: 'service flapped past its restart budget' });
+          if (!fresh || fresh.state === 'recycling') return;
+          // A LEASED environment is someone's work (decision 0039): the
+          // service that crash-loops is stopped and reported as failed, and
+          // the environment, its data, its other services and its logs stay.
+          // The next `up` retries it.
+          if (this.journal.leaseForEnv(env.id)) {
+            this.serviceFailed(env.id, service, exit);
+            return;
           }
+          // Nobody holds it: the environment is degraded — skipped by acquire,
+          // recycled by the sweeper (decision 0007).
+          fresh.state = 'degraded';
+          this.journal.saveEnv(fresh);
+          logEvent({ level: 'warn', kind: 'degraded', envId: env.id, detail: `'${service}' ${describeExit(exit)} — the environment is unleased and will be recycled` });
         },
         () => {
           // A pid changed (start/restart/exit): keep the journal truthful so
@@ -1075,6 +1098,56 @@ export class Engine {
       if (texts.some((t) => ref.test(t))) users.add(name);
     }
     return users.size > 0 ? users : null;
+  }
+
+  /** The datastores an environment of `stack` provisions: all but the `copies_only` ones (decision 0039). */
+  private envDatastores(stack: Stack): string[] {
+    return envDatastoreNames(stack.manifest);
+  }
+
+  /** `up --preset` and `reset-data --preset` name only datastores an environment has (decision 0039). */
+  private refuseCopiesOnlyPresets(stack: Stack, presets: Record<string, string>): void {
+    for (const name of Object.keys(presets)) {
+      if (stack.manifest.datastores?.[name]?.copies_only === true) {
+        throw new BrokerError('work-error', `datastore '${name}' is copies_only in ${manifestFileOf(stack)}: an environment has none to reload — 'runly db new ${name} --preset ${presets[name]}' takes a copy`, 'manifest');
+      }
+    }
+  }
+
+  /**
+   * Give back the namespaces of datastores an environment no longer
+   * provisions — one made before its datastore became `copies_only` (decision
+   * 0039) — by the drop recorded for each. A drop that fails stays on the row
+   * for teardown to retry.
+   */
+  private async retireEnvDatastores(stack: Stack, env: EnvRow, say: Progress): Promise<void> {
+    const keep = new Set(this.envDatastores(stack));
+    for (const name of Object.keys(env.datastoreNs)) {
+      const spec = stack.manifest.datastores?.[name];
+      if (keep.has(name) || !spec || spec.copies_only !== true) continue;
+      const recipe = env.dropRecipes?.[name];
+      try {
+        say(`dropping datastore '${name}' from this environment (copies_only)`);
+        if (recipe) await this.runDropRecipe(recipe, recipe.cwd && existsSync(recipe.cwd) ? recipe.cwd : stack.root);
+        else await makeDatastore(name, spec, stack.id).drop({ envId: env.id, cwd: stack.root, dataDir: this.envDirs(env.id).data });
+      } catch (err) {
+        logEvent({ level: 'warn', kind: 'datastore', envId: env.id, detail: `datastore '${name}' is copies_only now, but dropping its environment namespace failed (teardown retries): ${String((err as Error).message ?? err)}` });
+        continue;
+      }
+      delete env.datastoreNs[name];
+      delete env.presets[name];
+      if (env.templates) delete env.templates[name];
+      if (env.dropRecipes) delete env.dropRecipes[name];
+      const live = this.journal.getEnv(env.id);
+      if (live) {
+        delete live.datastoreNs[name];
+        delete live.presets[name];
+        if (live.templates) delete live.templates[name];
+        if (live.dropRecipes) delete live.dropRecipes[name];
+        this.journal.saveEnv(live);
+      }
+      logEvent({ level: 'info', kind: 'datastore', envId: env.id, detail: `datastore '${name}' is copies_only: its environment namespace was dropped (decision 0039)` });
+    }
   }
 
   /**
@@ -1292,10 +1365,28 @@ export class Engine {
     // disjoint template name — two stacks can no longer silently share a
     // template with the wrong schema.
     const bakeKeys = templateBakeKeys(stack.manifest, stack.root, files);
-    for (const dsName of upkeep.rebakeTemplates) {
-      const spec = stack.manifest.datastores?.[dsName];
-      if (spec) await makeDatastore(dsName, spec, stack.id, bakeKeys[dsName]).rebake(stack.root);
+    // A fired `@rebake-template` rule names the datastore whose trigger files
+    // changed for THIS environment — but the template key already folds in
+    // that content (decision 0039): a template whose key matches was baked
+    // from the same create command and the same files, so it is reused, and
+    // one that is missing is baked by the restore that needs it. Rebaking it
+    // on every fresh environment cost a destroyed worktree 90-110 s per `up`.
+    // Only `--pristine` (nothing is trusted) drops the current templates.
+    if (hygiene === 'pristine') {
+      for (const dsName of upkeep.rebakeTemplates) {
+        const spec = stack.manifest.datastores?.[dsName];
+        if (spec) await makeDatastore(dsName, spec, stack.id, bakeKeys[dsName]).rebake(stack.root);
+      }
     }
+    // Which datastores hold data from a template other than the current one:
+    // a fired rule reloads only those (a fresh environment creates every
+    // store anyway).
+    const staleTemplate = (name: string): boolean => {
+      const spec = stack.manifest.datastores?.[name];
+      if (!spec || !upkeep.rebakeTemplates.includes(name)) return false;
+      const ref = makeDatastore(name, spec, stack.id, bakeKeys[name]).templateRef(presetToRestore(name, spec, env.presets[name]));
+      return ref === null || env.templates?.[name] !== ref;
+    };
 
     // runly does not know whether the worktree's code changed (decision 0032:
     // no source identity, no build cache), so every `up` runs the build of
@@ -1414,24 +1505,48 @@ export class Engine {
     // their data (probe first — infra-error, not code blame).
     trace.phase('data');
     trace.result.reloaded = Object.keys(reloadPresets);
-    await this.prepareDatastores(stack, env, bakeKeys, Object.keys(stack.manifest.datastores ?? {}).map((name) => ({
-      name,
-      force: reloadPresets[name] !== undefined || hygiene !== 'reuse' || upkeep.rebakeTemplates.includes(name),
-      preset: reloadPresets[name],
-    })), say);
-
+    await this.retireEnvDatastores(stack, env, say);
+    // Data and builds are independent (decision 0039): the datastores are
+    // restored (or baked) while the services build, and the services start
+    // only once both are done. A build's templates may name a datastore's url
+    // or ns — both are derived from the environment, not from the restore.
+    const data = async () => {
+      const t0 = performance.now();
+      try {
+        await this.prepareDatastores(stack, env, bakeKeys, this.envDatastores(stack).map((name) => ({
+          name,
+          force: reloadPresets[name] !== undefined || hygiene !== 'reuse' || staleTemplate(name),
+          preset: reloadPresets[name],
+        })), say);
+      } finally {
+        phaseMs.data = performance.now() - t0;
+      }
+    };
     // Builds: every service this bind starts that declares one (decision
     // 0032) — except a `build: { when: }` whose inputs are unchanged since its
     // last successful build (decision 0038). runly keeps no build cache —
     // MSBuild, pnpm and the Angular CLI decide what is already up to date.
     // Under the worktree lock: `runly warm` builds into the same output.
     const ctx = this.templateCtx(stack, env);
-    trace.phase('build');
-    await this.treeLocked(stack.id, () => this.inWaves(this.buildWaves(stack, active), async (name) => {
-      const b = await this.buildService(stack, env, name, serviceOf(stack, name), ctx, say, { rebuild, mode: 'bind' });
-      trace.result.builds.push({ service: name, durationMs: b.durationMs, restart: true, reason: b.ran ? 'full-rebind' : 'when-unchanged' });
-    }), waitTree);
+    const builds = async () => {
+      const t0 = performance.now();
+      try {
+        await this.treeLocked(stack.id, () => this.inWaves(this.buildWaves(stack, active), async (name) => {
+          const b = await this.buildService(stack, env, name, serviceOf(stack, name), ctx, say, { rebuild, mode: 'bind' });
+          trace.result.builds.push({ service: name, durationMs: b.durationMs, restart: true, reason: b.ran ? 'full-rebind' : 'when-unchanged' });
+        }), waitTree);
+      } finally {
+        phaseMs.build = performance.now() - t0;
+      }
+    };
+    const phaseMs = { data: 0, build: 0 };
+    // Both run to the end before a failure is reported: a build is never left
+    // running behind the caller's back, and the data error (if any) wins.
+    const [dataDone, buildsDone] = await Promise.allSettled([data(), builds()]);
+    trace.overlapped(phaseMs);
     reservation.releaseBuild();
+    if (dataDone.status === 'rejected') throw dataDone.reason;
+    if (buildsDone.status === 'rejected') throw buildsDone.reason;
 
     trace.phase('ready');
     await startSlice(active);
@@ -1456,6 +1571,23 @@ export class Engine {
       // in the degraded window filter URLs by the wrong set.
       this.journal.saveEnv({ ...current, servicePids: sup.pids(), activeServices: this.recordedShape(stack, active), lastUsedAt: now() });
       throw new BrokerError('env-error', `environment ${env.id} degraded during bind — a service flapped past its restart budget`, 'pool');
+    }
+    // A service of this (leased) bind crash-looped while a later one booted
+    // (decision 0039): the bind failed, but the environment and the services
+    // that run stay; the next `up` starts the failed one again.
+    const failedNow = [...active].flatMap((n) => {
+      const f = this.failureOf(env.id, n);
+      return f ? [{ name: n, f }] : [];
+    });
+    const firstFailed = failedNow[0];
+    if (firstFailed) {
+      const pids = sup.pids();
+      this.journal.saveEnv({ ...current, state: Object.keys(pids).length > 0 ? 'hot' : 'warm', servicePids: pids, activeServices: this.recordedShape(stack, active), lastUsedAt: now() });
+      throw new BrokerError(
+        'work-error',
+        `service ${failedNow.map((x) => `'${x.name}'`).join(', ')} ${describeExit(firstFailed.f)} during this bind — 'runly logs ${firstFailed.name}' shows why; the other services keep running and the next 'runly up' retries it`,
+        firstFailed.name,
+      );
     }
     // Nothing wanted means nothing running, which is exactly what `warm`
     // means — services stopped, ports and data intact. Publishing it as `hot`
@@ -1792,6 +1924,7 @@ export class Engine {
         const resolved = { ...spec, run: template(spec.run, ctx) };
         const callerValues = serviceCallerEnv(spec, inputs.values);
         const serviceEnv = { ...templateEnv(spec.env, ctx), ...callerValues };
+        this.failedServices.delete(`${env.id}\0${name}`);
         sup.start(name, resolved, serviceEnv, Object.values(callerValues).filter((value): value is string => value !== undefined));
         // From now on the running service is what the budget counts; its share
         // leaves the reservation (it was counted twice until the bind ended).
@@ -1970,7 +2103,7 @@ export class Engine {
     const forbiddenNotice = await this.enforceHolderPreviewForbidden(stack, holder, opts.onProgress);
     // Removed by decision 0034; the CLI answers it with exit 64 before the daemon.
     if (opts.dataOnly) throw new BrokerError('work-error', DATA_ONLY_REMOVED, 'manifest');
-    validatePresetRequest(stack.manifest, opts.presets, stack.file);
+    this.refuseCopiesOnlyPresets(stack, validatePresetRequest(stack.manifest, opts.presets, stack.file));
     // Resolve a requested slice BEFORE acquiring an env: an unknown name is a
     // user typo, not a bind failure, so it must not reach bindAndStart's catch
     // (which bumps failStreak — two typos would escalate the next real bind to a
@@ -2072,7 +2205,9 @@ export class Engine {
     if (!env) {
       throw new BrokerError('env-error', `environment ${targetId} no longer exists (it was recycled) — run 'runly up' to bind a fresh one`, 'lease');
     }
-    this.touch(env.id); // asking for context means an agent is still working here
+    // Reading the context is not activity (decision 0039): an agent that only
+    // polls `ctx` must not keep services awake. Only verbs that USE the
+    // environment touch its clock (see touch()).
     const ctx = this.templateCtx(stack, env);
     // A subset env only reports the URLs it actually has up; a full env (active
     // undefined) reports everything, unchanged.
@@ -2106,6 +2241,8 @@ export class Engine {
        * down with `runly down`). `urls` lists the wanted ones.
        */
       services: this.serviceStates(stack, env),
+      /** Services that crash-looped and were stopped (decision 0039), with their last exit; the next `up` retries them. */
+      failures: this.serviceFailures(stack, env),
       /**
        * `logins` stays the PRIMARY login even for a stack that declares a list, so
        * a consumer reading `ctx.logins.user` is unaffected by the manifest growing
@@ -2134,11 +2271,29 @@ export class Engine {
     };
   }
 
-  /** Where each declared service stands: running, stopped (wanted, not running) or down (not wanted). */
-  private serviceStates(stack: Stack, env: EnvRow): Record<string, 'running' | 'stopped' | 'down'> {
+  /**
+   * Where each declared service stands: running, failed (wanted, crash-looped
+   * and stopped — decision 0039), stopped (wanted, not running) or down (not
+   * wanted).
+   */
+  private serviceStates(stack: Stack, env: EnvRow): Record<string, 'running' | 'failed' | 'stopped' | 'down'> {
     const running = new Set(Object.keys(this.supervisors.get(env.id)?.pids() ?? {}));
     const wanted = this.desiredServices(stack, env);
-    return Object.fromEntries(Object.keys(stack.manifest.services).map((n) => [n, running.has(n) ? 'running' : wanted.has(n) ? 'stopped' : 'down']));
+    return Object.fromEntries(Object.keys(stack.manifest.services).map((n) => [
+      n,
+      running.has(n) ? 'running' : !wanted.has(n) ? 'down' : this.failureOf(env.id, n) ? 'failed' : 'stopped',
+    ]));
+  }
+
+  /** The failed services of `env` (decision 0039): how each last ended, and the log to read. */
+  private serviceFailures(stack: Stack, env: EnvRow): Record<string, { reason: string; exitCode: number | null; signal: string | null; at: number; detail: string; hint: string }> {
+    const states = this.serviceStates(stack, env);
+    const out: Record<string, { reason: string; exitCode: number | null; signal: string | null; at: number; detail: string; hint: string }> = {};
+    for (const [name, state] of Object.entries(states)) {
+      const f = state === 'failed' ? this.failureOf(env.id, name) : undefined;
+      if (f) out[name] = { reason: f.reason, exitCode: f.code, signal: f.signal, at: f.at, detail: describeExit(f), hint: `runly logs ${name}` };
+    }
+    return out;
   }
 
   /**
@@ -2245,7 +2400,7 @@ export class Engine {
     const h = this.callerHolder(cwd, holder, stack);
     const noLease = () => new BrokerError('env-error', `no active lease — run 'runly up' first`, 'lease');
     const forbiddenNotice = await this.enforceHolderPreviewForbidden(stack, h, onProgress);
-    validatePresetRequest(stack.manifest, presets, stack.file);
+    this.refuseCopiesOnlyPresets(stack, validatePresetRequest(stack.manifest, presets, stack.file));
     const lease = this.journal.leaseForHolder(h, stack.id);
     if (!lease || lease.expiresAt <= now()) throw noLease();
     const env = this.envForLease(lease);
@@ -2281,10 +2436,12 @@ export class Engine {
   /**
    * Record that an environment was USED, without extending its lease.
    *
-   * lastUsedAt only moved on bind, so an agent that bound once and then ran
-   * exec/logs/ctx for an hour looked completely idle — and would be quiesced by
-   * the sweep below while actively working. Activity and ownership are
-   * different questions and are now tracked separately.
+   * Activity is what keeps services awake (decision 0035), so only verbs that
+   * USE the environment call this (decision 0039): `up` and `reset-data` (a
+   * bind sets the clock itself), `exec`, `token`, `preview` and `down`. The
+   * read-only verbs — `ctx`, `ps`, `plan`, `logs`, `status`, `db ls`,
+   * `doctor` — do not: an agent polling them is not using a service, and
+   * counting them kept idle services running for as long as anyone looked.
    */
   private touch(envId: string): void {
     try {
@@ -2411,7 +2568,7 @@ export class Engine {
     const lease = this.journal.leaseForHolder(this.callerHolder(cwd, holder, stack), stack.id);
     const env = lease ? this.envForLease(lease) : this.journal.envsForStack(stack.id)[0];
     if (!env) throw new BrokerError('env-error', `this worktree has no environment — run 'runly up' first`, 'lease');
-    this.touch(env.id);
+    // Reading logs is not activity (decision 0039).
     const dir = this.envDirs(env.id).logs;
     const names = services.length > 0 ? services : Object.keys(stack.manifest.services);
     const files = names.map((service) => ({ service, file: build ? buildLogOf(dir, service) : logFileOf(dir, service) }));
@@ -2835,6 +2992,7 @@ export class Engine {
       const fresh = this.journal.getEnv(env.id);
       if (!fresh) throw new BrokerError('env-error', `environment ${env.id} was recycled during down — retry`, 'pool');
       const remaining = new Set([...wanted].filter((n) => !names.includes(n)));
+      for (const n of names) this.failedServices.delete(`${env.id}\0${n}`);
       fresh.activeServices = this.recordedShape(stack, remaining);
       const stillRunning = Object.keys(this.supervisor(fresh).pids());
       if (stillRunning.length === 0 && fresh.state === 'hot') fresh.state = 'warm';
@@ -2953,6 +3111,44 @@ export class Engine {
     }
   }
 
+  /**
+   * `runly db with` records the command it runs against a copy (decision
+   * 0039), so a drop can take that command down first when its CLI died.
+   */
+  dbAttach(name: string, child: { pid: number; start?: number; pgid?: number }) {
+    if (!Number.isInteger(child.pid) || child.pid <= 0) throw new BrokerError('work-error', 'db-attach needs the pid of the command', 'db');
+    if (child.pgid !== undefined && child.pgid !== child.pid) throw new BrokerError('work-error', 'db-attach: a recorded process group must be led by the command itself', 'db');
+    const row = this.journal.getDbCopy(name);
+    if (!row) throw new BrokerError('work-error', `no database copy '${name}'`, 'db');
+    row.child = { pid: child.pid, ...(child.start !== undefined && Number.isFinite(child.start) ? { start: child.start } : {}), ...(child.pgid !== undefined ? { pgid: child.pgid } : {}) };
+    this.journal.saveDbCopy(row);
+    return { attached: name };
+  }
+
+  /**
+   * Stop whatever still runs against copy `row` (decision 0039): the command
+   * `runly db with` recorded — its process group when it has its own, else
+   * the verified pid — and, on Linux, every process carrying the copy's tag.
+   * Only a pid whose start time still matches is signalled. Returns how many
+   * processes were stopped.
+   */
+  private async stopCopyUsers(row: DbCopyRow): Promise<number> {
+    const kills: Array<Promise<boolean>> = [];
+    const c = row.child;
+    if (c && sameProcess(c.pid, c.start)) {
+      // killGroupVerified signals the group only through a verified leader.
+      kills.push(c.pgid !== undefined ? this.reapServiceGroup(c.pid, c.start, 2000, c.pgid) : killPidVerified(c.pid, c.start));
+    }
+    for (const p of scanDbCopy(row.name, stateRoot())) {
+      if (p.pid === process.pid || p.pid === c?.pid) continue;
+      kills.push(killPidVerified(p.pid, p.startTime));
+    }
+    await Promise.all(kills);
+    const stopped = kills.length;
+    if (stopped > 0) logEvent({ level: 'info', kind: 'db', detail: `stopped ${stopped} process(es) of 'runly db with' still running against ${row.name} before dropping it` });
+    return stopped;
+  }
+
   /** Is `path` a copy's own directory under the state root (never anything else)? */
   private isPrivateDbDir(path: string): boolean {
     const rel = relative(dbCopiesRoot(), path);
@@ -2971,6 +3167,12 @@ export class Engine {
     if (!live) return { ok: true };
     live.state = 'dropping';
     this.journal.saveDbCopy(live);
+    // Nothing may go on working against a database that is about to vanish.
+    try {
+      await this.stopCopyUsers(live);
+    } catch (err) {
+      logEvent({ level: 'warn', kind: 'db', detail: `stopping the command of ${live.name} failed: ${String((err as Error).message ?? err)}` });
+    }
     let ok = true;
     let output: string | undefined;
     if (live.dropCmd) {
@@ -3040,6 +3242,10 @@ export class Engine {
   private dbCopyOrphanReason(c: DbCopyRow): string | null {
     if (c.state === 'creating') return 'its creation never finished (the daemon stopped mid-restore)';
     if (c.state === 'dropping') return 'an earlier drop did not complete';
+    // `runly db with` tethers the copy to its own CLI, which never comes back
+    // once dead: its copy (and the command it ran) go at once, not after the
+    // agent tether's grace.
+    if (c.child && c.holderPid !== undefined && this.holderGone(c.holderPid, c.holderStart)) return `its 'runly db with' process ${c.holderPid} is gone`;
     if (c.holderPid !== undefined && this.tetherGone(`copy:${c.name}`, c.holderPid, c.holderStart)) return `its holder process ${c.holderPid} is gone`;
     if (!existsSync(c.stackRoot)) return `its worktree ${c.stackRoot} is gone`;
     try {
@@ -3110,9 +3316,14 @@ export class Engine {
         const key = stack?.manifest.services[name]?.port;
         const st = key ? stats[key] : undefined;
         const pid = pids[name]?.pid;
-        const state = st?.state === 'starting' ? 'starting' : pid !== undefined ? 'running' : !wanted.has(name) ? 'down' : this.idleStopped.has(`${env.id}\0${name}`) ? 'idle' : 'stopped';
+        const failure = pid === undefined && wanted.has(name) ? this.failureOf(env.id, name) : undefined;
+        const state = st?.state === 'starting' ? 'starting' : pid !== undefined ? 'running' : !wanted.has(name) ? 'down' : failure ? 'failed' : this.idleStopped.has(`${env.id}\0${name}`) ? 'idle' : 'stopped';
         const spec = stack?.manifest.services[name];
-        const limit = serviceIdleMs(spec);
+        // One clock for IDLE and STOPS IN (decision 0039): the one the sweeper
+        // stops by — the service's own start, the last verb that used the
+        // environment and the last client byte on its port — with the same
+        // limit (the unleased cap included).
+        const limit = this.serviceIdleLimit(env, spec);
         const clock = this.serviceClock(env, name, spec);
         const lastSeen = st?.lastActivityAt ?? (key ? env.activity?.[key] : undefined);
         services.push({
@@ -3123,18 +3334,23 @@ export class Engine {
           publicPort: key ? env.ports[key] ?? null : null,
           internalPort: st?.internalPort ?? null,
           pid: pid ?? null,
+          /** The last client byte through its public port (null: none yet). */
           lastActivityAt: lastSeen ?? null,
-          idleMs: lastSeen ? now() - lastSeen : null,
+          /** How long the running service has been idle by the clock the sweeper reads; null when it is not running. */
+          idleMs: pid !== undefined ? Math.max(0, now() - clock) : null,
           /** When this running service is stopped for idleness unless it is used (decision 0035); null when it never is. */
           idleStopInMs: pid !== undefined && Number.isFinite(limit) ? Math.max(0, clock + limit - now()) : null,
           rssBytes: rss.get(`${env.id}\0${name}`) ?? null,
+          /** A failed service (decision 0039): how it last ended, and where to look. */
+          failure: failure
+            ? { reason: failure.reason, exitCode: failure.code, signal: failure.signal, at: failure.at, detail: describeExit(failure), hint: `runly logs ${name}` }
+            : null,
           holder: lease?.holder ?? null,
           busy: this.busy.has(env.id) ? (this.busyOp.get(env.id) ?? 'an operation') : null,
         });
       }
     }
     const databases = this.journal.allDbCopies().filter((c) => root === undefined || c.stackRoot === root).map((c) => this.dbCopyView(c));
-    if (root !== undefined) for (const env of this.journal.allEnvs()) if (env.stackRoot === root) this.touch(env.id);
     const committed = this.budget.committed();
     const b = policy().budget;
     return {
@@ -3156,7 +3372,6 @@ export class Engine {
     const h = this.callerHolder(cwd, holder, stack);
     const lease = this.journal.leaseForHolder(h, stack.id);
     const env = (lease ? this.journal.getEnv(lease.envId) : undefined) ?? this.journal.envsForStack(stack.id)[0];
-    if (env) this.touch(env.id);
     const running = new Set(Object.keys(env ? this.supervisors.get(env.id)?.pids() ?? {} : {}));
     const continuing = env !== undefined && lease !== undefined;
     const base = env ? (continuing ? new Set([...this.desiredServices(stack, env), ...running]) : running) : new Set<string>();
@@ -3188,10 +3403,12 @@ export class Engine {
 
   /**
    * `runly destroy` (decision 0035): everything runly holds for this worktree
-   * goes now — its environment (services, data, preview, ports, lease), its
-   * database copies and its worktree records. What a worktree pool calls when
-   * it takes a worktree back; the sweeper does the same by itself when the
-   * worktree is removed or its agent's tether dies.
+   * goes now — its environment (services, data, preview, ports, lease) and its
+   * database copies. What a worktree pool calls when it takes a worktree back;
+   * the sweeper does the same by itself when the worktree is removed or its
+   * agent's tether dies. The worktree's upkeep and build records, and the
+   * baked templates, stay (decision 0039): the next `up` finds its installs
+   * and templates current instead of redoing them.
    */
   async destroy(cwd: string) {
     const stack = loadStack(cwd);
@@ -3217,8 +3434,11 @@ export class Engine {
         this.dbBusy.delete(c.name);
       }
     }
-    const state = join(worktreesRoot(), stack.id);
-    if (existsSync(state)) rmSync(state, { recursive: true, force: true });
+    // The worktree's own records (upkeep ledger, trigger cache, build ledger)
+    // STAY (decision 0039): they describe files in the worktree, which destroy
+    // never touches, so forgetting them only made the next `up` re-run every
+    // upkeep rule and build for nothing. `up --pristine` forgets them; the
+    // sweeper removes them once the worktree itself is gone.
     logEvent({ level: 'info', kind: 'destroy', detail: `destroyed ${stack.root}: ${envs.length} environment(s), ${copies.length} copy(ies)${failed.length ? `, ${failed.length} copy drop(s) failed (retried by the sweeper)` : ''}` });
     return { worktree: stack.root, environments: envs, copies, copiesNotDropped: failed };
   }
@@ -4033,6 +4253,7 @@ export class Engine {
     this.activityFlushedAt.delete(env.id);
     for (const key of [...this.startedAt.keys()]) if (key.startsWith(`${env.id}\0`)) this.startedAt.delete(key);
     for (const key of [...this.idleStopped]) if (key.startsWith(`${env.id}\0`)) this.idleStopped.delete(key);
+    for (const key of [...this.failedServices.keys()]) if (key.startsWith(`${env.id}\0`)) this.failedServices.delete(key);
     for (const key of [...this.idleStoppedAt.keys()]) if (key.startsWith(`${env.id}\0`)) this.idleStoppedAt.delete(key);
     for (const key of [...this.waking.keys()]) if (key.startsWith(`${env.id}\0`)) this.waking.delete(key);
     this.envChains.delete(env.id); // don't leak a settled chain for a dead id
@@ -4248,6 +4469,16 @@ export class Engine {
     return at;
   }
 
+  /**
+   * How long a running service of `env` may sit idle: its `idle:` (or the
+   * default), capped for an UNLEASED environment — nobody can wake that one by
+   * traffic — at BACKLOT_IDLE_TTL_MS (the pre-0.16 quiesce). `ps` shows the same.
+   */
+  private serviceIdleLimit(env: EnvRow, spec: ServiceSpec | undefined): number {
+    const unleasedCap = this.journal.leaseForEnv(env.id) ? Infinity : policy().idleTtlMs;
+    return Math.min(serviceIdleMs(spec), unleasedCap);
+  }
+
   /** Stop the running services of `env` whose idle clock ran out. */
   private async stopIdleServices(env: EnvRow): Promise<void> {
     if (env.state !== 'hot') return;
@@ -4257,10 +4488,9 @@ export class Engine {
     // Nobody can wake an UNLEASED environment by traffic, so its services stop
     // after BACKLOT_IDLE_TTL_MS at the latest, whatever `idle:` says (the
     // pre-0.16 quiesce of an unleased environment).
-    const unleasedCap = this.journal.leaseForEnv(env.id) ? Infinity : policy().idleTtlMs;
     const due = (row: EnvRow) => Object.keys(sup.pids()).filter((name) => {
       const spec = manifest?.services[name];
-      const limit = Math.min(serviceIdleMs(spec), unleasedCap);
+      const limit = this.serviceIdleLimit(row, spec);
       return Number.isFinite(limit) && now() - this.serviceClock(row, name, spec) > limit;
     });
     if (due(env).length === 0) return;
@@ -4325,6 +4555,8 @@ export class Engine {
       if (stack.id !== env.stack) return false;
       const name = Object.entries(stack.manifest.services).find(([, spec]) => spec.port === key)?.[0];
       if (!name || !this.desiredServices(stack, env).has(name)) return false;
+      // A failed service is retried by `up`, not by traffic (decision 0039).
+      if (this.failureOf(envId, name)) return false;
       const id = `${envId}\0${name}`;
       if (!this.waking.has(id)) {
         const p = this.wakeService(env.id, name)
@@ -4415,7 +4647,7 @@ export class Engine {
     try {
       const say: Progress = opts.say ?? (() => undefined);
       await this.ensureAppliances(stack, say, reservation);
-      const missing = Object.keys(stack.manifest.datastores ?? {}).filter((n) => !env.datastoreNs[n]);
+      const missing = this.envDatastores(stack).filter((n) => !env.datastoreNs[n]);
       if (missing.length > 0) {
         const bakeKeys = templateBakeKeys(stack.manifest, stack.root, await triggerSet(stack.root, stack.manifest, worktreeStateDir(stack.id)));
         await this.prepareDatastores(stack, env, bakeKeys, missing.map((n) => ({ name: n, force: false })), say);
@@ -4453,7 +4685,8 @@ export class Engine {
       return; // the verb reports the manifest itself
     }
     const running = new Set(Object.keys(this.supervisor(env).pids()));
-    const stopped = [...this.desiredServices(stack, env)].filter((n) => !running.has(n));
+    // A failed service (decision 0039) is not resumed by a verb: `up` retries it.
+    const stopped = [...this.desiredServices(stack, env)].filter((n) => !running.has(n) && !this.failureOf(env.id, n));
     if (stopped.length === 0) return;
     const unexplained = stopped.filter((n) => !this.idleStopped.has(`${env.id}\0${n}`));
     if (unexplained.length > 0 || (env.failStreak ?? 0) > 0) {
@@ -4506,6 +4739,49 @@ export class Engine {
   private serviceGaveUp(envId: string, service: string): void {
     const key = this.envManifests.get(envId)?.services[service]?.port;
     if (key) this.proxy.down(envId, key);
+  }
+
+  /**
+   * A service of a LEASED environment crash-looped past its restart budget
+   * (decision 0039). It is stopped and reported as failed — `ps` and `ctx`
+   * show `failed` with its last exit, `runly logs <svc>` says why — while the
+   * environment, its data, its other services and its logs stay. Nothing
+   * restarts it on its own (a wake skips it); the next `up` does.
+   */
+  private serviceFailed(envId: string, service: string, exit: ServiceExit): void {
+    const key = `${envId}\0${service}`;
+    this.failedServices.set(key, { ...exit, at: now() });
+    const portKey = this.envManifests.get(envId)?.services[service]?.port;
+    if (portKey) this.proxy.down(envId, portKey);
+    logEvent({
+      level: 'warn',
+      kind: 'service-failed',
+      envId,
+      detail: `'${service}' ${describeExit(exit)} — stopped and marked failed; the environment, its data, its other services and its logs are kept. 'runly logs ${service}' shows why; the next 'runly up' starts it again`,
+    });
+    const sup = this.supervisors.get(envId);
+    if (!sup) return;
+    // What is left of it (its process group, tagged stragglers) is reaped
+    // under the environment lock. A bind holding the lock now fails on its
+    // own and stops everything first; then this finds nothing to do.
+    void this.envLocked(envId, async () => {
+      if (this.supervisors.get(envId) !== sup || !this.failedServices.has(key) || sup.pids()[service]) return;
+      const env = this.journal.getEnv(envId);
+      if (!env || env.state === 'recycling') return;
+      await this.stopServicesForRestart(env, [service]);
+      const post = this.journal.getEnv(envId);
+      if (post && post.state === 'hot' && Object.keys(sup.pids()).length === 0) {
+        post.state = 'warm';
+        this.journal.saveEnv(post);
+      }
+    }, undefined, 'stopping a failed service').catch((err) =>
+      logEvent({ level: 'warn', kind: 'service-failed', envId, detail: `stopping failed '${service}' left survivors: ${String((err as Error).message ?? err)}` }),
+    );
+  }
+
+  /** How a failed service ended, or undefined (decision 0039). */
+  private failureOf(envId: string, service: string): (ServiceExit & { at: number }) | undefined {
+    return this.failedServices.get(`${envId}\0${service}`);
   }
 
   // ---------------------------------------------------------------- sweeper
@@ -4725,10 +5001,12 @@ export class Engine {
         continue;
       }
       if (env.state === 'degraded') {
-        // Dead env — reap regardless of a stale lease (force), but never while an
-        // op is in flight (claimForTeardown always respects busy). The holder's
-        // stale lease is dropped with the env; its next `up` gets a fresh one.
-        await this.recycleOne(env.id, true);
+        // Only an UNLEASED environment is recycled for a crash loop (decision
+        // 0039): a leased one keeps its data, services and logs, and its
+        // holder's next `up` retries. (A leased environment is not marked
+        // degraded any more; one an older daemon marked is left to its holder.)
+        if (this.journal.leaseForEnv(env.id)) continue;
+        await this.recycleOne(env.id, false);
         continue;
       }
       // Idle (decision 0035): each running service on its own clock — the

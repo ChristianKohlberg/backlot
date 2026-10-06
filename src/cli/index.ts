@@ -5,7 +5,7 @@
  * 3 infra-error, 64 usage. See docs/architecture.md §11.
  */
 import { ensureDaemon, daemonInfo, rpc, classifyClientError, awaitDaemonGone, daemonStopTimeoutMs, type RpcError, type RpcResponse } from './client.js';
-import { isAlive } from '../core/procscan.js';
+import { dbCopyTag, isAlive, startTime } from '../core/procscan.js';
 import { join } from 'node:path';
 import { stateRoot } from '../core/paths.js';
 import { BUILD, VERSION, rebuiltSince, versionSkew } from '../core/version.js';
@@ -992,7 +992,7 @@ interface DbCopy {
 
 interface PsData {
   scope: string;
-  services: Array<{ env: string; worktree?: string; service: string; state: string; publicPort: number | null; internalPort: number | null; pid: number | null; idleMs: number | null; idleStopInMs?: number | null; rssBytes: number | null }>;
+  services: Array<{ env: string; worktree?: string; service: string; state: string; publicPort: number | null; internalPort: number | null; pid: number | null; idleMs: number | null; idleStopInMs?: number | null; rssBytes: number | null; failure?: { detail: string; hint: string } | null }>;
   databases: DbCopy[];
   budget?: { enabled: boolean; memoryBytes: number; cpu: number; committedMemoryBytes: number; committedCpu: number; waiting: number };
 }
@@ -1044,27 +1044,54 @@ function doctorLines(d: PoolDoctorData): string[] {
 /**
  * Run `db with`'s command against the copy, its exit code as ours. One token
  * is a shell string (as for exec); several keep the caller's own word splits.
- * SIGINT/SIGTERM are passed on, so the copy is dropped after the command stops.
+ * SIGINT/SIGTERM/SIGHUP are passed on, so the copy is dropped after the
+ * command stops.
+ *
+ * If THIS process dies without that chance (SIGKILL, OOM), the daemon drops
+ * the copy — and must take the command down first, or it goes on working
+ * against a dropped database (decision 0039). So the command carries the
+ * copy's tag (`BACKLOT_DB_COPY`, inherited by everything it starts: Linux
+ * finds them all by it), its pid and start time are recorded on the copy, and
+ * without a terminal it runs in its own process group, which the daemon
+ * signals as a whole. At a terminal it stays in ours, so job control (Ctrl-C,
+ * reading the terminal) behaves as before; there the daemon signals the
+ * recorded pid and, on Linux, every tagged process.
  */
 async function runWithCopy(parts: string[], copy: DbCopy): Promise<number> {
   const { spawn } = await import('node:child_process');
   const { constants } = await import('node:os');
-  const env = { ...process.env, RUNLY_DB_URL: copy.url, RUNLY_DB_NAME: copy.name };
+  const env = { ...process.env, RUNLY_DB_URL: copy.url, RUNLY_DB_NAME: copy.name, ...dbCopyTag(copy.name, stateRoot()) };
+  const fromTerminal = process.stdin.isTTY === true || process.stdout.isTTY === true || process.stderr.isTTY === true;
+  const ownGroup = !fromTerminal;
   const child = parts.length === 1
-    ? spawn(parts[0]!, { stdio: 'inherit', env, shell: true })
-    : spawn(parts[0]!, parts.slice(1), { stdio: 'inherit', env });
+    ? spawn(parts[0]!, { stdio: 'inherit', env, shell: true, detached: ownGroup })
+    : spawn(parts[0]!, parts.slice(1), { stdio: 'inherit', env, detached: ownGroup });
+  if (child.pid !== undefined) {
+    // Best effort: a daemon that cannot record it still finds the command by
+    // its tag on Linux.
+    const attached = await rpc('db-attach', { name: copy.name, pid: child.pid, start: startTime(child.pid), pgid: ownGroup ? child.pid : undefined }).catch(() => null);
+    if (attached && !attached.ok) console.error(`runly db with: could not record the command on ${copy.name} (${attached.error.message})`);
+  }
   const forward = (sig: NodeJS.Signals) => () => {
-    try { child.kill(sig); } catch { /* already gone */ }
+    try {
+      // In its own group, the whole group: `sh -c` forks, and the real
+      // command is its child.
+      if (ownGroup && child.pid !== undefined) process.kill(-child.pid, sig);
+      else child.kill(sig);
+    } catch {
+      /* already gone */
+    }
   };
   // Ctrl-C at a terminal signals the whole foreground process group, and the
   // child is in ours: it already has its SIGINT. Forwarding sent it a second
   // one, which makes many tools (npm, a test runner) abort their own cleanup.
   // Only a SIGINT sent to this process alone (no terminal) is passed on.
-  const fromTerminal = process.stdin.isTTY === true || process.stderr.isTTY === true;
   const onInt = fromTerminal ? () => undefined : forward('SIGINT');
   const onTerm = forward('SIGTERM');
+  const onHup = forward('SIGHUP');
   process.on('SIGINT', onInt);
   process.on('SIGTERM', onTerm);
+  process.on('SIGHUP', onHup);
   return new Promise((resolve) => {
     child.on('error', (err) => {
       console.error(`runly db with: could not start '${parts[0]}': ${err.message}`);
@@ -1073,6 +1100,7 @@ async function runWithCopy(parts: string[], copy: DbCopy): Promise<number> {
     child.on('exit', (code, signal) => {
       process.off('SIGINT', onInt);
       process.off('SIGTERM', onTerm);
+      process.off('SIGHUP', onHup);
       resolve(code ?? (signal ? 128 + (constants.signals[signal] ?? 0) : 1));
     });
   });
@@ -1108,6 +1136,8 @@ function psLines(d: PsData, all: boolean): string[] {
       s.env, ...(all ? [s.worktree ?? ''] : []), s.service, s.state, s.publicPort === null ? '' : String(s.publicPort), s.internalPort === null ? '' : String(s.internalPort),
       s.pid === null ? '' : String(s.pid), ago(s.idleMs), s.idleStopInMs === null || s.idleStopInMs === undefined ? '' : ago(s.idleStopInMs), mb(s.rssBytes),
     ])));
+    // A failed service says how it ended and where to look (decision 0039).
+    for (const s of d.services) if (s.failure) out.push(`${s.service} ${s.failure.detail} — '${s.failure.hint}' shows why; the next 'runly up' retries it`);
     const running = d.services.filter((s) => s.state === 'running' || s.state === 'starting').length;
     if (running === 0) out.push(`nothing is running — ${d.services.length} service(s) idle, stopped or down; the next 'runly up' or connection starts what is wanted`);
   }
@@ -1128,7 +1158,8 @@ interface CtxView {
   lease: { id: string; expiresAt: number } | null;
   urls?: Record<string, string>;
   ports?: Record<string, number>;
-  services?: Record<string, 'running' | 'stopped' | 'down'>;
+  services?: Record<string, 'running' | 'failed' | 'stopped' | 'down'>;
+  failures?: Record<string, { detail: string; hint: string }>;
   datastores?: Record<string, { url: string; preset?: string | null }>;
   logins?: { user: string; password: string } | null;
   previewUrls?: Record<string, string>;
@@ -1156,6 +1187,7 @@ function ctxSummary(c: CtxView, verb: 'up' | 'ctx'): string[] {
     const url = c.urls?.[n] ?? '';
     out.push(`  ${n.padEnd(width)}  ${state.padEnd(7)}  ${url}${c.previewUrls?.[n] ? `  (preview ${c.previewUrls[n]})` : ''}`.trimEnd());
   }
+  for (const [n, f] of Object.entries(c.failures ?? {})) out.push(`  ${n} ${f.detail} — '${f.hint}' shows why; the next 'runly up' retries it`);
   for (const [n, ds] of Object.entries(c.datastores ?? {})) out.push(`  datastore ${n}: ${ds.url}${ds.preset ? ` (${ds.preset})` : ''}`);
   if (c.logins) out.push(`  login: ${c.logins.user} / ${c.logins.password}`);
   out.push(`  'runly ctx --env' for shell exports, --json for everything`);

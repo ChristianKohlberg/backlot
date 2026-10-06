@@ -234,6 +234,9 @@ export async function ensureDaemon(cwd = process.cwd()): Promise<DaemonInfo> {
   // HOME/XDG inputs may legitimately be service-specific. Pin routing before
   // the stripped daemon recomputes its state root from its own environment.
   daemonEnv.BACKLOT_STATE_DIR = stateRoot();
+  // A daemon autospawned from inside `runly db with`'s command must not carry
+  // that copy's tag: reaping the copy kills what carries it (decision 0039).
+  delete daemonEnv.BACKLOT_DB_COPY;
   const log = openSync(join(stateRoot(), 'daemon.log'), 'a');
   // node:sqlite (the journal) prints "SQLite is an experimental feature" on
   // every spawn, burying daemon.log's signal. Suppress ONLY that warning class,
