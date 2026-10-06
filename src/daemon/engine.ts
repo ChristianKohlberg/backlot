@@ -3700,7 +3700,14 @@ export class Engine {
     const committed = this.budget.committed();
     const b = policy().budget;
     return {
-      pid: process.pid, envs, poolMaxTotal: POOL_MAX_TOTAL(), ports,
+      pid: process.pid,
+      /**
+       * Who restarts this daemon when it crashes (decision 0039): `systemd` or
+       * `launchd` after `runly daemon install`, `autospawn` (the next CLI
+       * command) otherwise.
+       */
+      supervisor: process.env.INVOCATION_ID ? 'systemd' : (process.env.XPC_SERVICE_NAME ?? '').startsWith('dev.runly.daemon') ? 'launchd' : 'autospawn',
+      envs, poolMaxTotal: POOL_MAX_TOTAL(), ports,
       /** The server-wide load budget (decision 0036). */
       budget: { ...b, committedMemoryBytes: committed.memoryBytes, committedCpu: committed.cpu, committed: committed.items, waiting: this.budget.queueLength() },
       events: recentEvents(15),

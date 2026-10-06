@@ -10,6 +10,7 @@ import { join } from 'node:path';
 import { stateRoot } from '../core/paths.js';
 import { BUILD, VERSION, rebuiltSince, versionSkew } from '../core/version.js';
 import { installKind } from './install.js';
+import { installUnit, installedUnit, startUnit, uninstallUnit, unitPlan } from './daemon-unit.js';
 import { collectCallerEnv } from '../core/caller-env.js';
 import { loadStack, manifestDeprecations } from '../core/manifest.js';
 import { parsePresetArgs } from '../core/presets.js';
@@ -144,6 +145,13 @@ Usage:
   runly daemon stop       stop the daemon and wait for it (60 s,
                           BACKLOT_DAEMON_STOP_TIMEOUT_MS); environments are
                           recovered on next use
+  runly daemon install [--print]
+                          supervise the daemon: a systemd user unit (Linux) or
+                          launchd agent (macOS) that restarts it within seconds
+                          when it crashes; the CLI then starts the daemon
+                          through it. --print shows the unit without writing it.
+                          A daemon already running moves under it on 'runly update'
+  runly daemon uninstall  disable and remove that unit
   runly update [--check] [--force]
                           make the RUNNING daemon be the INSTALLED build. An
                           upgrade replaces the files on disk but not the daemon
@@ -201,7 +209,7 @@ const verb = rawArgv[0];
 // flags survive) — the F1 class of argv bugs. Everything after a lone `--`, and
 // EVERYTHING for `exec`, is treated as a raw passthrough command.
 const VALUE_FLAGS = new Set(['--holder', '--holder-pid', '--ttl', '--role', '--lines', '--ref', '--spec', '--preset', '--https-port', '--since', '--grep', '--until', '--timeout']);
-const BOOL_FLAGS = new Set(['--json', '--env', '--watch', '--reset-data', '--pristine', '--pull', '--detach', '--all', '--force', '--raw', '--data-only', '--progress', '--quiet', '--check', '--rebuild', '--follow', '--build', '--fix']);
+const BOOL_FLAGS = new Set(['--print', '--json', '--env', '--watch', '--reset-data', '--pristine', '--pull', '--detach', '--all', '--force', '--raw', '--data-only', '--progress', '--quiet', '--check', '--rebuild', '--follow', '--build', '--fix']);
 
 const flagVals = new Map<string, string>();
 const presetArgs: string[] = [];
@@ -424,6 +432,14 @@ async function main(): Promise<void> {
   if (presetArgs.length > 0 && verb !== 'db') {
     const manifest = loadStack(process.cwd()).manifest;
     presets = parsePresetArgs(manifest, presetArgs);
+  }
+  if (verb === 'daemon' && (positional[0] === 'install' || positional[0] === 'uninstall')) {
+    await daemonUnitVerb(positional[0]);
+    return;
+  }
+  if (verb === 'daemon' && positional[0] !== 'stop') {
+    console.error('runly daemon: stop | install [--print] | uninstall');
+    process.exit(64);
   }
   const stopping = verb === 'daemon' && positional[0] === 'stop';
   const daemon = stopping ? await daemonInfo() : await ensureDaemon(process.cwd());
@@ -813,10 +829,6 @@ async function main(): Promise<void> {
       break;
     }
     case 'daemon': {
-      if (positional[0] !== 'stop') {
-        console.error('runly daemon: only `stop` is supported');
-        process.exit(64);
-      }
       res = await rpc('shutdown', {});
       if (!res.ok) break;
       if (!(await awaitDaemonGone(daemon.pid, daemonStopTimeoutMs()))) {
@@ -1039,6 +1051,57 @@ function doctorLines(d: PoolDoctorData): string[] {
   const out = d.findings.map((f) => `${f.fixed ? 'removed' : f.error ? 'FAILED ' : d.fix && f.kind !== 'foreign-namespace' ? 'kept   ' : 'found  '} ${f.kind.padEnd(17)} ${f.what} — ${f.detail}${f.error ? ` (${f.error})` : ''}`);
   if (!d.fix && !d.clean) out.push(`dry run — 'runly pool doctor --fix' removes what is listed (never foreign-namespace)`);
   return out;
+}
+
+/**
+ * `runly daemon install [--print]` / `runly daemon uninstall` (decision 0039):
+ * a systemd user unit (Linux) or launchd agent (macOS) that restarts a crashed
+ * daemon within seconds. Install writes and enables it; it starts the daemon
+ * through it when none runs, and otherwise says how to move the running one
+ * under it (`runly update`, which keeps leases). Uninstall disables and
+ * removes it; a running daemon keeps running, unsupervised.
+ */
+async function daemonUnitVerb(sub: 'install' | 'uninstall'): Promise<void> {
+  const plan = unitPlan();
+  if (!plan) {
+    errExit({ class: 'work-error', message: `runly daemon ${sub}: no supervisor for ${process.platform} (systemd user units on Linux, launchd on macOS)`, source: 'daemon' });
+    return;
+  }
+  if (sub === 'install' && flags.has('--print')) {
+    if (json) out({ kind: plan.kind, name: plan.name, path: plan.path, content: plan.content });
+    else process.stdout.write(plan.content);
+    return;
+  }
+  if (sub === 'uninstall') {
+    const installed = installedUnit();
+    if (!installed) {
+      out({ kind: plan.kind, name: plan.name, path: plan.path, removed: false, detail: 'no unit is installed for this state root' });
+      return;
+    }
+    const r = uninstallUnit(installed);
+    out({ kind: plan.kind, name: plan.name, path: plan.path, removed: true, steps: r.steps, detail: 'the running daemon (if any) keeps running without a supervisor; the next verb that finds none autospawns one' });
+    return;
+  }
+  const r = installUnit(plan);
+  if (r.error) {
+    errExit({ class: 'infra-error', message: `runly daemon install: ${r.error}`, source: 'daemon', logExcerpt: r.steps.join('\n') });
+    return;
+  }
+  const running = await daemonInfo().catch(() => null);
+  let started = false;
+  if (!running) {
+    started = startUnit(plan);
+    if (started) {
+      const deadline = Date.now() + 10_000;
+      while (Date.now() < deadline && !(await daemonInfo().catch(() => null))) await new Promise((res) => setTimeout(res, 100));
+    }
+  }
+  const next = running
+    ? `a daemon (pid ${running.pid}) is already running outside the unit — 'runly update' restarts it under the unit (leases survive)`
+    : started
+      ? `the daemon now runs under ${plan.kind === 'systemd' ? `${plan.name}.service` : plan.name}`
+      : `the unit is installed; the next runly verb starts the daemon through it`;
+  out({ kind: plan.kind, name: plan.name, path: plan.path, installed: true, started, steps: r.steps, next });
 }
 
 /**
