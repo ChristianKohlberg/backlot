@@ -1,14 +1,13 @@
 /**
- * DESIGN TARGET — NOT YET WIRED. These are the FROZEN-FOR-0.3 shapes for the
- * remote SUBSTRATE seam, which the engine does not yet call (v0.4 hardcodes
- * local process supervision). The LIVE datastore seam is `DsDriver` in
- * ./datastores.ts, not this file. Do not import these types expecting the
- * engine to honor them; they exist so the substrate interface is designed
- * before it is built (see docs/driver-spec.md).
+ * DESIGN TARGET — NOT YET WIRED. These are sketches for the remote SUBSTRATE
+ * seam, which the engine does not call: it supervises local processes itself.
+ * The LIVE datastore seam is `DsDriver` in ./datastores.ts and the live preview
+ * seam is `PreviewPublisher` in ./preview.ts, not this file. Do not import
+ * these types expecting the engine to honor them (see docs/driver-spec.md).
  *
  * Drivers own TRANSPORT and STORAGE mechanics; the engine owns all POLICY
- * (pooling, leases, hygiene, upkeep, sync, error taxonomy). A driver that
- * wants policy is a design bug.
+ * (leases, hygiene, upkeep, idle and teardown, the load budget, error
+ * taxonomy). A driver that wants policy is a design bug.
  */
 
 export interface ExecOptions {
@@ -46,7 +45,7 @@ export interface SubstrateDriver {
   /** Idempotent per env id. */
   provision(envId: string): Promise<EnvHandle>;
   exec(env: EnvHandle, cmd: string[], opts?: ExecOptions): Promise<ExecResult>;
-  /** A git remote/path the sync layer can fetch/push through. */
+  /** Superseded design: the git-sync transport went with the source copy (decision 0032); how a remote substrate reaches the worktree is open. */
   gitEndpoint(env: EnvHandle): Promise<string>;
   /** Consumer-reachable URL for a port inside the environment. */
   expose(env: EnvHandle, port: number): Promise<string>;

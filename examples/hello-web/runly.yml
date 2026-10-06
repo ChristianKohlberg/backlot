@@ -19,7 +19,7 @@ datastores:
     driver: sqlite
     create: node seed.mjs {{ns}} {{preset}}
     presets: [dev, empty]
-    default_preset: { run: dev, session: dev }
     template: true # sqlite templating = file copy
 
-# The smoke test is the repo's own: eval "$(runly ctx --env)" && node smoke.test.mjs
+# The smoke test is the repo's own:
+#   eval "$(runly ctx --env)" && node smoke.test.mjs

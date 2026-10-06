@@ -1,923 +1,154 @@
 # runly
 
-Previously **Backlot**. Install with `npm install -g runly`; use `runly up` and `runly ctx`.
-
-The `backlot` command and `backlot.yml` manifests remain accepted. `runly.yml` takes precedence. State stays in `~/.local/state/backlot`; `.backlot` files, process tags and `BACKLOT_*` environment variables retain their names so existing leases and services remain discoverable. After upgrading, run `runly update` to update the running daemon. The GitHub repository remains `ChristianKohlberg/backlot`.
-
 [![npm](https://img.shields.io/npm/v/runly)](https://www.npmjs.com/package/runly) [![ci](https://github.com/ChristianKohlberg/backlot/actions/workflows/ci.yml/badge.svg)](https://github.com/ChristianKohlberg/backlot/actions/workflows/ci.yml) [![release](https://img.shields.io/github/v/release/ChristianKohlberg/backlot)](https://github.com/ChristianKohlberg/backlot/releases)
 
-**runly puts a working instance of your web application in front of a coding agent
-(or a human) — running, seeded, authenticated, provable — as a cheap, repeatable act.**
+runly puts a running, seeded, authenticated instance of your web application in
+front of a coding agent or a human. It runs your repo's own commands in the
+worktree you call it from, one environment per worktree, described by one
+`runly.yml`.
 
-It brokers environments; it never provides them. Local processes today, your own cloud
-sandboxes (Morph, Sprites, SSH) tomorrow — same verbs, same model.
-
-> **Status: 0.16.** The local loop — pool, leases, in-place binds, data states —
-> is complete, hardened by two full review cycles, and proven end to end against
-> a real .NET + Angular + MSSQL monorepo (its Playwright e2e suite runs against a
-> runly environment, and each release is verified by driving a real session
-> before publish). The one unbuilt milestone is the remote substrate driver
-> (Morph/SSH). Details live in the
-> [release notes](https://github.com/ChristianKohlberg/backlot/releases).
-
-## Why
-
-Coding agents need three things from an app under development, constantly: a running
-seeded instance to **inspect**, a deterministic environment to **prove** changes in
-(their e2e suite, against known data), and a seconds-fast **iterate** loop — all for
-*uncommitted worktree state*, which CI can never serve. Hand-rolled harnesses converge
-on the same machinery in every repo (port allocation, DB namespacing, capacity gating,
-zombie reaping) and stay welded to that repo. runly is that machinery, extracted,
-with the repo-specific knowledge moved into one declarative file.
-
-The core trick: **environments are pooled, durable, and warm, and they run in your
-worktree — one per worktree.** Binding runs the upkeep rules whose trigger files
-changed, then your own build commands, in the worktree you call from, whose caches are
-already warm — seconds, not minutes; no copy of your source is made, and runly keeps no
-build cache of its own: your build tools decide what is current
-([decision 0032](docs/decisions/0032-environments-run-in-the-callers-worktree.md)).
-What an environment keeps to itself is its ports, its datastore namespace and its logs. Abandoning an environment is a non-event: your lease lapses and
-the environment returns to the pool with its heat intact. ([Why not checkpointing?](docs/decisions/0006-convergence-over-checkpointing.md))
-
-## Quickstart
-
-The one prerequisite: a `runly.yml` at the repo root (the manifest — see the
-example below). Every runnable fixture in [`examples/`](examples/) ships one, so
-the fastest first contact is a checkout:
+## Install
 
 ```bash
-git clone https://github.com/ChristianKohlberg/runly runly && cd runly
-npm install && npm run build && npm link   # (or, for your own repos: npm i -g runly)
-cd examples/hello-web
-runly up --json          # lease an env: upkeep, seed, build and start in THIS worktree — returns the full context blob (URLs + creds)
-runly ctx --json         # re-read that same blob later, read-only — no re-bind (up already returned it)
-eval "$(runly ctx --env)" && node smoke.test.mjs   # your own tests, fed RUNLY_URL_WEB etc.
-runly up                 # after editing: due upkeep + builds, restarts what the builds changed
-runly up api             # ADD a service (and its depends_on) — up never stops what runs
-runly down web           # stop one service; lease, data and ports stay
-runly up --preset main=empty   # reload ONE datastore; the others keep their data
-runly ps                 # what runs for this worktree: services and database copies
-runly plan               # would an up start now, or wait for the server-wide load budget (and for what)?
-runly logs -f --until 'compiled' --timeout 120   # follow all services' logs until a line matches (124 = timed out)
-runly db with main -- npm test # a fresh database copy for one command, dropped after it
-runly warm               # due upkeep + builds in this worktree, no lease, no services (prepare an idle worktree)
-runly exec <cmd>         # run a command in the worktree with your lease's URLs/ports/conn strings (raw exit, not a verdict)
-runly preview <service>  # publish one service (public tunnel via cloudflared, or the tailnet via tailscale)
-runly preview stop       # stop the preview tunnel on your lease
-runly release            # environment returns to the pool, warm
-runly destroy            # tear down everything this worktree holds, now (worktree pools)
+npm i -g runly        # requires Node ≥ 22.13 and git
+runly update          # after every upgrade: restarts the running daemon onto the installed build
 ```
 
-**Idle services stop by themselves, and start again when used** (0.16). A service
-that saw no runly verb and no client byte for 10 minutes is stopped; its port,
-data and lease stay, and the next connection to it starts it and is held until it
-answers. Under Claude Code the environment is tied to the session and torn down a
-minute after it ends. See [Idle, wake and teardown](#idle-wake-and-teardown).
-
-**Your tests, runly's environment.** runly does not run checks (decision 0032).
-`runly ctx --env` prints the environment as shell-exportable lines with stable
-names, and your own test command reads them:
-
-| Variable | Value |
-| --- | --- |
-| `RUNLY_ENV_ID` | the environment's id |
-| `RUNLY_PORT_<PORT>` | each public port, by its manifest key |
-| `RUNLY_URL_<SERVICE>` | each running service's URL |
-| `RUNLY_DATASTORE_<NAME>_URL` | each datastore's connection string |
-| `RUNLY_DATASTORE_<NAME>_PRESET` | the preset that datastore holds now |
-| `RUNLY_LOGIN_USER`, `RUNLY_LOGIN_PASSWORD` | the primary login, when the stack declares one |
-
-Names are upper-cased, every other character becomes `_` (`web-audit` →
-`RUNLY_URL_WEB_AUDIT`), and a value is single-quoted only when a shell needs it.
-`ctx --json` carries the same and more for programs. Want known data first?
-`runly up --preset <store>=<preset>` reloads one store, `runly up --reset-data`
-all of them. A test lane that wants a database and not the application uses
-`runly db with <store> -- <cmd>` instead.
-`exec <cmd>` is the other way in: it runs a command in your worktree with the
-lease's environment in its variables (`BACKLOT_URL_*`, `BACKLOT_DS_*`,
-`BACKLOT_PORT_*`) and hands back its raw stdout and exit code.
-
-The `backlot-mcp` executable and MCP adapter have been removed. Remove existing
-MCP launch entries from your agent configuration and invoke CLI commands through
-your shell tools, for example `runly up --json` and `runly ctx --env`.
-The CLI, daemon RPC and Claude Code skill remain supported.
-
-**Every `up` applies the worktree as it is — and restarts only what changed.** It
-runs the due upkeep rules and the `build:` of every service it runs (your build
-tool decides what is current; runly keeps no build cache). It is **additive**: it
-starts the services you name next to the running ones and never stops one
-([decision 0034](docs/decisions/0034-additive-up-database-copies-and-ps.md)). Then:
-
-- a running service whose build **output** changed is restarted. A service says
-  what its build produces with `outputs:` globs (`bin/**`, `dist/web`); runly
-  compares path, size and mtime before and after the build;
-- a service with a `build:` and no `outputs:` is restarted after every build;
-- a service with **no** `build:` keeps running (a dev server reads the worktree
-  itself). To restart one on every `up`, give it `build: "true"`;
-- a service that is not running is started; dependents of a restarted service
-  are not restarted (its port did not move);
-- a datastore named with `--preset` is reloaded, and the running services that
-  use it restart around the reload.
-
-A changed manifest, changed caller inputs, an upkeep rule that ran, a moved public
-port, `--reset-data`/`--pristine`, an unhealthy environment or one with nothing
-running take the full bind instead: everything stops, data is prepared,
-everything is built and started. Adding a service and choosing a preset do not.
-Comments and whitespace alone do not change the parsed manifest. See
-[the in-place rules](docs/architecture.md#6-in-place--verbs-converge-watch-observes) and
-[preview reconciliation](docs/decisions/0027-lease-scoped-public-preview.md).
-
-Your services run in your **live** worktree: an edit you make while tests run is
-visible to them. `runly pull`, `--pull`, `bind --ref`, `sync`, `run`, `job`,
-`--watch` and `--detach` were removed (decision 0032); each is a usage error that
-names its replacement.
-
-### Warming an idle worktree
-
-`runly warm` runs the stack's due upkeep rules and services' `build:` steps in the
-current worktree **without a lease and without starting services**, printing each
-step and how long it took (`--json` for the structured form). Upkeep it ran is
-recorded, so the next `up` skips it; a plain `build:` is not — the next `up`
-runs it again, your build tool finds its output current, and the services keep
-running when their `outputs:` did not change. A `build: { run, when }` that
-succeeded is recorded, so the next `up` skips it while its inputs are unchanged. The intended
-use is a pooled worktree moved to a new commit between tasks:
-
-```bash
-git checkout <sha> && runly warm
-```
-
-It waits for any operation in flight on the worktree's environment. Build lines
-that template an environment's ports or datastores, and `@` built-ins (they act
-on an environment's data), are reported as skipped — the next bind does them.
-
-### What runs in your worktree
-
-Since environments run in place, the repo's own commands write into the worktree:
-upkeep installs, builds, service-generated files, your tests' results. Worth
-knowing:
-
-- **Ignore your output.** Anything a build or service writes that git does not
-  ignore — and `caches:` does not declare — can match an upkeep trigger glob.
-  Declare build output under `caches:` (it is then never a trigger) or
-  git-ignore it.
-- **Wiped `node_modules` by hand? Bind `--pristine`.** runly records which upkeep
-  rules it ran; it cannot see you deleting what they installed. A pristine bind
-  forgets that record and re-runs every upkeep rule — it never deletes anything in
-  the worktree. Two consecutive bind failures escalate to it automatically.
-- **One environment per worktree.** A second holder (`--holder`) of the same
-  worktree waits for its environment — and is refused at once, naming the holder,
-  when that lease outlasts the wait. Parallel lanes need separate worktrees.
-
-### Upgrading to 0.16 (from 0.14) — additive `up`, `runly db`, idle and wake, load budget, logs ([decisions 0034–0038](docs/decisions/))
-
-After installing, run `runly update`: the journal schema is 4 (an older daemon
-refuses it), and the running daemon must be the installed build. 0.15 and 0.16
-change behaviour in these ways — a 0.14 user reads all of it, a 0.15 user from
-"**New in 0.16**" on.
-
-**From 0.15** ([decision 0034](docs/decisions/0034-additive-up-database-copies-and-ps.md)):
-
-- **`up <service>` no longer stops the services you did not name.** It adds.
-  To stop one, `runly down <service>`; to stop all and keep the environment,
-  `runly down`. A script that relied on `up api` taking `web` down needs a
-  `down web`.
-- **No `--preset` keeps the data**, also for a new holder (0.14 reseeded a fresh
-  holder's stores to their defaults). A lane that needs known data says so.
-  The forms: `--preset NAME` when the stack has one datastore,
-  `--preset <store>=<preset>` (repeatable) to reload just that store, `--reset-data`
-  for all of them. `--preset` restarts only the services that use the store, and
-  naming the preset a store already holds reloads it too.
-- **`up --data-only` is gone** (exit 64, naming the replacement). A database
-  without the application is a copy: `runly db with <store> [--preset NAME] -- <cmd>`
-  (a fresh copy for one command, `RUNLY_DB_URL`/`RUNLY_DB_NAME`, dropped when it
-  exits, its exit code passed on) or `runly db new <store>` (prints `name=`, `url=`,
-  `preset=`; dropped by `runly db drop <name>`, or when its holder or worktree goes).
-  A repo wrapper like `with-test-db` becomes `runly db with <store> -- <cmd>`.
-  `BACKLOT_POOL_MAX_DATA_ONLY` is ignored. On its first start the daemon turns a
-  **leased** data-only environment into one with no services wanted (lease and data
-  kept) and **recycles** an unleased one.
-- `ctx.dataOnly` is gone; `ctx.services` reports what runs, and
-  `.datastores.<name>.preset` is always the preset the store holds.
-  `ctx --env` adds `RUNLY_DATASTORE_<NAME>_PRESET`. `runly ps` is new.
-
-**New in 0.16** ([0035](docs/decisions/0035-services-idle-on-their-own-clock-and-wake-on-demand.md),
-[0036](docs/decisions/0036-a-server-wide-load-budget.md),
-[0037](docs/decisions/0037-cleanup-by-reference-and-pool-doctor.md),
-[0038](docs/decisions/0038-time-stamped-logs-and-build-skip.md)):
-
-- **Services stop after 10 idle minutes** (no runly verb on the environment, no
-  client byte on their port) and start again on the next connection, which is
-  held meanwhile. A test lane that idles longer than that between steps pays one
-  start, not a failure. To keep one running, `idle: never` (or `idle: 2h`) on the
-  service; server-wide, `BACKLOT_SERVICE_IDLE_MS`. `BACKLOT_LEASED_IDLE_TTL_MS` is
-  ignored.
-- **A dead holder now tears the environment down** (after a 1-minute grace), not
-  just the lease; under Claude Code `up` and `db new` tie to the session
-  automatically (`CLAUDE_PID`; `BACKLOT_TETHER=off` opts out). A deleted worktree
-  takes its environment with it even while leased. `runly destroy` does both now.
-- **A server-wide load budget** queues an `up` that does not fit (FIFO, up to
-  10 min, then env-error, exit 2). Declare what services cost —
-  `resources: { memory: 1G, cpu: 1, build: { memory: 3G, cpu: 4 } }` — or the
-  default (512M / 0.5 cpu running, 1G / 1 cpu building) is assumed. `runly plan`
-  shows whether an `up` would start now. `BACKLOT_BUDGET=off` disables it. The
-  default `BACKLOT_POOL_MAX_TOTAL` rises to 2 x cores (it now bounds held
-  environments; the budget bounds load).
-- **`runly logs` is new in shape**: no service = all of them, interleaved with
-  `svc | ` prefixes; `--since up|10m`, `--grep`, `-f --until <re> --timeout <s>`
-  (exit 124 on timeout), `--build`. One named service prints bare lines as before;
-  `--json` keeps `lines` (the text) and adds `entries`. Logs are capped at 20 MB
-  with one rotation, and a polling loop over `runly logs` can become one
-  `runly logs <svc> -f --until '<ready line>' --timeout 300`.
-- **`build: { run, when: [globs] }`** skips a build while the files it reads are
-  unchanged (`build api: skipped (when: unchanged)`); `up --rebuild` forces every
-  build. **`outputs: { paths, compare: content }`** restarts a service only when
-  its build changed bytes, not just mtimes. Plain `build:`/`outputs:` behave as before.
-- **Templates are kept per datastore and preset** (the newest, plus every one an
-  environment or copy uses; `BACKLOT_TEMPLATES_KEEP` default 1, after a 1-hour
-  grace), and `runly pool doctor [--fix]` lists — and with `--fix` removes —
-  what runly left behind. A datastore may declare `list:` (a command printing its
-  namespaces) so doctor can find orphaned server-side databases. The old drift
-  report is `runly doctor`.
-- `ps` adds the `idle` state and a `STOPS IN` column; `status --json` and
-  `ps --json` add `budget`.
-
-### Upgrading to 0.14 — ports ([decision 0033](docs/decisions/0033-the-daemon-holds-public-ports-behind-an-l4-proxy.md))
-
-- **The daemon now holds every environment's public port** and proxies TCP to the
-  service, which listens on a fresh internal port per start. Public ports come
-  from **20000–29999**, internal ones from **30000–31999**, derived tailnet
-  ports from **32000–32767** — all below the OS ephemeral range.
-- **Your environment's ports change once.** The first 0.14 daemon moves every
-  port a 0.13 journal recorded (they came from the ephemeral range) into the
-  public block and journals the new number. Re-read `ctx` after `runly update`;
-  a preview tunnel did not survive the daemon restart anyway — publish again.
-- **Nothing to change in a manifest that uses `{{ports.x}}`.** In a service's own
-  `run:`/`env:`, its own `{{ports.x}}` is now the internal port it must listen
-  on; everywhere else (other services, builds, `exec`, `ctx`) it is the public
-  port. A service that has to advertise its own public address uses the new
-  `{{public_ports.x}}`.
-- A pinned `--https-port`/`preview.https_port` keeps working anywhere, including
-  inside 20000–29999: tailscale binds the tailnet address, the proxy loopback.
-
-### Upgrading to 0.13 — breaking ([decision 0032](docs/decisions/0032-environments-run-in-the-callers-worktree.md))
-
-- **Environments run in your worktree, one per worktree.** No source copy is made.
-  A second holder of the same worktree waits for its environment (refused at once,
-  naming the holder, when that lease outlasts the wait); parallel lanes need
-  separate worktrees.
-- **`up` is the only bind verb.** Every `up` runs the due upkeep and the builds of
-  the services it starts, then restarts only the services whose build output
-  changed — declare it per service with `outputs:` (none declared = restart after
-  every build; no `build:` = keep running). **`sync` and `bind` are removed** —
-  where you ran `sync`, run `up`. `--watch` is removed with them; `watch_run` and
-  `hot_reload` are accepted and ignored.
-- **runly runs no checks.** `runly run`, `--detach`, `runly job` and verdict
-  artifacts are removed. Run your tests yourself against
-  `eval "$(runly ctx --env)"` (variables above). A manifest that still declares
-  `checks:` loads with a one-line warning; delete the section and move its
-  commands into your own scripts. A top-level `outputs:` is silently ignored.
-- **`BACKLOT_POOL_MAX` is removed** — the per-stack ceiling, its `config.json`
-  `poolMax` and its `status` field. A leftover setting is ignored.
-  `BACKLOT_POOL_MAX_TOTAL` and `BACKLOT_POOL_MAX_DATA_ONLY` are unchanged.
-- **runly caches no builds**, so `build:` runs on every `up` that starts its
-  service; a no-op build of an incremental tool is cheap.
-- Removed verbs and flags — `pull`, `sync`, `bind`, `run`, `job`, `--pull`,
-  `--ref`, `--watch`, `--detach` — are usage errors (exit 64) naming decision 0032.
-- `bindDiagnostics`: `reuse` is `reused` (services kept), `restarted` (with the
-  `restarted` list) or `rebound`; `builds` lists every build with its duration,
-  whether it restarted its service and why. `source`, the `fingerprint` phase and
-  `refreshed`/`projected` are gone.
-- `reset-data` restores data only (no sweep of untracked files); `--pristine`
-  re-runs every upkeep rule and never deletes worktree files.
-- New: `runly warm`, `runly ctx --env`.
-
-### Moving from Backlot to Runly
-
-For an existing global npm install, remove the old package first: both packages
-provide the compatibility command `backlot`, so installing
-Runly alongside Backlot otherwise fails with `EEXIST`.
-
-```bash
-npm uninstall -g backlot
-npm install -g runly
-runly update
-```
-
-Uninstalling the npm package leaves the state directory and databases intact.
-For a source checkout already linked as Backlot, rebuild and use
-`npm link --force` to replace the old links, then run `runly update`.
-The update command refuses while operations are busy; retry once they finish.
-Existing `backlot.yml` files need no rename. New manifests use `runly.yml`.
-
-### Upgrading: `runly update` after you install
-
-Installing a new runly replaces the files on disk. It does **not** replace the
-daemon already running — that process keeps serving the old code for as long as
-it lives. So an upgrade is two steps:
-
-```bash
-npm i -g runly@latest    # or whatever installed it — runly never installs itself
-runly update             # restart the daemon onto the build you just installed
-```
-
-Skip the second step and runly tells you, rather than quietly serving you the
-old behaviour: every verb except `update`, `doctor` and `daemon stop` fails with
-`infra-error` (exit 3) naming both versions. That refusal is deliberate — an old
-daemon does not reject a flag it has never heard of, it *ignores* it, so
-`up --data-only` against a pre-0.9.0 daemon would have booted the whole application into
-what you asked to be a database-only lease and report success.
-
-```bash
-runly --version          # this CLI
-runly update --check     # cli vs daemon, who would have to rebind, and the upgrade command for your install
-runly update             # restart; no-op when the daemon is already the installed build
-```
-
-`runly daemon stop` waits up to 60 seconds after the shutdown acknowledgement
-for the old daemon and its service teardown to finish. Success includes
-`stopped: true` (and retains `stopping: true` for compatibility); if no daemon is
-running, it succeeds without starting one. A shutdown still in progress at the
-deadline returns `infra-error` (exit 3) saying so — the daemon is still shutting
-down, so wait for it to exit rather than issuing another stop.
-
-**What a restart costs.** Leases **survive** it. Services stop, environments drop
-to `warm`, and each holder's next verb rebinds — seconds, the same transition the
-idle sweeper already performs on a leased environment. `update` names every holder
-before acting. It refuses only two things: an **in-flight operation** (a bind
-or `exec` whose caller is waiting on it) and a **downgrade** (an older CLI restarting
-a newer daemon). `--force` overrides either.
-
-### Additive `up`, and `down`
-
-`up` **adds** ([decision 0034](docs/decisions/0034-additive-up-database-copies-and-ps.md)).
-Name one or more services and runly starts **those plus their transitive
-`depends_on` closure**, next to whatever already runs; it never stops a running
-service. `up` with no service adds every service. `down` stops just the services
-it names — or, with no names, all of them — and keeps the lease, the data and
-the public ports.
-
-Take [`examples/hello-multi`](examples/hello-multi/runly.yml): `web`
-`depends_on: [api]`, and `worker` stands alone.
-
-```bash
-cd examples/hello-multi
-runly up web       # starts web + api (its depends_on closure) — worker stays down
-runly up worker    # adds worker; web and api keep running, same pids
-runly down web     # stops web alone; api and worker keep running, web's port stays reserved
-runly up           # adds everything not running yet (here: web)
-runly down         # stops every service; the lease, data and ports stay
-```
-
-Only services are named — never a datastore or an appliance: datastores exist
-for the environment's whole life, and appliances are shared (decision 0018). A
-service whose dependency you take down keeps running and is named in the `down`
-answer, because it now reaches a port with nothing behind it. What the lease
-wants survives a quiesce and a daemon restart: the next `up` brings it back. An
-unknown service name is a manifest work-error. `ctx.services` reports each
-service as `running`, `stopped` (wanted, not running) or `down`, and `ctx.urls`
-lists the wanted ones. A fresh holder starts from what is running, never from
-the previous holder's wishes.
-
-### Datastore presets: reload one, keep the rest
-
-Every datastore keeps its data unless you ask otherwise — on every `up`, for a
-new holder, after a daemon restart. runly never resets a store to its default
-behind your back. To reload a store, name its preset:
-
-```bash
-runly up --preset main=empty                   # reload main only; restart the services that use it
-runly up --preset main=dev --preset audit=empty
-runly up --preset empty                        # the short form, for a stack with one datastore
-runly reset-data                               # restore every store, each with the preset it holds
-runly reset-data --preset main=empty           # …with main switched to empty
-```
-
-A named preset reloads that datastore from its template — even when it already
-holds that preset, which is how you reset one store — and restarts only the
-running services that **use** it: those whose `run:`, `build:` or `env:` templates
-`{{datastores.<name>.…}}`. When no service references the store, runly cannot
-tell who reads it, so every running service restarts. Other stores and services
-are untouched.
-
-`ctx --json` reports `.datastores.<name>.preset`, the preset the store **holds**
-(null before its first restore), and `ctx --env` exports it as
-`RUNLY_DATASTORE_<NAME>_PRESET`. Bind diagnostics list what was reloaded
-(`reloaded`) and restarted (`restarted`).
-
-Names must appear in that datastore's `presets` catalog, and so must the names a
-`default_preset` declares: a declared default outside the catalog fails every
-bind, with or without `--preset`. Without a catalog (omitted or empty), the
-implicit `default` and any manifest-declared `default_preset` names remain valid.
-Unknown stores, unknown presets, duplicate targets and ambiguous bare names are
-refused before acquiring an environment or changing data. A store is created
-with its default (`default_preset.session`, then the first catalog entry, then
-`default`). A store whose held preset left the catalog keeps its data; the next
-reset restores the default. A `--preset` whose bind fails is not remembered —
-run it again. RPC accepts the same choices as a `presets` object mapping
-datastore names to preset names. Other CLI verbs reject `--preset` with exit 64.
-
-### Database copies: `runly db`
-
-A test lane wants a seeded database of its own — often several at once — and not
-the application. `runly db` makes **copies** of a datastore outside any
-environment: no lease, no ports, no services, as many in parallel as you like.
-Each is restored from the same template the environments use (baked first if it
-is missing):
-
-```bash
-runly db with main -- dotnet test            # a fresh copy for one command; dropped when it exits
-runly db with main --preset empty -- npm test
-runly db new main --json                     # {name, url, preset, …}: keep it until you drop it
-runly db ls                                  # this worktree's copies (--all: every one)
-runly db drop main-k3j9x2
-```
-
-`db with` runs the command with `RUNLY_DB_URL` (the connection string) and
-`RUNLY_DB_NAME` set, drops the copy when the command exits — also when it fails,
-and after Ctrl-C, which it passes on — and exits with the command's exit code.
-`db new` prints `name=`, `url=` and `preset=` lines (`--json` for the object).
-
-Every copy is recorded in the journal with its holder — this worktree, and the
-agent's process when you pass `--holder-pid` (or `BACKLOT_HOLDER_PID`); `db with`
-tethers the copy to its own process — and with the drop command it needs. It is
-reaped exactly like an environment: when the holder process is gone, when the
-worktree is removed, after a daemon restart too. There is no TTL: a copy made
-with no tether lives until its worktree goes or you drop it. A command-family
-datastore needs a `drop:` command to be copied at all. `db new` does not run
-upkeep; a template that needs an install first wants `runly warm`.
-
-### What runs: `runly ps`
-
-```bash
-runly ps            # this worktree: services and database copies
-runly ps --all      # the whole server
-runly ps --json
-```
-
-One row per service — environment, service, state (`running`, `starting`,
-`idle` (stopped for idleness, wakes on a connection), `stopped`, `down`), public
-and internal port, pid, idle time since the last use, when it stops for
-idleness, resident memory (Linux) — and one per database copy — name, datastore,
-preset, state, holder, age. With the load budget on, a last line says how much
-of it is committed.
-
-### Idle, wake and teardown
-
-[Decision 0035](docs/decisions/0035-services-idle-on-their-own-clock-and-wake-on-demand.md).
-Each running service has its own idle clock. It is reset by any runly verb on the
-environment (`up`, `ctx`, `exec`, `logs`, `ps`, …), by any client byte through the
-service's public port, and by its own start. An agent merely being alive does
-not count. After 10 minutes (`BACKLOT_SERVICE_IDLE_MS`; per service
-`idle: 30m` / `idle: never`) the service is stopped. Its lease, data and public
-port stay.
-
-The next connection to that port **starts it again** and is held until it is
-ready (`BACKLOT_PROXY_HOLD_MS`, 90 s): appliances ensured, data kept, its build
-run only if needed. Because services reach each other through public ports, a
-browser hitting an idle SPA whose dev server forwards `/api` wakes the SPA, and
-the SPA's request wakes the API. A service whose *readiness check* needs another
-service must list it in `depends_on`. A service stopped with `runly down` stays
-down; an unleased environment is never woken by traffic. A crashing service's
-restart gap is held the same way.
-
-**When everything goes.** An environment is torn down completely — services,
-data, preview, ports, lease — when:
-
-- its **holder process** (`--holder-pid`, `BACKLOT_HOLDER_PID`, or Claude Code's
-  automatic tether) has been gone for a minute (`BACKLOT_TETHER_GRACE_MS`). While
-  it lives, the lease does not expire;
-- its **worktree** no longer exists, leased or not, also across a daemon restart;
-- you run **`runly destroy`** — for worktree pools that take a worktree back,
-  which runly cannot see on its own.
-
-**Claude Code.** Claude Code exports `CLAUDE_PID`, the `claude` process every
-Bash tool call runs under. `up` and `db new` tie to it when it is alive and an
-ancestor of the CLI. The tether is kept alive by that session process: subagents,
-background shells and tool calls all run under it. Ending, closing or killing
-the session starts the one-minute grace. `BACKLOT_TETHER=off` opts out; the lease
-then lives by its TTL.
-
-### The load budget: `runly plan`
-
-[Decision 0036](docs/decisions/0036-a-server-wide-load-budget.md). One daemon
-serves every stack on the box and admits every start and build against one
-budget. By default that is 70 % of RAM and 1.5 x cores of *declared* resources.
-On Linux, MemAvailable must also stay above max(2 GiB, 10 % of RAM), and the
-1-minute load must be at most 2 x cores. A build holds its share only while it
-builds, and an idle-stopped service holds none.
-
-```yaml
-services:
-  api:
-    resources: { memory: 1G, cpu: 1, build: { memory: 3G, cpu: 4 } }
-appliances:
-  mssql: { probe: "localhost:1433", start: "...", resources: { memory: 4G, cpu: 2 } }
-```
-
-Undeclared costs are 512M / 0.5 cpu running and 1G / 1 cpu building; `runly plan`
-says which costs were assumed. An `up` that does not fit **queues** first come,
-first served, showing its position and what it waits for. After
-`BACKLOT_BUDGET_WAIT_MS` (10 min) it fails with env-error (exit 2), naming what
-is committed.
-
-```bash
-runly plan            # every service: starts now | would wait for <memory|cpu|free memory|load>
-runly plan web --json
-```
-
-Knobs: `BACKLOT_BUDGET=off`, `BACKLOT_BUDGET_MEMORY` (`48G`), `BACKLOT_BUDGET_CPU`,
-`BACKLOT_BUDGET_RESERVE`, `BACKLOT_BUDGET_LOAD_PER_CORE`, `BACKLOT_BUDGET_WAIT_MS`,
-`BACKLOT_BUDGET_MAX_QUEUE`, or `budget: {…}` in `config.json`.
-`BACKLOT_POOL_MAX_TOTAL` still caps how many environments are *held*. Its default
-is 2 x cores, clamped to 4–64; with the budget off it reverts to the pre-0.16
-heuristic.
-
-### Logs: `runly logs`
-
-[Decision 0038](docs/decisions/0038-time-stamped-logs-and-build-skip.md).
-
-```bash
-runly logs                         # every service, interleaved: "api | …", "web | …" (last 40 lines)
-runly logs api --since up          # only the current api process (since its last start)
-runly logs --since 10m --grep 'ERROR|WARN'
-runly logs web -f --until 'Compiled successfully' --timeout 300   # 0 on match, 124 on timeout
-runly logs --build                 # each service's last build output, and the last upkeep output
-```
-
-Each line is stored with its arrival time. Logs survive idle stops and daemon
-restarts, are capped at 20 MB per service with one rotation
-(`BACKLOT_LOG_CAP_BYTES`), and are deleted with the environment.
-
-### Cleanup: `runly pool doctor`
-
-[Decision 0037](docs/decisions/0037-cleanup-by-reference-and-pool-doctor.md).
-`runly pool doctor` lists what runly left behind and is a dry run by default:
-
-- environment and copy directories nobody references;
-- worktree records of deleted worktrees;
-- superseded, unreferenced templates;
-- service processes of gone environments;
-- listeners of gone environments;
-- with a datastore `list:` command, server-side databases in runly's naming that
-  nothing references.
-
-`--fix` removes them. It only ever touches runly's own: files under the state
-root, processes tagged with this state root, and databases of stacks this state
-root knows. Another state root's databases are shown as `foreign-namespace` and
-left alone.
-
-```yaml
-datastores:
-  main:
-    driver: mssql
-    drop: scripts/db drop {{ns}}
-    list: scripts/db list          # one database name per line
-```
-
-Each environment records how to drop its databases when it creates them, so a
-deleted worktree's databases are still dropped with the command it was created
-with.
-
-### How long you hold it: `--ttl` for agents, `--holder-pid` for shells
-
-A lease has a TTL, and there are two ways to say when you are done with an
-environment:
-
-```bash
-runly up --ttl 45                       # agents, scripts, CI: hold it for 45 minutes
-BACKLOT_HOLDER_PID=$$ runly up          # an interactive shell: hold it until THIS shell exits
-```
-
-Every `up` renews the lease (to `--ttl`, or the default). `reset-data` preserves
-a continuing lease's absolute deadline. Use `up --ttl <minutes>` to extend it;
-`preview <service> --ttl <minutes>` also renews explicitly. Read-only polling does not extend ownership. A fresh or
-expired acquisition takes a normal new deadline; `reset-data` requires a live
-lease and refuses an expired one before changing data.
-
-**`--ttl` is the form for anything automated** — except under Claude Code, which
-tethers automatically (above). `--holder-pid <pid>` (or `BACKLOT_HOLDER_PID`) pins
-the lease to a process: a minute after that process exits the environment is torn
-down instead of waiting out the TTL, and while it lives the lease does not expire.
-That is only useful if the process genuinely outlives the command.
-
-It does **not** work from an agent harness, because those run each command in a
-fresh shell: by the time `runly up` returns, the `$$` it was given is a shell
-that has already exited. Runly refuses such a bind (exit `64`) rather than
-create a lease that is reclaimable the moment it exists — otherwise the sweeper
-frees the environment while you are still using it, the next bind takes it, and
-you are quietly looking at somebody else's database through the same URL.
-
-`runly release` hands the environment back early. If it answers
-`{"released": false}`, read the `reason`: use the same holder that bound it
-(`--holder` if supplied, otherwise the caller directory). See
-[physical stack identity and legacy holder recovery](docs/architecture.md#physical-stack-identity)
-for symlink aliases and upgrade recovery.
-
-For your own repo: `npm i -g runly`, write the `runly.yml`, then the same
-verbs. Requires Node ≥ 22.13 and git. The daemon auto-spawns on first use (unix
-socket, per-machine state under `~/.local/state/backlot`; isolate with
-`BACKLOT_STATE_DIR`).
-
-The manifest, by example ([schema](schema/runly.schema.json)):
-
-```yaml
-name: myapp
-services:
-  api:
-    build:
-      run: dotnet build backend/Host
-      when: ["backend/**/*.cs", "backend/**/*.csproj"]   # skipped while these are unchanged
-    outputs: [backend/Host/bin/**]   # restarted on `up` only when the build changed these
-    resources: { memory: 1G, cpu: 1, build: { memory: 3G, cpu: 4 } }   # the load budget
-    run: dotnet run --no-build --project backend/Host
-    port: api
-    env: { ConnectionStrings__Main: "{{datastores.main.url}}" }
-    ready: { http: /health }
-  web:
-    run: pnpm exec ng serve --port {{ports.web}}
-    port: web
-    ready: { http: / }    # no build: — ng serve reloads itself, `up` keeps it running
-datastores:
-  main:
-    driver: postgres
-    create: bin/seed {{ns}} {{preset}}
-    presets: [dev, empty]
-    template: true
-upkeep:
-  - { when: pnpm-lock.yaml, run: pnpm install --frozen-lockfile }
-auth:
-  logins:                 # one object, or a list — the first entry is the primary
-    - { user: qa-admin,    password: Demo!1234, role: admin, description: "all rights, all branches" }
-    - { user: qa-readonly, password: Demo!1234, description: "read-only, proves a denied write" }
-  token: scripts/mint-token --role {{role}} --json
-```
-
-Your tests are yours: `eval "$(runly ctx --env)" && pnpm e2e`.
-
-**Ports: public and internal.** Each `port:` key gets a **public** port for the
-environment's whole life (20000–29999), which the daemon listens on and pipes to
-the service ([decision 0033](docs/decisions/0033-the-daemon-holds-public-ports-behind-an-l4-proxy.md)).
-The service itself is started on a fresh **internal** port (30000–31999): in its
-own `run:` and `env:`, `{{ports.<its key>}}` is that internal port, so
-`ng serve --port {{ports.web}}` keeps working unchanged. Everywhere else —
-another service's `env:`, builds, `exec`, `ctx` — `{{ports.x}}` and
-`{{services.x.url}}` are public; `{{public_ports.x}}` is public everywhere.
-Because of that indirection:
-
-- the URL survives every restart, and a connection that arrives while its
-  service (re)starts is **held** until it is ready (up to
-  `BACKLOT_PROXY_HOLD_MS`, default 90 s), not refused;
-- traffic is counted: `ctx --json` and `status --json` report, per port,
-  `proxy: { state, clientBytes, lastActivityAt, open, held, accepted }`.
-  runly's own readiness probes bypass the proxy and never count;
-- it is pure TCP — WebSockets and any other protocol pass through.
-
-The blocks are configurable (`BACKLOT_PORT_RANGE`, `BACKLOT_INTERNAL_PORT_RANGE`,
-`BACKLOT_TUNNEL_PORT_RANGE`, form `LO-HI`); `status --json` shows them under
-`ports`. A public port moves only when it cannot be held — another process took
-it while the daemon was down — and the move is reported.
-
-An upkeep rule may set `timeout` in seconds, for example
-`{ when: Cargo.lock, run: cargo build --release, timeout: 1200 }`.
-Rules without it keep the 300-second default; `BACKLOT_CMD_TIMEOUT_S` overrides
-both. The deadline kills the command's process group. With `--progress`, each
-command reports its rule number before starting, elapsed time every five seconds,
-and completion on stderr; command text and output are not streamed, and `--json`
-stdout stays machine-readable. Successful unchanged rules remain skipped.
-
-Services are commands, not containers. Backing infrastructure (your DB server) stays
-externally run — runly probes it and classifies its absence honestly
-(`infra-error`, never blaming your code). If the repo has one blessed way to start
-that infrastructure, declare it as an **appliance** and runly ensures it without
-ever owning it ([decision 0018](docs/decisions/0018-appliances-ensured-not-owned.md)).
-
-### Caller environment inputs
-
-Services may explicitly request variables from the process invoking `up`:
-
-```yaml
-services:
-  api:
-    run: node server.mjs
-    env_from:
-      API_KEY: optional
-      API_ENDPOINT: required
-```
-
-Export those names in your shell, then run `runly up`. The CLI sends only
-declared names over the local socket; the shared daemon does not need a restart.
-When autospawning, it removes those names from the new daemon's environment so
-the first caller's inputs cannot become ambient configuration for other leases.
-`required` refuses a missing value before claiming an environment. An empty string
-is a supplied value. A supplied input overrides a same-named `env` entry. An omitted
-`optional` input keeps the service's explicit `env` default (templated as usual);
-without such a default it is unset and masks a same-named daemon variable. They are
-service and readiness-probe inputs, not build, upkeep or `exec` inputs.
-`BACKLOT_*` names are reserved for broker controls and cannot be declared here.
-
-Each explicit `up` refreshes the lease's inputs, including clearing omitted optional
-values, and changed inputs restart services even when source files are unchanged.
-`reset-data` keeps that lease's inputs. A new
-holder never inherits them: reusing its warm environment restarts input-configured
-services with the new holder's values.
-
-Values remain in daemon/process memory, never in the journal or context/status
-responses. Broker service logs redact exact input values, including values split
-across output chunks. Repo commands can still write their own files or transform
-values; applications own that output. Release forgets the input record; existing
-warm services retain their startup environment until stopped or rebound. After a
-daemon restart, run `up` again with the values: required inputs refuse a rebind
-without them, and optional inputs stay off until supplied again.
-
-### Several logins, each with a purpose
-
-Most seeded stacks have more than one account, and the difference matters: an admin
-login is the one account that can never expose a scoping bug. `auth.logins` therefore
-takes **either a single login (unchanged) or a list**, and each login may carry a
-`role` — the `{{role}}` your `auth.token` hook takes — and a `description` saying what
-it is *for*, so a consumer picks the right one without reading your seed script.
-
-`ctx` reports both, and the redundancy is the point — nothing has to ask which form
-the manifest used:
-
-```jsonc
-{
-  "logins":    { "user": "qa-admin", "password": "Demo!1234", "role": "admin", "description": "all rights, all branches" },
-  "allLogins": [ /* every declared login, in manifest order — `logins` is entry 0 */ ]
-}
-```
-
-`logins` stays **the primary login**, always a single object, always the manifest's
-first entry, so anything reading `ctx.logins.user` is untouched when a stack grows a
-list. A single-login stack reports the same object in both places. An empty list is
-rejected — omitting the key remains how a stack says it has no logins
-([decision 0026](docs/decisions/0026-a-stack-may-advertise-several-logins.md)).
-
-Runly does not create these logins, verify them, or know what a role means: the seed
-makes them, the manifest declares what exists, `ctx` reports it.
-
-### A preview URL that is still valid tomorrow
-
-`runly preview` publishes through a **publisher**. The default,
-`cloudflare-quick`, takes whatever `*.trycloudflare.com` name Cloudflare hands
-it — right for "look at this for ten minutes", wrong for a bookmark, a ticket, a
-device you type an address into by hand, or an app pinned to a dev server. Every
-restart invalidates all of them.
-
-Preview launchers may fork children within their process group: Backlot preserves
-that leased group through a repeated `up` and idle cleanup, and stops it when the lease ends.
-The launcher must remain alive and keep its tunnel children in that group;
-detached children that call `setsid` are outside this ownership guarantee. Orphan
-tag scanning is Linux-only; macOS uses recorded identity and group teardown.
-
-`cloudflare-named` publishes under a zone you own instead:
-
-```yaml
-preview:
-  publisher: cloudflare-named
-  domain: example.dev     # the zone; required by this publisher
-  prefix: myapp           # optional — see below
-```
-
-`web` then appears at `https://web-myapp.example.dev`, and it is the same
-address next week. Backlot creates the named tunnel and its DNS record on first
-use and reuses them; `preview stop` ends the process, not the name.
-
-**It needs a login, once:** `cloudflared tunnel login` for the zone, which leaves
-the origin certificate the publisher checks for. No API token, and runly holds
-no new secret.
-
-**Leave `prefix` unset unless you mean it.** It defaults to the environment id,
-which is unique by construction. A pooled stack has several environments and one
-manifest, so a prefix written there is shared — and the second publish of `web`
-takes the hostname from the first. Set it only to pin a name a human has to
-remember, and only where one environment of the stack runs at a time.
-
-**A named URL is durable, and so is the exposure.** Put a Cloudflare Access
-policy over the zone; it matches on hostname, so one policy covers every preview
-you will ever publish there ([decision 0028](docs/decisions/0028-named-preview-hostnames.md)).
-
-### A preview only your tailnet can reach
-
-`tailscale` publishes on this machine's own tailnet name instead of the internet:
-
-```yaml
-preview:
-  publisher: tailscale
-  https_port: 20601       # optional — see below
-```
-
-`web` then appears at `https://<machine>.<tailnet>.ts.net:20601` for every device
-on your tailnet, and for nobody else. runly runs `tailscale serve` in the
-**foreground** as a child of your lease, so the mapping exists exactly as long as
-that process: `preview stop`, `release`, a moved port or a reaped environment
-takes the URL down with it, and nothing is left in tailscale's persistent config
-([decision 0031](docs/decisions/0031-tailscale-preview-publisher.md)).
-
-**It needs the operator, once:** `sudo tailscale set --operator=$USER`, plus
-MagicDNS and HTTPS Certificates enabled for the tailnet. runly never calls sudo —
-sudo would move `tailscale serve` out of the process group and environment it
-reaps by.
-
-**Leave `https_port` unset unless you mean it.** Unset, the port is derived from
-the environment id and service (in the tunnel block 32000–32767, past anything
-this machine already serves), so the same environment gets the same address every time it
-publishes. Pin it only for an address a human has to remember, and only where
-one environment of the stack publishes at a time; a pinned port that is already
-served is refused, not taken over.
-
-For one long-lived environment that should keep a remembered address — a demo box,
-say — pin the port on the command instead of in the shared manifest:
-`runly preview web --https-port 20601`. It applies to that publish only.
-
-### Understanding a slow bind
-
-`up --json` and `reset-data --json` return
-`bindDiagnostics` for that operation. `ctx` does not replay timings from earlier calls. The report
-includes:
-
-- `durationMs`: elapsed daemon-side operation time, excluding CLI startup.
-- `phasesMs`: time spent acquiring/waiting (`queue`), preparing, ensuring
-  appliances, upkeep, stopping services, data preparation, builds, readiness, and
-  finalization. Skipped phases are zero.
-- `reuse`: `reused` when every service kept running (the builds ran and changed
-  no declared output), `restarted` when only the services in `restarted` were
-  restarted, or `rebound` for the full stop/data/build/start path. `reasons`
-  explains why the full path was taken (`manifest-changed`, `upkeep-required`,
-  `hygiene-reset-data`, `environment-not-running`, …).
-- `upkeep`: numbers of rules run and skipped; `builds`: each build that ran in this
-  operation, how long it took, whether its service was restarted and why
-  (`outputs-changed`, `outputs-unchanged`, `no-outputs-declared`, `full-rebind`).
-  runly keeps no build cache — every `up` that starts a service runs its
-  `build:`, and the build tool decides what is current.
-
-Timings are request-local and appear on successful results. They contain no
-command output or caller environment values. For progress while a command is
-still running, use `--progress`, including alongside `--json`.
-
-## What it is / is not
-
-| runly is | runly is not |
-| --- | --- |
-| a warm pool of leased, isolated environments | a compute provider (bring your own, local or cloud) |
-| in-place binds: your dirty worktree, running, in seconds | a build system (it invokes your commands, never understands them) |
-| seeded, template-restored data states | CI (CI may call runly; never the reverse) |
-| machine-readable context and a work/env/infra error taxonomy | an agent (no LLM calls, no browser driving), or a test runner |
-
-## Learn more
-
-- [docs/overview.md](docs/overview.md) — the two-page tour, with diagrams. Start here.
-- [docs/objections.md](docs/objections.md) — "my agent can just run the dev servers", "compose does this" — taken seriously, with receipts. (Its "why the copy?" answer predates [decision 0032](docs/decisions/0032-environments-run-in-the-callers-worktree.md), which removed the copy.)
-- [docs/architecture.md](docs/architecture.md) — the full design; it *is* the product.
-- [docs/decisions/](docs/decisions/) — why it is the way it is.
-
-## Security model
-
-Be clear-eyed about what running runly means:
-
-- **`runly.yml` commands execute with your privileges.** Services, seeds, upkeep
-  rules and builds are shell commands from the repo — exactly like `make`, npm
-  scripts, or a Justfile. Cloning an untrusted repo and running `runly up` runs
-  that repo's commands as you. Review manifests you didn't write.
-- **The daemon has no network surface.** It listens on a unix socket in your
-  per-user state dir (filesystem permissions are the auth) — no TCP, no remote
-  callers. Future remote substrates run the same model *on the remote box*, reached
-  over your own SSH/provider credentials.
-- **Environments are not sandboxes.** They run in your worktree, and isolation
-  between them is namespacing (ports, database namespaces, private log/data
-  directories), not a security boundary — code in an environment runs as you, on
-  your machine, and writes into your worktree. For untrusted
-  code, put the *substrate* in a sandbox (a VM, a cloud box), not your laptop.
-- **Public preview URLs are world-readable.** `runly preview` publishes the
-  chosen service through a quick tunnel (Cloudflare by default; the `tailscale`
-  publisher reaches only your tailnet instead). The URL is
-  **unauthenticated** — anyone with the link reaches the service, and under
-  `cloudflare-named` (below) that link still works tomorrow, so put an access
-  policy in front of the zone if what you publish is not meant for everyone.
-  Stacks that must never be published set `preview.forbidden: true` in
-  `runly.yml`. The
-  tunnel lives as long as your **lease**, not as long as a service process: a
-  repeated `up`, a rebind or an idle quiesce leaves it up. A bind tears it down if the
-  manifest starts forbidding preview, if the previewed service drops out of the
-  running set, or if its port moves — and if `--reset-data` leaves the *same* URL
-  serving *new* data, it says so in the bind's `previewNotice`. `runly preview
-  stop` and `runly release` both end it.
-
-## Claude Code
-
-runly ships an official [Claude Code](https://claude.com/claude-code) plugin —
-a stack-agnostic skill that teaches an agent the lease model and the verb table so
-it drives runly correctly against any repo's `runly.yml`. This repository
-doubles as its own plugin marketplace. From inside Claude Code:
+The daemon starts on first use (a unix socket in `~/.local/state/backlot`;
+`BACKLOT_STATE_DIR` moves it). The `backlot` command and `backlot.yml` are
+accepted aliases, and every setting is a `BACKLOT_*` environment variable
+([list](docs/architecture.md#configuration)).
+
+For Claude Code, install the bundled skill:
 
 ```
 /plugin marketplace add ChristianKohlberg/backlot
 /plugin install runly
 ```
 
-CLI-only, no MCP server — see [`plugins/runly`](plugins/runly/).
-Already using `backlot@backlot`? Follow the [plugin migration instructions](plugins/runly/README.md#existing-backlot-installations); updating the CLI does not rename an installed plugin.
+## Quickstart
+
+```bash
+git clone https://github.com/ChristianKohlberg/backlot && cd backlot
+npm ci && npm run build && npm link
+cd examples/hello-multi
+
+runly up web                 # upkeep, builds, data; start web and its depends_on (api); prints the context
+runly up                     # add every other service; up never stops one
+runly ps                     # services and database copies of this worktree
+eval "$(runly ctx --env)" && node smoke.test.mjs   # your tests, fed exported RUNLY_* variables
+runly up --preset main=empty # reload one datastore; the others keep their data
+runly db with main -- sh -c 'echo "$RUNLY_DB_URL"'   # a fresh database copy for one command, dropped after
+runly logs api -f --until 'listening' --timeout 60   # wait for the current process's line (124 on timeout)
+runly down web               # stop one service; lease, data and port stay
+runly destroy                # tear down everything this worktree holds
+```
+
+After an edit, run `runly up` again: it runs the due upkeep and the builds and
+restarts only the services whose build output changed. Idle services stop after
+10 minutes and start again on the next request. How an environment lives and
+ends is in [the guide](docs/overview.md#an-environments-life).
+
+## Manifest reference
+
+`runly.yml` at the repo root ([JSON Schema](schema/runly.schema.json)). Commands
+run under `sh` in the worktree; write POSIX sh.
+
+| Field | Meaning |
+| --- | --- |
+| `name` | Stack name (`a-z0-9-`). Required. |
+| `services.<svc>.run` | The supervised command. Required. |
+| `services.<svc>.build` | Command run before the service starts, on every `up`. `{ run, when: [globs], serial }`: `when` skips it while the matched files are unchanged since the last successful build; `serial: true` runs it alone. |
+| `services.<svc>.outputs` | Globs the build produces; a running service restarts only when they changed. `{ paths, compare: stat \| content }`. None declared = restart after every build. |
+| `services.<svc>.port` | Symbolic port name. Omit for a portless worker. |
+| `services.<svc>.env` | Environment variables; values may use templates (below). |
+| `services.<svc>.env_from` | Caller variables to pass in: `NAME: required \| optional`. Not `BACKLOT_*`. |
+| `services.<svc>.cwd` | Working directory, relative to the repo root. |
+| `services.<svc>.ready` | Readiness: `http` (path answering 200), `log` (regex), or `cmd` (exit 0); `timeout` seconds (120). |
+| `services.<svc>.fatal_logs` | Regex that fails the start at once when it appears in the log. |
+| `services.<svc>.depends_on` | Services that must be ready first. |
+| `services.<svc>.idle` | Idle time before the service is stopped (`90s`, `30m`, `2h`, seconds, or `never`). Default 10 minutes. |
+| `services.<svc>.resources` | Cost for the load budget: `{ memory, cpu, build: { memory, cpu } }`. Default 512M / 0.5 cpu running, 1G / 1 cpu building. |
+| `datastores.<ds>.driver` | `sqlite`, `postgres`, `mssql`, `mysql` or `redis`. Required. |
+| `datastores.<ds>.create` | Creates and seeds a namespace; `{{ns}}`, `{{preset}}`. |
+| `datastores.<ds>.drop` | Drops a namespace; `{{ns}}`. Needed for `runly db` copies of a server datastore. |
+| `datastores.<ds>.template_restore` | Restores a baked template into a namespace; `{{template}}`, `{{ns}}`. Server drivers. |
+| `datastores.<ds>.template` | `true`: bake a template file and restore by copy. sqlite only. |
+| `datastores.<ds>.url` | Connection string handed to services; `{{ns}}`. Required for server drivers. |
+| `datastores.<ds>.probe` | `host:port` checked before anything starts (unreachable = infra-error). |
+| `datastores.<ds>.server` | `external` (the only value): runly never runs a database server. |
+| `datastores.<ds>.presets` | Named seed states. |
+| `datastores.<ds>.default_preset` | The preset a new datastore is created with (else the first preset). A name, or `{ session, run }` read as one value. |
+| `datastores.<ds>.ephemeral` | `true`: no presets or templates; a reset runs `drop:` as a flush (Redis-class). |
+| `datastores.<ds>.list` | Command printing the namespaces on the server, one per line; read only by `runly pool doctor`. |
+| `appliances.<name>` | A shared backing server: `probe` (required), `start` (run once when the probe fails), `stop` (only for `runly appliance stop`), `ready`, `timeout` (60), `resources`. |
+| `upkeep[]` | `{ when: <path or glob>, run: <cmd>, timeout: <s> }`: runs when the matched files' content changed since it last ran in this worktree. `run: "@rebake-template <ds>"` rebakes that datastore's template. Timeout 300 s. |
+| `builds` | `parallel` (default): builds run in `depends_on` waves, each wave at once. `serial`: one at a time, in manifest order. |
+| `caches` | Build and install output in the worktree (`node_modules`, `**/obj`); never an upkeep trigger. |
+| `sync.include` | Git-ignored files an upkeep `when:` may still match (`.env.local`). |
+| `auth.logins` | One `{ user, password, role, description }` or a list; the first is the primary login. |
+| `auth.token` | Command printing a token on stdout; `{{role}}`. |
+| `preview.publisher` | `cloudflare-quick` (default), `cloudflare-named` or `tailscale`. |
+| `preview.domain`, `preview.prefix` | `cloudflare-named`: the zone, and the hostname suffix (default: the environment id). |
+| `preview.https_port` | `tailscale`: the tailnet HTTPS port (default: derived per environment and service). |
+| `preview.forbidden` | `true`: `runly preview` is refused. |
+
+Templates: `{{ports.<port>}}`, `{{public_ports.<port>}}`, `{{services.<svc>.url}}`,
+`{{datastores.<ds>.url}}`, `{{datastores.<ds>.ns}}`. In a service's own `run:` and
+`env:`, its own `{{ports.<port>}}` is the internal port it must listen on;
+everywhere else ports and URLs are the stable public ones. Top-level `outputs`,
+`checks` (with a warning), `sync.keep`, `watch_run` and `hot_reload` are accepted
+and ignored.
+
+## Command reference
+
+Every verb takes `--json` (stdout is one JSON object). Exit codes: `0` ok, `1`
+work-error (your code), `2` env-error (the environment), `3` infra-error
+(something external), `64` usage.
+
+| Command | What it does |
+| --- | --- |
+| `runly up [svc...]` | Lease this worktree's environment, run due upkeep and builds, start the named services and their `depends_on` (none named = all). Never stops a running service. Prints a short summary; `--json` the full context. |
+| `  --preset [ds=]NAME` | Reload that datastore from its template (repeatable); the services that use it restart. Without it, data is kept. |
+| `  --reset-data` / `--pristine` | Restore every datastore / that, plus re-run every upkeep rule and build (never deletes worktree files). |
+| `  --rebuild` | Run every build, ignoring `when:`. |
+| `  --ttl <minutes>` | Lease length (default 30). |
+| `  --env` | Print the `ctx --env` export lines instead of the summary. |
+| `  --holder-pid <pid>` | Tie the environment to a process that outlives the command; torn down a minute after it exits. |
+| `runly down [svc...]` | Stop these services (none = all); lease, data and ports stay. |
+| `runly ctx [--env]` | A short summary (service URLs and states, datastores, login); `--json` the full context; `--env` prints `export RUNLY_*=…` lines for `eval`. |
+| `runly ps [--all]` | Services (state, ports, pid, idle, memory) and database copies of this worktree, or of the whole box (with a worktree column). |
+| `runly plan [svc...] [--rebuild]` | What an `up` would build and start, what it costs, and whether it starts now or waits for the load budget. |
+| `runly logs [svc...]` | Service logs, interleaved (last 40 lines). `--lines N`, `--since up\|10m`, `--grep <re>`, `--build`. |
+| `  -f [--until <re>] [--timeout <s>]` | Follow; `--until` exits 0 on the first matching line of the current process (never an earlier one), `--timeout` exits 124. |
+| `runly db with <ds> [--preset NAME] -- <cmd>` | Run a command against a fresh copy (`RUNLY_DB_URL`, `RUNLY_DB_NAME`), drop it after, exit with its code. |
+| `runly db new <ds> [--preset NAME]` | Make a copy and print `name=`, `url=`, `preset=`. |
+| `runly db ls [--all]` / `db drop <name>` | List copies / drop one now. |
+| `runly exec <cmd...>` | Run a command in the worktree with the `ctx --env` variables (and `BACKLOT_URL_*`, `BACKLOT_PORT_*`, `BACKLOT_DS_*`) set. Exits 0 or 1; `--json` carries `exitCode`. |
+| `runly warm` | Run due upkeep and builds now, with no lease and no services. |
+| `runly reset-data [--preset ds=NAME]` | Restore the data of the current lease. |
+| `runly token [--role <r>] [--raw]` | Run `auth.token` (role default `admin`, also in `RUNLY_ROLE`); `--raw` prints the bare token. |
+| `runly release` | End the lease; the environment stays for the next `up`. |
+| `runly destroy` | Tear down everything runly holds for this worktree: services, data, copies, ports, lease. |
+| `runly preview <svc> [--ttl <minutes>] [--https-port N]` | Publish one service through the preview publisher. Unauthenticated. |
+| `runly preview stop` | End the preview. |
+| `runly status` / `runly doctor` | Daemon, environments and budget / health and drift report. |
+| `runly appliance ls\|start\|stop [name]` | Probe, start or stop shared backing servers. |
+| `runly pool ls\|recycle [<env-id>] [--force]\|reconcile\|gc` | Environments; recycle one (or all); reap degraded ones; reclaim orphaned processes. |
+| `runly pool doctor [--fix]` | List (and with `--fix` remove) what runly left behind. Only runly's own. |
+| `runly update [--check] [--force]` | Restart the daemon onto the installed build. Leases survive. |
+| `runly daemon stop` / `runly --version` | Stop the daemon, waiting up to 60 s (`BACKLOT_DAEMON_STOP_TIMEOUT_MS`) / print the CLI version. |
+
+The verbs that act on a lease or copy take `--holder <name>` to act for a holder
+other than the caller's directory (the default). `up`, `warm` and `reset-data` show progress on a terminal;
+`--progress` forces it, `--quiet` silences it.
+
+## More
+
+- [docs/overview.md](docs/overview.md) — the guide: environment life, ports,
+  testing, data, builds, the load budget, previews, security.
+- [docs/architecture.md](docs/architecture.md) — the design and every setting.
+- [docs/decisions/](docs/decisions/) — why it is the way it is.
 
 ## License
 

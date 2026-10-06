@@ -2,7 +2,7 @@
 
 > The MCP portion of this historical decision is superseded by [0029](0029-cli-only-agent-interface.md).
 
-- Status: Accepted
+- Status: Accepted — its MCP remarks superseded by [0029](0029-cli-only-agent-interface.md)
 - Date: 2026-07
 - Context: [0013](0013-typescript-node-npm-apache2.md) chose TypeScript on Node; this
   revisits that choice against evidence rather than preference.

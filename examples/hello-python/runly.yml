@@ -18,4 +18,5 @@ datastores:
     presets: [dev, empty]
     template: true
 
-# The smoke test is the repo's own: eval "$(runly ctx --env)" && python3 smoke.py
+# The smoke test is the repo's own:
+#   eval "$(runly ctx --env)" && python3 smoke.py

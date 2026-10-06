@@ -5,11 +5,10 @@ gets the honest version: where the objection is *right*, and where it stops
 being right. runly was extracted from a hand-rolled harness that lived
 through every failure below — this page is that experience, not advocacy.
 
-## "Why not copy the source into each environment? Wasn't that the point?"
+## "Why not copy the source into each environment?"
 
-It was, until [decision 0032](decisions/0032-environments-run-in-the-callers-worktree.md).
-Each environment used to keep its own projected copy of the worktree and build and run
-there. Measured on the founding monorepo (35k tracked files, 1.07 GB of source), each
+runly did that once, and stopped ([decision 0032](decisions/0032-environments-run-in-the-callers-worktree.md)).
+Measured on the founding monorepo (35k tracked files, 1.07 GB of source), each
 environment tree weighed 2.0–2.6 GB: a full source copy (ext4 has no reflink, so
 copy-on-write fell back to a real copy) plus a second, cold set of caches — and those
 caches could never be borrowed from the worktree, because .NET (`project.assets.json`,
@@ -19,11 +18,10 @@ warm caches from its earlier tasks. So environments now run **in** the worktree.
 
 What the copy bought, and what became of it:
 
-- **Uncontaminated verdicts — given up.** A check ran against the snapshot synced at
-  its start; now the services run from the live worktree, and an edit made while the
-  tests run is visible to them. An agent that wants a fixed input does not edit while
-  its tests run, or runs them from a second worktree. (runly no longer runs checks at
-  all: the repo's own tests read `runly ctx --env`.)
+- **A frozen input for tests — given up.** The services run from the live worktree,
+  and an edit made while the tests run is visible to them. An agent that wants a fixed
+  input does not edit while its tests run, or runs them from a second worktree. (runly
+  runs no tests itself: the repo's own tests read `runly ctx --env`.)
 - **Two environments from one worktree — given up.** A worktree has exactly one
   environment now; a second holder waits for it. Two environments building into one
   worktree's `bin/` under each other's running services was the alternative, and the
@@ -33,10 +31,10 @@ What the copy bought, and what became of it:
   reclaim needs no deliberation. Teardown checks the path before it deletes.
 - **Clean worktrees — given up.** Upkeep, builds and services write where they run. Ignore
   your output (or declare it under `caches:`), or an upkeep trigger glob may match it.
-- **runly's build cache — given up.** It used to skip a build whose source and
-  command it had seen before. Builds now run on every `up`; MSBuild, pnpm and the
-  Angular CLI decide what is current, which is what they are for, and runly restarts
-  only the services whose declared build output changed.
+- **A build cache in runly — given up.** Builds run on every `up`; MSBuild, pnpm and
+  the Angular CLI decide what is current, which is what they are for, and runly
+  restarts only the services whose declared build output changed. A build may opt in
+  to being skipped while the files it reads are unchanged (`build: { run, when }`).
 
 If those trade-offs matter more to you than a warm cache — many concurrent test
 lanes from one checkout, editing while tests run — give each lane its own worktree.
@@ -58,11 +56,13 @@ usually made to defend. What arrives, in order:
 3. **The crash.** An agent dies; its `dotnet` and `node` processes don't.
    Nothing owns them, nothing records them, and a fleet manufactures orphans
    daily. (runly spends real machinery here: process-group kills, pid
-   identity pinning, tag-based reclaim — because even *with* supervision this
-   is hard.)
+   identity pinning, tag-based reclaim, and an environment tied to the agent's
+   session that goes when the session does — because even *with* supervision
+   this is hard.)
 4. **The cold start, every task.** Restore, build, seed — minutes per task,
-   because nothing durable outlives the task. The warm pool's entire economy
-   is that environments do.
+   because nothing durable outlives the task. runly's economy is that an
+   environment outlives its lease, its data restores from a template in
+   seconds, and an idle service wakes on the next request.
 5. **The raw error.** "Connection refused": my bug, stale deps, or the DB
    server being down? A DIY agent burns its context debugging the environment.
    runly's error taxonomy (work / env / infra) exists because each of those
@@ -88,21 +88,22 @@ overlap. The structural gaps:
 
 1. **Uncommitted code has no good path into a container.** Rebuild the image
    per edit — minutes per iteration, no inner loop. Or bind-mount the worktree
-   in — which is worktree-hosting again (mid-run edits contaminate verdicts;
+   in — which is worktree-hosting again (mid-run edits reach the running tests;
    one worktree cannot back two differently-bound stacks), plus the
    well-documented macOS bind-mount I/O tax on exactly the watcher-heavy dev
    loops agents hammer, plus the `node_modules` inside-vs-outside volume
    dance. runly runs commands in the worktree directly — no container, no
    mount — and accepts the live-worktree semantics that come with that
    ([decision 0032](decisions/0032-environments-run-in-the-callers-worktree.md)).
-2. **`up`/`down` is not a pool.** No leases, no reclaim, no warm reuse:
+2. **Compose has no leases.** No reclaim, no warm reuse, no idle stop:
    nothing distinguishes an abandoned stack from a used one, and every fresh
    `up` pays start + seed again. Containers restart from the *image* — the
    incremental state that makes rebinds fast (compiler caches, `obj/`,
    `.angular`) is exactly what an image does not carry, so it becomes
    hand-managed volumes.
-3. **No data or verdict layer.** Presets, template restore, `reset-data`
-   mid-lease, hygiene escalation, a classified error taxonomy —
+3. **No data or lifecycle layer.** Presets, template restore, database copies,
+   `reset-data` mid-lease, idle stop and wake, hygiene escalation, a classified
+   error taxonomy —
    compose has no concept of any of it (v2.30 added generic
    `post_start`/`pre_stop` hooks; still no named data states, no
    reset-to-baseline), so teams script it around compose.
@@ -115,8 +116,8 @@ overlap. The structural gaps:
 And they compose, literally: a service's `run:` may start a container, and
 appliances routinely `docker run` the database (runly's own mssql test
 does). Compose answers *how do my containers run*. runly answers *who gets
-which running, seeded instance, in what data state, with what proof — and who
-cleans up when they vanish.* Building the second thing on top of the first is
+which running, seeded instance, in what data state — and who cleans up when they
+vanish.* Building the second thing on top of the first is
 exactly the half-finished harness this project was extracted from.
 
 Honest concession: a fully containerized shop with disciplined `-p` projects,

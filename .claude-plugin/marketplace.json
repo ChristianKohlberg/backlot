@@ -8,7 +8,7 @@
   "plugins": [
     {
       "name": "runly",
-      "description": "Lease a running, seeded, authenticated env from runly's warm pool: a warm env in your worktree, additive per-service up/down, database copies (runly db), ps, then ctx/release. Bundles the stack-agnostic runly skill.",
+      "description": "Put a running, seeded, authenticated app in your worktree with runly: additive up/down, ctx --env for your own tests, database copies (db with), ps, plan and logs. Bundles the stack-agnostic runly skill.",
       "source": "./plugins/runly",
       "category": "productivity",
       "author": {

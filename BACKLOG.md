@@ -55,7 +55,7 @@ What it exposed:
   run verdicts conflate bind time into durationMs (91.9s reported for a
   sub-second check); suspects include the 29k-file project, emulated MSSQL
   seeding, and dotnet build.
-- [ ] **P2 · Watch lifecycle is invisible and uncontrollable.** up --watch
+- [x] OBSOLETE — `--watch` was removed (decision 0032). **P2 · Watch lifecycle is invisible and uncontrollable.** up --watch
   returns immediately with nothing saying a daemon-resident watcher engaged;
   status/pool ls carry no watching flag; no stop verb; a later plain up does
   NOT disengage it (only release does). Surface it and give it an off switch.
@@ -63,7 +63,7 @@ What it exposed:
   recorded watch projections and recovery but no bind/upkeep/recycle/
   lease-expiry events — an upkeep-triggered full rebind left no trace; and
   daemon.log stayed empty all session.
-- [ ] **P3 · Old-shape datastore namespaces are unreclaimable on shared
+- [x] ADDRESSED by decision 0037: a datastore `list:` lets `runly pool doctor` find and `--fix` drop orphaned `backlot_*` databases. **P3 · Old-shape datastore namespaces are unreclaimable on shared
   servers.** The 0.6 ns scheme (name-suffixed) strands prior-shape
   `backlot_*_e1` DBs on the shared MSSQL — no gc reaches them; pool gc or a
   doctor hint should surface server-side orphans matching the backlot_ prefix.
@@ -79,7 +79,7 @@ What it exposed:
   and daemons deliberately outlive their parents. An empty pool + N minutes
   without an RPC should exit the daemon; that closes the leak class
   structurally. Diagnose with `ps -eo pid,etime,command | grep dist/daemon`.
-- [ ] **P2 · Per-checkout pools waste warmth across worktree fleets (owner
+- [x] DECIDED by decision 0032: one environment per worktree, running in it, so a worktree's own caches are the warm ones. **P2 · Per-checkout pools waste warmth across worktree fleets (owner
   decision needed).** Stack identity hashes the root path, so every
   treehouse/worktree slot of one repo is its own stack: N slots = N cold
   provisions, N template bakes, N env sets, all pressing POOL_MAX_TOTAL —
@@ -87,7 +87,7 @@ What it exposed:
   yesterday's P1 bug), but an OPT-IN shared identity (e.g. keyed by git
   remote, `pool: per-repo`) would let fleet slots share one pool. Shared pool
   = shared capacity and shared degradation; needs the owner's call.
-- [ ] **P3 · `backlot up --shell` (treehouse-style session ergonomics).** Open
+- [ ] (Partly covered by decision 0035's automatic Claude Code tether and `runly destroy`.) **P3 · `backlot up --shell` (treehouse-style session ergonomics).** Open
   a subshell with BACKLOT_HOLDER_PID set to it: `exit` returns the env to the
   pool in seconds instead of the TTL. One flag; makes the treehouse pairing
   feel native. Pair with a docs note: treehouse makes worktrees, backlot
@@ -425,10 +425,10 @@ substrate shipping (S4). Do not pick these up without one.
 ## Roadmap (from the design + reviews)
 
 - [ ] **Remote substrate driver (0.3).** The one big rock. A `morph`/`ssh` substrate:
-  daemon-on-the-box + local CLI forwarding verbs over an SSH-tunneled socket, worktree
-  capture moves CLI-side, detached submit-and-poll runs (already built), provider-side
-  TTLs, `pool reconcile` adopt/reap of forgotten instances. Requires threading the
-  fs/exec seam through sync + supervision. Freezes the `SubstrateDriver` interface
+  daemon-on-the-box + local CLI forwarding verbs over an SSH-tunneled socket, a way for
+  the box to reach the caller's worktree (the git-sync transport went with decision
+  0032), provider-side TTLs, `pool reconcile` adopt/reap of forgotten instances.
+  Requires threading the fs/exec seam through supervision. Freezes the `SubstrateDriver` interface
   (`src/drivers/types.ts`, currently design-only).
 
 - [x] **mssql `template_restore`.** PROVEN LIVE 2026-07-19: tests/mssql.test.ts (docker- and image-gated) drives BACKUP/RESTORE bake+restore against MSSQL 2022, 4/4. Original entry: Revamp binds currently re-seed (~30–50s) instead of

@@ -24,85 +24,101 @@ const USAGE = `runly — puts a working instance of a web application in front o
 Usage:
   runly up [service...] [--preset [DATASTORE=]NAME]... [--reset-data|--pristine]
            [--rebuild] [--ttl <minutes>] [--holder-pid <pid>] [--env]
-                          session lease on THIS worktree's one environment.
-                          ADDITIVE: starts the named services plus their
-                          depends_on closure (none named = every service) and
-                          never stops one that is already running. Every up
-                          applies the worktree as it is now: the due upkeep
-                          rules, then every build: of the services it runs —
-                          except a build: {run, when: [globs]} whose matched
-                          files are unchanged since its last successful build
+                          lease THIS worktree's one environment and start the
+                          named services plus their depends_on closure (none
+                          named = every service). ADDITIVE: never stops a
+                          service that is already running. Every up applies the
+                          worktree as it is now: the due upkeep rules, then the
+                          build: of every service it runs — except a
+                          build: {run, when: [globs]} whose matched files are
+                          unchanged since its last successful build
                           ('build <svc>: skipped (when: unchanged)'); --rebuild
                           runs every build regardless.
                           A running service whose build OUTPUT changed (its
                           outputs: globs; none declared = always) is restarted;
                           one whose output is unchanged, or that has no build:,
                           keeps running. Dependents are not restarted.
-                          Every datastore exists for the environment's life and
-                          keeps its data; --preset reloads ONLY that datastore
-                          from its template and restarts the running services
-                          that use it.
+                          Every datastore keeps its data; --preset reloads ONLY
+                          that datastore from its template and restarts the
+                          running services that use it. --reset-data restores
+                          every datastore; --pristine also re-runs every upkeep
+                          rule and build (it never deletes worktree files).
                           A service idle for 10 minutes (no runly verb on the
                           environment, no bytes through its port; idle: per
                           service) is stopped, its port kept; the next
                           connection starts it again and is held until it is up.
+                          Builds run in depends_on waves (parallel within a
+                          wave); builds: serial / build: {serial: true} opt out.
                           Waits in the server-wide load budget's queue when the
                           box is full ('runly plan' says whether it would).
                           Prints a short summary (--json: the context blob);
                           --env prints the 'ctx --env' lines instead.
+  runly down [service...] stop just these services (none named = all of them).
+                          The lease, the data and the public ports stay
   runly plan [service...] [--rebuild]
                           what an up would build and start, what that costs
                           (resources:, or the default — said so), and whether
                           it starts now or would wait (and for what)
-  runly destroy           tear down everything runly holds for this worktree
-                          now: services, data, copies, ports, lease, records.
-                          For a worktree pool taking a worktree back
-  runly down [service...] stop just these services (none named = all of them).
-                          The lease, the data and the public ports stay.
-  runly ctx [--env]     the consumer context blob (URLs, services, logins,
-                          conn strings and the preset each datastore holds).
+  runly ctx [--env]       a short summary of the environment (URLs, service
+                          states, datastores and the preset each holds, the
+                          login); --json for the full context blob.
                           --env prints 'export KEY=value' lines instead:
                           RUNLY_ENV_ID, RUNLY_PORT_<PORT>, RUNLY_URL_<SERVICE>,
                           RUNLY_DATASTORE_<NAME>_URL, RUNLY_DATASTORE_<NAME>_PRESET,
                           RUNLY_LOGIN_USER and RUNLY_LOGIN_PASSWORD (names
-                          uppercased, any other character as _). Run your checks
+                          uppercased, any other character as _). Run your tests
                           with them: eval "$(runly ctx --env)" && npm test
-  runly ps [--all]      what runs for this worktree: each service (state, public
+  runly ps [--all]        what runs for this worktree: each service (state, public
                           and internal port, pid, idle time, memory) and each
-                          database copy. --all for the whole server
+                          database copy. --all for the whole server, with a
+                          WORKTREE column
   runly db new <datastore> [--preset NAME] [--holder-pid <pid>]
                           a fresh copy of a datastore from the same template the
                           environments use — no lease, no ports, no services.
                           Prints its name, url and preset. It is dropped when
-                          the holder process (--holder-pid / BACKLOT_HOLDER_PID)
-                          exits or this worktree goes away, or by 'db drop'
+                          its holder process exits (--holder-pid, or the Claude
+                          Code session), when this worktree goes away, or by
+                          'db drop'
   runly db with <datastore> [--preset NAME] -- <cmd...>
                           run a command against a fresh copy (RUNLY_DB_URL,
                           RUNLY_DB_NAME), drop the copy when it exits, and exit
                           with its exit code
-  runly db ls [--all]   this worktree's database copies (--all: every one)
-  runly db drop <name>  drop one copy now
-  runly warm            run this worktree's due upkeep rules and its service
+  runly db ls [--all]     this worktree's database copies (--all: every one)
+  runly db drop <name>    drop one copy now
+  runly warm              run this worktree's due upkeep rules and its service
                           builds now — no lease, no services. For an idle worktree
                           just moved to a new commit
-  runly exec <cmd...>   run a command in the worktree with the lease's ports,
+  runly exec <cmd...>     run a command in the worktree with the lease's ports,
                           URLs and connection strings in its environment
+                          (the RUNLY_* names of 'ctx --env', and BACKLOT_PORT_*,
+                          BACKLOT_URL_*, BACKLOT_DS_*). Exits 0 or 1; --json
+                          reports the command's own exitCode
   runly logs [service...] [--lines N] [--since up|<duration>] [--grep <re>]
              [-f|--follow [--until <re>] [--timeout <s>]] [--build]
-                          the services' output, interleaved by time with a
-                          'service | ' prefix when there are several (none
-                          named = all). --since up: only the current process
+                          the services' output (last 40 lines), interleaved by
+                          time with a 'service | ' prefix when there are several
+                          (none named = all). --since up: only the current process
                           of each; --since 10m: the last ten minutes. -f keeps
                           following; --until exits 0 at the first matching line
-                          and 124 when --timeout runs out. --build: the output
-                          of each service's last build (and of upkeep)
-  runly reset-data      restore the data template on the current lease
-  runly token --role <r> [--raw]
-                          mint an auth token via the stack's auth.token hook.
-                          Default output is JSON ({token, role}); --raw prints the
-                          bare token, which is what an Authorization header wants
-  runly release         release the current lease (environment stays warm)
-  runly preview <service> [--ttl ...] [--https-port N]
+                          of each service's current process (lines before its
+                          last start never match); --timeout exits 124 when it
+                          runs out. --build: the output of each service's last
+                          build (and of upkeep)
+  runly reset-data [--preset [DATASTORE=]NAME]...
+                          restore the data of the current lease, each datastore
+                          with the preset it holds (or the one named)
+  runly token [--role <r>] [--raw]
+                          mint an auth token via the stack's auth.token hook
+                          (role default: admin; a name, also passed as
+                          RUNLY_ROLE). Default output is JSON
+                          ({token, role}); --raw prints the bare token, which is
+                          what an Authorization header wants
+  runly release           end the current lease; the environment stays for the
+                          next up
+  runly destroy           tear down everything runly holds for this worktree
+                          now: services, data, copies, ports, lease, records.
+                          For a worktree pool taking a worktree back
+  runly preview <service> [--ttl <minutes>] [--https-port N]
                           publish a service from your lease on a public quick
                           tunnel (Cloudflare by default). The URL is unauthenticated
                           — anyone with the link reaches the service. Requires
@@ -110,20 +126,23 @@ Usage:
                           With preview.publisher: tailscale it is served on this
                           machine's tailnet name instead (tailnet only);
                           --https-port pins that port for this publish.
-  runly preview stop    stop the preview tunnel on your lease
-  runly status          daemon, pool, and lease overview
+  runly preview stop      stop the preview tunnel on your lease
+  runly status            daemon, environments, leases and the load budget
   runly appliance ls|start|stop [name]
                           shared backing servers: probe, ensure up, explicit stop
   runly pool ls|recycle [<env-id>] [--force]|reconcile|gc|doctor [--fix]
                           recycle with an env-id recycles exactly that one; with
-                          none, the whole pool. A LEASED environment is never
+                          none, every environment. A LEASED environment is never
                           taken without --force (--all is the old spelling).
-                          gc reclaims service processes orphaned by an ungraceful
-                          exit; doctor lists what runly left behind (databases,
+                          reconcile reaps degraded environments now; gc reclaims
+                          service processes orphaned by an ungraceful exit;
+                          doctor lists what runly left behind (databases,
                           templates, copies, processes, listeners, state dirs)
                           and --fix removes it — only runly's own
-  runly doctor          daemon health and drift, without acting on it
-  runly daemon stop     stop the daemon (environments are recovered on next use)
+  runly doctor            daemon health and drift, without acting on it
+  runly daemon stop       stop the daemon and wait for it (60 s,
+                          BACKLOT_DAEMON_STOP_TIMEOUT_MS); environments are
+                          recovered on next use
   runly update [--check] [--force]
                           make the RUNNING daemon be the INSTALLED build. An
                           upgrade replaces the files on disk but not the daemon
@@ -134,38 +153,44 @@ Usage:
                           versions and who would rebind, and changes nothing.
                           runly never installs itself: it prints the command
                           for your install and leaves it to you.
-  runly --version       the version of this CLI
+  runly --version         the version of this CLI
 
-Holding an environment — two forms, and the right one depends on who you are:
+Holding an environment:
 
-  --ttl <minutes>          THE FORM FOR AGENTS AND SCRIPTS. The lease lives for the
-                           stated time no matter what process asked for it.
+  Under Claude Code, up and db new tether to the session automatically
+  (CLAUDE_PID, when it is a live ancestor of the CLI): the environment lives
+  while the session does and is torn down a minute after it ends.
+  BACKLOT_TETHER=off opts out.
+
+  --ttl <minutes>          the lease length (default 30) — the form for other
+                           agents and scripts. up renews it.
   --holder-pid <pid>       For an interactive shell, or any caller that OUTLIVES the
-  (BACKLOT_HOLDER_PID)     command. Ties the lease to that process: a minute after it
-                           exits, the environment is torn down (services, data,
-                           ports, lease) rather than waiting out the TTL.
-
-Under Claude Code, up and db new tether to the agent automatically (CLAUDE_PID,
-when it is a live ancestor of the CLI); BACKLOT_TETHER=off opts out.
+  (BACKLOT_HOLDER_PID)     command. Ties the environment to that process: a minute
+                           after it exits, the environment is torn down (services,
+                           data, ports, lease); while it lives, the lease does not
+                           expire.
 
 'BACKLOT_HOLDER_PID=$$ runly up' works at a shell prompt and CANNOT work from an
 agent harness: each command runs in a fresh shell, so '$$' names a process that has
 already exited. Such a lease would be reclaimable the instant it was created — the
-environment would be handed to the next caller while you were still using it — so
-runly refuses the bind instead. Use --ttl.
+environment would be torn down while you were still using it — so runly refuses
+the bind instead. Use --ttl.
 
 up and reset-data accept --preset NAME (one datastore), or repeatable
 --preset DATASTORE=NAME; a named datastore is reloaded from its template, every
 other one keeps its data. ctx reports the preset each datastore holds. db new and
 db with take --preset NAME for their one datastore.
 
+Verbs that act on a lease or a copy take --holder <name> to act for another
+holder than the caller's directory.
+
 Every verb accepts --json. Long verbs (up/warm/reset-data) show live progress
 on a terminal (stderr); force with --progress, silence with --quiet. stdout stays clean.
 Exit codes: 0 ok · 1 work-error · 2 env-error · 3 infra-error · 64 usage.
 
-Removed in 0.13 (decision 0032; each now exits 64 naming its replacement):
-sync, bind, pull, run, job, --watch, --detach, --pull, --ref.
-Removed in 0.15 (decision 0034): up --data-only — use 'runly db new|with'.`;
+Removed verbs and flags exit 64 naming their replacement: sync, bind, pull, run,
+job, --watch, --detach, --pull, --ref (decision 0032) and --data-only (decision
+0034; use 'runly db new|with').`;
 
 const rawArgv = process.argv.slice(2);
 const verb = rawArgv[0];

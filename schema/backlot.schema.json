@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://raw.githubusercontent.com/backlot-dev/backlot/main/schema/backlot.schema.json",
   "title": "Runly stack manifest (runly.yml; backlot.yml and stack.yaml accepted)",
-  "description": "What a repo declares so runly can broker environments for it. Everything {{...}} is injected by the engine (symbolic ports, datastore URLs, service URLs). Policy (pool sizes, TTLs, substrates) never lives here.",
+  "description": "What a repo declares so runly can run environments for it, in the worktree the manifest lives in. Everything {{...}} is injected by the engine (ports, public_ports, services.<svc>.url, datastores.<ds>.url/.ns). Policy (TTLs, pool caps, the load budget, substrates) never lives here.",
   "type": "object",
   "required": [
     "name",
@@ -13,7 +13,7 @@
     "name": {
       "type": "string",
       "pattern": "^[a-z0-9][a-z0-9-]*$",
-      "description": "Stack identity; pools are keyed by repo + this name."
+      "description": "Stack name. A stack is this name plus the worktree the manifest is in; each worktree has one environment."
     },
     "services": {
       "type": "object",
@@ -21,7 +21,7 @@
       "additionalProperties": {
         "$ref": "#/$defs/service"
       },
-      "description": "Supervised shell commands, one per service. Commands, not containers."
+      "description": "Supervised shell commands, one per service, run in the worktree. Commands, not containers."
     },
     "appliances": {
       "type": "object",
@@ -34,12 +34,16 @@
       "type": "object",
       "additionalProperties": {
         "$ref": "#/$defs/datastore"
-      }
+      },
+      "description": "Data an environment owns: one namespace per environment (and per `runly db` copy) on an externally run server, or a sqlite file."
     },
     "builds": {
-      "enum": ["parallel", "serial"],
+      "enum": [
+        "parallel",
+        "serial"
+      ],
       "default": "parallel",
-      "description": "How one `up` runs its services' builds. `parallel` (default): in depends_on waves — a build runs after the builds of what its service depends on, and the builds of one wave run at once (the load budget holds their summed resources). `serial`: one at a time, in manifest order — for builds that share an output or a lock the build tool does not handle."
+      "description": "How one `up` (or `warm`) runs its services' builds. `parallel` (default): in depends_on waves \u2014 a build runs after the builds of what its service depends on, and the builds of one wave run at once (the load budget holds the costliest wave's summed resources). `serial`: one at a time, in manifest order \u2014 for builds that share an output or a lock the build tool does not handle."
     },
     "caches": {
       "type": "array",
@@ -57,7 +61,7 @@
           "items": {
             "type": "string"
           },
-          "description": "Accepted for compatibility and ignored: since decision 0032 there is no environment-side reset for it to protect files from."
+          "description": "Accepted and ignored."
         },
         "include": {
           "type": "array",
@@ -66,21 +70,22 @@
           },
           "description": "Git-ignored files that still count as source (.env.local), so an upkeep `when:` glob can match them."
         }
-      }
+      },
+      "description": "Only `include` is read; `keep` is accepted and ignored."
     },
     "outputs": {
       "type": "array",
       "items": {
         "type": "string"
       },
-      "description": "Accepted and ignored since decision 0032: it listed files `runly run` reported as changed, and `runly run` was removed. Build outputs that decide a restart are declared per service (`services.<name>.outputs`)."
+      "description": "Accepted and ignored. Build outputs that decide a restart are declared per service (`services.<name>.outputs`)."
     },
     "upkeep": {
       "type": "array",
       "items": {
         "$ref": "#/$defs/upkeepRule"
       },
-      "description": "Closed list of fingerprint->action rules, run at bind time in order (decision 0008)."
+      "description": "Closed list of (trigger files -> command) rules, run in order by `up` and `runly warm` when the content of a rule's trigger files changed since it last ran in this worktree."
     },
     "auth": {
       "type": "object",
@@ -103,13 +108,13 @@
         },
         "token": {
           "type": "string",
-          "description": "Command minting an auth token; {{role}} available. Must print JSON."
+          "description": "Command printing an auth token on stdout (trimmed; `runly token` wraps it as {token, role}); {{role}} available, also as RUNLY_ROLE in its environment. Runs in the worktree."
         }
       }
     },
     "checks": {
       "type": "object",
-      "description": "Accepted and ignored since decision 0032: `runly run` was removed. A manifest that still declares checks loads, with a one-line deprecation warning; repo scripts read the environment from `runly ctx --env` instead."
+      "description": "Accepted and ignored, with a one-line warning: runly runs no checks. Repo scripts read the environment from `runly ctx --env`."
     },
     "preview": {
       "type": "object",
@@ -117,7 +122,7 @@
       "properties": {
         "forbidden": {
           "type": "boolean",
-          "description": "When true, `runly preview` is refused (work-error). Stacks with fixed dev credentials must set this."
+          "description": "When true, `runly preview` is refused (work-error), and a bind ends a live preview. Stacks with fixed dev credentials must set this."
         },
         "publisher": {
           "type": "string",
@@ -174,7 +179,7 @@
       "properties": {
         "run": {
           "type": "string",
-          "description": "The supervised process. Daemon is its parent. Executes under `sh` (dash on Ubuntu, bash-as-sh on macOS) \u2014 write POSIX sh, no bashisms."
+          "description": "The supervised process; the daemon is its parent. Runs in the worktree (or `cwd`) under `sh` (dash on Ubuntu, bash-as-sh on macOS) \u2014 write POSIX sh, no bashisms."
         },
         "build": {
           "oneOf": [
@@ -198,7 +203,7 @@
                   "items": {
                     "type": "string"
                   },
-                  "description": "Globs (relative to the stack root, git-listed, minus caches:) of what the build reads. When none of the matched files changed (path, size, mtime) since the last SUCCESSFUL build of this service in this worktree, the build is skipped and `up` says so; `up --rebuild` forces it (decision 0038)."
+                  "description": "Globs (relative to the stack root, git-listed, minus caches:) of what the build reads. While none of the matched files changed (path, size, mtime) since the last SUCCESSFUL build of this service in this worktree, the build is skipped and `up` says so; `up --rebuild` forces it."
                 },
                 "serial": {
                   "type": "boolean",
@@ -208,7 +213,7 @@
               }
             }
           ],
-          "description": "String form: run on every `up` that starts or keeps this service, and on every `runly warm` \u2014 runly keeps no build cache; the build tool decides what is current (decision 0032). Object form `{run, when}`: skipped while its `when:` files are unchanged since the last successful build (decision 0038). Executes under `sh` (dash on Ubuntu, bash-as-sh on macOS) \u2014 write POSIX sh, no bashisms."
+          "description": "String form: runs on every `up` that starts or keeps this service, and on every `runly warm` \u2014 runly keeps no build cache; the build tool decides what is current. Object form `{run, when, serial}`: skipped while its `when:` files are unchanged since the last successful build; `serial: true` runs it alone. Builds otherwise run in depends_on waves (see top-level `builds`). Runs under `sh` (dash on Ubuntu, bash-as-sh on macOS) \u2014 write POSIX sh, no bashisms."
         },
         "outputs": {
           "oneOf": [
@@ -246,11 +251,11 @@
               }
             }
           ],
-          "description": "Globs (relative to the stack root) of what `build:` produces, e.g. `backend/host/Fid.Host/bin/**` or `dist/web-audit`. Every `up` snapshots them around the build and restarts this service only when they changed. Without it, a service with a build is restarted after every build (decision 0032). The object form chooses how they are compared (decision 0038)."
+          "description": "Globs (relative to the stack root) of what `build:` produces, e.g. `backend/Host/bin/**` or `dist/web`. Every `up` snapshots them around the build and restarts this service only when they changed. Without it, a service with a build is restarted after every build. The object form chooses how they are compared."
         },
         "watch_run": {
           "type": "string",
-          "description": "Accepted and ignored since decision 0032 (`--watch` was removed); the service always runs `run:`."
+          "description": "Accepted and ignored; the service always runs `run:`."
         },
         "cwd": {
           "type": "string",
@@ -266,7 +271,7 @@
           "additionalProperties": {
             "type": "string"
           },
-          "description": "Injected environment; values may template {{ports.*}}, {{public_ports.*}}, {{datastores.*.url}}, {{services.*.url}}."
+          "description": "Injected environment; values may template {{ports.*}}, {{public_ports.*}}, {{services.*.url}}, {{datastores.*.url}}, {{datastores.*.ns}}."
         },
         "env_from": {
           "type": "object",
@@ -279,7 +284,7 @@
               "optional"
             ]
           },
-          "description": "Allowlisted caller environment inputs. `up` refreshes values from its caller; reset-data retains the lease's inputs. A supplied value overrides a same-named env entry; a missing optional input keeps an explicit env default, otherwise masks the daemon value. Memory only: re-run up after a daemon restart."
+          "description": "Allowlisted caller environment inputs: `required` refuses an `up` without the variable, `optional` may be missing. Every `up` refreshes the values from its caller; reset-data keeps them. A supplied value overrides a same-named env entry; a missing optional input keeps an explicit env default, otherwise masks the daemon's value. Memory only: re-run up after a daemon restart. Not passed to builds, upkeep or exec."
         },
         "ready": {
           "$ref": "#/$defs/readiness"
@@ -293,11 +298,11 @@
           "items": {
             "type": "string"
           },
-          "description": "Services that must be ready before this one starts."
+          "description": "Services that must be ready before this one starts. `up <svc>` starts them too, and a wake starts them through their ports; a service whose readiness needs another must list it."
         },
         "hot_reload": {
           "type": "boolean",
-          "description": "Accepted and ignored since decision 0032 (`sync` was removed). Whether an `up` restarts a running service is decided by its build `outputs:`; a service without a build keeps running."
+          "description": "Accepted and ignored. Whether an `up` restarts a running service is decided by its build `outputs:`; a service without a build keeps running."
         },
         "idle": {
           "oneOf": [
@@ -310,7 +315,7 @@
               "minimum": 0
             }
           ],
-          "description": "How long this service may go without client bytes through its public port and without a runly verb on its environment before it is stopped; the next connection starts it again (decision 0035). A duration (90s, 10m, 2h), seconds as a number, or `never`. Default BACKLOT_SERVICE_IDLE_MS (10 minutes)."
+          "description": "How long this service may go without client bytes through its public port and without a runly verb on its environment before it is stopped; the next connection to its port starts it again (leased environments only). A duration (90s, 10m, 2h), seconds as a number, or `never`/`off`. Default BACKLOT_SERVICE_IDLE_MS (10 minutes)."
         },
         "resources": {
           "$ref": "#/$defs/resources"
@@ -324,7 +329,7 @@
       "properties": {
         "http": {
           "type": "string",
-          "description": "Path polled on the service's port until 200."
+          "description": "Path requested on the service's internal port until it answers 200."
         },
         "log": {
           "type": "string",
@@ -332,7 +337,7 @@
         },
         "cmd": {
           "type": "string",
-          "description": "Command that must exit 0."
+          "description": "Command that must exit 0 (run in the worktree)."
         },
         "timeout": {
           "type": "number",
@@ -372,7 +377,7 @@
         },
         "url": {
           "type": "string",
-          "description": "Connection-string template handed to services and `runly ctx --env`; {{ns}} available. Required for server drivers; ignored for sqlite (the ns IS the file path)."
+          "description": "Connection-string template handed to services, `ctx` and `runly ctx --env`; {{ns}} available. Required for server drivers; ignored for sqlite (the ns IS the file path)."
         },
         "create": {
           "type": "string",
@@ -380,29 +385,36 @@
         },
         "drop": {
           "type": "string",
-          "description": "Repo command that drops a namespace; {{ns}} available. Best-effort (run before restore and on recycle)."
+          "description": "Repo command that drops a namespace; {{ns}} available. Run before a restore, at teardown and for copies (recorded when the namespace is created, so a later drop needs no manifest). Required for `runly db` copies of a server datastore."
         },
         "template_restore": {
           "type": "string",
-          "description": "Repo command that clones a baked template namespace into a fresh one; {{template}} and {{ns}} available (e.g. postgres: createdb -T {{template}} {{ns}}). When present, `create` bakes once per seed-content hash and every bind restores in seconds."
+          "description": "Repo command that clones a baked template namespace into a fresh one; {{template}} and {{ns}} available (e.g. postgres: createdb -T {{template}} {{ns}}). When present, `create` bakes a template once per preset and template key (the create command, plus the trigger content of an @rebake-template rule), and every bind and copy restores from it."
         },
         "presets": {
           "type": "array",
           "items": {
             "type": "string"
           },
-          "description": "Named seed states."
+          "description": "Named seed states; `--preset` and `default_preset` must name one of them. Omitted: the preset is `default` (or the default_preset name)."
         },
         "default_preset": {
-          "description": "The preset a datastore is created with when none is named. A name; the pre-0.13 {run, session} form is still accepted (session wins, then run).",
+          "description": "The preset a datastore is created with when none is named (default: the first of `presets`). A preset name, or `{session, run}` read as one value (session, then run).",
           "oneOf": [
-            { "type": "string", "minLength": 1 },
+            {
+              "type": "string",
+              "minLength": 1
+            },
             {
               "type": "object",
               "additionalProperties": false,
               "properties": {
-                "run": { "type": "string" },
-                "session": { "type": "string" }
+                "run": {
+                  "type": "string"
+                },
+                "session": {
+                  "type": "string"
+                }
               }
             }
           ]
@@ -410,12 +422,12 @@
         "template": {
           "type": "boolean",
           "default": false,
-          "description": "sqlite only: bake a template file per seed-content hash and restore by copy. Server drivers use template_restore instead."
+          "description": "sqlite only: bake a template file per preset and template key, and restore by copy. Server drivers use template_restore instead."
         },
         "ephemeral": {
           "type": "boolean",
           "default": false,
-          "description": "No presets; reset-data = flush (Redis-class)."
+          "description": "No presets or templates; `create` runs on first bind and a reset runs `drop` as the flush (Redis-class)."
         },
         "list": {
           "type": "string",
@@ -433,11 +445,11 @@
       "properties": {
         "when": {
           "type": "string",
-          "description": "A file path or glob(...) whose content hash triggers the rule (direction-agnostic per-env ledger)."
+          "description": "A file path or glob (optionally written glob(...)), relative to the stack root, whose matched files' content triggers the rule. Recorded per worktree, direction-agnostic: a changed hash in either direction runs it again."
         },
         "run": {
           "type": "string",
-          "description": "Repo command, or an engine built-in prefixed with @ (e.g. @rebake-template <datastore>)."
+          "description": "Repo command run in the worktree, or the engine built-in `@rebake-template <datastore>` (rebakes that datastore's template)."
         },
         "timeout": {
           "type": "number",
@@ -476,7 +488,7 @@
         },
         "resources": {
           "$ref": "#/$defs/resources",
-          "description": "What the appliance costs while running; counted against the load budget when an `up` would start it (decision 0036). Its build: entry is ignored."
+          "description": "What the appliance costs while running; counted against the load budget when an `up` would start it. Its build: entry is ignored."
         }
       }
     },
@@ -496,7 +508,7 @@
     "resources": {
       "type": "object",
       "additionalProperties": false,
-      "description": "What this costs the box, for the server-wide load budget (decision 0036). Left out = a conservative default (run 512M / 0.5 cpu; build 1G / 1 cpu), which `runly plan` says it assumed.",
+      "description": "What this costs the box, for the server-wide load budget. Left out = a conservative default (run 512M / 0.5 cpu; build 1G / 1 cpu), which `runly plan` says it assumed.",
       "properties": {
         "memory": {
           "$ref": "#/$defs/size",
