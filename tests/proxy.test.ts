@@ -285,7 +285,7 @@ describe('the proxy in front of a real environment', () => {
       `name: rebuild\nservices:\n  web: { build: "true", run: node server.mjs, port: web, env: { PORT: "{{ports.web}}", BOOT_DELAY_MS: "2500" }, ready: { log: listening, timeout: 20 } }\n`,
     );
     const up = await d.cli(['up', '--json'], wt);
-    expect(up.exitCode, up.stderr).toBe(0);
+    expect(up.exitCode, up.stderr + up.stdout).toBe(0);
     const pub = portsOf(up).web!;
     const second = d.cli(['up', '--json'], wt);
     await new Promise((r) => setTimeout(r, 800));

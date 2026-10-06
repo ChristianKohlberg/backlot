@@ -1,6 +1,6 @@
 # 0035. Each service stops on its own idle clock and starts on demand; an environment goes with its agent or its worktree
 
-- Status: Accepted
+- Status: Accepted — amended by [0039](0039-teardown-keeps-templates-a-leased-environment-survives-a-crash-loop.md): only verbs that use an environment are activity (`ctx`, `ps`, `plan`, `logs` are not); `destroy` keeps the worktree's upkeep and build records
 - Date: 2026-10
 - Amends: [0021](0021-quiesce-is-not-a-teardown.md) — the leased-idle quiesce of a
   whole environment (`leasedIdleTtlMs`) is replaced by a per-service idle stop

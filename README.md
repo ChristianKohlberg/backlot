@@ -80,9 +80,10 @@ run under `sh` in the worktree; write POSIX sh.
 | `datastores.<ds>.presets` | Named seed states. |
 | `datastores.<ds>.default_preset` | The preset a new datastore is created with (else the first preset). A name, or `{ session, run }` read as one value. |
 | `datastores.<ds>.ephemeral` | `true`: no presets or templates; a reset runs `drop:` as a flush (Redis-class). |
+| `datastores.<ds>.copies_only` | `true`: never provisioned for an environment; only the source of `runly db new\|with` copies (template baked on the first copy). No service may template it; `ctx` does not list it. |
 | `datastores.<ds>.list` | Command printing the namespaces on the server, one per line; read only by `runly pool doctor`. |
 | `appliances.<name>` | A shared backing server: `probe` (required), `start` (run once when the probe fails), `stop` (only for `runly appliance stop`), `ready`, `timeout` (60), `resources`. |
-| `upkeep[]` | `{ when: <path or glob>, run: <cmd>, timeout: <s> }`: runs when the matched files' content changed since it last ran in this worktree. `run: "@rebake-template <ds>"` rebakes that datastore's template. Timeout 300 s. |
+| `upkeep[]` | `{ when: <path or glob>, run: <cmd>, timeout: <s> }`: runs when the matched files' content changed since it last ran in this worktree. `run: "@rebake-template <ds>"` makes the matched files part of that datastore's template key: changed content gets a new template (baked once, then reused) and reloads the store; `--pristine` rebakes. Timeout 300 s. |
 | `builds` | `parallel` (default): builds run in `depends_on` waves, each wave at once. `serial`: one at a time, in manifest order. |
 | `caches` | Build and install output in the worktree (`node_modules`, `**/obj`); never an upkeep trigger. |
 | `sync.include` | Git-ignored files an upkeep `when:` may still match (`.env.local`). |
@@ -117,7 +118,7 @@ work-error (your code), `2` env-error (the environment), `3` infra-error
 | `  --holder-pid <pid>` | Tie the environment to a process that outlives the command; torn down a minute after it exits. |
 | `runly down [svc...]` | Stop these services (none = all); lease, data and ports stay. |
 | `runly ctx [--env]` | A short summary (service URLs and states, datastores, login); `--json` the full context; `--env` prints `export RUNLY_*=…` lines for `eval`. |
-| `runly ps [--all]` | Services (state, ports, pid, idle, memory) and database copies of this worktree, or of the whole box (with a worktree column). |
+| `runly ps [--all]` | Services (state, ports, pid, idle, memory) and database copies of this worktree, or of the whole box (with a worktree column). A service that crash-looped shows `failed` with its last exit; the next `up` retries it. |
 | `runly plan [svc...] [--rebuild]` | What an `up` would build and start, what it costs, and whether it starts now or waits for the load budget. |
 | `runly logs [svc...]` | Service logs, interleaved (last 40 lines). `--lines N`, `--since up\|10m`, `--grep <re>`, `--build`. |
 | `  -f [--until <re>] [--timeout <s>]` | Follow; `--until` exits 0 on the first matching line of the current process (never an earlier one), `--timeout` exits 124. |
@@ -129,7 +130,7 @@ work-error (your code), `2` env-error (the environment), `3` infra-error
 | `runly reset-data [--preset ds=NAME]` | Restore the data of the current lease. |
 | `runly token [--role <r>] [--raw]` | Run `auth.token` (role default `admin`, also in `RUNLY_ROLE`); `--raw` prints the bare token. |
 | `runly release` | End the lease; the environment stays for the next `up`. |
-| `runly destroy` | Tear down everything runly holds for this worktree: services, data, copies, ports, lease. |
+| `runly destroy` | Tear down everything runly holds for this worktree: services, data, copies, ports, lease. Its upkeep and build records and templates stay. |
 | `runly preview <svc> [--ttl <minutes>] [--https-port N]` | Publish one service through the preview publisher. Unauthenticated. |
 | `runly preview stop` | End the preview. |
 | `runly status` / `runly doctor` | Daemon, environments and budget / health and drift report. |
@@ -138,6 +139,7 @@ work-error (your code), `2` env-error (the environment), `3` infra-error
 | `runly pool doctor [--fix]` | List (and with `--fix` remove) what runly left behind. Only runly's own. |
 | `runly update [--check] [--force]` | Restart the daemon onto the installed build. Leases survive. |
 | `runly daemon stop` / `runly --version` | Stop the daemon, waiting up to 60 s (`BACKLOT_DAEMON_STOP_TIMEOUT_MS`) / print the CLI version. |
+| `runly daemon install [--print]` / `daemon uninstall` | Supervise the daemon with a systemd user unit (Linux) or launchd agent (macOS) that restarts it when it crashes; `--print` shows the unit. |
 
 The verbs that act on a lease or copy take `--holder <name>` to act for a holder
 other than the caller's directory (the default). `up`, `warm` and `reset-data` show progress on a terminal;

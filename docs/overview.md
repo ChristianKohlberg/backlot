@@ -75,7 +75,10 @@ A test lane that needs a database and not the application takes a **copy**:
 `runly db with main -- npm test` restores a fresh copy from the environments'
 template, runs the command with `RUNLY_DB_URL` and `RUNLY_DB_NAME`, drops the
 copy when it exits (also on failure and Ctrl-C) and exits with its code. Copies
-need no lease and run in parallel.
+need no lease and run in parallel. If the `db with` process itself is killed
+(SIGKILL), the daemon drops the copy at its next sweep and stops the command
+first, with everything it started, so nothing keeps running against a dropped
+database.
 
 `runly exec <cmd>` is the other way in: it runs a command in the worktree with
 the same `RUNLY_*` variables (plus `BACKLOT_URL_*`, `BACKLOT_PORT_*` and
@@ -87,15 +90,15 @@ It exits 0 or 1; `--json` reports the command's own `exitCode`.
 | Event | What happens |
 | --- | --- |
 | `up` | Creates the worktree's environment if there is none, takes or renews the lease (`--ttl`, default 30 min) and starts services. |
-| A service sees no runly verb on its environment and no client byte on its port for 10 min (`idle:` per service, `BACKLOT_SERVICE_IDLE_MS`) | That service is stopped (`ps` says `idle`). Its port, data and the lease stay. |
+| A service sees no runly verb that uses its environment and no client byte on its port for 10 min (`idle:` per service, `BACKLOT_SERVICE_IDLE_MS`) | That service is stopped (`ps` says `idle`). Its port, data and the lease stay. The verbs that count are `up`, `reset-data`, `exec`, `token`, `preview` and `down`; reading (`ctx`, `ps`, `plan`, `logs`, `status`) does not. |
 | A connection reaches an idle service's port | The service starts again (its dependencies too, through their own ports) and the connection is held until it is ready (`BACKLOT_PROXY_HOLD_MS`, 90 s). Only a leased environment wakes; a service stopped with `down` stays down. |
 | The holder process dies (`--holder-pid`, `BACKLOT_HOLDER_PID`, or the Claude Code session) | After a one-minute grace (`BACKLOT_TETHER_GRACE_MS`) everything goes: services, data, the copies that process held, preview, ports, lease. While the holder lives, the lease does not expire. |
 | The lease's TTL runs out (no holder process) | The lease ends; the environment stays for the worktree's next `up`. Its services stop after their idle time and are not woken by traffic. |
 | `release` | The same as a TTL end, now. |
 | The worktree is deleted | Everything goes, leased or not, also across a daemon restart. |
-| `destroy` | Everything goes now, the worktree's database copies included. For worktree pools that take a worktree back. |
+| `destroy` | Everything goes now, the worktree's database copies included. For worktree pools that take a worktree back. The worktree's upkeep and build records and its templates stay, so the next `up` does not redo installs or bakes. |
 | The box needs a slot (`BACKLOT_POOL_MAX_TOTAL`) | The least recently used unleased environment idle for 30 min (`BACKLOT_IDLE_TTL_MS`) is recycled. |
-| A service crashes past its restart budget | The environment is marked `degraded` and recycled; the next `up` builds a fresh one. |
+| A service crashes past its restart budget (4 exits in quick succession) | Leased: that service is stopped and shown `failed` in `ps` and `ctx` with its last exit (`runly logs <svc>` says why); the environment, its data, its other services and its logs stay, and the next `up` starts it again. Unleased: the environment is marked `degraded` and recycled. |
 
 **Claude Code.** Claude Code exports `CLAUDE_PID`, the session process that every
 Bash tool call runs under. When it is a live ancestor of the CLI, `up` and
@@ -109,6 +112,27 @@ already exited, so runly refuses it (exit 64); use `--ttl` there.
 
 A daemon restart (`runly update`) keeps leases, data and ports; services stop and
 the next `up` starts them.
+
+### The daemon
+
+The CLI starts the daemon on first use. If it crashes, the next CLI command
+starts a new one, which takes the ports back and reaps what the old one left; until
+then the ports refuse connections. To have it restarted at once instead, install
+a supervisor:
+
+```bash
+runly daemon install --print   # show the unit (systemd user unit on Linux, launchd agent on macOS)
+runly daemon install           # write and enable it; start the daemon through it if none runs
+runly update                   # if a daemon was already running: restart it under the unit (leases survive)
+runly daemon uninstall         # disable and remove it
+```
+
+The unit restarts the daemon a second after it crashes and leaves its services
+alone when it stops. It runs with the `PATH` and `BACKLOT_*` settings of the
+shell that installed it; reinstall after changing them. Once it is installed, a
+CLI that finds no daemon starts the unit rather than a daemon of its own, and
+`runly status` reports `supervisor: systemd` (or `launchd`). There is one unit
+per state root. runly never installs it by itself.
 
 ## Ports
 
@@ -124,7 +148,10 @@ daemon listens on it and forwards TCP to the service, which is started on a fres
   public everywhere;
 - client bytes are counted per port (`proxy` in `ctx --json` and `status
   --json`); runly's readiness probes bypass the proxy and do not count;
-- it is plain TCP, so WebSockets pass through.
+- it is plain TCP, so WebSockets pass through;
+- a connection the service accepts and drops before answering (it crashed, or
+  an `up` is restarting it) is retried with what the client sent, like a
+  refused one, instead of reaching the client as an empty reply.
 
 Derived tailnet preview ports use a third block (32000–32767). The blocks sit
 below the OS ephemeral range and can be moved with `BACKLOT_PORT_RANGE`,
@@ -151,6 +178,10 @@ was down), and the move is reported.
    (a dev server reloads itself). Dependents of a restarted service are not
    restarted: its port did not move.
 4. Starts the services that are not running yet.
+
+On the full path (below) the datastores are restored while the services build;
+the services start once both are done. A datastore's `create:` must therefore
+not need a service's build; put such a step in an upkeep rule.
 
 A changed manifest, changed caller inputs, an upkeep rule that ran, a moved port,
 `--reset-data`/`--pristine`, or an environment that is unhealthy or has nothing
@@ -195,9 +226,20 @@ preset must be in the datastore's `presets:`. A new datastore gets
 Data states are restored from **templates**: the `create:` command bakes one per
 preset, and every environment and copy restores from it (sqlite by file copy with
 `template: true`, server drivers through `template_restore:`). A template is keyed
-by the `create:` command; to rebake when the seed changes, add an upkeep rule
-`{ when: "seeds/**", run: "@rebake-template main" }`. `ephemeral: true`
-datastores (Redis-class) have no presets; a reset runs `drop:` as a flush.
+by the `create:` command and, with an upkeep rule
+`{ when: "seeds/**", run: "@rebake-template main" }`, by the content of the files
+that rule matches. A template whose key matches is reused, also by a new
+environment after `destroy`; when the seed files change, the next `up` bakes a new
+one and reloads the datastore from it. `--pristine` bakes the current templates
+again. Restores of one template run side by side; a failed restore is logged
+(`runly status` events, kind `template`) and retried, and only a second failure
+rebakes. `ephemeral: true` datastores (Redis-class) have no presets; a reset runs
+`drop:` as a flush.
+
+A datastore only tests use, never the application, can be `copies_only: true`:
+environments never get one, so it costs nothing until a `runly db new|with`
+copy bakes its template (once, then reused). No service may template it, and
+`ctx` does not list it.
 
 `runly db new <ds>` makes a copy that lives until you `db drop` it, its holder
 process exits, or its worktree is deleted; `db ls` lists them. A server
@@ -314,7 +356,9 @@ Every failure carries a class, and the class says who acts:
 | `infra-error` | something external (database down, version skew) | 3 | act on the message; nobody's code is blamed |
 | usage | a wrong or removed flag or verb | 64 | read the message |
 
-A service that dies during a bind fails it as env-error. `fatal_logs` fails a
+A service that dies during a bind fails it as env-error; one that crash-loops
+fails it as work-error naming the service, and the services that run keep
+running. `fatal_logs` fails a
 start in seconds instead of waiting for the readiness timeout. When the CLI and
 the running daemon are different builds, every verb except `update`, `doctor`
 and `daemon stop` fails with infra-error until `runly update` restarts the daemon.

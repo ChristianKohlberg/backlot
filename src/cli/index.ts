@@ -1129,6 +1129,15 @@ async function runWithCopy(parts: string[], copy: DbCopy): Promise<number> {
   const child = parts.length === 1
     ? spawn(parts[0]!, { stdio: 'inherit', env, shell: true, detached: ownGroup })
     : spawn(parts[0]!, parts.slice(1), { stdio: 'inherit', env, detached: ownGroup });
+  // Listen before anything is awaited: a command that ends while the
+  // attach RPC is in flight must not be missed.
+  const ended = new Promise<number>((resolve) => {
+    child.on('error', (err) => {
+      console.error(`runly db with: could not start '${parts[0]}': ${err.message}`);
+      resolve(127);
+    });
+    child.on('exit', (code, signal) => resolve(code ?? (signal ? 128 + (constants.signals[signal] ?? 0) : 1)));
+  });
   if (child.pid !== undefined) {
     // Best effort: a daemon that cannot record it still finds the command by
     // its tag on Linux.
@@ -1155,18 +1164,11 @@ async function runWithCopy(parts: string[], copy: DbCopy): Promise<number> {
   process.on('SIGINT', onInt);
   process.on('SIGTERM', onTerm);
   process.on('SIGHUP', onHup);
-  return new Promise((resolve) => {
-    child.on('error', (err) => {
-      console.error(`runly db with: could not start '${parts[0]}': ${err.message}`);
-      resolve(127);
-    });
-    child.on('exit', (code, signal) => {
-      process.off('SIGINT', onInt);
-      process.off('SIGTERM', onTerm);
-      process.off('SIGHUP', onHup);
-      resolve(code ?? (signal ? 128 + (constants.signals[signal] ?? 0) : 1));
-    });
-  });
+  const code = await ended;
+  process.off('SIGINT', onInt);
+  process.off('SIGTERM', onTerm);
+  process.off('SIGHUP', onHup);
+  return code;
 }
 
 /** A plain, aligned table; `-` for an empty cell. */
