@@ -102,6 +102,28 @@ export class EnvSupervisor {
   }
 
   start(name: string, spec: ServiceSpec, env: NodeJS.ProcessEnv, secrets: string[] = []): void {
+    // A start while the previous incarnation waits out a crash backoff (it is
+    // missing from pids(), so a wake or an `up` starts it again): the pending
+    // relaunch is cancelled first. Left armed, it spawned a second process
+    // the map no longer named — untracked, and squatting the internal port.
+    const previous = this.services.get(name);
+    if (previous) {
+      previous.expectedExit = true;
+      if (previous.restartTimer) {
+        clearTimeout(previous.restartTimer);
+        previous.restartTimer = null;
+      }
+      if (previous.proc?.pid && previous.proc.exitCode === null && previous.proc.signalCode === null) {
+        // Still running (a caller that should have stopped it first): its
+        // whole group goes, rather than run on beside the new one.
+        try {
+          process.kill(-previous.proc.pid, 'SIGKILL');
+        } catch {
+          /* already gone */
+        }
+      }
+      this.note(name, 'replaced by a new start');
+    }
     const cmd = spec.run;
     // A repo can already run arbitrary shell here, so this is not a privilege
     // boundary — it makes an ACCIDENT loud. `cwd: ../sibling` silently ran the

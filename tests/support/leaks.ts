@@ -10,6 +10,7 @@
 import { readdirSync, readFileSync, existsSync, rmSync } from 'node:fs';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { join } from 'node:path';
+import { execFileSync } from 'node:child_process';
 
 export interface Leaked {
   pid: number;
@@ -144,4 +145,33 @@ export function disposeStateSync(stateDir: string): void {
   for (let i = 0; i < 20 && processesUnder(stateDir).length > 0; i++) sleepSync(100);
   for (const p of processesUnder(stateDir)) kill(p.pid, 'SIGKILL');
   rmSync(stateDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+}
+
+/** Name for a docker container a test starts: tagged with this run's id so
+ *  the teardown's leak check finds it (and only it). */
+export function testContainerName(kind: string): string {
+  const run = process.env.RUNLY_TEST_RUN_ID ?? 'norun';
+  return `runly-${kind}-test-${run}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+/** Remove every container of this run (runly-*-test-<run>-*) still present;
+ *  returns their names. No docker: nothing to check. */
+export function removeTestContainers(run: string): string[] {
+  let names: string[];
+  try {
+    names = execFileSync('docker', ['ps', '-a', '--format', '{{.Names}}'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 15_000 })
+      .split('\n').map((n) => n.trim()).filter(Boolean);
+  } catch {
+    return [];
+  }
+  const mine = new RegExp(`^runly-[a-z0-9]+-test-${run}-[a-z0-9]+$`);
+  const leaked = names.filter((n) => mine.test(n));
+  for (const n of leaked) {
+    try {
+      execFileSync('docker', ['rm', '-f', n], { stdio: 'ignore', timeout: 30_000 });
+    } catch {
+      /* reported anyway */
+    }
+  }
+  return leaked;
 }

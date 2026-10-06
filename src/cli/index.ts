@@ -4,7 +4,7 @@
  * human); exit codes are contractual — 0 ok, 1 work-error, 2 env-error,
  * 3 infra-error, 64 usage. See docs/architecture.md §11.
  */
-import { ensureDaemon, daemonInfo, rpc, classifyClientError, awaitDaemonGone, DAEMON_STOP_TIMEOUT_MS, type RpcError, type RpcResponse } from './client.js';
+import { ensureDaemon, daemonInfo, rpc, classifyClientError, awaitDaemonGone, daemonStopTimeoutMs, type RpcError, type RpcResponse } from './client.js';
 import { isAlive } from '../core/procscan.js';
 import { join } from 'node:path';
 import { stateRoot } from '../core/paths.js';
@@ -17,12 +17,13 @@ import { BrokerError } from '../core/util.js';
 import { parseSince, showLogs, type LogsSpec } from './logs.js';
 import { autoTether } from './tether.js';
 import { formatDuration, formatSize, parseDuration } from '../core/units.js';
+import { exportLines, shellValue } from '../core/env-vars.js';
 
 const USAGE = `runly — puts a working instance of a web application in front of you.
 
 Usage:
   runly up [service...] [--preset [DATASTORE=]NAME]... [--reset-data|--pristine]
-           [--rebuild] [--ttl <minutes>] [--holder-pid <pid>]
+           [--rebuild] [--ttl <minutes>] [--holder-pid <pid>] [--env]
                           session lease on THIS worktree's one environment.
                           ADDITIVE: starts the named services plus their
                           depends_on closure (none named = every service) and
@@ -47,6 +48,8 @@ Usage:
                           connection starts it again and is held until it is up.
                           Waits in the server-wide load budget's queue when the
                           box is full ('runly plan' says whether it would).
+                          Prints a short summary (--json: the context blob);
+                          --env prints the 'ctx --env' lines instead.
   runly plan [service...] [--rebuild]
                           what an up would build and start, what that costs
                           (resources:, or the default — said so), and whether
@@ -58,7 +61,7 @@ Usage:
                           The lease, the data and the public ports stay.
   runly ctx [--env]     the consumer context blob (URLs, services, logins,
                           conn strings and the preset each datastore holds).
-                          --env prints shell-exportable KEY=value lines instead:
+                          --env prints 'export KEY=value' lines instead:
                           RUNLY_ENV_ID, RUNLY_PORT_<PORT>, RUNLY_URL_<SERVICE>,
                           RUNLY_DATASTORE_<NAME>_URL, RUNLY_DATASTORE_<NAME>_PRESET,
                           RUNLY_LOGIN_USER and RUNLY_LOGIN_PASSWORD (names
@@ -332,6 +335,16 @@ async function main(): Promise<void> {
     console.error(`runly: unknown verb '${verb}'\n\n${USAGE}`);
     process.exit(64);
   }
+  if (flags.has('--env')) {
+    if (verb !== 'ctx' && verb !== 'up') {
+      console.error(`runly ${verb}: --env is for 'ctx' and 'up'`);
+      process.exit(64);
+    }
+    if (json) {
+      console.error(`runly ${verb}: --env and --json are alternatives — pick one`);
+      process.exit(64);
+    }
+  }
 
   // Collect before autospawn: a malformed binding manifest must not start a
   // shared daemon with input values in its inherited environment.
@@ -340,7 +353,9 @@ async function main(): Promise<void> {
   // with a one-line warning on stderr; stdout stays clean for --json.
   if (!['status', 'doctor', 'daemon', 'update', 'pool'].includes(verb)) {
     try {
-      for (const w of manifestDeprecations(loadStack(process.cwd()).manifest)) console.error(`runly: warning: ${w}`);
+      // Not validated here: the daemon validates the manifest it acts on, and the
+      // schema compile cost every CLI call ~100 ms (ctx, ps, logs are hot paths).
+      for (const w of ((st) => manifestDeprecations(st.manifest, st.file))(loadStack(process.cwd(), { validate: false }))) console.error(`runly: warning: ${w}`);
     } catch {
       /* no manifest here, or an invalid one — the verb itself reports that */
     }
@@ -438,7 +453,8 @@ async function main(): Promise<void> {
       console.error(
         `runly: ${holderPidSource} ${holderPid} is not a live process — the lease would be reclaimable the moment it is created.\n` +
           `  If this came from '$$': each agent command runs in a fresh shell, so that shell is already gone.\n` +
-          `  Use 'runly ${verb} --ttl <minutes>' instead; ${holderPidSource} is for interactive shells that outlive the command.`,
+          `  Under Claude Code, drop ${holderPidSource}: runly tethers the lease to the agent by itself (CLAUDE_PID, when it is a live ancestor).\n` +
+          `  Elsewhere use 'runly ${verb} --ttl <minutes>'; ${holderPidSource} is for interactive shells that outlive the command.`,
       );
       process.exit(64);
     }
@@ -471,6 +487,13 @@ async function main(): Promise<void> {
         const builds = (res.data as { bindDiagnostics?: { builds?: Array<{ service: string; reason: string }> } }).bindDiagnostics?.builds ?? [];
         for (const b of builds) if (b.reason === 'when-unchanged') console.error(`build ${b.service}: skipped (when: unchanged)`);
       }
+      if (res.ok && !json) {
+        const c = res.data as CtxView;
+        if (c.previewNotice) console.error(`runly: ${c.previewNotice}`);
+        // `up --env`: the environment as shell exports, ready for eval.
+        for (const line of flags.has('--env') ? exportLines(c) : ctxSummary(c, 'up')) console.log(line);
+        return;
+      }
       break;
     }
     case 'down':
@@ -500,7 +523,7 @@ async function main(): Promise<void> {
     case 'ps':
       res = await rpc('ps', { cwd, all: flags.has('--all') });
       if (res.ok && !json) {
-        for (const line of psLines(res.data as PsData)) console.log(line);
+        for (const line of psLines(res.data as PsData, flags.has('--all'))) console.log(line);
         return;
       }
       break;
@@ -545,13 +568,13 @@ async function main(): Promise<void> {
     case 'ctx':
       res = await rpc('ctx', { cwd, holder });
       if (res.ok && flags.has('--env')) {
-        if (flags.has('--json')) {
-          console.error('runly ctx: --env and --json are alternatives — pick one');
-          process.exit(64);
-        }
-        // Shell-exportable KEY=value lines — the interface a repo's own scripts
-        // (its tests, its smoke checks) read instead of `runly run`.
-        for (const line of envLines(res.data as CtxForEnv)) console.log(line);
+        // `export KEY=value` lines — the interface a repo's own scripts (its
+        // tests, its smoke checks) read: eval "$(runly ctx --env)" && npm test.
+        for (const line of exportLines(res.data as CtxView)) console.log(line);
+        return;
+      }
+      if (res.ok && !json) {
+        for (const line of ctxSummary(res.data as CtxView, 'ctx')) console.log(line);
         return;
       }
       break;
@@ -652,7 +675,8 @@ async function main(): Promise<void> {
       if (!res.ok) break;
       const spec = res.data as LogsSpec;
       const code = await showLogs(spec, { lines, since, grep, follow, until, timeoutMs, json, prefix: spec.files.length !== 1 });
-      if (code === 124) console.error(`runly logs: --until /${until?.source ?? ''}/ did not match within ${rawTimeout ?? ''}${/^\d+$/.test(rawTimeout ?? '') ? 's' : ''}`);
+      const within = `${rawTimeout ?? ''}${/^\d+$/.test(rawTimeout ?? '') ? 's' : ''}`;
+      if (code === 124) console.error(until ? `runly logs: --until /${until.source}/ did not match within ${within}` : `runly logs: --timeout ${within} ran out (exit 124, decision 0038)`);
       process.exit(code);
       break;
     }
@@ -769,11 +793,11 @@ async function main(): Promise<void> {
       }
       res = await rpc('shutdown', {});
       if (!res.ok) break;
-      if (!(await awaitDaemonGone(daemon.pid, DAEMON_STOP_TIMEOUT_MS))) {
+      if (!(await awaitDaemonGone(daemon.pid, daemonStopTimeoutMs()))) {
         errExit({
           class: 'infra-error',
           message:
-            `the daemon accepted shutdown and is still shutting down after ${Math.round(DAEMON_STOP_TIMEOUT_MS / 1000)}s — ` +
+            `the daemon accepted shutdown and is still shutting down after ${Math.round(daemonStopTimeoutMs() / 1000)}s — ` +
             `service teardown may still be in progress. Do not issue another stop; wait for ${daemon.pid !== undefined ? `pid ${daemon.pid}` : 'the daemon'} to exit, ` +
             `and check ${join(stateRoot(), 'daemon.log')} if it never does.`,
           source: 'daemon',
@@ -927,14 +951,6 @@ async function main(): Promise<void> {
   out(res.data);
 }
 
-interface CtxForEnv {
-  envId: string;
-  ports?: Record<string, number>;
-  urls?: Record<string, string>;
-  datastores?: Record<string, { url: string; preset?: string | null }>;
-  logins?: { user: string; password: string } | null;
-}
-
 interface DbCopy {
   name: string;
   datastore: string;
@@ -950,7 +966,7 @@ interface DbCopy {
 
 interface PsData {
   scope: string;
-  services: Array<{ env: string; service: string; state: string; publicPort: number | null; internalPort: number | null; pid: number | null; idleMs: number | null; idleStopInMs?: number | null; rssBytes: number | null }>;
+  services: Array<{ env: string; worktree?: string; service: string; state: string; publicPort: number | null; internalPort: number | null; pid: number | null; idleMs: number | null; idleStopInMs?: number | null; rssBytes: number | null }>;
   databases: DbCopy[];
   budget?: { enabled: boolean; memoryBytes: number; cpu: number; committedMemoryBytes: number; committedCpu: number; waiting: number };
 }
@@ -988,7 +1004,7 @@ function planLines(p: PlanData): string[] {
     out.push(`  budget ${formatSize(p.budget.memoryBytes)}, ${p.budget.cpu} cpu — runly has committed ${formatSize(p.committed.memoryBytes)}, ${Math.round(p.committed.cpu * 10) / 10} cpu; ${p.queue} waiting`);
   } else out.push('  budget off (BACKLOT_BUDGET=off)');
   out.push(`  box: ${p.machine.availableBytes === null ? '' : `${formatSize(p.machine.availableBytes)} of `}${formatSize(p.machine.totalBytes)} available, load ${p.machine.load1.toFixed(1)} on ${p.machine.cores} cores; a wait gives up after ${formatDuration(p.budget.waitMs)}`);
-  if (p.defaultsAssumed.length) out.push(`  note: ${p.defaultsAssumed.length} cost(s) are the conservative default — declare resources: in runly.yml for an exact plan`);
+  if (p.defaultsAssumed.length) out.push(`  note: ${p.defaultsAssumed.length} cost(s) are the conservative default — declare resources: in the manifest for an exact plan`);
   return out;
 }
 
@@ -1014,7 +1030,12 @@ async function runWithCopy(parts: string[], copy: DbCopy): Promise<number> {
   const forward = (sig: NodeJS.Signals) => () => {
     try { child.kill(sig); } catch { /* already gone */ }
   };
-  const onInt = forward('SIGINT');
+  // Ctrl-C at a terminal signals the whole foreground process group, and the
+  // child is in ours: it already has its SIGINT. Forwarding sent it a second
+  // one, which makes many tools (npm, a test runner) abort their own cleanup.
+  // Only a SIGINT sent to this process alone (no terminal) is passed on.
+  const fromTerminal = process.stdin.isTTY === true || process.stderr.isTTY === true;
+  const onInt = fromTerminal ? () => undefined : forward('SIGINT');
   const onTerm = forward('SIGTERM');
   process.on('SIGINT', onInt);
   process.on('SIGTERM', onTerm);
@@ -1050,14 +1071,20 @@ function dbLines(copies: DbCopy[]): string[] {
   ]));
 }
 
-function psLines(d: PsData): string[] {
+function psLines(d: PsData, all: boolean): string[] {
   const out: string[] = [];
-  out.push(...(d.services.length === 0
-    ? ['no environment for this worktree']
-    : table(['ENV', 'SERVICE', 'STATE', 'PORT', 'INTERNAL', 'PID', 'IDLE', 'STOPS IN', 'RSS'], d.services.map((s) => [
-      s.env, s.service, s.state, s.publicPort === null ? '' : String(s.publicPort), s.internalPort === null ? '' : String(s.internalPort),
+  if (d.services.length === 0) {
+    out.push(all ? 'no environments on this server — nothing runs' : `no environment for this worktree — 'runly up' starts one`);
+  } else {
+    // --all spans worktrees, so each row says which one it is.
+    const header = ['ENV', ...(all ? ['WORKTREE'] : []), 'SERVICE', 'STATE', 'PORT', 'INTERNAL', 'PID', 'IDLE', 'STOPS IN', 'RSS'];
+    out.push(...table(header, d.services.map((s) => [
+      s.env, ...(all ? [s.worktree ?? ''] : []), s.service, s.state, s.publicPort === null ? '' : String(s.publicPort), s.internalPort === null ? '' : String(s.internalPort),
       s.pid === null ? '' : String(s.pid), ago(s.idleMs), s.idleStopInMs === null || s.idleStopInMs === undefined ? '' : ago(s.idleStopInMs), mb(s.rssBytes),
-    ]))));
+    ])));
+    const running = d.services.filter((s) => s.state === 'running' || s.state === 'starting').length;
+    if (running === 0) out.push(`nothing is running — ${d.services.length} service(s) idle, stopped or down; the next 'runly up' or connection starts what is wanted`);
+  }
   if (d.budget?.enabled) {
     out.push('');
     out.push(`budget: ${formatSize(d.budget.committedMemoryBytes)} of ${formatSize(d.budget.memoryBytes)}, ${Math.round(d.budget.committedCpu * 10) / 10} of ${d.budget.cpu} cpu committed${d.budget.waiting ? `; ${d.budget.waiting} waiting` : ''}`);
@@ -1067,31 +1094,46 @@ function psLines(d: PsData): string[] {
   return out;
 }
 
-/** `web-audit` -> `WEB_AUDIT`: a valid, stable shell variable suffix. */
-const envName = (s: string): string => s.toUpperCase().replace(/[^A-Z0-9]/g, '_');
-/** Quoted only when it has to be, so plain values stay plain `KEY=value`. */
-const shellValue = (v: string): string => (/^[A-Za-z0-9_./:@%+,=-]*$/.test(v) ? v : `'${v.replace(/'/g, `'\\''`)}'`);
+/** What `up` and `ctx` return, as far as the plain summary and `--env` read it. */
+interface CtxView {
+  stack: string;
+  envId: string;
+  state: string;
+  lease: { id: string; expiresAt: number } | null;
+  urls?: Record<string, string>;
+  ports?: Record<string, number>;
+  services?: Record<string, 'running' | 'stopped' | 'down'>;
+  datastores?: Record<string, { url: string; preset?: string | null }>;
+  logins?: { user: string; password: string } | null;
+  previewUrls?: Record<string, string>;
+  previewNotice?: string;
+  bindDiagnostics?: { durationMs?: number; reuse?: string; started?: string[]; restarted?: string[] };
+}
 
 /**
- * `runly ctx --env` (decision 0032). Names are stable and documented:
- * RUNLY_ENV_ID, RUNLY_PORT_<PORT>, RUNLY_URL_<SERVICE>,
- * RUNLY_DATASTORE_<NAME>_URL, RUNLY_DATASTORE_<NAME>_PRESET (decision 0034),
- * RUNLY_LOGIN_USER, RUNLY_LOGIN_PASSWORD.
+ * The plain (non-`--json`) `up` and `ctx`: a few lines a person or an agent
+ * reads at a glance — where each service is, what each datastore holds, how
+ * to log in. `--json` is the full blob, unchanged; `--env` the shell exports.
  */
-function envLines(c: CtxForEnv): string[] {
-  const lines = [`RUNLY_ENV_ID=${shellValue(c.envId)}`];
-  for (const [k, v] of Object.entries(c.ports ?? {}).sort()) lines.push(`RUNLY_PORT_${envName(k)}=${v}`);
-  for (const [k, v] of Object.entries(c.urls ?? {}).sort()) lines.push(`RUNLY_URL_${envName(k)}=${shellValue(v)}`);
-  for (const [k, v] of Object.entries(c.datastores ?? {}).sort()) {
-    lines.push(`RUNLY_DATASTORE_${envName(k)}_URL=${shellValue(v.url)}`);
-    // What the datastore holds right now (decision 0034); absent before its first restore.
-    if (v.preset) lines.push(`RUNLY_DATASTORE_${envName(k)}_PRESET=${shellValue(v.preset)}`);
+function ctxSummary(c: CtxView, verb: 'up' | 'ctx'): string[] {
+  const out: string[] = [];
+  const until = c.lease ? ` — lease until ${new Date(c.lease.expiresAt).toLocaleTimeString()}` : ' — no lease';
+  const d = c.bindDiagnostics;
+  const how = verb === 'up' && d
+    ? ` (${d.reuse === 'rebound' || !d.reuse ? 'bound' : d.reuse}${d.durationMs !== undefined ? ` in ${formatDuration(d.durationMs)}` : ''}${d.started?.length ? `; started ${d.started.join(', ')}` : ''}${d.restarted?.length ? `; restarted ${d.restarted.join(', ')}` : ''})`
+    : '';
+  out.push(`${c.stack} ${c.envId} ${c.state}${how}${until}`);
+  const names = Object.keys(c.services ?? c.urls ?? {});
+  const width = Math.max(0, ...names.map((n) => n.length));
+  for (const n of names) {
+    const state = c.services?.[n] ?? 'running';
+    const url = c.urls?.[n] ?? '';
+    out.push(`  ${n.padEnd(width)}  ${state.padEnd(7)}  ${url}${c.previewUrls?.[n] ? `  (preview ${c.previewUrls[n]})` : ''}`.trimEnd());
   }
-  if (c.logins) {
-    lines.push(`RUNLY_LOGIN_USER=${shellValue(c.logins.user)}`);
-    lines.push(`RUNLY_LOGIN_PASSWORD=${shellValue(c.logins.password)}`);
-  }
-  return lines;
+  for (const [n, ds] of Object.entries(c.datastores ?? {})) out.push(`  datastore ${n}: ${ds.url}${ds.preset ? ` (${ds.preset})` : ''}`);
+  if (c.logins) out.push(`  login: ${c.logins.user} / ${c.logins.password}`);
+  out.push(`  'runly ctx --env' for shell exports, --json for everything`);
+  return out;
 }
 
 main().catch((err) => {

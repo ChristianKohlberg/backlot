@@ -49,8 +49,8 @@ function write(stackId: string, root: string, builds: BuildLedgerFile['builds'])
  * The key a build is recorded under: its (templated) command plus path, size
  * and mtime of every file its `when:` globs match.
  */
-export function buildInputsKey(root: string, manifest: Manifest, cmd: string, when: string[]): string {
-  const files = enumerateSource(root, manifest, when);
+export async function buildInputsKey(root: string, manifest: Manifest, cmd: string, when: string[]): Promise<string> {
+  const files = await enumerateSource(root, manifest, when);
   const lines = files.map((f) => {
     try {
       const st = statSync(join(root, f));

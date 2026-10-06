@@ -273,6 +273,13 @@ function listenOn(server: Server, port: number, host: string): Promise<boolean> 
 
 export class ProxyHub {
   private targets = new Map<string, Target>();
+  /**
+   * Internal ports handed to a start that is not `up` yet, by env/key. A port
+   * is probed free when it is allocated, and the service binds it seconds
+   * later; without this, two starts in that window were given the same port
+   * and one environment's public URL served the other's process.
+   */
+  private reservedInternal = new Map<string, number>();
   private wakeHook?: WakeHook;
   private activityHook?: (envId: string, key: string) => void;
 
@@ -338,11 +345,20 @@ export class ProxyHub {
     return out;
   }
 
-  /** Every internal port currently assigned to a target (up or not), so none is handed out twice. */
+  /** Every internal port currently assigned to a target (up or not) or reserved for a start, so none is handed out twice. */
   assignedInternalPorts(): Set<number> {
-    const out = new Set<number>();
+    const out = new Set<number>(this.reservedInternal.values());
     for (const t of this.targets.values()) if (t.internalPort !== undefined) out.add(t.internalPort);
     return out;
+  }
+
+  /** Hold `port` for the start of env/key until it is `up` (then the target owns it) or goes down. */
+  reserveInternal(envId: string, key: string, port: number): void {
+    this.reservedInternal.set(this.id(envId, key), port);
+  }
+
+  private release(id: string): void {
+    this.reservedInternal.delete(id);
   }
 
   /**
@@ -401,12 +417,14 @@ export class ProxyHub {
     if (!t) return;
     t.state = 'up';
     t.internalPort = internalPort;
+    this.reservedInternal.set(this.id(envId, key), internalPort);
     if (service) t.service = service;
     t.flush();
   }
 
   /** Nothing is (or will soon be) behind env/key: held connections are closed. */
   down(envId: string, key: string): void {
+    this.release(this.id(envId, key));
     const t = this.targets.get(this.id(envId, key));
     if (!t) return;
     t.state = 'down';
@@ -420,6 +438,7 @@ export class ProxyHub {
       if (t.envId === envId && t.service === service && t.state === 'up') {
         t.state = 'down';
         t.internalPort = undefined;
+        this.release(this.id(t.envId, t.key));
         t.flush();
       }
     }
@@ -431,6 +450,7 @@ export class ProxyHub {
       if (t.envId === envId && t.state === 'starting') {
         t.state = 'down';
         t.internalPort = undefined;
+        this.release(this.id(t.envId, t.key));
         t.flush();
       }
     }
@@ -445,6 +465,12 @@ export class ProxyHub {
     const id = this.id(envId, key);
     this.targets.get(id)?.close();
     this.targets.delete(id);
+    this.release(id);
+  }
+
+  /** The port keys this daemon holds a listener for, for one environment. */
+  keysOf(envId: string): string[] {
+    return [...this.targets.values()].filter((t) => t.envId === envId).map((t) => t.key);
   }
 
   /** Release every listener of an environment (teardown). */
@@ -455,11 +481,13 @@ export class ProxyHub {
         this.targets.delete(id);
       }
     }
+    for (const id of [...this.reservedInternal.keys()]) if (id.startsWith(`${envId}\u0000`)) this.reservedInternal.delete(id);
   }
 
   closeAll(): void {
     for (const t of this.targets.values()) t.close();
     this.targets.clear();
+    this.reservedInternal.clear();
   }
 
   /** Stats by port key for one environment. */

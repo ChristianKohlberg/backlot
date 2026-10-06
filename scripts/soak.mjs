@@ -25,7 +25,7 @@
  *   (b) restart traffic — a source edit + up must keep a service that has no
  *       build (same pid), and an upkeep-trigger touch + up MUST produce the
  *       full-bind restart (new service pid + upkeep marker)
- *   (c) env export — `ctx --env` must parse as KEY=value lines, and the
+ *   (c) env export — `ctx --env` must parse as `export KEY=value` lines, and the
  *       stack's own check run with them must pass (decision 0032: runly no
  *       longer runs checks)
  *   (c2) down/db — `down web` keeps the lease and URL, `up web` restores it;
@@ -131,6 +131,7 @@ Object.assign(daemonEnv, {
   BACKLOT_BUDGET_CPU: '64',
   BACKLOT_BUDGET_RESERVE: '0',
   BACKLOT_BUDGET_LOAD_PER_CORE: '1000',
+  BACKLOT_BUDGET_CPU_PRESSURE: '1000', // like the load gate: a busy CI box must not refuse the soak
   BACKLOT_WAIT_MS: '30000',
   BACKLOT_RPC_TIMEOUT_MS: '120000',
 });
@@ -594,12 +595,12 @@ async function phaseEnvExport() {
   const vars = {};
   const bad = [];
   for (const line of out.stdout.split('\n').filter(Boolean)) {
-    const m = /^(RUNLY_[A-Z0-9_]+)=(.*)$/.exec(line);
+    const m = /^export (RUNLY_[A-Z0-9_]+)=(.*)$/.exec(line);
     if (!m) bad.push(line);
     else vars[m[1]] = m[2].replace(/^'(.*)'$/, '$1');
   }
   if (!must(out.code === 0 && bad.length === 0 && vars.RUNLY_URL_WEB && vars.RUNLY_DATASTORE_MAIN_URL, 'env',
-    'ctx --env did not print the expected KEY=value lines', `${out.code} ${out.stdout}${out.stderr}`.slice(0, 400))) return;
+    'ctx --env did not print the expected export KEY=value lines', `${out.code} ${out.stdout}${out.stderr}`.slice(0, 400))) return;
   const check = await new Promise((resolveCheck) => {
     execFile(process.execPath, ['check-pass.mjs'], { cwd: stackA, env: { ...process.env, ...vars }, timeout: 60_000 }, (err, stdout, stderr) =>
       resolveCheck({ code: err ? (err.code ?? 1) : 0, out: String(stdout) + String(stderr) }));

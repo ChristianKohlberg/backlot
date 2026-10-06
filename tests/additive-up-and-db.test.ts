@@ -231,8 +231,8 @@ describe('presets: one datastore reloads, the rest keep their data', () => {
 
     // ctx reports what each holds, as JSON and as env lines.
     const env = await ctx.cli(['ctx', '--env'], wt);
-    expect(env.stdout).toContain('RUNLY_DATASTORE_MAIN_PRESET=alt');
-    expect(env.stdout).toContain('RUNLY_DATASTORE_AUDIT_PRESET=dev');
+    expect(env.stdout).toContain('export RUNLY_DATASTORE_MAIN_PRESET=alt');
+    expect(env.stdout).toContain('export RUNLY_DATASTORE_AUDIT_PRESET=dev');
   }, 120_000);
 
   it('no preset keeps the data — on a plain up, across a release and a fresh holder, and a reset restores what each holds', async () => {

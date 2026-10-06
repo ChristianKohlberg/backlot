@@ -36,6 +36,11 @@
         "$ref": "#/$defs/datastore"
       }
     },
+    "builds": {
+      "enum": ["parallel", "serial"],
+      "default": "parallel",
+      "description": "How one `up` runs its services' builds. `parallel` (default): in depends_on waves — a build runs after the builds of what its service depends on, and the builds of one wave run at once (the load budget holds their summed resources). `serial`: one at a time, in manifest order — for builds that share an output or a lock the build tool does not handle."
+    },
     "caches": {
       "type": "array",
       "items": {
@@ -194,6 +199,11 @@
                     "type": "string"
                   },
                   "description": "Globs (relative to the stack root, git-listed, minus caches:) of what the build reads. When none of the matched files changed (path, size, mtime) since the last SUCCESSFUL build of this service in this worktree, the build is skipped and `up` says so; `up --rebuild` forces it (decision 0038)."
+                },
+                "serial": {
+                  "type": "boolean",
+                  "default": false,
+                  "description": "Run this build alone, never at the same time as another service's build. By default the builds of services that do not depend on each other run at once (depends_on waves)."
                 }
               }
             }
@@ -384,16 +394,18 @@
           "description": "Named seed states."
         },
         "default_preset": {
-          "type": "object",
-          "additionalProperties": false,
-          "properties": {
-            "run": {
-              "type": "string"
-            },
-            "session": {
-              "type": "string"
+          "description": "The preset a datastore is created with when none is named. A name; the pre-0.13 {run, session} form is still accepted (session wins, then run).",
+          "oneOf": [
+            { "type": "string", "minLength": 1 },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "run": { "type": "string" },
+                "session": { "type": "string" }
+              }
             }
-          }
+          ]
         },
         "template": {
           "type": "boolean",

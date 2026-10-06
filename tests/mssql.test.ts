@@ -18,7 +18,7 @@ import { execFile, execFileSync } from 'node:child_process';
 import { mkdtempSync, rmSync, writeFileSync, readFileSync, readdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { disposeStateSync } from './support/leaks.js';
+import { disposeStateSync, testContainerName } from './support/leaks.js';
 
 const repo = join(import.meta.dirname, '..');
 const CLI = join(repo, 'dist', 'cli', 'index.js');
@@ -38,7 +38,7 @@ const hasMssql = (() => {
   }
 })();
 
-const CONTAINER = `runly-mssql-test-${Math.random().toString(36).slice(2, 8)}`;
+const CONTAINER = testContainerName('mssql');
 const SQLCMD = `/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P ${PASS} -C -b`;
 // All mechanics go through docker exec — the url is handed to services but
 // never dialed by runly itself (zero embedded DB clients).
@@ -150,7 +150,7 @@ datastores:
     const res = await cli(['ctx', '--env']);
     expect(res.exitCode, `stdout: ${res.stdout ?? ''}
 stderr: ${res.stderr ?? ''}`).toBe(0);
-    expect(String(res.stdout)).toMatch(/^RUNLY_DATASTORE_MAIN_URL=.+/m);
+    expect(String(res.stdout)).toMatch(/^export RUNLY_DATASTORE_MAIN_URL=.+/m);
   }, T);
 
   it('recycle drops the server-side namespace', async () => {

@@ -26,6 +26,7 @@ import {
 import { basename, dirname, join } from 'node:path';
 import { connect } from 'node:net';
 import { templatesRoot } from '../core/paths.js';
+import { recordNamespace } from '../core/namespaces.js';
 import { sha256, template, BrokerError } from '../core/util.js';
 import { runBounded, cmdTimeoutS, DEFAULT_CMD_TIMEOUT_S } from '../core/exec.js';
 import type { DatastoreSpec } from '../core/manifest.js';
@@ -67,7 +68,7 @@ export interface DsDriver {
    * How to drop this namespace later without the manifest (decision 0037):
    * the templated command and where to run it, or the file to delete.
    */
-  dropRecipe(h: DsHandle): { cmd?: string; cwd?: string; path?: string };
+  dropRecipe(h: DsHandle): { cmd?: string; cwd?: string; path?: string; ns?: string };
   /**
    * The template a restore at `preset` uses, as `<stack>/<marker file>` under
    * the templates root, or null when this datastore bakes none. Retention
@@ -467,12 +468,15 @@ class CommandDs implements DsDriver {
     return this.spec.template_restore && !this.spec.ephemeral ? `${this.stackId}/${this.markerName(preset)}` : null;
   }
 
-  dropRecipe(h: DsHandle): { cmd?: string; cwd?: string } {
-    return this.spec.drop ? { cmd: template(this.spec.drop, { ns: this.ns(h) }), cwd: h.cwd } : {};
+  dropRecipe(h: DsHandle): { cmd?: string; cwd?: string; ns?: string } {
+    // `ns` rides along so `pool doctor` counts the namespace as referenced
+    // from the moment the drop is recorded — before the restore creates it.
+    return this.spec.drop ? { cmd: template(this.spec.drop, { ns: this.ns(h) }), cwd: h.cwd, ns: this.ns(h) } : { ns: this.ns(h) };
   }
 
   async ensure(h: DsHandle, preset: string, force: boolean, exists: boolean): Promise<void> {
     const nsE = this.ns(h);
+    recordNamespace(nsE, this.stackId);
     if (this.spec.ephemeral) {
       // Ephemeral (redis-class): no presets, no templates — reset = the drop:
       // command as a flush; create (optional) runs only on first bind.
@@ -494,6 +498,7 @@ class CommandDs implements DsDriver {
     if (this.spec.drop) await shQuiet(template(this.spec.drop, { ns }), h.cwd); // clean slate, best-effort
     if (this.spec.template_restore) {
       const tpl = this.templateNs(preset);
+      recordNamespace(tpl, this.stackId);
       // Serialize bake-check + bake + mark on the STACK key (vetbill-1i49
       // covered bake-vs-bake per template; rebake deletes the whole stack
       // marker dir, so only a stack-scoped lock excludes it too).

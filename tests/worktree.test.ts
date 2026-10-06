@@ -33,7 +33,7 @@ function repo() {
 }
 
 describe('enumeration', () => {
-  it('follows deletions, and ignores what git ignores unless sync.include names it', () => {
+  it('follows deletions, and ignores what git ignores unless sync.include names it', async () => {
     const { src } = repo();
     writeFileSync(join(src, 'a.txt'), 'alpha');
     writeFileSync(join(src, 'gone.txt'), 'x');
@@ -42,29 +42,29 @@ describe('enumeration', () => {
     writeFileSync(join(src, 'node_modules', 'dep.js'), 'installed');
     writeFileSync(join(src, '.env.local'), 'A=1');
     rmSync(join(src, 'gone.txt'));
-    expect(enumerateSource(src, manifest)).toEqual(['.gitignore', 'a.txt']);
+    expect(await enumerateSource(src, manifest)).toEqual(['.gitignore', 'a.txt']);
     const withInclude = { name: 'wt', services: {}, sync: { include: ['.env.local'] } } as never;
-    expect(enumerateSource(src, withInclude)).toContain('.env.local');
+    expect(await enumerateSource(src, withInclude)).toContain('.env.local');
   });
 
-  it('filters by the given globs before it looks at a file', () => {
+  it('filters by the given globs before it looks at a file', async () => {
     const { src } = repo();
     writeFileSync(join(src, 'pnpm-lock.yaml'), 'lock');
     mkdirSync(join(src, 'migrations'));
     writeFileSync(join(src, 'migrations', '001.sql'), 'create');
     writeFileSync(join(src, 'app.ts'), 'code');
-    expect(enumerateSource(src, manifest, ['pnpm-lock.yaml', 'migrations/**'])).toEqual(['migrations/001.sql', 'pnpm-lock.yaml']);
+    expect(await enumerateSource(src, manifest, ['pnpm-lock.yaml', 'migrations/**'])).toEqual(['migrations/001.sql', 'pnpm-lock.yaml']);
   });
 
-  it('a dangling symlink in a non-git tree does not throw', () => {
+  it('a dangling symlink in a non-git tree does not throw', async () => {
     const src = mkdtempSync(join(tmpdir(), 'runly-wt-nogit-'));
     dirs.push(src);
     writeFileSync(join(src, 'real.txt'), 'here');
     symlinkSync(join(src, 'nowhere.txt'), join(src, 'broken-link'));
-    expect(enumerateSource(src, manifest)).toEqual(['real.txt']);
+    expect(await enumerateSource(src, manifest)).toEqual(['real.txt']);
   });
 
-  it('a checked-out submodule is enumerated, so a trigger inside it fires', () => {
+  it('a checked-out submodule is enumerated, so a trigger inside it fires', async () => {
     const { src } = repo();
     const inner = mkdtempSync(join(tmpdir(), 'runly-wt-sub-'));
     dirs.push(inner);
@@ -76,56 +76,56 @@ describe('enumeration', () => {
     execFileSync('git', ['-c', 'protocol.file.allow=always', 'submodule', 'add', '-q', inner, 'vendor/dep'], { cwd: src });
 
     const m = withRules('vendor/dep/lib.lock');
-    const before = triggerHash(src, triggerFiles(src, m), 'vendor/dep/lib.lock');
-    expect(triggerFiles(src, m)).toEqual(['vendor/dep/lib.lock']);
+    const before = triggerHash(src, await triggerFiles(src, m), 'vendor/dep/lib.lock');
+    expect(await triggerFiles(src, m)).toEqual(['vendor/dep/lib.lock']);
     writeFileSync(join(src, 'vendor', 'dep', 'lib.lock'), 'edited in the submodule');
-    expect(triggerHash(src, triggerFiles(src, m), 'vendor/dep/lib.lock')).not.toBe(before);
+    expect(triggerHash(src, await triggerFiles(src, m), 'vendor/dep/lib.lock')).not.toBe(before);
   }, 60_000);
 
-  it('a build writing under caches: is never a trigger', () => {
+  it('a build writing under caches: is never a trigger', async () => {
     const { src } = repo();
     const m = { name: 'wt', services: {}, caches: ['**/obj'], upkeep: [{ when: '**/*.json', run: 'true' }] } as never;
     writeFileSync(join(src, 'package.json'), '{}');
     mkdirSync(join(src, 'svc', 'obj'), { recursive: true });
     writeFileSync(join(src, 'svc', 'obj', 'project.assets.json'), '{}');
-    expect(triggerFiles(src, m)).toEqual(['package.json']);
+    expect(await triggerFiles(src, m)).toEqual(['package.json']);
   });
 });
 
 describe('trigger hashing', () => {
-  it('reads only the files a when: glob matches, and asks git nothing without rules', () => {
+  it('reads only the files a when: glob matches, and asks git nothing without rules', async () => {
     const { src } = repo();
     writeFileSync(join(src, 'pnpm-lock.yaml'), 'lock');
     writeFileSync(join(src, 'app.ts'), 'code');
-    expect(triggerFiles(src, manifest)).toEqual([]);
+    expect(await triggerFiles(src, manifest)).toEqual([]);
     const m = withRules('pnpm-lock.yaml');
-    const set = triggerSet(src, m);
+    const set = await triggerSet(src, m);
     expect(set.files).toEqual(['pnpm-lock.yaml']);
     const before = triggerHash(src, set, 'pnpm-lock.yaml');
     // An edit outside every glob changes nothing runly looks at.
     writeFileSync(join(src, 'app.ts'), 'code v2');
-    expect(triggerHash(src, triggerSet(src, m), 'pnpm-lock.yaml')).toBe(before);
+    expect(triggerHash(src, await triggerSet(src, m), 'pnpm-lock.yaml')).toBe(before);
     writeFileSync(join(src, 'pnpm-lock.yaml'), 'lock v2');
-    expect(triggerHash(src, triggerSet(src, m), 'pnpm-lock.yaml')).not.toBe(before);
+    expect(triggerHash(src, await triggerSet(src, m), 'pnpm-lock.yaml')).not.toBe(before);
   });
 
-  it('keeps its small cache in the state root, never in the worktree, and only for trigger files', () => {
+  it('keeps its small cache in the state root, never in the worktree, and only for trigger files', async () => {
     const { src, cache } = repo();
     writeFileSync(join(src, 'pnpm-lock.yaml'), 'lock');
     writeFileSync(join(src, 'app.ts'), 'code');
-    triggerSet(src, withRules('pnpm-lock.yaml'), cache);
+    await triggerSet(src, withRules('pnpm-lock.yaml'), cache);
     expect(execFileSync('git', ['status', '--porcelain', '--ignored'], { cwd: src, encoding: 'utf8' })).toBe('?? app.ts\n?? pnpm-lock.yaml\n');
     const written = JSON.parse(readFileSync(join(cache, 'triggers.json'), 'utf8')) as { root: string; entries: Record<string, unknown> };
     expect(written.root).toBe(src);
     expect(Object.keys(written.entries)).toEqual(['pnpm-lock.yaml']);
   });
 
-  it('re-reads a trigger whose recorded stat still matches after a same-size edit (racily clean)', () => {
+  it('re-reads a trigger whose recorded stat still matches after a same-size edit (racily clean)', async () => {
     const { src, cache } = repo();
     const m = withRules('lock.txt');
     const file = join(src, 'lock.txt');
     writeFileSync(file, 'alpha-v1'); // 8 bytes
-    const first = triggerHash(src, triggerSet(src, m, cache), 'lock.txt');
+    const first = triggerHash(src, await triggerSet(src, m, cache), 'lock.txt');
 
     // The adversarial state, constructed exactly rather than raced for:
     // different content of the SAME size, a cache stat that matches it, and
@@ -139,14 +139,14 @@ describe('trigger hashing', () => {
     parsed.writtenAt = live.mtimeMs; // written no later than the file's mtime -> "racily clean"
     writeFileSync(cachePath, JSON.stringify(parsed));
 
-    expect(triggerHash(src, triggerSet(src, m, cache), 'lock.txt')).not.toBe(first);
+    expect(triggerHash(src, await triggerSet(src, m, cache), 'lock.txt')).not.toBe(first);
   });
 
-  it('trusts the stat gate for a genuinely unchanged trigger', () => {
+  it('trusts the stat gate for a genuinely unchanged trigger', async () => {
     const { src, cache } = repo();
     const m = withRules('lock.txt');
     writeFileSync(join(src, 'lock.txt'), 'unchanging');
-    const first = triggerHash(src, triggerSet(src, m, cache), 'lock.txt');
+    const first = triggerHash(src, await triggerSet(src, m, cache), 'lock.txt');
     // Past the racy window, the recorded hash is used without reading the
     // file: plant a different hash and see it come back.
     const cachePath = join(cache, 'triggers.json');
@@ -154,39 +154,39 @@ describe('trigger hashing', () => {
     parsed.writtenAt += 10_000;
     parsed.entries['lock.txt']!.hash = 'planted';
     writeFileSync(cachePath, JSON.stringify(parsed));
-    expect(triggerHash(src, triggerSet(src, m, cache), 'lock.txt')).not.toBe(first);
+    expect(triggerHash(src, await triggerSet(src, m, cache), 'lock.txt')).not.toBe(first);
   });
 });
 
 describe('declared outputs (snapshotOutputs)', () => {
-  it('changes when a matched file is rewritten, added or removed, and only then', () => {
+  it('changes when a matched file is rewritten, added or removed, and only then', async () => {
     const { src } = repo();
     mkdirSync(join(src, 'bin', 'Debug'), { recursive: true });
     writeFileSync(join(src, 'bin', 'Debug', 'app.dll'), 'v1');
     writeFileSync(join(src, 'unrelated.txt'), 'x');
     const globs = ['bin/**'];
-    const first = snapshotOutputs(src, globs);
+    const first = await snapshotOutputs(src, globs);
     expect(first).toContain('bin/Debug/app.dll');
-    expect(snapshotOutputs(src, globs)).toBe(first); // stable when nothing changed
+    expect(await snapshotOutputs(src, globs)).toBe(first); // stable when nothing changed
     writeFileSync(join(src, 'unrelated.txt'), 'changed outside the outputs');
-    expect(snapshotOutputs(src, globs)).toBe(first);
+    expect(await snapshotOutputs(src, globs)).toBe(first);
     writeFileSync(join(src, 'bin', 'Debug', 'app.dll'), 'version 2');
-    const second = snapshotOutputs(src, globs);
+    const second = await snapshotOutputs(src, globs);
     expect(second).not.toBe(first);
     writeFileSync(join(src, 'bin', 'Debug', 'new.dll'), 'n');
-    const third = snapshotOutputs(src, globs);
+    const third = await snapshotOutputs(src, globs);
     expect(third).not.toBe(second);
     rmSync(join(src, 'bin', 'Debug', 'new.dll'));
-    expect(snapshotOutputs(src, globs)).toBe(second);
+    expect(await snapshotOutputs(src, globs)).toBe(second);
   });
 
-  it('takes a literal file or a literal directory, skips what is absent, and refuses to leave the worktree', () => {
+  it('takes a literal file or a literal directory, skips what is absent, and refuses to leave the worktree', async () => {
     const { src } = repo();
     mkdirSync(join(src, 'dist', 'nested'), { recursive: true });
     writeFileSync(join(src, 'dist', 'nested', 'main.js'), 'm');
     writeFileSync(join(src, 'lock.json'), '{}');
-    const snap = snapshotOutputs(src, ['dist', 'lock.json', 'missing.ts', '../escape.txt']);
+    const snap = await snapshotOutputs(src, ['dist', 'lock.json', 'missing.ts', '../escape.txt']);
     expect(snap.split('\n').map((l) => l.slice(0, l.indexOf(':'))).sort()).toEqual(['dist/nested/main.js', 'lock.json']);
-    expect(snapshotOutputs(src, ['missing/**'])).toBe('');
+    expect(await snapshotOutputs(src, ['missing/**'])).toBe('');
   });
 });

@@ -6,12 +6,14 @@ import { mkdirSync, rmSync, readdirSync, existsSync, readFileSync, writeFileSync
 import { isAbsolute, join, relative, sep } from 'node:path';
 import { Journal, JOURNAL_SCHEMA_VERSION, type DbCopyRow, type DropRecipe, type EnvRow, type LeaseRow } from '../core/journal.js';
 import { BUILD, VERSION, compareVersions, versionSkew } from '../core/version.js';
-import { buildOf, canonicalDirectory, outputsOf, stackIdentity, retiredStackIdentity, loadStack, normalizeLogins, type Manifest, type ServiceSpec, type Stack } from '../core/manifest.js';
+import { buildOf, canonicalDirectory, outputsOf, stackIdentity, retiredStackIdentity, loadStack, normalizeLogins, manifestFileOf, type Manifest, type ServiceSpec, type Stack } from '../core/manifest.js';
 import { snapshotOutputs } from '../core/worktree.js';
+import { forgetNamespace, recordedNamespaces } from '../core/namespaces.js';
+import { runlyEnvVars } from '../core/env-vars.js';
 import { buildInputsKey, buildIsCurrent, clearBuilds, everBuilt, forgetBuild, recordBuild } from '../core/builds.js';
 import { LogWriter, UPKEEP_LOG, beginBuildLog, buildLogOf, logFileOf, readLog } from '../core/logs.js';
 import { formatDuration, parseDuration } from '../core/units.js';
-import { LoadBudget, costsOf, needOf, total, type Committed, type Need, type NeedItem, type Reservation } from './budget.js';
+import { BudgetRefusal, LoadBudget, costsOf, needOf, total, type Committed, type Need, type NeedItem, type Reservation } from './budget.js';
 import { clearTreeLedger, pickEnvKeys, pickTreeKeys, readTreeLedger, worktreeStateDir, writeTreeLedger } from '../core/tree-ledger.js';
 import { defaultPresetFor, presetToRestore, validatePresetRequest } from '../core/presets.js';
 import { runUpkeep, templateBakeKeys, triggerSet, type UpkeepStep } from '../core/upkeep.js';
@@ -35,8 +37,16 @@ import { BindTrace, type BindDiagnostics } from '../core/diagnostics.js';
 import type { Hygiene, LeaseKind, ServicePid } from '../core/types.js';
 
 const POOL_MAX_TOTAL = () => policy().poolMaxTotal;
-const LEASE_TTL = (_kind: LeaseKind) => policy().sessionTtlMs;
+/** A service the manifest declares (callers pass names taken from it). */
+const serviceOf = (stack: Stack, name: string): ServiceSpec => {
+  const spec = stack.manifest.services[name];
+  if (!spec) throw new BrokerError('work-error', `no service '${name}' in ${manifestFileOf(stack)}`, 'manifest');
+  return spec;
+};
+const LEASE_TTL = () => policy().sessionTtlMs;
 const IDLE_TTL = () => policy().idleTtlMs;
+/** A wake within this long of the service's idle stop skips the budget's CPU gate (decision 0036). */
+const RECENT_RUN_MS = 60 * 60_000;
 const WAIT_MS = () => policy().waitMs;
 /** How long a service may sit idle (decision 0035): its manifest `idle:`, else the policy default. */
 const serviceIdleMs = (spec: ServiceSpec | undefined): number => parseDuration(spec?.idle) ?? policy().serviceIdleMs;
@@ -85,7 +95,16 @@ export interface UpOptions {
   holderPid?: number;
   /** Set by the daemon per-request; emits progress frames back to the client. */
   onProgress?: Progress;
+  /**
+   * Aborted when the requesting client disconnects (the daemon wires it to
+   * the response's close). A queued `up` whose caller is gone gives up
+   * instead of binding for nobody.
+   */
+  signal?: AbortSignal;
 }
+
+/** The caller of a queued request disconnected (not a bind failure). */
+class CallerGone extends BrokerError {}
 
 /**
  * Pin a lease to a live process, when the caller names one.
@@ -184,8 +203,14 @@ export class Engine {
   private goneSince = new Map<string, number>();
   /** The manifest each environment's running services were started from (budget accounting). */
   private envManifests = new Map<string, Manifest>();
-  /** Appliances runly started in this daemon life, by probe address (budget accounting). */
+  /** Appliances runly started in this daemon life, by probe address (budget accounting); pruned when one stops. */
   private startedAppliances = new Map<string, { name: string; cost: { memoryBytes: number; cpu: number } }>();
+  /** When each idle-stopped service stopped: a wake soon after skips the CPU gate (decision 0036). */
+  private idleStoppedAt = new Map<string, number>();
+  /** A sweep is running: the next tick is skipped rather than overlapping it. */
+  private sweeping = false;
+  /** shutdown() has begun: no sweep, no wake, nothing new. */
+  stopping = false;
 
   /** The server-wide load budget (decision 0036). */
   readonly budget = new LoadBudget(() => policy().budget, () => this.committedRunning());
@@ -502,14 +527,28 @@ export class Engine {
     return port;
   }
 
-  /** A fresh internal port for one service start (decision 0033). */
-  private async allocInternalPort(exclude: Set<number>): Promise<number> {
+  /**
+   * A fresh internal port for one start of env/key (decision 0033), reserved
+   * in the proxy at once. The probe awaits, so another start can be probing
+   * the same port meanwhile: the reservation is re-checked after it and taken
+   * with no await in between. Released when the target goes down (a stop, a
+   * failed start, a settle) or is owned by the target once it is up.
+   */
+  private async allocInternalPort(exclude: Set<number>, envId: string, key: string): Promise<number> {
     const block = internalBlock();
-    const port = await allocateInBlock(block, new Set([...exclude, ...this.proxy.assignedInternalPorts()]));
-    if (port === undefined) {
-      throw new BrokerError('env-error', `no free internal port left in ${block.lo}-${block.hi} — something else is listening there; widen BACKLOT_INTERNAL_PORT_RANGE`, 'pool');
+    const tried = new Set(exclude);
+    for (;;) {
+      const port = await allocateInBlock(block, new Set([...tried, ...this.proxy.assignedInternalPorts()]));
+      if (port === undefined) {
+        throw new BrokerError('env-error', `no free internal port left in ${block.lo}-${block.hi} — something else is listening there; widen BACKLOT_INTERNAL_PORT_RANGE`, 'pool');
+      }
+      if (this.proxy.assignedInternalPorts().has(port)) {
+        tried.add(port); // reserved by a concurrent start while we probed
+        continue;
+      }
+      this.proxy.reserveInternal(envId, key, port);
+      return port;
     }
-    return port;
   }
 
   /**
@@ -582,7 +621,11 @@ export class Engine {
     if (mine && !(onlyMine && mine.expiresAt <= now())) {
       const env = this.journal.getEnv(mine.envId);
       if (env && env.state !== 'recycling' && env.state !== 'degraded') {
-        this.journal.saveLease({ ...mine, hygiene, expiresAt: now() + ttlMs, ...holderIdentity(holderPid) });
+        // The tether is the LATEST caller's: an `up` that names no holder
+        // process (a human, BACKLOT_TETHER=off) clears the previous one. Kept,
+        // an agent's tether outlived the hand-over, and the agent's exit then
+        // tore down the environment — data and all — under the next user.
+        this.journal.saveLease({ ...mine, hygiene, expiresAt: now() + ttlMs, holderPid: undefined, holderStart: undefined, ...holderIdentity(holderPid) });
         // A continuing lease keeps the services it wants: bindAndStart adds
         // the request to env.activeServices (decision 0034).
         return { env, fresh: false };
@@ -828,7 +871,7 @@ export class Engine {
   }
 
   /** Queue at capacity WITHOUT holding the pool lock while sleeping. */
-  private async acquireEnv(stack: Stack, holder: string, kind: LeaseKind, hygiene: Hygiene, ttlMs: number, holderPid?: number): Promise<{ env: EnvRow; fresh: boolean }> {
+  private async acquireEnv(stack: Stack, holder: string, kind: LeaseKind, hygiene: Hygiene, ttlMs: number, holderPid?: number, signal?: AbortSignal): Promise<{ env: EnvRow; fresh: boolean }> {
     const start = now();
     // A holder that already holds this stack's LIVE lease consumes no
     // capacity — rebinding only re-saves it (renewing the deadline for an
@@ -852,7 +895,7 @@ export class Engine {
     queue.push(ticket);
     this.waiting.set(stack.id, queue);
     try {
-      return await this.acquireQueued(stack, holder, kind, hygiene, ttlMs, start, ticket, holderPid);
+      return await this.acquireQueued(stack, holder, kind, hygiene, ttlMs, start, ticket, holderPid, signal);
     } finally {
       const rest = (this.waiting.get(stack.id) ?? []).filter((t) => t !== ticket);
       if (rest.length > 0) this.waiting.set(stack.id, rest);
@@ -869,8 +912,11 @@ export class Engine {
     start: number,
     ticket: number,
     holderPid?: number,
+    signal?: AbortSignal,
   ): Promise<{ env: EnvRow; fresh: boolean }> {
     for (;;) {
+      // A caller that went away while queued must not claim anything.
+      if (signal?.aborted) throw new CallerGone('env-error', `the caller disconnected while '${stack.manifest.name}' was queued for its environment`, 'pool');
       // Only the head of THIS STACK's queue may claim; everyone else waits.
       const queue = this.waiting.get(stack.id);
       const myTurn = !queue || queue.length === 0 || queue[0] === ticket;
@@ -981,7 +1027,7 @@ export class Engine {
       if (closure.has(name)) return;
       const spec = all[name];
       if (!spec) {
-        throw new BrokerError('work-error', `no service '${name}' in runly.yml (have: ${Object.keys(all).join(', ') || 'none'})`, 'manifest');
+        throw new BrokerError('work-error', `no service '${name}' in ${manifestFileOf(stack)} (have: ${Object.keys(all).join(', ') || 'none'})`, 'manifest');
       }
       closure.add(name);
       for (const dep of spec.depends_on ?? []) visit(dep);
@@ -1087,7 +1133,7 @@ export class Engine {
     return restored;
   }
 
-  private async bindAndStart(stack: Stack, envSnapshot: EnvRow, hygiene: Hygiene, onProgress?: Progress, requestedServices?: string[], freshClaim = false, callerEnv?: unknown, requestedPresets?: unknown, rebuild = false): Promise<{ env: EnvRow; previewNotice?: string; bindDiagnostics: BindDiagnostics }> {
+  private async bindAndStart(stack: Stack, envSnapshot: EnvRow, hygiene: Hygiene, onProgress?: Progress, requestedServices?: string[], freshClaim = false, callerEnv?: unknown, requestedPresets?: unknown, rebuild = false, signal?: AbortSignal): Promise<{ env: EnvRow; previewNotice?: string; bindDiagnostics: BindDiagnostics }> {
     const say = onProgress ?? (() => undefined);
     // The load budget (decision 0036): state what this bind builds and starts
     // BEFORE doing any of it, and wait in the server-wide queue while it does
@@ -1101,6 +1147,7 @@ export class Engine {
     const reservation = await this.budget.admit(need, `up ${stack.manifest.name} (${live.id})`, {
       onWait: (position, etaMs, why) => say(`waiting for the load budget: position ${position}, about ${formatDuration(etaMs)} — ${why}`),
       source: 'budget',
+      signal,
     });
     try {
       return await this.bindAndStartInner(stack, envSnapshot, hygiene, onProgress, requestedServices, freshClaim, callerEnv, requestedPresets, rebuild, reservation);
@@ -1132,7 +1179,7 @@ export class Engine {
     if (!this.journal.leaseForEnv(env.id)) throw new BrokerError('env-error', 'lease ended before bind; run runly up again', 'lease');
     // Only the datastores the caller NAMED are reloaded; every other one keeps
     // what it holds (decision 0034).
-    const reloadPresets = validatePresetRequest(stack.manifest, requestedPresets);
+    const reloadPresets = validatePresetRequest(stack.manifest, requestedPresets, stack.file);
     // Which services this bind leaves running (decision 0034: `up` is
     // ADDITIVE). It never stops a running service, so the base is everything
     // running now; a continuing lease also brings back what it wants and is
@@ -1171,6 +1218,16 @@ export class Engine {
         env.ports[spec.port] = await this.allocPublicPort();
         addedPort = true;
       }
+    }
+    // …and a port key the manifest no longer declares gives its port back: its
+    // listener closes, so nothing answers a URL no service stands behind.
+    const declaredKeys = new Set(Object.values(stack.manifest.services).map((s) => s.port).filter((k): k is string => Boolean(k)));
+    for (const key of Object.keys(env.ports)) {
+      if (declaredKeys.has(key)) continue;
+      this.proxy.closeKey(env.id, key);
+      delete env.ports[key];
+      addedPort = true;
+      logEvent({ level: 'info', kind: 'proxy', envId: env.id, detail: `port key '${key}' is no longer declared in ${manifestFileOf(stack)} — its public port was released` });
     }
     if (addedPort) this.journal.saveEnv(env);
     // The proxy holds every public port from here on (decision 0033). A port it
@@ -1211,7 +1268,7 @@ export class Engine {
     // else is worth doing. Milliseconds when they're up; a one-time start
     // when they're not (decision 0018). Failures here are infra-errors.
     trace.phase('appliances');
-    await this.ensureAppliances(stack, say);
+    await this.ensureAppliances(stack, say, reservation);
 
     // No copy: the services run in the worktree itself (decision 0032), and
     // runly keeps no identity of it. Upkeep reads exactly the files its rules'
@@ -1220,7 +1277,7 @@ export class Engine {
     const waitTree = (s: number) => say(`waiting for another bind in this worktree … ${s}s`);
     const { upkeep, files } = await this.treeLocked(stack.id, async () => {
       // Read under the worktree lock: `runly warm` may be mid-install.
-      const triggers = triggerSet(stack.root, stack.manifest, worktreeStateDir(stack.id));
+      const triggers = await triggerSet(stack.root, stack.manifest, worktreeStateDir(stack.id));
       const ledger = this.treeLedgerSession(stack);
       const out = await runUpkeep(stack.root, triggers, stack.manifest, { ...pickEnvKeys(env.fingerprints), ...ledger.get() }, say, {
         commit: (fps) => ledger.commitRules(fps),
@@ -1270,39 +1327,37 @@ export class Engine {
     // the worktree's half (command rules) was written under the worktree lock.
     env.fingerprints = pickEnvKeys(upkeep.fingerprints);
 
-    const startSlice = (only: Set<string>) => this.startServices(stack, env, active, only, inputs, say, 'stop-all');
+    const startSlice = (only: Set<string>) => this.startServices(stack, env, active, only, inputs, say, 'stop-all', reservation);
 
     if (keepRunning) {
       trace.phase('build');
       const buildCtx = this.templateCtx(stack, env);
       const toRestart = new Set<string>();
-      await this.treeLocked(stack.id, async () => {
-        for (const [name, spec] of Object.entries(stack.manifest.services)) {
-          if (!active.has(name) || !buildOf(spec)) continue;
-          // A service this `up` adds is built and started; nothing to compare.
-          if (!running.has(name)) {
-            const b = await this.buildService(stack, env, name, spec, buildCtx, say, { rebuild, mode: 'bind' });
-            trace.result.builds.push({ service: name, durationMs: b.durationMs, restart: false, reason: b.ran ? 'not-running' : 'when-unchanged' });
-            continue;
-          }
-          const declared = outputsOf(spec);
-          const before = declared.paths.length > 0 ? snapshotOutputs(stack.root, declared.paths, declared.compare) : null;
+      await this.treeLocked(stack.id, () => this.inWaves(this.buildWaves(stack, active), async (name) => {
+        const spec = serviceOf(stack, name);
+        // A service this `up` adds is built and started; nothing to compare.
+        if (!running.has(name)) {
           const b = await this.buildService(stack, env, name, spec, buildCtx, say, { rebuild, mode: 'bind' });
-          if (!b.ran) {
-            // Its inputs did not change, so its output did not either.
-            trace.result.builds.push({ service: name, durationMs: b.durationMs, restart: false, reason: 'when-unchanged' });
-            continue;
-          }
-          const changed = before === null || snapshotOutputs(stack.root, declared.paths, declared.compare) !== before;
-          if (changed) toRestart.add(name);
-          trace.result.builds.push({
-            service: name,
-            durationMs: b.durationMs,
-            restart: changed,
-            reason: before === null ? 'no-outputs-declared' : changed ? 'outputs-changed' : 'outputs-unchanged',
-          });
+          trace.result.builds.push({ service: name, durationMs: b.durationMs, restart: false, reason: b.ran ? 'not-running' : 'when-unchanged' });
+          return;
         }
-      }, waitTree);
+        const declared = outputsOf(spec);
+        const before = declared.paths.length > 0 ? await snapshotOutputs(stack.root, declared.paths, declared.compare) : null;
+        const b = await this.buildService(stack, env, name, spec, buildCtx, say, { rebuild, mode: 'bind' });
+        if (!b.ran) {
+          // Its inputs did not change, so its output did not either.
+          trace.result.builds.push({ service: name, durationMs: b.durationMs, restart: false, reason: 'when-unchanged' });
+          return;
+        }
+        const changed = before === null || (await snapshotOutputs(stack.root, declared.paths, declared.compare)) !== before;
+        if (changed) toRestart.add(name);
+        trace.result.builds.push({
+          service: name,
+          durationMs: b.durationMs,
+          restart: changed,
+          reason: before === null ? 'no-outputs-declared' : changed ? 'outputs-changed' : 'outputs-unchanged',
+        });
+      }), waitTree);
       reservation.releaseBuild();
       // A reloaded datastore must not be held open across its restore: the
       // running services that use it stop first and start again on the new
@@ -1372,14 +1427,10 @@ export class Engine {
     // Under the worktree lock: `runly warm` builds into the same output.
     const ctx = this.templateCtx(stack, env);
     trace.phase('build');
-    await this.treeLocked(stack.id, async () => {
-      for (const [name, spec] of Object.entries(stack.manifest.services)) {
-        if (!active.has(name)) continue; // don't build what we won't start
-        if (!buildOf(spec)) continue;
-        const b = await this.buildService(stack, env, name, spec, ctx, say, { rebuild, mode: 'bind' });
-        trace.result.builds.push({ service: name, durationMs: b.durationMs, restart: true, reason: b.ran ? 'full-rebind' : 'when-unchanged' });
-      }
-    }, waitTree);
+    await this.treeLocked(stack.id, () => this.inWaves(this.buildWaves(stack, active), async (name) => {
+      const b = await this.buildService(stack, env, name, serviceOf(stack, name), ctx, say, { rebuild, mode: 'bind' });
+      trace.result.builds.push({ service: name, durationMs: b.durationMs, restart: true, reason: b.ran ? 'full-rebind' : 'when-unchanged' });
+    }), waitTree);
     reservation.releaseBuild();
 
     trace.phase('ready');
@@ -1435,6 +1486,71 @@ export class Engine {
   }
 
   /**
+   * The order the builds of `names` run in: depends_on waves. A build runs
+   * after the builds of what its service depends on (transitively), and the
+   * builds of one wave run at once — independent services no longer wait for
+   * each other. `build: {serial: true}` runs alone; `builds: serial` on the
+   * stack runs every build alone, in manifest order (the behaviour before
+   * 0.16.1). The load budget holds the costliest wave's sum (needFor).
+   *
+   * Builds that write one shared output or take one tool lock belong in
+   * `serial`. Two Angular projects are fine in parallel: the CLI's persistent
+   * cache is keyed per project (`.angular/cache/<version>/<project>`).
+   */
+  private buildWaves(stack: Stack, names: Iterable<string>): string[][] {
+    const services = stack.manifest.services;
+    const wanted = new Set([...names].filter((n) => buildOf(services[n] ?? {}) !== undefined));
+    const ordered = Object.keys(services).filter((n) => wanted.has(n));
+    if (stack.manifest.builds === 'serial') return ordered.map((n) => [n]);
+    const level = new Map<string, number>();
+    const depth = (n: string, seen: Set<string>): number => {
+      const known = level.get(n);
+      if (known !== undefined) return known;
+      if (seen.has(n)) return 0; // a depends_on cycle: the start loop reports it
+      seen.add(n);
+      const deps = (services[n]?.depends_on ?? []).map((d) => depth(d, seen));
+      seen.delete(n);
+      const d = deps.length === 0 ? 0 : Math.max(...deps) + 1;
+      level.set(n, d);
+      return d;
+    };
+    const byLevel = new Map<number, string[]>();
+    for (const n of ordered) {
+      const l = depth(n, new Set());
+      byLevel.set(l, [...(byLevel.get(l) ?? []), n]);
+    }
+    const waves: string[][] = [];
+    for (const l of [...byLevel.keys()].sort((a, b) => a - b)) {
+      const members = byLevel.get(l) ?? [];
+      const serial = (n: string) => buildOf(services[n] ?? {})?.serial === true;
+      for (const n of members) if (serial(n)) waves.push([n]);
+      const together = members.filter((n) => !serial(n));
+      if (together.length > 0) waves.push(together);
+    }
+    return waves;
+  }
+
+  /**
+   * Run `fn` for each service of `waves`, wave after wave, the members of one
+   * wave at once. A failure fails the call once its whole wave has settled —
+   * never with a sibling build still running behind the caller's back.
+   */
+  private async inWaves(waves: string[][], fn: (name: string) => Promise<void>): Promise<void> {
+    for (const wave of waves) {
+      const results = await Promise.allSettled(wave.map((n) => fn(n)));
+      const failed = results.find((r): r is PromiseRejectedResult => r.status === 'rejected');
+      if (failed) throw failed.reason;
+    }
+  }
+
+  /** Build `names` (those that declare a build) in waves. MUST run under treeLocked. */
+  private runBuilds(stack: Stack, env: EnvRow | undefined, names: Iterable<string>, ctx: Record<string, unknown> | undefined, say: Progress, opts: { rebuild: boolean; mode: 'bind' | 'wake' | 'warm' }): Promise<void> {
+    return this.inWaves(this.buildWaves(stack, names), async (name) => {
+      await this.buildService(stack, env, name, serviceOf(stack, name), ctx, say, opts);
+    });
+  }
+
+  /**
    * Run one service's build in the worktree. MUST run under treeLocked. Its
    * output goes to `<service>.build.log` in the environment's log directory
    * (decision 0038), replaced by each build; `logDir` is undefined only for a
@@ -1473,9 +1589,9 @@ export class Engine {
    * string build always runs on a bind, and on a wake only when it never
    * succeeded here (a wake resumes what ran; `up` applies changes).
    */
-  private buildDecision(stack: Stack, name: string, spec: ServiceSpec, cmd: string, opts: { rebuild: boolean; mode: 'bind' | 'wake' | 'warm' | 'plan' }): { run: boolean; key: string; reason?: string } {
+  private async buildDecision(stack: Stack, name: string, spec: ServiceSpec, cmd: string, opts: { rebuild: boolean; mode: 'bind' | 'wake' | 'warm' | 'plan' }): Promise<{ run: boolean; key: string; reason?: string }> {
     const b = buildOf(spec) ?? { run: cmd };
-    const key = b.when ? buildInputsKey(stack.root, stack.manifest, cmd, b.when) : sha256(`${cmd}\nalways`);
+    const key = b.when ? await buildInputsKey(stack.root, stack.manifest, cmd, b.when) : sha256(`${cmd}\nalways`);
     if (opts.rebuild) return { run: true, key };
     if (b.when && buildIsCurrent(stack.id, name, key)) return { run: false, key, reason: 'when: unchanged' };
     if (!b.when && opts.mode === 'wake' && everBuilt(stack.id, name)) return { run: false, key, reason: 'a wake resumes the last build' };
@@ -1490,7 +1606,7 @@ export class Engine {
     const b = buildOf(spec);
     if (!b) return { ran: false, durationMs: 0 };
     const cmd = ctx ? template(b.run, ctx) : b.run;
-    const decision = this.buildDecision(stack, name, spec, cmd, opts);
+    const decision = await this.buildDecision(stack, name, spec, cmd, opts);
     if (!decision.run) {
       say(`build ${name}: skipped (${decision.reason})`);
       return { ran: false, durationMs: 0 };
@@ -1521,12 +1637,34 @@ export class Engine {
     };
   }
 
-  /** Ensure the stack's appliances (decision 0018), remembering the ones runly started for the budget. */
-  private async ensureAppliances(stack: Stack, say: Progress): Promise<void> {
+  /**
+   * Ensure the stack's appliances (decision 0018), remembering the ones runly
+   * started for the budget. A started one is counted as running from now on,
+   * so its share leaves the caller's reservation.
+   */
+  private async ensureAppliances(stack: Stack, say: Progress, reservation?: Reservation): Promise<void> {
     for (const [name, spec] of Object.entries(stack.manifest.appliances ?? {})) {
       const state = await ensureAppliance(name, spec, stack.root, say);
-      if (state === 'started') this.startedAppliances.set(spec.probe, { name, cost: costsOf(spec.resources, policy().budget).run });
+      if (state === 'started') {
+        const cost = costsOf(spec.resources, policy().budget).run;
+        this.startedAppliances.set(spec.probe, { name, cost });
+        reservation?.consume(cost);
+      }
       if (state !== 'up') logEvent({ level: 'info', kind: 'appliance', detail: `'${name}' ${state} (${spec.probe})` });
+    }
+  }
+
+  /**
+   * Forget appliances that are no longer up (stopped by hand, crashed, a
+   * reboot): their cost stayed committed for the rest of the daemon's life.
+   * Re-probed every sweep — a TCP connect per appliance runly started.
+   */
+  private async pruneStartedAppliances(): Promise<void> {
+    for (const [probe, a] of [...this.startedAppliances]) {
+      if (!(await probeTcp(probe, 1000))) {
+        this.startedAppliances.delete(probe);
+        logEvent({ level: 'info', kind: 'appliance', detail: `'${a.name}' (${probe}) is no longer up — its cost leaves the budget` });
+      }
     }
   }
 
@@ -1569,6 +1707,9 @@ export class Engine {
     } catch {
       ctx = undefined;
     }
+    // Builds of one wave run at once, so their costs add up (needOf).
+    const waveOf = new Map<string, number>();
+    this.buildWaves(stack, builds).forEach((wave, i) => { for (const n of wave) waveOf.set(n, i); });
     for (const [name, spec] of Object.entries(stack.manifest.services)) {
       const costs = costsOf(spec.resources, b);
       const declaredBuild = buildOf(spec);
@@ -1577,12 +1718,12 @@ export class Engine {
         try {
           const raw = declaredBuild.run;
           const cmd = ctx ? template(raw, ctx) : raw;
-          const d = this.buildDecision(stack, name, spec, cmd, { rebuild: opts.rebuild, mode: opts.mode === 'plan' ? 'bind' : opts.mode });
+          const d = await this.buildDecision(stack, name, spec, cmd, { rebuild: opts.rebuild, mode: opts.mode === 'plan' ? 'bind' : opts.mode });
           if (!d.run) skipped = d.reason;
         } catch {
           /* an untemplatable line (no environment yet): it will run */
         }
-        items.push({ kind: 'build', name, cost: costs.build, ...(skipped ? { skipped } : {}) });
+        items.push({ kind: 'build', name, cost: costs.build, wave: waveOf.get(name), ...(skipped ? { skipped } : {}) });
       }
       if (starts.has(name)) items.push({ kind: 'start', name, cost: costs.run });
     }
@@ -1603,6 +1744,7 @@ export class Engine {
   private async startServices(
     stack: Stack, env: EnvRow, active: Set<string>, only: Set<string>,
     inputs: { values: Record<string, string> }, say: Progress, onFailure: 'stop-all' | 'stop-these',
+    reservation?: Reservation,
   ): Promise<void> {
     const sup = this.supervisor(env);
     this.envManifests.set(env.id, stack.manifest);
@@ -1613,7 +1755,7 @@ export class Engine {
       const pending = entries.filter(([n]) => !started.has(n));
       if (pending.length === 0) break;
       const ready = pending.filter(([, s]) => (s.depends_on ?? []).every((d) => started.has(d) || !active.has(d)));
-      if (ready.length === 0) throw new BrokerError('work-error', 'depends_on cycle in runly.yml', 'manifest');
+      if (ready.length === 0) throw new BrokerError('work-error', `depends_on cycle in ${manifestFileOf(stack)}`, 'manifest');
       for (const [name, spec] of ready) {
         // The service listens on a fresh INTERNAL port (decision 0033); the
         // proxy keeps the public one and forwards to it once it is ready.
@@ -1624,7 +1766,7 @@ export class Engine {
           if (env.ports[spec.port] === undefined) {
             throw new BrokerError('env-error', `environment ${env.id} has no port recorded for service '${name}' — the port ledger is inconsistent; try 'runly pool recycle ${env.id}'`, name);
           }
-          internal = await this.allocInternalPort(internalTaken);
+          internal = await this.allocInternalPort(internalTaken, env.id, spec.port);
           internalTaken.add(internal);
           this.proxy.starting(env.id, spec.port, name);
         }
@@ -1635,6 +1777,9 @@ export class Engine {
         const callerValues = serviceCallerEnv(spec, inputs.values);
         const serviceEnv = { ...templateEnv(spec.env, ctx), ...callerValues };
         sup.start(name, resolved, serviceEnv, Object.values(callerValues).filter((value): value is string => value !== undefined));
+        // From now on the running service is what the budget counts; its share
+        // leaves the reservation (it was counted twice until the bind ended).
+        reservation?.consume(costsOf(spec.resources, policy().budget).run);
         // A fresh start is activity: an old idle clock must not stop it at once.
         this.startedAt.set(`${env.id}\0${name}`, now());
         this.idleStopped.delete(`${env.id}\0${name}`);
@@ -1809,7 +1954,7 @@ export class Engine {
     const forbiddenNotice = await this.enforceHolderPreviewForbidden(stack, holder, opts.onProgress);
     // Removed by decision 0034; the CLI answers it with exit 64 before the daemon.
     if (opts.dataOnly) throw new BrokerError('work-error', DATA_ONLY_REMOVED, 'manifest');
-    validatePresetRequest(stack.manifest, opts.presets);
+    validatePresetRequest(stack.manifest, opts.presets, stack.file);
     // Resolve a requested slice BEFORE acquiring an env: an unknown name is a
     // user typo, not a bind failure, so it must not reach bindAndStart's catch
     // (which bumps failStreak — two typos would escalate the next real bind to a
@@ -1823,7 +1968,8 @@ export class Engine {
     if (opts.holderPid !== undefined && !isAlive(opts.holderPid)) {
       throw new BrokerError(
         'work-error',
-        `holder pid ${opts.holderPid} is not a live process — the lease would be reclaimable the moment it is created; use a TTL instead`,
+        `holder pid ${opts.holderPid} is not a live process — the lease would be reclaimable the moment it is created. ` +
+          `Under Claude Code, leave the holder pid out: the CLI tethers the lease to the agent itself (CLAUDE_PID); elsewhere use a TTL (--ttl <minutes>)`,
         'lease',
       );
     }
@@ -1844,7 +1990,7 @@ export class Engine {
     opts.onProgress?.(`acquiring this worktree's environment (machine ${this.journal.allEnvs().length}/${POOL_MAX_TOTAL()})`);
     const queueStarted = performance.now();
     let queueMs = 0;
-    const { env, fresh } = await this.acquireEnv(stack, holder, kind, hygiene, opts.ttlMs ?? LEASE_TTL(kind), opts.holderPid);
+    const { env, fresh } = await this.acquireEnv(stack, holder, kind, hygiene, opts.ttlMs ?? LEASE_TTL(), opts.holderPid, opts.signal);
     // Auto-escalation (decision 0007): two consecutive bind failures on this
     // warm environment -> the next bind is pristine, whatever was asked.
     if (hygiene !== 'pristine' && env.failStreak >= 2) hygiene = 'pristine';
@@ -1853,7 +1999,8 @@ export class Engine {
         env.id,
         () => {
           queueMs = performance.now() - queueStarted;
-          return this.bindAndStart(stack, env, hygiene, opts.onProgress, services, fresh, suppliedInputs, opts.presets, Boolean(opts.rebuild));
+          if (opts.signal?.aborted) throw new CallerGone('env-error', `the caller disconnected before its bind of ${env.id} started`, 'pool');
+          return this.bindAndStart(stack, env, hygiene, opts.onProgress, services, fresh, suppliedInputs, opts.presets, Boolean(opts.rebuild), opts.signal);
         },
         (s) => opts.onProgress?.(`waiting for another operation on this environment … ${s}s`),
         'a bind',
@@ -1862,8 +2009,13 @@ export class Engine {
       bindDiagnostics.durationMs = performance.now() - requestStarted;
       return { ...this.ctx(opts.cwd, holder, bound.id), previewNotice: previewNotice ?? forbiddenNotice, bindDiagnostics };
     } catch (err) {
+      // Only a bind that FAILED counts toward the escalation (decision 0007).
+      // A budget refusal or a caller that went away touched nothing: counted,
+      // one refusal switched wake-on-connect off and two made the next `up`
+      // pristine — wiping the data of an environment that never failed.
+      const notABindFailure = err instanceof BudgetRefusal || err instanceof CallerGone;
       const fresh = this.journal.getEnv(env.id);
-      if (fresh) {
+      if (fresh && !notABindFailure) {
         fresh.failStreak += 1;
         this.journal.saveEnv(fresh);
       }
@@ -2006,7 +2158,7 @@ export class Engine {
     await this.envsLocked(envIds, () => this.treeLocked(stack.id, async () => {
       const ledger = this.treeLedgerSession(stack);
       try {
-        const upkeep = await runUpkeep(stack.root, triggerSet(stack.root, stack.manifest, worktreeStateDir(stack.id)), stack.manifest, ledger.get(), say, {
+        const upkeep = await runUpkeep(stack.root, await triggerSet(stack.root, stack.manifest, worktreeStateDir(stack.id)), stack.manifest, ledger.get(), say, {
           builtins: false,
           commit: (fps) => ledger.commitRules(fps),
         });
@@ -2018,29 +2170,42 @@ export class Engine {
         return;
       }
       const env = envIds[0] !== undefined ? this.journal.getEnv(envIds[0]) : undefined;
-      for (const [name, spec] of Object.entries(stack.manifest.services)) {
-        const b = buildOf(spec);
-        if (!b) continue;
-        // No environment means no ports, URLs or datastores to fill in, and
-        // running the line with a placeholder would build the wrong thing.
+      // Builds of one wave finish in any order; the steps are reported in
+      // manifest order so the result does not depend on who finished first.
+      const order = Object.keys(stack.manifest.services);
+      const buildSteps = new Map<string, (typeof steps)[number]>();
+      const flush = () => { for (const n of order) { const st = buildSteps.get(n); if (st) steps.push(st); } };
+      // No environment means no ports, URLs or datastores to fill in, and
+      // running the line with a placeholder would build the wrong thing.
+      const buildable = order.filter((name) => {
+        const b = buildOf(serviceOf(stack, name));
+        if (!b) return false;
         if (/\{\{/.test(b.run)) {
-          steps.push({ kind: 'build', service: name, status: 'skipped', durationMs: 0, reason: 'its build line templates environment values; the next bind builds it' });
-          continue;
+          buildSteps.set(name, { kind: 'build', service: name, status: 'skipped', durationMs: 0, reason: 'its build line templates environment values; the next bind builds it' });
+          return false;
         }
-        const buildStart = performance.now();
-        try {
-          // The same build ledger a bind reads (decision 0038): a `when:`
-          // build warm ran is one the next `up` skips.
-          const r = await this.buildService(stack, env, name, spec, undefined, say, { rebuild: false, mode: 'warm' });
-          steps.push(r.ran
-            ? { kind: 'build', service: name, status: 'ran', durationMs: performance.now() - buildStart }
-            : { kind: 'build', service: name, status: 'skipped', durationMs: 0, reason: 'when: unchanged since its last successful build' });
-        } catch (err) {
-          steps.push({ kind: 'build', service: name, status: 'failed', durationMs: performance.now() - buildStart });
-          const e = err instanceof BrokerError ? err : new BrokerError('work-error', String((err as Error).message ?? err), name);
-          failure = e.toJSON();
-          return;
-        }
+        return true;
+      });
+      try {
+        await this.inWaves(this.buildWaves(stack, buildable), async (name) => {
+          const buildStart = performance.now();
+          try {
+            // The same build ledger a bind reads (decision 0038): a `when:`
+            // build warm ran is one the next `up` skips.
+            const r = await this.buildService(stack, env, name, serviceOf(stack, name), undefined, say, { rebuild: false, mode: 'warm' });
+            buildSteps.set(name, r.ran
+              ? { kind: 'build', service: name, status: 'ran', durationMs: performance.now() - buildStart }
+              : { kind: 'build', service: name, status: 'skipped', durationMs: 0, reason: 'when: unchanged since its last successful build' });
+          } catch (err) {
+            buildSteps.set(name, { kind: 'build', service: name, status: 'failed', durationMs: performance.now() - buildStart });
+            throw err instanceof BrokerError ? err : new BrokerError('work-error', String((err as Error).message ?? err), name);
+          }
+        });
+      } catch (err) {
+        failure = (err as BrokerError).toJSON();
+        return;
+      } finally {
+        flush();
       }
     }, (s) => say(`waiting for another bind in this worktree … ${s}s`)), (s) => say(`waiting for an operation on this worktree's environment … ${s}s`), 'a warm-up');
     const ran = steps.filter((st) => st.status === 'ran').length;
@@ -2064,7 +2229,7 @@ export class Engine {
     const h = this.callerHolder(cwd, holder, stack);
     const noLease = () => new BrokerError('env-error', `no active lease — run 'runly up' first`, 'lease');
     const forbiddenNotice = await this.enforceHolderPreviewForbidden(stack, h, onProgress);
-    validatePresetRequest(stack.manifest, presets);
+    validatePresetRequest(stack.manifest, presets, stack.file);
     const lease = this.journal.leaseForHolder(h, stack.id);
     if (!lease || lease.expiresAt <= now()) throw noLease();
     const env = this.envForLease(lease);
@@ -2113,7 +2278,8 @@ export class Engine {
     }
   }
 
-  private assertUsable(envId: string): EnvRow {
+  /** `resumable`: the caller starts idle-stopped services itself (resumeForVerb) instead of being refused. */
+  private assertUsable(envId: string, opts: { resumable?: boolean } = {}): EnvRow {
     const fresh = this.journal.getEnv(envId);
     if (!fresh || fresh.state === 'recycling') {
       throw new BrokerError('env-error', `environment ${envId} is being recycled — retry`, 'pool');
@@ -2127,7 +2293,7 @@ export class Engine {
     // what the holder has. Refusing it here would break `exec` on the one shape
     // that has nothing else to offer.
     const wantsServices = fresh.activeServices === undefined || fresh.activeServices.length > 0;
-    if (fresh.state === 'warm' && wantsServices) {
+    if (fresh.state === 'warm' && wantsServices && !opts.resumable) {
       throw new BrokerError(
         'env-error',
         `environment ${envId} holds your lease but its services are not running (the daemon restarted) — run 'runly up' to rebind before exec/token`,
@@ -2155,8 +2321,17 @@ export class Engine {
       extra[`BACKLOT_URL_${name.toUpperCase()}`] = s.url;
     }
     for (const [name, d] of Object.entries(ctx.datastores)) extra[`BACKLOT_DS_${name.toUpperCase()}`] = d.url;
+    // The names `runly ctx --env` prints, so a script reads one set whether it
+    // runs under `exec` or after `eval "$(runly ctx --env)"`.
+    Object.assign(extra, runlyEnvVars({
+      envId: env.id,
+      ports: env.ports,
+      urls: Object.fromEntries(Object.entries(ctx.services).filter(([n]) => !activeSet || activeSet.has(n)).map(([n, s]) => [n, s.url])),
+      datastores: Object.fromEntries(Object.entries(ctx.datastores).map(([n, d]) => [n, { url: d.url, preset: env.datastoreNs[n] ? (env.presets[n] ?? null) : null }])),
+      logins: normalizeLogins(stack.manifest.auth?.logins)[0] ?? null,
+    }));
     return this.envLocked(env.id, async () => {
-      this.assertUsable(env.id);
+      await this.resumeForVerb(this.assertUsable(env.id, { resumable: true }), 'exec');
       this.touch(env.id);
       // Bounded, detached, and tagged like a service: an exec blocking on stdin
       // held the env's busy bit forever, and its untagged children were
@@ -2179,16 +2354,22 @@ export class Engine {
   async token(cwd: string, role: string, holder?: string) {
     const stack = loadStack(cwd);
     const spec = stack.manifest.auth?.token;
-    if (!spec) throw new BrokerError('work-error', `runly.yml declares no auth.token command`, 'manifest');
+    if (!spec) throw new BrokerError('work-error', `${manifestFileOf(stack)} declares no auth.token command`, 'manifest');
+    // The role is spliced into a SHELL line ({{role}}), so it may only be a
+    // name: `--role 'x; rm -rf ~'` ran the rest as a command. It also rides in
+    // the environment as RUNLY_ROLE, for a hook that prefers to read it there.
+    if (!/^[A-Za-z0-9][A-Za-z0-9_.:@+-]*$/.test(role)) {
+      throw new BrokerError('work-error', `--role must be a name (letters, digits and _ . : @ + -), got ${JSON.stringify(role)}`, 'auth');
+    }
     const lease = this.journal.leaseForHolder(this.callerHolder(cwd, holder, stack), stack.id);
     if (!lease) throw new BrokerError('env-error', `no active lease — run 'runly up' first`, 'lease');
     const env = this.envForLease(lease);
     const ctx = { ...this.templateCtx(stack, env), role };
     return this.envLocked(env.id, async () => {
-      this.assertUsable(env.id);
+      await this.resumeForVerb(this.assertUsable(env.id, { resumable: true }), 'token');
       this.touch(env.id);
       const timeoutS = cmdTimeoutS();
-      const r = await runBoundedIO(template(spec, ctx), stack.root, timeoutS);
+      const r = await runBoundedIO(template(spec, ctx), stack.root, timeoutS, { ...process.env, RUNLY_ROLE: role });
       if (r.timedOut) {
         throw new BrokerError('work-error', `auth.token command timed out after ${timeoutS}s (process group killed)`, 'auth', r.stderr.slice(-400));
       }
@@ -2208,7 +2389,7 @@ export class Engine {
     const stack = loadStack(cwd);
     for (const name of services) {
       if (!stack.manifest.services[name]) {
-        throw new BrokerError('work-error', `no service '${name}' in runly.yml (have: ${Object.keys(stack.manifest.services).join(', ')})`, name);
+        throw new BrokerError('work-error', `no service '${name}' in ${manifestFileOf(stack)} (have: ${Object.keys(stack.manifest.services).join(', ')})`, name);
       }
     }
     const lease = this.journal.leaseForHolder(this.callerHolder(cwd, holder, stack), stack.id);
@@ -2275,7 +2456,7 @@ export class Engine {
     if (stack.manifest.preview?.forbidden) {
       throw new BrokerError(
         'work-error',
-        `this stack forbids public preview in runly.yml (preview.forbidden) — the manifest must not be published to the internet`,
+        `this stack forbids public preview in ${manifestFileOf(stack)} (preview.forbidden) — the manifest must not be published to the internet`,
         'manifest',
       );
     }
@@ -2406,6 +2587,7 @@ export class Engine {
     }
     this.journal.deleteLease(lease.id);
     this.leaseInputs.delete(lease.id);
+    this.goneSince.delete(`lease:${lease.id}`);
   }
 
   /**
@@ -2419,7 +2601,7 @@ export class Engine {
   private previewTarget(env: EnvRow, stack: Stack, service: string): number {
     const spec = stack.manifest.services[service];
     if (!spec) {
-      throw new BrokerError('work-error', `no service '${service}' in runly.yml`, 'manifest');
+      throw new BrokerError('work-error', `no service '${service}' in ${manifestFileOf(stack)}`, 'manifest');
     }
     const activeSet = env.activeServices ? new Set(env.activeServices) : null;
     if (activeSet && !activeSet.has(service)) {
@@ -2578,7 +2760,7 @@ export class Engine {
     const stack = loadStack(cwd);
     const specs = Object.entries(stack.manifest.appliances ?? {}).filter(([n]) => !name || n === name);
     if (name && specs.length === 0) {
-      throw new BrokerError('work-error', `no appliance '${name}' in runly.yml`, 'appliance');
+      throw new BrokerError('work-error', `no appliance '${name}' in ${manifestFileOf(stack)}`, 'appliance');
     }
     const results: Record<string, string> = {};
     for (const [n, spec] of specs) {
@@ -2592,8 +2774,9 @@ export class Engine {
   async applianceStop(cwd: string, name: string) {
     const stack = loadStack(cwd);
     const spec = stack.manifest.appliances?.[name];
-    if (!spec) throw new BrokerError('work-error', `no appliance '${name}' in runly.yml`, 'appliance');
+    if (!spec) throw new BrokerError('work-error', `no appliance '${name}' in ${manifestFileOf(stack)}`, 'appliance');
     await stopAppliance(name, spec, stack.root);
+    this.startedAppliances.delete(spec.probe);
     logEvent({ level: 'info', kind: 'appliance', detail: `'${name}' stopped (${spec.probe})` });
     return { stopped: name };
   }
@@ -2614,7 +2797,7 @@ export class Engine {
     const say = opts.onProgress ?? (() => undefined);
     for (const name of opts.services) {
       if (!stack.manifest.services[name]) {
-        throw new BrokerError('work-error', `no service '${name}' in runly.yml (have: ${Object.keys(stack.manifest.services).join(', ') || 'none'}) — only services are named here; datastores stay for the environment's life (decision 0034)`, 'manifest');
+        throw new BrokerError('work-error', `no service '${name}' in ${manifestFileOf(stack)} (have: ${Object.keys(stack.manifest.services).join(', ') || 'none'}) — only services are named here; datastores stay for the environment's life (decision 0034)`, 'manifest');
       }
     }
     const noLease = () => new BrokerError('env-error', `no active lease for this worktree — there is nothing to take down ('runly up' first)`, 'lease');
@@ -2697,9 +2880,9 @@ export class Engine {
     const stores = stack.manifest.datastores ?? {};
     const spec = stores[opts.datastore];
     if (!spec) {
-      throw new BrokerError('work-error', `no datastore '${opts.datastore}' in runly.yml (have: ${Object.keys(stores).join(', ') || 'none'})`, 'manifest');
+      throw new BrokerError('work-error', `no datastore '${opts.datastore}' in ${manifestFileOf(stack)} (have: ${Object.keys(stores).join(', ') || 'none'})`, 'manifest');
     }
-    const chosen = validatePresetRequest(stack.manifest, opts.preset === undefined ? undefined : { [opts.datastore]: opts.preset });
+    const chosen = validatePresetRequest(stack.manifest, opts.preset === undefined ? undefined : { [opts.datastore]: opts.preset }, stack.file);
     const preset = chosen[opts.datastore] ?? defaultPresetFor(opts.datastore, spec);
     const holder = this.callerHolder(opts.cwd, opts.holder, stack);
     if (opts.holderPid !== undefined && !isAlive(opts.holderPid)) {
@@ -2712,13 +2895,13 @@ export class Engine {
     // the worktree's trigger files exactly as a bind computes it. The trigger
     // cache is written atomically, so this needs no worktree lock — a copy
     // never waits for a bind's builds.
-    const bakeKeys = templateBakeKeys(stack.manifest, stack.root, triggerSet(stack.root, stack.manifest, worktreeStateDir(stack.id)));
+    const bakeKeys = templateBakeKeys(stack.manifest, stack.root, await triggerSet(stack.root, stack.manifest, worktreeStateDir(stack.id)));
     const ds = makeDatastore(opts.datastore, spec, stack.id, bakeKeys[opts.datastore]);
     const dir = join(dbCopiesRoot(), name);
     const h: DsHandle = { envId: `${stack.id}-db-${short}`, cwd: stack.root, dataDir: dir };
     const dropCmd = ds.dropCommand(h);
     if (!ds.fileBased && dropCmd === null) {
-      throw new BrokerError('work-error', `datastore '${opts.datastore}' declares no drop: command, so runly could never remove a copy of it — add one to runly.yml`, 'manifest');
+      throw new BrokerError('work-error', `datastore '${opts.datastore}' declares no drop: command, so runly could never remove a copy of it — add one to ${manifestFileOf(stack)}`, 'manifest');
     }
     const row: DbCopyRow = {
       name, stack: stack.id, stackRoot: stack.root, datastore: opts.datastore, preset,
@@ -2791,6 +2974,7 @@ export class Engine {
     }
     if (ok) {
       this.journal.deleteDbCopy(live.name);
+      this.goneSince.delete(`copy:${live.name}`);
       logEvent({ level: 'info', kind: 'db', detail: `dropped database copy ${live.name} of '${live.datastore}' — ${reason}` });
       return { ok: true };
     }
@@ -3040,7 +3224,8 @@ export class Engine {
 
     // 1. Environment directories no row names.
     for (const id of existsSync(envsRoot()) ? readdirSync(envsRoot()) : []) {
-      if (envIds.has(id) || !/-e\d+$/.test(id)) continue;
+      // Re-read: a bind that created its environment after the snapshot above owns it.
+      if (envIds.has(id) || !/-e\d+$/.test(id) || this.journal.getEnv(id)) continue;
       const dir = join(envsRoot(), id);
       const users = procScanSupported() ? scanByCwd(dir) : [];
       const f: (typeof findings)[number] = { kind: 'env-dir', what: dir, detail: users.length ? `no environment row names it; ${users.length} process(es) still run in it — left alone` : 'no environment row names it' };
@@ -3053,7 +3238,7 @@ export class Engine {
     // 2. Copy directories no copy row names.
     const copyNames = new Set(copies.map((c) => c.name));
     for (const name of existsSync(dbCopiesRoot()) ? readdirSync(dbCopiesRoot()) : []) {
-      if (copyNames.has(name)) continue;
+      if (copyNames.has(name) || this.dbBusy.has(name) || this.journal.getDbCopy(name)) continue;
       const dir = join(dbCopiesRoot(), name);
       const f: (typeof findings)[number] = { kind: 'copy-dir', what: dir, detail: 'no database copy row names it' };
       if (fix && this.isPrivateDbDir(dir)) {
@@ -3075,50 +3260,71 @@ export class Engine {
       findings.push(f);
     }
     // 4. Template markers nothing references, superseded or of a stack that is gone (no grace here).
+    //    Under each stack's bake lock: a bake in flight writes its marker last,
+    //    and must neither lose it nor see its database dropped half-made.
     const markerNs = new Set<string>();
-    for (const stackDir of existsSync(templatesRoot()) ? readdirSync(templatesRoot()) : []) {
-      const dir = join(templatesRoot(), stackDir);
+    const markersOf = (stackDir: string): string[] => {
+      const out: string[] = [];
       let files: string[];
-      try { files = readdirSync(dir); } catch { continue; }
-      const alive = refs.stackAlive(stackDir);
-      const seen = new Map<string, number>();
-      const ordered = files.filter((f) => !f.startsWith('.') && !f.endsWith('.retirement.json'))
-        .map((f) => ({ f, m: (() => { try { return statSync(join(dir, f)).mtimeMs; } catch { return 0; } })() }))
-        .sort((a, b) => b.m - a.m);
-      for (const { f } of ordered) {
-        const group = f.lastIndexOf('@') > 0 ? f.slice(0, f.lastIndexOf('@')) : '';
-        const rank = seen.get(group) ?? 0;
-        seen.set(group, rank + 1);
-        let ns: string | undefined;
-        if (f.endsWith('.baked')) {
-          try { ns = parseBakedMarker(readFileSync(join(dir, f), 'utf8')).ns; } catch { ns = undefined; }
-        }
-        const keep = (alive && rank < Math.max(1, policy().templatesKeep)) || refs.referenced.has(`${stackDir}/${f}`) || existsSync(join(dir, '.retired-stack.json'));
-        if (keep) {
-          if (ns) markerNs.add(ns);
-          continue;
-        }
-        const finding: (typeof findings)[number] = { kind: 'template', what: join(dir, f), detail: alive ? 'superseded, and no environment or copy was restored from it' : 'its stack can never be bound again (worktree gone, no rows)' };
-        if (fix) {
-          try {
-            const marker = f.endsWith('.baked') ? parseBakedMarker(readFileSync(join(dir, f), 'utf8')) : null;
-            if (marker?.drop) {
-              const r = await runBounded(marker.drop, stateRoot(), cmdTimeoutS());
-              if (r.code !== 0 || r.timedOut) throw new Error(`drop exited ${r.timedOut ? 'by timeout' : r.code}: ${r.output.slice(-200)}`);
-            }
-            rmSync(join(dir, f), { force: true });
-            finding.fixed = true;
-          } catch (err) {
-            finding.error = String((err as Error).message ?? err);
-            if (ns) markerNs.add(ns);
-          }
-        } else if (ns) markerNs.add(ns);
-        findings.push(finding);
+      try { files = readdirSync(join(templatesRoot(), stackDir)); } catch { return out; }
+      for (const f of files) {
+        if (!f.endsWith('.baked')) continue;
+        try { out.push(parseBakedMarker(readFileSync(join(templatesRoot(), stackDir, f), 'utf8')).ns); } catch { /* unreadable marker */ }
       }
+      return out;
+    };
+    for (const stackDir of existsSync(templatesRoot()) ? readdirSync(templatesRoot()) : []) {
+      await withBakeLock(stackDir, async () => {
+        const dir = join(templatesRoot(), stackDir);
+        let files: string[];
+        try { files = readdirSync(dir); } catch { return; }
+        const alive = refs.stackAlive(stackDir);
+        const seen = new Map<string, number>();
+        const ordered = files.filter((f) => !f.startsWith('.') && !f.endsWith('.retirement.json'))
+          .map((f) => ({ f, m: (() => { try { return statSync(join(dir, f)).mtimeMs; } catch { return 0; } })() }))
+          .sort((a, b) => b.m - a.m);
+        for (const { f } of ordered) {
+          const group = f.lastIndexOf('@') > 0 ? f.slice(0, f.lastIndexOf('@')) : '';
+          const rank = seen.get(group) ?? 0;
+          seen.set(group, rank + 1);
+          let ns: string | undefined;
+          if (f.endsWith('.baked')) {
+            try { ns = parseBakedMarker(readFileSync(join(dir, f), 'utf8')).ns; } catch { ns = undefined; }
+          }
+          const keep = (alive && rank < Math.max(1, policy().templatesKeep)) || refs.referenced.has(`${stackDir}/${f}`) || existsSync(join(dir, '.retired-stack.json'));
+          if (keep) {
+            if (ns) markerNs.add(ns);
+            continue;
+          }
+          const finding: (typeof findings)[number] = { kind: 'template', what: join(dir, f), detail: alive ? 'superseded, and no environment or copy was restored from it' : 'its stack can never be bound again (worktree gone, no rows)' };
+          if (fix) {
+            try {
+              const marker = f.endsWith('.baked') ? parseBakedMarker(readFileSync(join(dir, f), 'utf8')) : null;
+              if (marker?.drop) {
+                const r = await runBounded(marker.drop, stateRoot(), cmdTimeoutS());
+                if (r.code !== 0 || r.timedOut) throw new Error(`drop exited ${r.timedOut ? 'by timeout' : r.code}: ${r.output.slice(-200)}`);
+              }
+              rmSync(join(dir, f), { force: true });
+              finding.fixed = true;
+            } catch (err) {
+              finding.error = String((err as Error).message ?? err);
+              if (ns) markerNs.add(ns);
+            }
+          } else if (ns) markerNs.add(ns);
+          findings.push(finding);
+        }
+      });
     }
     // 5. Server-side namespaces in runly's naming that nothing references, via each datastore's `list:` hook.
-    const referencedNs = new Set<string>([...markerNs, ...copies.map((c) => c.ns)]);
-    for (const e of this.journal.allEnvs()) for (const ns of Object.values(e.datastoreNs)) referencedNs.add(ns);
+    //    Referenced: every live row's namespaces, the drop recipes a bind
+    //    records BEFORE its restore creates the namespace, every copy (also
+    //    one still `creating`), and every template marker.
+    const referencedNs = new Set<string>([...markerNs, ...this.journal.allDbCopies().map((c) => c.ns)]);
+    const referenceEnv = (e: EnvRow) => {
+      for (const ns of Object.values(e.datastoreNs)) referencedNs.add(ns);
+      for (const r of Object.values(e.dropRecipes ?? {})) if (r.ns) referencedNs.add(r.ns);
+    };
+    for (const e of this.journal.allEnvs()) referenceEnv(e);
     const sources = new Map<string, { stack: Stack; ds: string }>();
     const roots = new Set<string>([cwd, ...this.journal.allEnvs().map((e) => e.stackRoot), ...copies.map((c) => c.stackRoot)]);
     for (const root of roots) {
@@ -3128,7 +3334,19 @@ export class Engine {
       } catch { /* no readable manifest there */ }
     }
     const sanitize = (id: string) => id.replace(/[^A-Za-z0-9_]/g, '_');
-    const knownPrefixes = [...knownStacks].map((id) => [`backlot_${sanitize(id)}_`, `backlot_tpl_${sanitize(id)}_`, `backlot_${sanitize(id)}_db_`]).flat();
+    const prefixesOf = (id: string) => [`backlot_${sanitize(id)}_`, `backlot_tpl_${sanitize(id)}_`, `backlot_${sanitize(id)}_db_`];
+    // A namespace cut to 63 bytes may have lost its stack id: those are
+    // recorded with their stack when they are created (W4).
+    const recorded = recordedNamespaces();
+    const ownerOf = (ns: string): string | undefined => {
+      const rec = recorded.get(ns);
+      if (rec !== undefined) return rec;
+      return [...knownStacks].find((id) => prefixesOf(id).some((p) => ns.startsWith(p)));
+    };
+    // In flight: a bind (busy env) or a copy being created or dropped. Their
+    // namespaces are referenced above already; this also covers a row a
+    // concurrent request wrote after the snapshot.
+    const inFlight = () => [...this.busy].map((id) => `backlot_${sanitize(id)}_`);
     for (const { stack: st, ds } of sources.values()) {
       const spec = st.manifest.datastores?.[ds];
       if (!spec?.list || !spec.drop) continue;
@@ -3141,14 +3359,28 @@ export class Engine {
       const names = r.output.split('\n').map((l) => l.trim()).filter((l) => /^backlot_[A-Za-z0-9_]+$/.test(l));
       for (const ns of new Set(names)) {
         if (referencedNs.has(ns)) continue;
-        const owned = knownPrefixes.some((p) => ns.startsWith(p));
-        const finding: (typeof findings)[number] = owned
+        const owner = ownerOf(ns);
+        const finding: (typeof findings)[number] = owner !== undefined
           ? { kind: 'namespace', what: ns, detail: `datastore '${ds}' lists it and no environment, copy or template references it` }
           : { kind: 'foreign-namespace', what: ns, detail: `in runly's naming, but of a stack this state root has no record of (another state root's?) — never touched` };
-        if (fix && owned) {
-          const dr = await runBounded(template(drop, { ns }), st.root, cmdTimeoutS());
-          if (dr.code === 0 && !dr.timedOut) finding.fixed = true;
-          else finding.error = `drop exited ${dr.timedOut ? 'by timeout' : dr.code}: ${dr.output.slice(-200)}`;
+        if (fix && owner !== undefined) {
+          // Decided again at the last moment, under the owner's bake lock: the
+          // list ran seconds ago, and a bind, copy or bake may have claimed
+          // the name since.
+          await withBakeLock(owner, async () => {
+            for (const e of this.journal.allEnvs()) referenceEnv(e);
+            for (const c of this.journal.allDbCopies()) referencedNs.add(c.ns);
+            for (const m of markersOf(owner)) referencedNs.add(m);
+            if (referencedNs.has(ns) || inFlight().some((p) => ns.startsWith(p)) || [...this.dbBusy].some((name) => this.journal.getDbCopy(name)?.ns === ns)) {
+              finding.detail += ' — claimed by an operation in flight, left alone';
+              return;
+            }
+            const dr = await runBounded(template(drop, { ns }), st.root, cmdTimeoutS());
+            if (dr.code === 0 && !dr.timedOut) {
+              finding.fixed = true;
+              forgetNamespace(ns);
+            } else finding.error = `drop exited ${dr.timedOut ? 'by timeout' : dr.code}: ${dr.output.slice(-200)}`;
+          });
         }
         findings.push(finding);
       }
@@ -3565,8 +3797,8 @@ export class Engine {
     const url = lease.previewUrl ?? 'the preview tunnel';
     const confirmed = await this.stopPreviewForLease(lease);
     const detail = confirmed
-      ? `work-error: runly.yml now sets preview.forbidden, and a stack that forbids preview must not stay published — ${url} has been torn down`
-      : `work-error: runly.yml now sets preview.forbidden but the tunnel could NOT be confirmed dead — ${url} may still be serving, unauthenticated`;
+      ? `work-error: ${manifestFileOf(stack)} now sets preview.forbidden, and a stack that forbids preview must not stay published — ${url} has been torn down`
+      : `work-error: ${manifestFileOf(stack)} now sets preview.forbidden but the tunnel could NOT be confirmed dead — ${url} may still be serving, unauthenticated`;
     logEvent({ level: 'error', kind: 'preview', envId: env.id, detail });
     say(detail);
     return detail;
@@ -3619,7 +3851,7 @@ export class Engine {
     const port = portKey ? env.ports[portKey] : undefined;
 
     const cause = stack.manifest.preview?.forbidden
-      ? { klass: 'work-error', why: `runly.yml now sets preview.forbidden, and a stack that forbids preview must not stay published` }
+      ? { klass: 'work-error', why: `${manifestFileOf(stack)} now sets preview.forbidden, and a stack that forbids preview must not stay published` }
       : !active.has(service)
         ? { klass: 'env-error', why: `service '${service}' is not in this bind's running set${active.size ? ` (${[...active].map((n) => `'${n}'`).join(', ')})` : ' (this lease runs no services)'}, so its preview would publish a port with nothing behind it for the rest of the lease` }
         : opts.portsReallocated && port !== lease.previewPort
@@ -3773,7 +4005,10 @@ export class Engine {
     this.journal.deleteEnv(env.id);
     // Its public ports go back to the block only now, with the row that recorded them.
     this.proxy.closeEnv(env.id);
-    if (lease) this.leaseInputs.delete(lease.id);
+    if (lease) {
+      this.leaseInputs.delete(lease.id);
+      this.goneSince.delete(`lease:${lease.id}`);
+    }
     this.appliedInputs.delete(env.id);
     this.appliedInputSpecs.delete(env.id);
     this.appliedManifests.delete(env.id);
@@ -3782,6 +4017,8 @@ export class Engine {
     this.activityFlushedAt.delete(env.id);
     for (const key of [...this.startedAt.keys()]) if (key.startsWith(`${env.id}\0`)) this.startedAt.delete(key);
     for (const key of [...this.idleStopped]) if (key.startsWith(`${env.id}\0`)) this.idleStopped.delete(key);
+    for (const key of [...this.idleStoppedAt.keys()]) if (key.startsWith(`${env.id}\0`)) this.idleStoppedAt.delete(key);
+    for (const key of [...this.waking.keys()]) if (key.startsWith(`${env.id}\0`)) this.waking.delete(key);
     this.envChains.delete(env.id); // don't leak a settled chain for a dead id
     logEvent({ level: 'info', kind: 'teardown', envId: env.id, detail: `torn down: services, ${Object.keys(fresh.datastoreNs).length} datastore namespace(s), ports and lease` });
     return true;
@@ -4022,7 +4259,10 @@ export class Engine {
         logEvent({ level: 'warn', kind: 'idle', envId: env.id, detail: `stopping idle ${names.join(', ')} left survivors: ${String((err as Error).message ?? err)}` });
         return;
       }
-      for (const n of names) this.idleStopped.add(`${env.id}\0${n}`);
+      for (const n of names) {
+        this.idleStopped.add(`${env.id}\0${n}`);
+        this.idleStoppedAt.set(`${env.id}\0${n}`, now());
+      }
       const post = this.journal.getEnv(env.id);
       if (post) {
         if (Object.keys(sup.pids()).length === 0) post.state = 'warm';
@@ -4057,6 +4297,7 @@ export class Engine {
    */
   private requestWake(envId: string, key: string): boolean {
     try {
+      if (this.stopping) return false;
       const env = this.journal.getEnv(envId);
       if (!env || env.state === 'recycling' || env.state === 'degraded') return false;
       // A bind that failed is redone by `up`, not by traffic: its survivors
@@ -4096,7 +4337,7 @@ export class Engine {
       await this.envLocked(envId, async () => {
         const env = this.journal.getEnv(envId);
         const lease = this.journal.leaseForEnv(envId);
-        if (!env || !lease || env.state === 'recycling' || env.state === 'degraded') throw new BrokerError('env-error', `environment ${envId} cannot be woken (no live lease, or being torn down)`, 'wake');
+        if (this.stopping || !env || !lease || env.state === 'recycling' || env.state === 'degraded') throw new BrokerError('env-error', `environment ${envId} cannot be woken (no live lease, or being torn down)`, 'wake');
         const stack = loadStack(env.stackRoot);
         keyOf = (n) => stack.manifest.services[n]?.port;
         const sup = this.supervisor(env);
@@ -4110,33 +4351,20 @@ export class Engine {
         }
         const wanted = this.desiredServices(stack, env);
         closure = new Set([...this.resolveServiceClosure(stack, [name])].filter((n) => wanted.has(n) && !running.has(n)));
-        const values = this.leaseInputs.get(lease.id)?.values ?? selectCallerEnv(stack.manifest, {});
-        requireCallerEnv(stack.manifest, closure, values);
-        const need = await this.needFor(stack, env, closure, closure, { rebuild: false, mode: 'wake' });
-        const reservation = await this.budget.admit(need, `wake ${name} (${envId})`, { waitMs: Math.max(1000, HOLD_MS() - (now() - started) - 5_000), source: 'wake' });
-        try {
-          const say: Progress = () => undefined;
-          await this.ensureAppliances(stack, say);
-          const dsHandle = Object.keys(stack.manifest.datastores ?? {}).map((n) => ({ name: n, force: false }));
-          if (dsHandle.length > 0) await this.prepareDatastores(stack, env, templateBakeKeys(stack.manifest, stack.root, triggerSet(stack.root, stack.manifest, worktreeStateDir(stack.id))), dsHandle, say);
-          const ctx = this.templateCtx(stack, env);
-          await this.treeLocked(stack.id, async () => {
-            for (const n of closure) {
-              const spec = stack.manifest.services[n];
-              if (spec && buildOf(spec)) await this.buildService(stack, env, n, spec, ctx, say, { rebuild: false, mode: 'wake' });
-            }
-          });
-          reservation.releaseBuild();
-          await this.startServices(stack, env, new Set([...running, ...closure]), closure, { values }, say, 'stop-these');
-        } finally {
-          reservation.release();
+        if (closure.size === 0) {
+          // A `down` queued ahead of this wake took the service out of the
+          // wanted set: nothing is to start. Close what the proxy holds now
+          // and leave the environment's state alone — marking it `hot` with
+          // nothing running held the client until the hold timeout.
+          const key = keyOf(name);
+          if (key && this.proxy.state(envId, key) !== 'up') this.proxy.down(envId, key);
+          return;
         }
-        const post = this.journal.getEnv(envId);
-        if (post) {
-          post.state = 'hot';
-          post.servicePids = sup.pids();
-          this.journal.saveEnv(post);
-        }
+        await this.startStoppedLocked(stack, env, lease, closure, {
+          label: `wake ${name} (${envId})`,
+          source: 'wake',
+          waitMs: Math.max(1000, HOLD_MS() - (now() - started) - 5_000),
+        });
         logEvent({ level: 'info', kind: 'wake', envId, detail: `started ${[...closure].map((n) => `'${n}'`).join(', ')} on a connection to its public port (${formatDuration(now() - started)})` });
       }, undefined, 'a start on demand');
     } catch (err) {
@@ -4147,6 +4375,84 @@ export class Engine {
       }
       throw err;
     }
+  }
+
+  /**
+   * Start `closure` — stopped services the lease wants — the way a wake does.
+   * MUST run under the environment's lock. A wake never restores data: a
+   * datastore that exists is kept as it is, so the trigger listing behind the
+   * template keys is computed only for one that is missing.
+   */
+  private async startStoppedLocked(
+    stack: Stack, env: EnvRow, lease: LeaseRow, closure: Set<string>,
+    opts: { label: string; source: string; waitMs?: number; say?: Progress },
+  ): Promise<void> {
+    const sup = this.supervisor(env);
+    const running = new Set(Object.keys(sup.pids()));
+    const values = this.leaseInputs.get(lease.id)?.values ?? selectCallerEnv(stack.manifest, {});
+    requireCallerEnv(stack.manifest, closure, values);
+    const need = await this.needFor(stack, env, closure, closure, { rebuild: false, mode: 'wake' });
+    // Resuming what ran a moment ago adds nothing the box did not just carry:
+    // the CPU gate is skipped for it (the memory gates still apply).
+    const recent = [...closure].every((n) => now() - (this.idleStoppedAt.get(`${env.id}\0${n}`) ?? -Infinity) < RECENT_RUN_MS);
+    const reservation = await this.budget.admit(need, opts.label, { waitMs: opts.waitMs, source: opts.source, skipLoadGate: recent });
+    try {
+      const say: Progress = opts.say ?? (() => undefined);
+      await this.ensureAppliances(stack, say, reservation);
+      const missing = Object.keys(stack.manifest.datastores ?? {}).filter((n) => !env.datastoreNs[n]);
+      if (missing.length > 0) {
+        const bakeKeys = templateBakeKeys(stack.manifest, stack.root, await triggerSet(stack.root, stack.manifest, worktreeStateDir(stack.id)));
+        await this.prepareDatastores(stack, env, bakeKeys, missing.map((n) => ({ name: n, force: false })), say);
+      }
+      const ctx = this.templateCtx(stack, env);
+      await this.treeLocked(stack.id, () => this.runBuilds(stack, env, closure, ctx, say, { rebuild: false, mode: 'wake' }));
+      reservation.releaseBuild();
+      await this.startServices(stack, env, new Set([...running, ...closure]), closure, { values }, say, 'stop-these', reservation);
+    } finally {
+      reservation.release();
+    }
+    const post = this.journal.getEnv(env.id);
+    if (post) {
+      post.state = 'hot';
+      post.servicePids = sup.pids();
+      this.journal.saveEnv(post);
+    }
+  }
+
+  /**
+   * `exec` and `token` run against the environment as the lease left it. A
+   * service the idle clock stopped (decision 0035) is started first — under
+   * the lock these verbs hold, where a connection-triggered wake would only
+   * queue behind them until the proxy's hold ran out. What stopped for
+   * another reason (a daemon restart) is refused as before: `runly up`
+   * rebinds it, and a failed bind is redone by `up`, never by a verb.
+   */
+  private async resumeForVerb(env: EnvRow, verb: string): Promise<void> {
+    const lease = this.journal.leaseForEnv(env.id);
+    if (!lease) throw new BrokerError('env-error', `no active lease — run 'runly up' first`, 'lease');
+    let stack: Stack;
+    try {
+      stack = loadStack(env.stackRoot);
+    } catch {
+      return; // the verb reports the manifest itself
+    }
+    const running = new Set(Object.keys(this.supervisor(env).pids()));
+    const stopped = [...this.desiredServices(stack, env)].filter((n) => !running.has(n));
+    if (stopped.length === 0) return;
+    const unexplained = stopped.filter((n) => !this.idleStopped.has(`${env.id}\0${n}`));
+    if (unexplained.length > 0 || (env.failStreak ?? 0) > 0) {
+      throw new BrokerError(
+        'env-error',
+        (env.failStreak ?? 0) > 0
+          ? `environment ${env.id} holds your lease but its last 'runly up' failed and ${stopped.map((n) => `'${n}'`).join(', ')} ${stopped.length === 1 ? 'is' : 'are'} not running — run 'runly up' before ${verb}`
+          : `environment ${env.id} holds your lease but its services are not running (the daemon restarted) — run 'runly up' to rebind before exec/token`,
+        'lease',
+      );
+    }
+    const wanted = this.desiredServices(stack, env);
+    const closure = new Set([...this.resolveServiceClosure(stack, stopped)].filter((n) => wanted.has(n) && !running.has(n)));
+    await this.startStoppedLocked(stack, env, lease, closure, { label: `${verb} (${env.id})`, source: verb });
+    logEvent({ level: 'info', kind: 'wake', envId: env.id, detail: `started idle-stopped ${[...closure].map((n) => `'${n}'`).join(', ')} for ${verb}` });
   }
 
   /**
@@ -4189,6 +4495,18 @@ export class Engine {
   // ---------------------------------------------------------------- sweeper
 
   async sweep(): Promise<void> {
+    // One sweep at a time: a tick that lands while the last one still awaits
+    // a teardown or a drop would act on the same snapshot twice.
+    if (this.sweeping || this.stopping) return;
+    this.sweeping = true;
+    try {
+      await this.sweepOnce();
+    } finally {
+      this.sweeping = false;
+    }
+  }
+
+  private async sweepOnce(): Promise<void> {
     const t = now();
     const gap = t - this.lastSweep;
     const interval = Number(process.env.BACKLOT_SWEEP_MS ?? 15_000);
@@ -4277,6 +4595,8 @@ export class Engine {
 
     // Activity the proxy saw since the last flush reaches the journal (decision 0035).
     this.flushActivity(true);
+    // An appliance runly started and someone stopped since no longer costs anything.
+    await this.pruneStartedAppliances();
 
     for (const snapshot of this.journal.allLeases()) {
       // allLeases() is ONE snapshot and this body awaits — endLease blocks in
@@ -4345,8 +4665,8 @@ export class Engine {
         }
         // While the agent lives, its lease lives (decision 0035): the TTL
         // only bounds a lease nobody tethered.
-        if (sameProcess(lease.holderPid, lease.holderStart) && lease.expiresAt < now() + LEASE_TTL(lease.kind) / 2) {
-          this.journal.saveLease({ ...lease, expiresAt: now() + LEASE_TTL(lease.kind) });
+        if (sameProcess(lease.holderPid, lease.holderStart) && lease.expiresAt < now() + LEASE_TTL() / 2) {
+          this.journal.saveLease({ ...lease, expiresAt: now() + LEASE_TTL() });
           continue;
         }
       }
@@ -4409,6 +4729,14 @@ export class Engine {
   }
 
   async shutdown(): Promise<void> {
+    // Nothing new starts once a shutdown begins: no wake on a connection, no
+    // sweep, no public listener taking connections it can only hold. The
+    // listeners used to stay open through the (seconds-long) service stop
+    // below, so a connection in that window woke a service the stopping
+    // daemon then had to chase.
+    this.stopping = true;
+    this.proxy.setWakeHook(undefined);
+    this.proxy.closeAll();
     // Activity clocks survive a restart (decision 0035): whatever the throttle held back is written now.
     this.flushActivity(true);
     // Leases survive a daemon stop; their tunnels do not. Nothing supervises a

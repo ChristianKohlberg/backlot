@@ -98,7 +98,8 @@ describe('the local loop (hello-web)', () => {
     const res = await ctx.cli(['ctx', '--env'], wt.dir);
     expect(res.exitCode, res.stderr).toBe(0);
     const lines = res.stdout.trim().split('\n');
-    const vars = Object.fromEntries(lines.map((l) => [l.slice(0, l.indexOf('=')), l.slice(l.indexOf('=') + 1)]));
+    for (const l of lines) expect(l).toMatch(/^export RUNLY_[A-Z0-9_]+=/);
+    const vars = Object.fromEntries(lines.map((l) => l.slice('export '.length)).map((l) => [l.slice(0, l.indexOf('=')), l.slice(l.indexOf('=') + 1)]));
     expect(Object.keys(vars).sort()).toEqual(
       ['RUNLY_DATASTORE_MAIN_PRESET', 'RUNLY_DATASTORE_MAIN_URL', 'RUNLY_ENV_ID', 'RUNLY_PORT_WEB', 'RUNLY_URL_WEB'].sort(),
     );
@@ -114,7 +115,7 @@ describe('the local loop (hello-web)', () => {
 
   it('the example smoke test runs against ctx --env, outside runly', async () => {
     const env = (await ctx.cli(['ctx', '--env'], wt.dir)).stdout;
-    const out = execFileSync('sh', ['-c', `${env}\nexport RUNLY_URL_WEB\nexec node smoke.test.mjs`], { cwd: wt.dir, encoding: 'utf8' });
+    const out = execFileSync('sh', ['-c', `${env}\nexec node smoke.test.mjs`], { cwd: wt.dir, encoding: 'utf8' });
     expect(out).toContain('ok');
   });
 
@@ -303,9 +304,9 @@ describe('the multi-service topology (hello-multi)', () => {
 
   it('the example smoke test passes against ctx --env and writes its report in the worktree', async () => {
     const env = (await ctx.cli(['ctx', '--env'], wt.dir)).stdout;
-    expect(env).toMatch(/^RUNLY_URL_API=/m);
-    expect(env).toMatch(/^RUNLY_URL_WEB=/m);
-    execFileSync('sh', ['-c', `${env}\nexport RUNLY_URL_API RUNLY_URL_WEB\nexec node smoke.test.mjs`], { cwd: wt.dir, encoding: 'utf8' });
+    expect(env).toMatch(/^export RUNLY_URL_API=/m);
+    expect(env).toMatch(/^export RUNLY_URL_WEB=/m);
+    execFileSync('sh', ['-c', `${env}\nexec node smoke.test.mjs`], { cwd: wt.dir, encoding: 'utf8' });
     expect(existsSync(join(wt.dir, 'smoke-report.json'))).toBe(true);
   });
 

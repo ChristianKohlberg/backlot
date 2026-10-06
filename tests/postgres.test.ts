@@ -9,7 +9,7 @@ import { execFile, execFileSync } from 'node:child_process';
 import { mkdtempSync, rmSync, writeFileSync, readFileSync, readdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { disposeStateSync } from './support/leaks.js';
+import { disposeStateSync, testContainerName } from './support/leaks.js';
 
 const repo = join(import.meta.dirname, '..');
 const CLI = join(repo, 'dist', 'cli', 'index.js');
@@ -23,7 +23,7 @@ const hasDocker = (() => {
   }
 })();
 
-const CONTAINER = `runly-pg-test-${Math.random().toString(36).slice(2, 8)}`;
+const CONTAINER = testContainerName('pg');
 const pg = (args: string) =>
   execFileSync('sh', ['-c', `docker exec ${CONTAINER} ${args}`], { encoding: 'utf8', timeout: 30_000 });
 
@@ -119,7 +119,7 @@ datastores:
     const res = await cli(['ctx', '--env']);
     expect(res.exitCode, `stdout: ${res.stdout ?? ''}
 stderr: ${res.stderr ?? ''}`).toBe(0);
-    expect(String(res.stdout)).toMatch(/^RUNLY_DATASTORE_MAIN_URL=.+/m);
+    expect(String(res.stdout)).toMatch(/^export RUNLY_DATASTORE_MAIN_URL=.+/m);
   });
 
   it('recycle drops the server-side namespace', async () => {

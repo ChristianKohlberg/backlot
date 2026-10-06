@@ -245,7 +245,7 @@ describe('pool recycle honours the environment it was given (#40)', () => {
 
 describe('pool status states the conclusion instead of leaving it to be inferred (#40)', () => {
   it('marks a quiesced, unleased environment available', async () => {
-    const { cli, journal } = ctx({ BACKLOT_IDLE_TTL_MS: '1000', BACKLOT_LEASED_IDLE_TTL_MS: '1000' });
+    const { cli, journal } = ctx({ BACKLOT_IDLE_TTL_MS: '1000' });
     const up = await cli(['up', '--json']);
     const envId = String(up.json?.envId);
     await cli(['release', '--json']);
@@ -492,7 +492,7 @@ describe.runIf(procScanSupported())('teardown and quiesce reap what escaped the 
     // next bindAndStart meant its escapees held memory and PORTS for exactly
     // that long — and the next bind then failed with "port occupied by a
     // foreign process", which is what made the pool look wedged.
-    const { cli, stateDir, journal } = ctx({ BACKLOT_IDLE_TTL_MS: '1000', BACKLOT_LEASED_IDLE_TTL_MS: '1000' });
+    const { cli, stateDir, journal } = ctx({ BACKLOT_IDLE_TTL_MS: '1000' });
     const up = await cli(['up', '--json']);
     const envId = String(up.json?.envId);
     const envRoot = journal().getEnv(envId)!.root;

@@ -1,8 +1,8 @@
 import { readFileSync, existsSync, realpathSync } from 'node:fs';
 import { createHash } from 'node:crypto';
-import { dirname, join, resolve } from 'node:path';
+import { basename, dirname, join, resolve } from 'node:path';
 import { parse } from 'yaml';
-import Ajv2020 from 'ajv/dist/2020.js';
+import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
 import { BrokerError, safeJoin } from './util.js';
 
@@ -32,7 +32,7 @@ export interface ResourceSpec {
  * SUCCESSFUL build of this service in this worktree, the build is skipped
  * (decision 0038).
  */
-export type BuildSpec = string | { run: string; when?: string[] };
+export type BuildSpec = string | { run: string; when?: string[]; serial?: boolean };
 
 /**
  * What a build produces. String/array form: globs compared by path, size and
@@ -42,10 +42,10 @@ export type BuildSpec = string | { run: string; when?: string[] };
 export type OutputsSpec = string | string[] | { paths: string[]; compare?: 'stat' | 'content' };
 
 /** The build line and its `when:` globs, whichever form the manifest used. */
-export function buildOf(spec: { build?: BuildSpec }): { run: string; when?: string[] } | undefined {
+export function buildOf(spec: { build?: BuildSpec }): { run: string; when?: string[]; serial?: boolean } | undefined {
   if (spec.build === undefined) return undefined;
   if (typeof spec.build === 'string') return { run: spec.build };
-  return { run: spec.build.run, when: spec.build.when };
+  return { run: spec.build.run, when: spec.build.when, serial: spec.build.serial };
 }
 
 /** The output globs and how they are compared, whichever form the manifest used. */
@@ -98,7 +98,8 @@ export interface DatastoreSpec {
   drop?: string;
   template_restore?: string;
   presets?: string[];
-  default_preset?: { run?: string; session?: string };
+  /** One preset name; the pre-0.13 `{run, session}` split is accepted and read as one value (session, then run). */
+  default_preset?: string | { run?: string; session?: string };
   template?: boolean;
   ephemeral?: boolean;
   /**
@@ -208,6 +209,11 @@ export interface Manifest {
   preview?: PreviewSpec;
   appliances?: Record<string, ApplianceSpec>;
   datastores?: Record<string, DatastoreSpec>;
+  /**
+   * How one `up` runs its builds: `parallel` (default) in depends_on waves,
+   * the builds of one wave at once; `serial` one at a time in manifest order.
+   */
+  builds?: 'parallel' | 'serial';
   /** Build/install output in the worktree: never an upkeep trigger (decision 0032). */
   caches?: string[];
   /** `include`: git-ignored files an upkeep `when:` glob may still match. `keep` is accepted and ignored (decision 0032). */
@@ -228,10 +234,10 @@ export interface Manifest {
  * One-line warnings for manifest sections runly accepts but no longer acts on.
  * The CLI prints them to stderr; the manifest still loads.
  */
-export function manifestDeprecations(manifest: Manifest): string[] {
+export function manifestDeprecations(manifest: Manifest, file = 'runly.yml'): string[] {
   const out: string[] = [];
   if (manifest.checks !== undefined) {
-    out.push(`runly.yml declares 'checks:', which is ignored since 'runly run' was removed (decision 0032) — run your checks yourself, with 'runly ctx --env' for the environment`);
+    out.push(`${file} declares 'checks:', which is ignored since 'runly run' was removed (decision 0032) — run your checks yourself, with 'runly ctx --env' for the environment`);
   }
   return out;
 }
@@ -242,7 +248,12 @@ export interface Stack {
   root: string;
   /** Stable identity: pools are keyed by this. */
   id: string;
+  /** The manifest's file name as found (runly.yml, backlot.yml or stack.yaml), for messages. */
+  file?: string;
 }
+
+/** The manifest's file name for a message: the one actually loaded. */
+export const manifestFileOf = (stack?: { file?: string }): string => stack?.file ?? 'runly.yml';
 
 const schemaPath = () =>
   join(dirname(fileURLToPath(import.meta.url)), '..', '..', 'schema', 'runly.schema.json');
@@ -251,9 +262,13 @@ const schemaPath = () =>
 let validator: any;
 function validate(data: unknown): void {
   if (!validator) {
-    // ajv is CJS; the constructor lands on .default under real ESM interop.
+    // Loaded on first use: ajv and the schema compile cost ~100 ms, which a
+    // CLI verb paid on every invocation although the daemon validates the
+    // manifest it acts on anyway. ajv is CJS; the constructor lands on
+    // .default under real ESM interop.
+    const Ajv2020 = createRequire(import.meta.url)('ajv/dist/2020.js');
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const AjvCtor: any = (Ajv2020 as any).default ?? Ajv2020;
+    const AjvCtor: any = Ajv2020.default ?? Ajv2020;
     const ajv = new AjvCtor({ allErrors: true });
     validator = ajv.compile(JSON.parse(readFileSync(schemaPath(), 'utf8')));
   }
@@ -303,12 +318,17 @@ export function findStackRoot(from: string): string {
   }
 }
 
-export function loadStack(from: string): Stack {
+/**
+ * Find, read and validate the manifest from `from` upward. `validate: false`
+ * skips the schema check — only for a CLI-side read whose result the daemon
+ * re-reads and validates before acting on it (the deprecation warnings).
+ */
+export function loadStack(from: string, opts: { validate?: boolean } = {}): Stack {
   const root = findStackRoot(from);
   const file = manifestIn(root);
   if (!file) throw new BrokerError('work-error', `no runly.yml (or backlot.yml / stack.yaml) in ${root}`, 'manifest');
   const manifest = parse(readFileSync(file, 'utf8')) as Manifest;
-  validate(manifest);
+  if (opts.validate !== false) validate(manifest);
   // A path that escapes the worktree is refused at load, whether or not an
   // upkeep rule ever makes runly read it: it is never a legitimate source file.
   for (const inc of manifest.sync?.include ?? []) safeJoin(root, inc, 'sync.include');
@@ -316,9 +336,16 @@ export function loadStack(from: string): Stack {
   // path: slicing base64url(root) kept only the last ~6 bytes, so sibling
   // worktrees like agent-1/myapp and agent-2/myapp collided into one pool.
   const id = stackIdentity(manifest.name, root);
-  return { manifest, root, id };
+  return { manifest, root, id, file: basename(file) };
 }
 
-export function defaultPreset(ds: DatastoreSpec, kind: 'run' | 'session'): string {
-  return ds.default_preset?.[kind] ?? ds.presets?.[0] ?? 'default';
+/** The declared default preset, if any — one value, whichever form the manifest used. */
+export function declaredDefaultPreset(ds: DatastoreSpec): string | undefined {
+  const d = ds.default_preset;
+  if (d === undefined) return undefined;
+  return typeof d === 'string' ? d : (d.session ?? d.run);
+}
+
+export function defaultPreset(ds: DatastoreSpec): string {
+  return declaredDefaultPreset(ds) ?? ds.presets?.[0] ?? 'default';
 }

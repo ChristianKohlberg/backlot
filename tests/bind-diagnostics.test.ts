@@ -4,7 +4,9 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { BindDiagnostics } from '../src/core/diagnostics.js';
-import type { Context } from '../src/core/types.js';
+/** The slice of the ctx/up --json response these tests read. */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+type Context = { bindDiagnostics?: BindDiagnostics } & Record<string, any>;
 import { disposeStateSync } from './support/leaks.js';
 
 const CLI = join(import.meta.dirname, '..', 'dist', 'cli', 'index.js');

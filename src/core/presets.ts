@@ -1,18 +1,18 @@
-import { defaultPreset, type DatastoreSpec, type Manifest } from './manifest.js';
+import { declaredDefaultPreset, defaultPreset, type DatastoreSpec, type Manifest } from './manifest.js';
 import { BrokerError } from './util.js';
 
 /** The presets a datastore offers. A manifest without a catalog keeps its historical default choices. */
 export function presetCatalog(spec: DatastoreSpec): string[] {
-  return spec.presets?.length ? spec.presets : [...new Set(['default', ...Object.values(spec.default_preset ?? {})])];
+  const declared = declaredDefaultPreset(spec);
+  return spec.presets?.length ? spec.presets : [...new Set(['default', ...(declared === undefined ? [] : [declared])])];
 }
 
 /** A datastore's default preset, validated against its catalog. */
 export function defaultPresetFor(name: string, spec: DatastoreSpec): string {
   const catalog = presetCatalog(spec);
-  for (const value of Object.values(spec.default_preset ?? {})) {
-    if (!catalog.includes(value)) throw new BrokerError('work-error', `default preset '${value}' for '${name}' is not declared in presets`, 'manifest');
-  }
-  const value = defaultPreset(spec, 'session');
+  const declared = declaredDefaultPreset(spec);
+  if (declared !== undefined && !catalog.includes(declared)) throw new BrokerError('work-error', `default preset '${declared}' for '${name}' is not declared in presets`, 'manifest');
+  const value = defaultPreset(spec);
   if (!catalog.includes(value)) {
     throw new BrokerError('work-error', `no preset '${value}' for datastore '${name}' (have: ${catalog.join(', ') || 'none'})`, 'manifest');
   }
@@ -25,14 +25,14 @@ export function defaultPresetFor(name: string, spec: DatastoreSpec): string {
  * the caller named: an explicit preset reloads that datastore from its
  * template, and a datastore nobody named keeps whatever it holds.
  */
-export function validatePresetRequest(manifest: Manifest, requested?: unknown): Record<string, string> {
+export function validatePresetRequest(manifest: Manifest, requested?: unknown, file = 'runly.yml'): Record<string, string> {
   const stores = manifest.datastores ?? {};
   if (requested !== undefined && (requested === null || typeof requested !== 'object' || Array.isArray(requested))) {
     throw new BrokerError('work-error', 'presets must map datastore names to preset names', 'manifest');
   }
   const choices = (requested ?? {}) as Record<string, unknown>;
   for (const [name, value] of Object.entries(choices)) {
-    if (!Object.hasOwn(stores, name)) throw new BrokerError('work-error', `no datastore '${name}' in runly.yml`, 'manifest');
+    if (!Object.hasOwn(stores, name)) throw new BrokerError('work-error', `no datastore '${name}' in ${file}`, 'manifest');
     if (typeof value !== 'string' || !value) throw new BrokerError('work-error', `preset for '${name}' must be a nonempty name`, 'manifest');
   }
   const out: Record<string, string> = {};
