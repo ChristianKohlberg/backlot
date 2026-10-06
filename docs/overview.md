@@ -193,7 +193,9 @@ start. `bindDiagnostics` in `up --json` says which path ran (`reused`,
 for an idle worktree just moved to a new commit (`git checkout <sha> && runly
 warm`). `--pristine` re-runs every upkeep rule and every build; it never deletes
 a file in the worktree, so use it after deleting `node_modules` by hand. Two
-failed binds in a row escalate to it automatically.
+failed binds in a row escalate to it automatically — but never for an
+environment you already hold: its data is your work, so runly leaves the choice
+to you.
 
 Because everything runs in your worktree, its output lands there too. Declare
 build output under `caches:` or git-ignore it, or an upkeep `when:` may match it.
@@ -356,9 +358,11 @@ Every failure carries a class, and the class says who acts:
 | `infra-error` | something external (database down, version skew) | 3 | act on the message; nobody's code is blamed |
 | usage | a wrong or removed flag or verb | 64 | read the message |
 
-A service that dies during a bind fails it as env-error; one that crash-loops
-fails it as work-error naming the service, and the services that run keep
-running. `fatal_logs` fails a
+A service that fails during a bind of your environment — it exits, hits a
+`fatal_logs` marker or crash-loops — fails `up` as work-error naming the
+service; that service shows `failed` in `ps`, what depends on it is not
+started, and the other services keep running (one failed service does not count
+as a failed bind). `fatal_logs` fails a
 start in seconds instead of waiting for the readiness timeout. When the CLI and
 the running daemon are different builds, every verb except `update`, `doctor`
 and `daemon stop` fails with infra-error until `runly update` restarts the daemon.

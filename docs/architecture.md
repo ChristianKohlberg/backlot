@@ -87,7 +87,10 @@ was started on, fresh at each start. A connection that arrives while its service
 restarts is held until it is ready — also one the service accepted and dropped
 before its first byte back (a crash the supervisor has not seen yet, a restart
 under way): the proxy keeps what the client sent until the service answers and
-replays it, like a refused connect (decision 0039); client bytes and the last activity time are
+replays it, like a refused connect — but only when no process can have acted on
+it: nothing reached the process, or an idempotent HTTP request (`GET`/`HEAD`/`OPTIONS`)
+carried to one relaunch at most; a `POST` or a non-HTTP stream that reached a
+process is never replayed (decision 0039, corrected in 0.18.1); client bytes and the last activity time are
 counted per port (`proxy` in `ctx`/`status`), and readiness probes bypass the
 proxy. Derived tailnet ports use a third block (32000–32767); all three sit below
 the OS ephemeral range. `src/daemon/proxy.ts` owns the proxy, `ensureProxies` in
@@ -220,10 +223,11 @@ environment lock; lease, data, ports and the other services stay, and `ps` says
 closure, appliances, datastores kept, load budget, build only if needed) and is held
 until it is ready; services reach each other through public ports, so wakes chain. A
 crash restart marks the port `starting` (supervisor hooks `onCrashed` / `onRelaunched` /
-`onGaveUp`), and a refused forward — or one dropped before the first byte back — is
-retried and held, so the self-restart gap holds connections too. A service that
-crash-loops past its restart budget in a LEASED environment is stopped and reported
-`failed` (`ps`, `ctx.failures`, a `service-failed` event: last exit, `runly logs
+`onGaveUp`), and a refused forward — or one dropped before the first byte back, under
+the replay rule above — is retried and held, so the self-restart gap holds connections
+too. A service that crash-loops past its restart budget in a LEASED environment — or,
+during a bind, fails its boot on its own account (exit, `fatal_logs`, daemonized) — is
+stopped and reported `failed` (`ps`, `ctx.failures`, a `service-failed` event: last exit, `runly logs
 <svc>`); the environment, its data, its other services and its logs stay, nothing
 wakes it, and the next `up` starts it again (decision 0039). Only an unleased
 environment is marked `degraded` and recycled for it. Activity clocks are persisted (`envs.activity`, throttled to 5 s, and
@@ -438,7 +442,9 @@ first bind; no presets or templates).
 
 Two consecutive bind failures on the same warm environment auto-escalate the next bind
 to `pristine` (a per-env `failStreak` in the journal, cleared by any successful bind) —
-the standard defense against stale-cache heisenbugs. A service that flaps past its
+the standard defense against stale-cache heisenbugs. Never for an environment the
+caller already leases (0.18.1): pristine reloads its data, which is the holder's work.
+One failed service (decision 0039) does not count as a bind failure. A service that flaps past its
 restart budget marks an UNLEASED environment `degraded`: skipped by acquisition, recycled
 by the sweeper. In a leased environment it is stopped and reported `failed` instead
 (decision 0039). **Warm is a cache, not a home**: the pool stays honest only while

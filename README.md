@@ -118,7 +118,7 @@ work-error (your code), `2` env-error (the environment), `3` infra-error
 | `  --holder-pid <pid>` | Tie the environment to a process that outlives the command; torn down a minute after it exits. |
 | `runly down [svc...]` | Stop these services (none = all); lease, data and ports stay. |
 | `runly ctx [--env]` | A short summary (service URLs and states, datastores, login); `--json` the full context; `--env` prints `export RUNLY_*=…` lines for `eval`. |
-| `runly ps [--all]` | Services (state, ports, pid, idle, memory) and database copies of this worktree, or of the whole box (with a worktree column). A service that crash-looped shows `failed` with its last exit; the next `up` retries it. |
+| `runly ps [--all]` | Services (state, ports, pid, idle, memory) and database copies of this worktree, or of the whole box (with a worktree column). A service that crash-looped, or failed its boot during an `up`, shows `failed` with its last exit; the next `up` retries it. |
 | `runly plan [svc...] [--rebuild]` | What an `up` would build and start, what it costs, and whether it starts now or waits for the load budget. |
 | `runly logs [svc...]` | Service logs, interleaved (last 40 lines). `--lines N`, `--since up\|10m`, `--grep <re>`, `--build`. |
 | `  -f [--until <re>] [--timeout <s>]` | Follow; `--until` exits 0 on the first matching line of the current process (never an earlier one), `--timeout` exits 124. |
