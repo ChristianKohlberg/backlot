@@ -105,6 +105,12 @@ export interface UpOptions {
 
 /** The caller of a queued request disconnected (not a bind failure). */
 class CallerGone extends BrokerError {}
+/**
+ * One service of a leased environment failed (decision 0039) while the bind
+ * itself succeeded: the environment, its data and its other services are
+ * fine. Not a bind failure — it never counts toward failStreak (0.18.1).
+ */
+class ServiceFailure extends BrokerError {}
 
 /**
  * Pin a lease to a live process, when the caller names one.
@@ -140,6 +146,7 @@ function describeExit(exit: ServiceExit): string {
   const last = exit.signal ? `signal ${exit.signal}` : exit.code === null ? 'no process' : `exit ${exit.code}`;
   if (exit.reason === 'daemonized') return `exited 0 at once — a service must stay in the foreground (last ${last})`;
   if (exit.reason === 'spawn-failed') return 'could not be spawned after 3 attempts';
+  if (exit.reason === 'boot-failed') return `failed to boot: ${exit.detail ?? last}`;
   return `crash-looped past its restart budget (last ${last})`;
 }
 
@@ -1418,7 +1425,11 @@ export class Engine {
     // the worktree's half (command rules) was written under the worktree lock.
     env.fingerprints = pickEnvKeys(upkeep.fingerprints);
 
-    const startSlice = (only: Set<string>) => this.startServices(stack, env, active, only, inputs, say, 'stop-all', reservation);
+    // Services a failed one kept from starting (its depends_on dependents, 0.18.1).
+    let blocked = new Set<string>();
+    const startSlice = async (only: Set<string>) => {
+      blocked = await this.startServices(stack, env, active, only, inputs, say, 'stop-all', reservation);
+    };
 
     if (keepRunning) {
       trace.phase('build');
@@ -1583,9 +1594,12 @@ export class Engine {
     if (firstFailed) {
       const pids = sup.pids();
       this.journal.saveEnv({ ...current, state: Object.keys(pids).length > 0 ? 'hot' : 'warm', servicePids: pids, activeServices: this.recordedShape(stack, active), lastUsedAt: now() });
-      throw new BrokerError(
+      const notStarted = [...blocked].filter((n) => !(n in pids));
+      throw new ServiceFailure(
         'work-error',
-        `service ${failedNow.map((x) => `'${x.name}'`).join(', ')} ${describeExit(firstFailed.f)} during this bind — 'runly logs ${firstFailed.name}' shows why; the other services keep running and the next 'runly up' retries it`,
+        `service ${failedNow.map((x) => `'${x.name}'`).join(', ')} ${describeExit(firstFailed.f)} during this bind — 'runly logs ${firstFailed.name}' shows why; ` +
+          (notStarted.length > 0 ? `${notStarted.map((n) => `'${n}'`).join(', ')} (depending on it) ${notStarted.length === 1 ? 'was' : 'were'} not started; ` : '') +
+          `the other services keep running and the next 'runly up' retries it`,
         firstFailed.name,
       );
     }
@@ -1887,20 +1901,37 @@ export class Engine {
    * so they count as started for depends_on — and so does a dependency the
    * lease took `down` on purpose (it is not wanted; the dependent reaches its
    * stable public port). On a failure a bind stops everything (`stop-all`); a
-   * wake stops only what it started (`stop-these`).
+   * wake stops only what it started (`stop-these`). In a LEASED environment a
+   * bind's service that fails to boot on its own account (a work-error: it
+   * exited, hit a fatal log marker, daemonized) is instead stopped and marked
+   * failed like a runtime crash loop (decision 0039, 0.18.1); its dependents
+   * are not started, everything else is. Returns those dependents.
    */
   private async startServices(
     stack: Stack, env: EnvRow, active: Set<string>, only: Set<string>,
     inputs: { values: Record<string, string> }, say: Progress, onFailure: 'stop-all' | 'stop-these',
     reservation?: Reservation,
-  ): Promise<void> {
+  ): Promise<Set<string>> {
     const sup = this.supervisor(env);
     this.envManifests.set(env.id, stack.manifest);
     const internalTaken = new Set<number>();
     const started = new Set<string>([...active].filter((n) => !only.has(n)));
     const entries = Object.entries(stack.manifest.services).filter(([n]) => only.has(n));
+    const failed = new Set<string>();
+    const blocked = new Set<string>();
     for (;;) {
-      const pending = entries.filter(([n]) => !started.has(n));
+      // A service that depends on a failed (or itself blocked) one is not started.
+      for (let grew = true; grew;) {
+        grew = false;
+        for (const [n, s] of entries) {
+          if (started.has(n) || failed.has(n) || blocked.has(n)) continue;
+          if ((s.depends_on ?? []).some((d) => failed.has(d) || blocked.has(d))) {
+            blocked.add(n);
+            grew = true;
+          }
+        }
+      }
+      const pending = entries.filter(([n]) => !started.has(n) && !failed.has(n) && !blocked.has(n));
       if (pending.length === 0) break;
       const ready = pending.filter(([, s]) => (s.depends_on ?? []).every((d) => started.has(d) || !active.has(d)));
       if (ready.length === 0) throw new BrokerError('work-error', `depends_on cycle in ${manifestFileOf(stack)}`, 'manifest');
@@ -1954,6 +1985,19 @@ export class Engine {
             }
             throw err;
           }
+          if (err instanceof BrokerError && err.klass === 'work-error' && err.source === name && this.journal.leaseForEnv(env.id)) {
+            try {
+              // The crash loop may have reported it already (onDegraded).
+              if (!this.failureOf(env.id, name)) {
+                this.serviceFailed(env.id, name, { code: sup.exitCodeOf(name), signal: null, reason: 'boot-failed', detail: err.message.replace(/^service '[^']*' /, '') });
+              }
+              await this.stopServicesForRestart(env, [name]);
+              failed.add(name);
+              continue;
+            } catch (stopErr) {
+              logEvent({ level: 'warn', kind: 'service-failed', envId: env.id, detail: `stopping '${name}' after its failed boot: ${String((stopErr as Error).message ?? stopErr)} — stopping the bind` });
+            }
+          }
           const survivors = await sup.stopAll();
           this.supervisors.delete(env.id);
           const unreaped = await this.reapEnvProcesses(env, survivors);
@@ -1970,6 +2014,11 @@ export class Engine {
         started.add(name);
       }
     }
+    for (const n of blocked) {
+      const key = stack.manifest.services[n]?.port;
+      if (key) this.proxy.down(env.id, key);
+    }
+    return blocked;
   }
 
   // ---------------------------------------------------------------- verbs
@@ -2141,8 +2190,11 @@ export class Engine {
     let queueMs = 0;
     const { env, fresh } = await this.acquireEnv(stack, holder, kind, hygiene, opts.ttlMs ?? LEASE_TTL(), opts.holderPid, opts.signal);
     // Auto-escalation (decision 0007): two consecutive bind failures on this
-    // warm environment -> the next bind is pristine, whatever was asked.
-    if (hygiene !== 'pristine' && env.failStreak >= 2) hygiene = 'pristine';
+    // warm environment -> the next bind is pristine, whatever was asked. Never
+    // for an environment this caller already held (0.18.1): a leased
+    // environment is someone's work, and pristine wipes its data (decision
+    // 0039). They can ask for `--pristine` themselves.
+    if (hygiene !== 'pristine' && env.failStreak >= 2 && !existingLease) hygiene = 'pristine';
     try {
       const { env: bound, previewNotice, bindDiagnostics } = await this.envLocked(
         env.id,
@@ -2162,7 +2214,10 @@ export class Engine {
       // A budget refusal or a caller that went away touched nothing: counted,
       // one refusal switched wake-on-connect off and two made the next `up`
       // pristine — wiping the data of an environment that never failed.
-      const notABindFailure = err instanceof BudgetRefusal || err instanceof CallerGone;
+      // Nor does one failed service (ServiceFailure, decision 0039): the bind
+      // itself worked, and counting it switched wake and exec off for the
+      // healthy services and escalated the next `up` to a data wipe.
+      const notABindFailure = err instanceof BudgetRefusal || err instanceof CallerGone || err instanceof ServiceFailure;
       const fresh = this.journal.getEnv(env.id);
       if (fresh && !notABindFailure) {
         fresh.failStreak += 1;
@@ -4562,8 +4617,9 @@ export class Engine {
       if (stack.id !== env.stack) return false;
       const name = Object.entries(stack.manifest.services).find(([, spec]) => spec.port === key)?.[0];
       if (!name || !this.desiredServices(stack, env).has(name)) return false;
-      // A failed service is retried by `up`, not by traffic (decision 0039).
-      if (this.failureOf(envId, name)) return false;
+      // A failed service is retried by `up`, not by traffic (decision 0039) —
+      // nor started as the dependency of one that is woken.
+      if (this.blockedByFailure(stack, envId, name)) return false;
       const id = `${envId}\0${name}`;
       if (!this.waking.has(id)) {
         const p = this.wakeService(env.id, name)
@@ -4693,7 +4749,7 @@ export class Engine {
     }
     const running = new Set(Object.keys(this.supervisor(env).pids()));
     // A failed service (decision 0039) is not resumed by a verb: `up` retries it.
-    const stopped = [...this.desiredServices(stack, env)].filter((n) => !running.has(n) && !this.failureOf(env.id, n));
+    const stopped = [...this.desiredServices(stack, env)].filter((n) => !running.has(n) && !this.blockedByFailure(stack, env.id, n));
     if (stopped.length === 0) return;
     const unexplained = stopped.filter((n) => !this.idleStopped.has(`${env.id}\0${n}`));
     if (unexplained.length > 0 || (env.failStreak ?? 0) > 0) {
@@ -4784,6 +4840,15 @@ export class Engine {
     }, undefined, 'stopping a failed service').catch((err) =>
       logEvent({ level: 'warn', kind: 'service-failed', envId, detail: `stopping failed '${service}' left survivors: ${String((err as Error).message ?? err)}` }),
     );
+  }
+
+  /** Is `name`, or a service it depends on (transitively), failed (decision 0039)? */
+  private blockedByFailure(stack: Stack, envId: string, name: string): boolean {
+    try {
+      return [...this.resolveServiceClosure(stack, [name])].some((n) => this.failureOf(envId, n) !== undefined);
+    } catch {
+      return this.failureOf(envId, name) !== undefined;
+    }
   }
 
   /** How a failed service ended, or undefined (decision 0039). */

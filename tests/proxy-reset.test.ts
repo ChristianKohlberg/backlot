@@ -4,6 +4,10 @@
  * it, or the stop an `up` does before a restart — must look to the client
  * like any other refused forward: held and retried, its request replayed to
  * the next process. Before, the client got an empty reply.
+ *
+ * 0.18.1: a replay is only safe when the dead process cannot have acted on
+ * the request — nothing reached it, or an idempotent HTTP method — and goes
+ * to one relaunch at most.
  */
 import { describe, it, expect, afterEach } from 'vitest';
 import { createServer, connect, type Server, type Socket } from 'node:net';
@@ -41,12 +45,12 @@ async function hub(): Promise<{ hub: ProxyHub; port: number }> {
 }
 
 describe('the proxy retries a connection its service dropped before answering (B4)', () => {
-  it('a reset before the first byte is retried and the request replayed', async () => {
+  it('an idempotent request reset before the first byte is replayed once', async () => {
     let accepted = 0;
     const seen: string[] = [];
     const service = createServer((sock: Socket) => {
       accepted++;
-      if (accepted <= 2) {
+      if (accepted <= 1) {
         // The process "died" with the connection accepted: reset, nothing written.
         sock.once('data', () => sock.resetAndDestroy());
         return;
@@ -62,7 +66,7 @@ describe('the proxy retries a connection its service dropped before answering (B
     h.up('env', 'web', internal, 'web');
     const reply = await request(port);
     expect(reply).toMatch(/200 OK[\s\S]*hello/);
-    expect(accepted).toBe(3);
+    expect(accepted).toBe(2);
     expect(seen[0]).toMatch(/^GET \/ HTTP\/1.0/); // the replayed request, intact
   });
 
@@ -99,7 +103,63 @@ describe('the proxy retries a connection its service dropped before answering (B
     expect(await request(port)).toBe('');
     expect(Date.now() - t0).toBeLessThan(5000);
     expect(accepted).toBeGreaterThan(1);
-    expect(accepted).toBeLessThanOrEqual(7);
+    expect(accepted).toBeLessThanOrEqual(2); // one replay at most (0.18.1)
+  });
+
+  it('a non-idempotent request the service received is never replayed (0.18.1)', async () => {
+    let accepted = 0;
+    const svc = createServer((sock: Socket) => {
+      accepted++;
+      // It acted on the request, then died before answering.
+      sock.once('data', () => sock.resetAndDestroy());
+    });
+    const svcPort = await listen(svc);
+    open.push({ close: () => svc.close() });
+    const { hub: h, port } = await hub();
+    h.up('env', 'web', svcPort, 'web');
+    for (const method of ['POST', 'PUT', 'PATCH', 'DELETE']) {
+      accepted = 0;
+      expect(await request(port, `${method} /charge HTTP/1.0\r\nContent-Length: 2\r\n\r\n42`)).toBe('');
+      expect(accepted, method).toBe(1);
+    }
+    // Not HTTP (a database or TLS wire protocol): the same.
+    accepted = 0;
+    expect(await request(port, '\x16\x03\x01\x00\x05hello')).toBe('');
+    expect(accepted).toBe(1);
+  });
+
+  it('an idempotent request is carried to one relaunch, never more (0.18.1)', async () => {
+    let accepted = 0;
+    const poison = createServer((sock: Socket) => {
+      accepted++;
+      sock.once('data', () => sock.resetAndDestroy());
+    });
+    const poisonPort = await listen(poison);
+    open.push({ close: () => poison.close() });
+    const { hub: h, port } = await hub();
+    h.up('env', 'web', poisonPort, 'web');
+    expect(await request(port)).toBe('');
+    expect(accepted).toBe(2);
+  });
+
+  it('a refused connect is retried for any request — nothing reached a process (0.18.1)', async () => {
+    const dead = createServer();
+    const deadPort = await listen(dead);
+    await new Promise<void>((r) => dead.close(() => r()));
+    const { hub: h, port } = await hub();
+    h.up('env', 'web', deadPort, 'web');
+    const pending = request(port, 'POST /charge HTTP/1.0\r\nContent-Length: 2\r\n\r\n42');
+    let accepted = 0;
+    const svc = createServer((sock: Socket) => {
+      accepted++;
+      sock.once('data', () => sock.end('HTTP/1.0 201 Created\r\n\r\nok'));
+    });
+    const svcPort = await listen(svc);
+    open.push({ close: () => svc.close() });
+    await new Promise((r) => setTimeout(r, 300));
+    h.up('env', 'web', svcPort, 'web');
+    expect(await pending).toMatch(/201 Created/);
+    expect(accepted).toBe(1);
   });
 
   it('an answered connection is piped as before (half-close included)', async () => {

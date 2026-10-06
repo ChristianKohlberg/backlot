@@ -69,10 +69,10 @@ interface Waiter {
 
 /**
  * What a connection sent before its service answered with a single byte —
- * kept so that a service that dies under it (accepted, then reset or closed
- * before replying) can be replaced transparently: the bytes are replayed to
- * the next process. Bounded; past the bound the connection is no longer
- * retryable and behaves like a plain pipe.
+ * kept so that a service that dies under it can be replaced transparently:
+ * the bytes are replayed to the next process. Replaying is safe only when the
+ * dead process provably did not act on them (see `replayable`). Bounded; past
+ * the bound the connection is no longer retryable and behaves like a plain pipe.
  */
 interface Carry {
   chunks: Buffer[];
@@ -81,6 +81,12 @@ interface Carry {
   ended: boolean;
   /** Retries while the target still said `up` (a service that closes on purpose must not loop). */
   resets: number;
+  /**
+   * Times bytes that already reached a process were sent to another one. At
+   * most MAX_REPLAYS: a request that kills every process it reaches (a poison
+   * request) must not be fed to each relaunch until the restart budget is gone.
+   */
+  replays: number;
   deadline: number;
 }
 
@@ -88,6 +94,23 @@ interface Carry {
 const MAX_REPLAY_BYTES = 1024 * 1024;
 /** Resets tolerated while the target is still `up` (the supervisor has not seen the exit yet). */
 const MAX_UP_RESETS = 5;
+/** Relaunches one connection's delivered bytes may be carried to. */
+const MAX_REPLAYS = 1;
+/** HTTP methods that are safe to repeat (RFC 9110 §9.2.1/§9.2.2) — no side effect a second run could double. */
+const IDEMPOTENT = /^(GET|HEAD|OPTIONS) /;
+
+/**
+ * May bytes a process already received be sent to the next one? Only when the
+ * connection's first bytes are an HTTP request with a method that is safe to
+ * repeat: the dead process may have acted on what it read (charged a card,
+ * inserted a row) before it died, and a replay would act a second time. Any
+ * other request — POST, PUT, PATCH, DELETE, a database or TLS wire protocol,
+ * a first chunk too short to tell — is not replayed once delivered.
+ */
+export function replayable(chunks: readonly Buffer[]): boolean {
+  const head = Buffer.concat(chunks.length > 1 ? chunks.slice(0, 4) : chunks).subarray(0, 8).toString('latin1');
+  return IDEMPOTENT.test(head);
+}
 
 class Target {
   servers: Server[] = [];
@@ -179,20 +202,24 @@ class Target {
    * Pipe `client` to the service on `internalPort`.
    *
    * Until the service sends its first byte back, the client's bytes are also
-   * kept (`carry`): a service that dies in the window before the supervisor
+   * kept (`carry`). A service that dies in the window before the supervisor
    * notices — the kernel accepted the connection, then the process exited and
-   * the socket was reset or closed with nothing written — is indistinguishable
-   * from a refused connect for the client, and is handled the same way (decision
-   * 0035: a refused forward is retried and held). Without this the client got
-   * an empty reply in the first ~50 ms after a crash, and during the stop an
-   * `up` does before restarting a service.
+   * the socket was reset or closed with nothing written — looks to the client
+   * like a refused connect, and is retried and held the same way (decision
+   * 0035) when that is safe:
+   * - nothing of the client's reached the process (refused, or lost before
+   *   the proxy wrote a byte upstream): always — it cannot have acted;
+   * - bytes reached it: only for an idempotent HTTP request (`replayable`),
+   *   and only to ONE more process (`MAX_REPLAYS`).
+   * Otherwise the client sees the close or reset, as it would without a proxy
+   * (decision 0039, corrected in 0.18.1).
    */
   private forward(client: Socket, internalPort: number, carry?: Carry): void {
     if (!this.open.has(client)) {
       this.open.add(client);
       client.once('close', () => this.open.delete(client));
     }
-    const replay: Carry = carry ?? { chunks: [], bytes: 0, ended: false, resets: 0, deadline: Date.now() + HOLD_MS() };
+    const replay: Carry = carry ?? { chunks: [], bytes: 0, ended: false, resets: 0, replays: 0, deadline: Date.now() + HOLD_MS() };
     connectInternal(internalPort, (err, upstream) => {
       if (err || !upstream) {
         this.refused(client, replay);
@@ -205,6 +232,12 @@ class Target {
       let answered = false;
       let retryable = replay.bytes <= MAX_REPLAY_BYTES;
       let settled = false;
+      // Did any client byte reach this process? Before one did, it cannot have
+      // acted on the request, so a retry is not a replay.
+      let delivered = replay.chunks.length > 0;
+      // May this connection be retried if the process goes away unanswered?
+      const canRetry = () =>
+        !answered && retryable && (!delivered || (replay.replays < MAX_REPLAYS && replayable(replay.chunks)));
       // Bytes the client sent while it waited (or before a reset) go first.
       for (const chunk of replay.chunks) upstream.write(chunk);
       if (replay.ended) upstream.end();
@@ -221,6 +254,7 @@ class Target {
             replay.chunks = [];
           }
         }
+        delivered = true;
         if (!upstream.write(chunk)) client.pause();
       };
       const onDrain = () => client.resume();
@@ -236,10 +270,12 @@ class Target {
         upstream.off('drain', onDrain);
         upstream.unpipe(client);
       };
-      // The service went away before it said anything: retry like a refusal.
+      // The service went away before it said anything, and retrying is safe
+      // (canRetry): retry like a refusal.
       const lost = () => {
         if (settled) return;
         settled = true;
+        if (delivered) replay.replays++;
         detach();
         upstream.destroy();
         if (client.destroyed) return;
@@ -251,7 +287,7 @@ class Target {
         replay.chunks = [];
       });
       upstream.on('error', () => {
-        if (!answered && retryable) lost();
+        if (canRetry()) lost();
         else client.destroy();
       });
       upstream.on('drain', onDrain);
@@ -261,9 +297,9 @@ class Target {
       upstream.pipe(client, { end: false });
       // Half-closes travel on (the service's FIN ends the client's side), and
       // a full close of either side ends the pair — unless the service closed
-      // before it said anything, which is a lost connection, retried above.
+      // before it said anything and retrying is safe: a lost connection, retried above.
       const finish = (closed: boolean) => {
-        if (!answered && retryable && !client.destroyed) {
+        if (canRetry() && !client.destroyed) {
           lost();
           return;
         }
