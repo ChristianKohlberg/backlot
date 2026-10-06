@@ -209,6 +209,8 @@ export interface BakedMarker {
   v: 1;
   ns: string;
   drop: string | null;
+  /** The datastore it was baked for (0.18+), so a rebake drops only that datastore's. */
+  ds?: string;
 }
 
 export function parseBakedMarker(content: string): BakedMarker {
@@ -590,6 +592,7 @@ class CommandDs implements DsDriver {
           v: 1,
           ns: tpl,
           drop: this.spec.drop ? template(this.spec.drop, { ns: tpl }) : null,
+          ds: this.name,
         };
         writeFileSync(marker, JSON.stringify(baked));
       };
@@ -683,15 +686,27 @@ class CommandDs implements DsDriver {
     // older keys of this one (retention collects those), stay.
     await withBakeLock(this.stackId, async () => {
       const dir = join(templatesRoot(), this.stackId);
-      for (const preset of presetNames(this.spec)) {
-        const file = join(dir, this.markerName(preset));
-        if (!existsSync(file)) continue;
+      const key = `@${this.contentKey().slice(0, 12)}.baked`;
+      const catalog = new Set(presetNames(this.spec));
+      let files: string[] = [];
+      try {
+        files = readdirSync(dir).filter((f) => f.startsWith(`${this.name}-`) && f.endsWith(key));
+      } catch {
+        return;
+      }
+      for (const f of files) {
+        const file = join(dir, f);
+        let baked: BakedMarker | null = null;
         try {
-          const baked = parseBakedMarker(readFileSync(file, 'utf8'));
-          if (baked.drop && !hasOtherTemplateOwner(file, baked.ns)) await shQuiet(baked.drop, cwd ?? templatesRoot());
+          baked = parseBakedMarker(readFileSync(file, 'utf8'));
         } catch {
-          /* unreadable marker: removing it is all that is left to do */
+          baked = null; // unreadable: removing it is all that is left to do
         }
+        // A marker names its datastore since 0.18; an older one is this
+        // datastore's when its preset is one this datastore offers.
+        const preset = f.slice(this.name.length + 1, -key.length);
+        if (baked?.ds !== undefined ? baked.ds !== this.name : !catalog.has(preset)) continue;
+        if (baked?.drop && !hasOtherTemplateOwner(file, baked.ns)) await shQuiet(baked.drop, cwd ?? templatesRoot());
         rmSync(file, { force: true });
       }
     });
