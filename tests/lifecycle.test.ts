@@ -215,7 +215,7 @@ describe('teardown when the agent or its worktree is gone (decision 0035)', () =
     expect(existsSync(join(c.stateDir, 'envs', envId))).toBe(false);
   }, 60_000);
 
-  it('runly destroy removes the environment, its copies and the worktree records now', async () => {
+  it('runly destroy removes the environment and its copies now, and keeps the worktree records (decision 0039)', async () => {
     const c = ctx();
     const wt = c.worktree({
       'runly.yml': `${STACK}datastores:\n  main: { driver: sqlite, create: 'node seed.mjs "{{ns}}"', template: true, presets: [dev] }\n`,
@@ -232,7 +232,9 @@ describe('teardown when the agent or its worktree is gone (decision 0035)', () =
     expect(d.json.copies).toEqual([copy.json.name]);
     expect(c.journal().allEnvs()).toEqual([]);
     expect(c.journal().allDbCopies()).toEqual([]);
-    expect(readdirSync(join(c.stateDir, 'worktrees'))).toEqual([]);
+    // The upkeep/build records describe the worktree, which destroy never
+    // touches: they stay, so the next `up` does not redo its installs.
+    expect(readdirSync(join(c.stateDir, 'worktrees')).length).toBe(1);
     await expect(fetch(up.json.urls.web, { signal: AbortSignal.timeout(3000) })).rejects.toThrow();
   }, 60_000);
 });

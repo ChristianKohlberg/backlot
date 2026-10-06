@@ -1,6 +1,7 @@
 /** Request-local bind explanations. Never persist commands or environment values. */
 export interface BindDiagnostics {
   durationMs: number;
+  /** Wall time per phase. On a full bind `data` and `build` overlap (decision 0039), so they may add up to more than `durationMs`. */
   phasesMs: Record<BindPhase, number>;
   /**
    * `reused`: no running service was stopped — every build ran and none
@@ -50,6 +51,17 @@ export class BindTrace {
     this.result.phasesMs[this.current] += at - this.marked;
     this.marked = at;
     this.current = next;
+  }
+
+  /**
+   * Phases that ran side by side (data and build on a full bind, decision
+   * 0039): each gets its own wall time, and the span they shared is not
+   * counted again for the phase that was current. `durationMs` is then less
+   * than the sum of the phases.
+   */
+  overlapped(ms: Partial<Record<BindPhase, number>>): void {
+    for (const [phase, v] of Object.entries(ms) as Array<[BindPhase, number]>) this.result.phasesMs[phase] += v;
+    this.marked = performance.now();
   }
 
   finish(): BindDiagnostics {

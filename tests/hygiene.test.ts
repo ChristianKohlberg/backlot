@@ -109,7 +109,7 @@ describe('degraded marking + auto-reap for a flapping service', () => {
     rmSync(wt, { recursive: true, force: true });
   });
 
-  it('a service dying after ready flaps out; the env goes degraded and is reaped', async () => {
+  it('a service dying after ready flaps out; leased, it is marked failed and the env stays — released, the env is reaped', async () => {
     writeFileSync(
       join(wt, 'server.mjs'),
       `import { createServer } from 'node:http';
@@ -127,7 +127,19 @@ services:
     execFileSync('git', ['init', '-q'], { cwd: wt });
 
     expect((await ctx.cli(['up', '--json'], wt)).exitCode).toBe(0); // ready, then it starts dying
-    // 3 bounded restarts (0.5+1+1.5s) -> flapping -> degraded -> sweeper reaps.
+    // 3 bounded restarts (0.5+1+1.5s) -> flapping. The environment is leased
+    // (decision 0039): the service is failed, the environment stays.
+    let state = '';
+    for (let i = 0; i < 60 && state !== 'failed'; i++) {
+      await new Promise((r) => setTimeout(r, 500));
+      state = ((await ctx.cli(['ctx', '--json'], wt)).json as { services?: Record<string, string> } | undefined)?.services?.web ?? '';
+    }
+    expect(state).toBe('failed');
+    expect((await envsOf(ctx, wt)).length).toBe(1);
+    // The next up retries it; released before it flaps again, nobody holds
+    // the environment, so it is degraded and reaped, as before.
+    expect((await ctx.cli(['up', '--json'], wt)).exitCode).toBe(0);
+    expect((await ctx.cli(['release', '--json'], wt)).exitCode).toBe(0);
     let envs: Awaited<ReturnType<typeof envsOf>> = [];
     for (let i = 0; i < 60; i++) {
       envs = await envsOf(ctx, wt);
@@ -135,7 +147,7 @@ services:
       await new Promise((r) => setTimeout(r, 500));
     }
     expect(envs.length).toBe(0);
-  }, 60_000);
+  }, 90_000);
 });
 
 describe('idle quiesce (hot -> warm) and rebind', () => {

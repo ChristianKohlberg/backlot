@@ -54,7 +54,7 @@ afterAll(async () => {
 });
 
 describe('a service that daemonizes is refused, fast and with the blame on the repo', () => {
-  it('up fails as work-error naming FOREGROUND, well before the ready timeout, and degrades the env', async () => {
+  it('up fails as work-error naming FOREGROUND, well before the ready timeout, and reports the service failed', async () => {
     const stateDir = mkdtempSync(join(tmpdir(), 'runly-dmz-'));
     const wt = mkdtempSync(join(tmpdir(), 'runly-dmz-wt-'));
     dirs.push(stateDir, wt);
@@ -95,11 +95,16 @@ describe('a service that daemonizes is refused, fast and with the blame on the r
     // the 30s ready timeout polling a probe that can never pass.
     expect(elapsed).toBeLessThan(20_000);
 
-    // The env must be OUT OF ROTATION — handing it to the next claim as
-    // healthy is how a dead service gets leased.
+    // The env is never handed out as healthy. It is leased, so it stays
+    // (decision 0039): not running, the service reported failed with why, and
+    // the next `up` retries it.
     const status = await cli(['status', '--json']);
     const envs = (status.json as { envs: Array<{ state: string }> }).envs;
     expect(envs.length).toBeGreaterThan(0);
-    expect(envs[0]!.state).toBe('degraded');
+    expect(envs[0]!.state).not.toBe('hot');
+    const ctx = await cli(['ctx', '--json']);
+    const view = ctx.json as { services: Record<string, string>; failures: Record<string, { reason: string }> };
+    expect(view.services.bg).toBe('failed');
+    expect(view.failures.bg!.reason).toBe('daemonized');
   }, 120_000);
 });

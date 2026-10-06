@@ -60,6 +60,12 @@ async function dispatch(verb: string, args: Record<string, unknown>, emit: (phas
       });
     case 'db-drop':
       return engine.dbDrop(String(args.name ?? ''));
+    case 'db-attach':
+      return engine.dbAttach(String(args.name ?? ''), {
+        pid: Number(args.pid),
+        start: args.start === undefined || args.start === null ? undefined : Number(args.start),
+        pgid: args.pgid === undefined || args.pgid === null ? undefined : Number(args.pgid),
+      });
     case 'db-ls':
       return engine.dbLs(cwd, Boolean(args.all));
     case 'ps':

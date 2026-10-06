@@ -7,6 +7,7 @@ import { spawn } from 'node:child_process';
 import { openSync, statSync, readSync, closeSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { installedUnit, startUnit, unitRunsThisBuild } from './daemon-unit.js';
 import { socketPath, stateRoot } from '../core/paths.js';
 import { isAlive } from '../core/procscan.js';
 import { collectCallerEnv } from '../core/caller-env.js';
@@ -218,6 +219,19 @@ export async function ensureDaemon(cwd = process.cwd()): Promise<DaemonInfo> {
   // `update` work (the next invocation after a stop brings up the installed
   // build) and equally what makes skew possible (an upgrade cannot replace a
   // daemon that is already running).
+  // A supervised daemon (decision 0039) is started through its unit, so it
+  // stays supervised: spawning one here would run it outside systemd/launchd.
+  // The election still guards against two; if the unit does not answer, the
+  // ordinary spawn below is the fallback.
+  const unit = installedUnit();
+  if (unit && unitRunsThisBuild(unit) && startUnit(unit)) {
+    const deadline = Date.now() + 10_000;
+    while (Date.now() < deadline) {
+      const info = await ping();
+      if (info) return info;
+      await new Promise((r) => setTimeout(r, 100));
+    }
+  }
   const daemonEntry = join(dirname(fileURLToPath(import.meta.url)), '..', 'daemon', 'index.js');
   const daemonEnv = { ...process.env };
   if (cwd !== undefined) {
@@ -234,6 +248,9 @@ export async function ensureDaemon(cwd = process.cwd()): Promise<DaemonInfo> {
   // HOME/XDG inputs may legitimately be service-specific. Pin routing before
   // the stripped daemon recomputes its state root from its own environment.
   daemonEnv.BACKLOT_STATE_DIR = stateRoot();
+  // A daemon autospawned from inside `runly db with`'s command must not carry
+  // that copy's tag: reaping the copy kills what carries it (decision 0039).
+  delete daemonEnv.BACKLOT_DB_COPY;
   const log = openSync(join(stateRoot(), 'daemon.log'), 'a');
   // node:sqlite (the journal) prints "SQLite is an experimental feature" on
   // every spawn, burying daemon.log's signal. Suppress ONLY that warning class,

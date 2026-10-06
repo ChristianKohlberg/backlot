@@ -5,11 +5,12 @@
  * 3 infra-error, 64 usage. See docs/architecture.md §11.
  */
 import { ensureDaemon, daemonInfo, rpc, classifyClientError, awaitDaemonGone, daemonStopTimeoutMs, type RpcError, type RpcResponse } from './client.js';
-import { isAlive } from '../core/procscan.js';
+import { dbCopyTag, isAlive, startTime } from '../core/procscan.js';
 import { join } from 'node:path';
 import { stateRoot } from '../core/paths.js';
 import { BUILD, VERSION, rebuiltSince, versionSkew } from '../core/version.js';
 import { installKind } from './install.js';
+import { installUnit, installedUnit, startUnit, uninstallUnit, unitPlan } from './daemon-unit.js';
 import { collectCallerEnv } from '../core/caller-env.js';
 import { loadStack, manifestDeprecations } from '../core/manifest.js';
 import { parsePresetArgs } from '../core/presets.js';
@@ -144,6 +145,13 @@ Usage:
   runly daemon stop       stop the daemon and wait for it (60 s,
                           BACKLOT_DAEMON_STOP_TIMEOUT_MS); environments are
                           recovered on next use
+  runly daemon install [--print]
+                          supervise the daemon: a systemd user unit (Linux) or
+                          launchd agent (macOS) that restarts it within seconds
+                          when it crashes; the CLI then starts the daemon
+                          through it. --print shows the unit without writing it.
+                          A daemon already running moves under it on 'runly update'
+  runly daemon uninstall  disable and remove that unit
   runly update [--check] [--force]
                           make the RUNNING daemon be the INSTALLED build. An
                           upgrade replaces the files on disk but not the daemon
@@ -201,7 +209,7 @@ const verb = rawArgv[0];
 // flags survive) — the F1 class of argv bugs. Everything after a lone `--`, and
 // EVERYTHING for `exec`, is treated as a raw passthrough command.
 const VALUE_FLAGS = new Set(['--holder', '--holder-pid', '--ttl', '--role', '--lines', '--ref', '--spec', '--preset', '--https-port', '--since', '--grep', '--until', '--timeout']);
-const BOOL_FLAGS = new Set(['--json', '--env', '--watch', '--reset-data', '--pristine', '--pull', '--detach', '--all', '--force', '--raw', '--data-only', '--progress', '--quiet', '--check', '--rebuild', '--follow', '--build', '--fix']);
+const BOOL_FLAGS = new Set(['--print', '--json', '--env', '--watch', '--reset-data', '--pristine', '--pull', '--detach', '--all', '--force', '--raw', '--data-only', '--progress', '--quiet', '--check', '--rebuild', '--follow', '--build', '--fix']);
 
 const flagVals = new Map<string, string>();
 const presetArgs: string[] = [];
@@ -424,6 +432,14 @@ async function main(): Promise<void> {
   if (presetArgs.length > 0 && verb !== 'db') {
     const manifest = loadStack(process.cwd()).manifest;
     presets = parsePresetArgs(manifest, presetArgs);
+  }
+  if (verb === 'daemon' && (positional[0] === 'install' || positional[0] === 'uninstall')) {
+    await daemonUnitVerb(positional[0]);
+    return;
+  }
+  if (verb === 'daemon' && positional[0] !== 'stop') {
+    console.error('runly daemon: stop | install [--print] | uninstall');
+    process.exit(64);
   }
   const stopping = verb === 'daemon' && positional[0] === 'stop';
   const daemon = stopping ? await daemonInfo() : await ensureDaemon(process.cwd());
@@ -813,10 +829,6 @@ async function main(): Promise<void> {
       break;
     }
     case 'daemon': {
-      if (positional[0] !== 'stop') {
-        console.error('runly daemon: only `stop` is supported');
-        process.exit(64);
-      }
       res = await rpc('shutdown', {});
       if (!res.ok) break;
       if (!(await awaitDaemonGone(daemon.pid, daemonStopTimeoutMs()))) {
@@ -992,7 +1004,7 @@ interface DbCopy {
 
 interface PsData {
   scope: string;
-  services: Array<{ env: string; worktree?: string; service: string; state: string; publicPort: number | null; internalPort: number | null; pid: number | null; idleMs: number | null; idleStopInMs?: number | null; rssBytes: number | null }>;
+  services: Array<{ env: string; worktree?: string; service: string; state: string; publicPort: number | null; internalPort: number | null; pid: number | null; idleMs: number | null; idleStopInMs?: number | null; rssBytes: number | null; failure?: { detail: string; hint: string } | null }>;
   databases: DbCopy[];
   budget?: { enabled: boolean; memoryBytes: number; cpu: number; committedMemoryBytes: number; committedCpu: number; waiting: number };
 }
@@ -1042,40 +1054,121 @@ function doctorLines(d: PoolDoctorData): string[] {
 }
 
 /**
+ * `runly daemon install [--print]` / `runly daemon uninstall` (decision 0039):
+ * a systemd user unit (Linux) or launchd agent (macOS) that restarts a crashed
+ * daemon within seconds. Install writes and enables it; it starts the daemon
+ * through it when none runs, and otherwise says how to move the running one
+ * under it (`runly update`, which keeps leases). Uninstall disables and
+ * removes it; a running daemon keeps running, unsupervised.
+ */
+async function daemonUnitVerb(sub: 'install' | 'uninstall'): Promise<void> {
+  const plan = unitPlan();
+  if (!plan) {
+    errExit({ class: 'work-error', message: `runly daemon ${sub}: no supervisor for ${process.platform} (systemd user units on Linux, launchd on macOS)`, source: 'daemon' });
+    return;
+  }
+  if (sub === 'install' && flags.has('--print')) {
+    if (json) out({ kind: plan.kind, name: plan.name, path: plan.path, content: plan.content });
+    else process.stdout.write(plan.content);
+    return;
+  }
+  if (sub === 'uninstall') {
+    const installed = installedUnit();
+    if (!installed) {
+      out({ kind: plan.kind, name: plan.name, path: plan.path, removed: false, detail: 'no unit is installed for this state root' });
+      return;
+    }
+    const r = uninstallUnit(installed);
+    out({ kind: plan.kind, name: plan.name, path: plan.path, removed: true, steps: r.steps, detail: 'the running daemon (if any) keeps running without a supervisor; the next verb that finds none autospawns one' });
+    return;
+  }
+  const r = installUnit(plan);
+  if (r.error) {
+    errExit({ class: 'infra-error', message: `runly daemon install: ${r.error}`, source: 'daemon', logExcerpt: r.steps.join('\n') });
+    return;
+  }
+  const running = await daemonInfo().catch(() => null);
+  let started = false;
+  if (!running) {
+    started = startUnit(plan);
+    if (started) {
+      const deadline = Date.now() + 10_000;
+      while (Date.now() < deadline && !(await daemonInfo().catch(() => null))) await new Promise((res) => setTimeout(res, 100));
+    }
+  }
+  const next = running
+    ? `a daemon (pid ${running.pid}) is already running outside the unit — 'runly update' restarts it under the unit (leases survive)`
+    : started
+      ? `the daemon now runs under ${plan.kind === 'systemd' ? `${plan.name}.service` : plan.name}`
+      : `the unit is installed; the next runly verb starts the daemon through it`;
+  out({ kind: plan.kind, name: plan.name, path: plan.path, installed: true, started, steps: r.steps, next });
+}
+
+/**
  * Run `db with`'s command against the copy, its exit code as ours. One token
  * is a shell string (as for exec); several keep the caller's own word splits.
- * SIGINT/SIGTERM are passed on, so the copy is dropped after the command stops.
+ * SIGINT/SIGTERM/SIGHUP are passed on, so the copy is dropped after the
+ * command stops.
+ *
+ * If THIS process dies without that chance (SIGKILL, OOM), the daemon drops
+ * the copy — and must take the command down first, or it goes on working
+ * against a dropped database (decision 0039). So the command carries the
+ * copy's tag (`BACKLOT_DB_COPY`, inherited by everything it starts: Linux
+ * finds them all by it), its pid and start time are recorded on the copy, and
+ * without a terminal it runs in its own process group, which the daemon
+ * signals as a whole. At a terminal it stays in ours, so job control (Ctrl-C,
+ * reading the terminal) behaves as before; there the daemon signals the
+ * recorded pid and, on Linux, every tagged process.
  */
 async function runWithCopy(parts: string[], copy: DbCopy): Promise<number> {
   const { spawn } = await import('node:child_process');
   const { constants } = await import('node:os');
-  const env = { ...process.env, RUNLY_DB_URL: copy.url, RUNLY_DB_NAME: copy.name };
+  const env = { ...process.env, RUNLY_DB_URL: copy.url, RUNLY_DB_NAME: copy.name, ...dbCopyTag(copy.name, stateRoot()) };
+  const fromTerminal = process.stdin.isTTY === true || process.stdout.isTTY === true || process.stderr.isTTY === true;
+  const ownGroup = !fromTerminal;
   const child = parts.length === 1
-    ? spawn(parts[0]!, { stdio: 'inherit', env, shell: true })
-    : spawn(parts[0]!, parts.slice(1), { stdio: 'inherit', env });
+    ? spawn(parts[0]!, { stdio: 'inherit', env, shell: true, detached: ownGroup })
+    : spawn(parts[0]!, parts.slice(1), { stdio: 'inherit', env, detached: ownGroup });
+  // Listen before anything is awaited: a command that ends while the
+  // attach RPC is in flight must not be missed.
+  const ended = new Promise<number>((resolve) => {
+    child.on('error', (err) => {
+      console.error(`runly db with: could not start '${parts[0]}': ${err.message}`);
+      resolve(127);
+    });
+    child.on('exit', (code, signal) => resolve(code ?? (signal ? 128 + (constants.signals[signal] ?? 0) : 1)));
+  });
+  if (child.pid !== undefined) {
+    // Best effort: a daemon that cannot record it still finds the command by
+    // its tag on Linux.
+    const attached = await rpc('db-attach', { name: copy.name, pid: child.pid, start: startTime(child.pid), pgid: ownGroup ? child.pid : undefined }).catch(() => null);
+    if (attached && !attached.ok) console.error(`runly db with: could not record the command on ${copy.name} (${attached.error.message})`);
+  }
   const forward = (sig: NodeJS.Signals) => () => {
-    try { child.kill(sig); } catch { /* already gone */ }
+    try {
+      // In its own group, the whole group: `sh -c` forks, and the real
+      // command is its child.
+      if (ownGroup && child.pid !== undefined) process.kill(-child.pid, sig);
+      else child.kill(sig);
+    } catch {
+      /* already gone */
+    }
   };
   // Ctrl-C at a terminal signals the whole foreground process group, and the
   // child is in ours: it already has its SIGINT. Forwarding sent it a second
   // one, which makes many tools (npm, a test runner) abort their own cleanup.
   // Only a SIGINT sent to this process alone (no terminal) is passed on.
-  const fromTerminal = process.stdin.isTTY === true || process.stderr.isTTY === true;
   const onInt = fromTerminal ? () => undefined : forward('SIGINT');
   const onTerm = forward('SIGTERM');
+  const onHup = forward('SIGHUP');
   process.on('SIGINT', onInt);
   process.on('SIGTERM', onTerm);
-  return new Promise((resolve) => {
-    child.on('error', (err) => {
-      console.error(`runly db with: could not start '${parts[0]}': ${err.message}`);
-      resolve(127);
-    });
-    child.on('exit', (code, signal) => {
-      process.off('SIGINT', onInt);
-      process.off('SIGTERM', onTerm);
-      resolve(code ?? (signal ? 128 + (constants.signals[signal] ?? 0) : 1));
-    });
-  });
+  process.on('SIGHUP', onHup);
+  const code = await ended;
+  process.off('SIGINT', onInt);
+  process.off('SIGTERM', onTerm);
+  process.off('SIGHUP', onHup);
+  return code;
 }
 
 /** A plain, aligned table; `-` for an empty cell. */
@@ -1108,6 +1201,8 @@ function psLines(d: PsData, all: boolean): string[] {
       s.env, ...(all ? [s.worktree ?? ''] : []), s.service, s.state, s.publicPort === null ? '' : String(s.publicPort), s.internalPort === null ? '' : String(s.internalPort),
       s.pid === null ? '' : String(s.pid), ago(s.idleMs), s.idleStopInMs === null || s.idleStopInMs === undefined ? '' : ago(s.idleStopInMs), mb(s.rssBytes),
     ])));
+    // A failed service says how it ended and where to look (decision 0039).
+    for (const s of d.services) if (s.failure) out.push(`${s.service} ${s.failure.detail} — '${s.failure.hint}' shows why; the next 'runly up' retries it`);
     const running = d.services.filter((s) => s.state === 'running' || s.state === 'starting').length;
     if (running === 0) out.push(`nothing is running — ${d.services.length} service(s) idle, stopped or down; the next 'runly up' or connection starts what is wanted`);
   }
@@ -1128,7 +1223,8 @@ interface CtxView {
   lease: { id: string; expiresAt: number } | null;
   urls?: Record<string, string>;
   ports?: Record<string, number>;
-  services?: Record<string, 'running' | 'stopped' | 'down'>;
+  services?: Record<string, 'running' | 'failed' | 'stopped' | 'down'>;
+  failures?: Record<string, { detail: string; hint: string }>;
   datastores?: Record<string, { url: string; preset?: string | null }>;
   logins?: { user: string; password: string } | null;
   previewUrls?: Record<string, string>;
@@ -1156,6 +1252,7 @@ function ctxSummary(c: CtxView, verb: 'up' | 'ctx'): string[] {
     const url = c.urls?.[n] ?? '';
     out.push(`  ${n.padEnd(width)}  ${state.padEnd(7)}  ${url}${c.previewUrls?.[n] ? `  (preview ${c.previewUrls[n]})` : ''}`.trimEnd());
   }
+  for (const [n, f] of Object.entries(c.failures ?? {})) out.push(`  ${n} ${f.detail} — '${f.hint}' shows why; the next 'runly up' retries it`);
   for (const [n, ds] of Object.entries(c.datastores ?? {})) out.push(`  datastore ${n}: ${ds.url}${ds.preset ? ` (${ds.preset})` : ''}`);
   if (c.logins) out.push(`  login: ${c.logins.user} / ${c.logins.password}`);
   out.push(`  'runly ctx --env' for shell exports, --json for everything`);

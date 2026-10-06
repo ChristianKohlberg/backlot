@@ -103,6 +103,13 @@ export interface DatastoreSpec {
   template?: boolean;
   ephemeral?: boolean;
   /**
+   * Never provisioned for an environment (decision 0039): it exists only as
+   * the source of `runly db new|with` copies. Its template is baked on the
+   * first copy and reused by the next. No service may template it, `ctx`
+   * does not list it, and `up --preset` / `reset-data` cannot name it.
+   */
+  copies_only?: boolean;
+  /**
    * Repo command printing the namespaces ({{ns}} values) of this datastore
    * that exist on its server, one per line. Only `runly pool doctor` reads it:
    * a listed name that matches runly's naming and no journal row references is
@@ -332,11 +339,40 @@ export function loadStack(from: string, opts: { validate?: boolean } = {}): Stac
   // A path that escapes the worktree is refused at load, whether or not an
   // upkeep rule ever makes runly read it: it is never a legitimate source file.
   for (const inc of manifest.sync?.include ?? []) safeJoin(root, inc, 'sync.include');
+  checkCopiesOnly(manifest, basename(file));
   // Identity = absolute root + declared name; filesystem-safe. Hash the WHOLE
   // path: slicing base64url(root) kept only the last ~6 bytes, so sibling
   // worktrees like agent-1/myapp and agent-2/myapp collided into one pool.
   const id = stackIdentity(manifest.name, root);
   return { manifest, root, id, file: basename(file) };
+}
+
+/**
+ * A `copies_only` datastore (decision 0039) has no environment namespace, so
+ * nothing that runs in an environment can be handed one: a service that
+ * templates it is refused at load, naming the alternative.
+ */
+function checkCopiesOnly(manifest: Manifest, file: string): void {
+  for (const [ds, spec] of Object.entries(manifest.datastores ?? {})) {
+    if (spec.copies_only !== true) continue;
+    const escaped = ds.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const ref = new RegExp(`\\{\\{\\s*datastores\\.${escaped}\\.`);
+    for (const [name, svc] of Object.entries(manifest.services ?? {})) {
+      const texts = [svc.run, buildOf(svc)?.run ?? '', ...Object.values(svc.env ?? {})];
+      if (texts.some((t) => typeof t === 'string' && ref.test(t))) {
+        throw new BrokerError(
+          'work-error',
+          `service '${name}' templates datastore '${ds}', which is copies_only in ${file} — an environment never has one; take a copy with 'runly db new ${ds}' (or 'runly db with ${ds} -- <cmd>'), or drop copies_only`,
+          'manifest',
+        );
+      }
+    }
+  }
+}
+
+/** The datastores an environment provisions: every declared one except `copies_only` (decision 0039). */
+export function envDatastoreNames(manifest: Manifest): string[] {
+  return Object.entries(manifest.datastores ?? {}).filter(([, spec]) => spec.copies_only !== true).map(([name]) => name);
 }
 
 /** The declared default preset, if any — one value, whichever form the manifest used. */

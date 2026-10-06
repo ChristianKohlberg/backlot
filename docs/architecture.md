@@ -84,7 +84,10 @@ Stable ports are held, not just recorded ([decision 0033](decisions/0033-the-dae
 the daemon listens on each environment's **public** ports (20000–29999) for the
 environment's life and pipes TCP to the **internal** port (30000–31999) the service
 was started on, fresh at each start. A connection that arrives while its service
-restarts is held until it is ready; client bytes and the last activity time are
+restarts is held until it is ready — also one the service accepted and dropped
+before its first byte back (a crash the supervisor has not seen yet, a restart
+under way): the proxy keeps what the client sent until the service answers and
+replays it, like a refused connect (decision 0039); client bytes and the last activity time are
 counted per port (`proxy` in `ctx`/`status`), and readiness probes bypass the
 proxy. Derived tailnet ports use a third block (32000–32767); all three sit below
 the OS ephemeral range. `src/daemon/proxy.ts` owns the proxy, `ensureProxies` in
@@ -179,6 +182,11 @@ Local pools are convergence all the way down. Same verbs above the driver line.
   cold machine all race to spawn it; the singleton election keeps that safe (one
   wins, losers concede, their clients fall through to the winner), but fleets
   should still warm the daemon with a cheap `runly status` before parallelizing.
+  `runly daemon install` (decision 0039) puts it under a systemd user unit or a
+  launchd agent instead, one per state root, which restarts it a second after a
+  crash (`Restart=on-failure`, `KillMode=process`: its services outlive it as
+  they always did); a CLI that finds no daemon then starts the unit rather than
+  spawning one, and the election still guarantees a single daemon.
 - **Concurrency lives at the environment boundary**: a short pool lock serializes
   claim/release bookkeeping; one lock per environment serializes bind/exec/reset on it.
   A third, per-worktree lock serializes what writes into a worktree (upkeep, builds)
@@ -188,7 +196,7 @@ Local pools are convergence all the way down. Same verbs above the driver line.
 - **Local even when compute is remote.** A Morph environment is a pool entry whose
   driver executes over SSH. The consumer's machine is the brain; substrates are muscles.
 - **Disk is truth; daemon memory is a cache.** After a daemon crash or reboot, the next
-  CLI call respawns the daemon, which reconciles: recorded processes reaped (by pid
+  CLI call (or the supervising unit) respawns the daemon, which reconciles: recorded processes reaped (by pid
   identity and tag), environments marked `warm`, public ports held again, leases past
   their TTL ended, unfinished teardowns and copy drops retried. A restart is a non-event.
 - **Team mode** (same daemon on a shared host, TCP + auth) is a possible future, not v1.
@@ -201,16 +209,24 @@ from warm ≈ start + ready-wait; pristine ≈ full provision (bounded by templa
 shared caches, below).
 
 **Lifecycle** ([decision 0035](decisions/0035-services-idle-on-their-own-clock-and-wake-on-demand.md)).
-Each running service has its own idle clock: the last runly verb on its environment,
-the last client byte through its own public port, its own start. Past
+Each running service has its own idle clock: the last runly verb that USES its
+environment (`up`, `reset-data`, `exec`, `token`, `preview`, `down` — reading with
+`ctx`, `ps`, `plan`, `logs` or `status` is not activity, decision 0039), the last
+client byte through its own public port, its own start. `ps` shows IDLE and STOPS
+IN from that one clock. Past
 `BACKLOT_SERVICE_IDLE_MS` (10 min; `idle:` per service) the sweeper stops it under the
 environment lock; lease, data, ports and the other services stay, and `ps` says
 `idle`. A connection to its public port wakes it (the proxy's wake hook → `wakeService`:
 closure, appliances, datastores kept, load budget, build only if needed) and is held
 until it is ready; services reach each other through public ports, so wakes chain. A
 crash restart marks the port `starting` (supervisor hooks `onCrashed` / `onRelaunched` /
-`onGaveUp`), and a refused forward is retried and held, so the self-restart gap holds
-connections too. Activity clocks are persisted (`envs.activity`, throttled to 5 s, and
+`onGaveUp`), and a refused forward — or one dropped before the first byte back — is
+retried and held, so the self-restart gap holds connections too. A service that
+crash-loops past its restart budget in a LEASED environment is stopped and reported
+`failed` (`ps`, `ctx.failures`, a `service-failed` event: last exit, `runly logs
+<svc>`); the environment, its data, its other services and its logs stay, nothing
+wakes it, and the next `up` starts it again (decision 0039). Only an unleased
+environment is marked `degraded` and recycled for it. Activity clocks are persisted (`envs.activity`, throttled to 5 s, and
 at sweep and shutdown). A lease or copy tethered to a holder process is torn down
 completely once the holder has been dead for `BACKLOT_TETHER_GRACE_MS` (60 s); a live
 holder renews its lease's TTL. Under Claude Code the CLI tethers to `CLAUDE_PID` when it
@@ -386,8 +402,14 @@ build/start:
   scheduling it is deferred.
 - **Data templates are keyed by the `create:` command string**, plus — when an
   `@rebake-template <datastore>` upkeep rule exists — the content of that rule's trigger
-  files. Editing a seed script therefore rebakes only when such a rule covers it (see
-  `examples/hello-multi/runly.yml`). `@rebake-template` is the one upkeep built-in.
+  files. Editing a seed script therefore yields a new template only when such a rule
+  covers it (see `examples/hello-multi/runly.yml`). A template whose key matches IS
+  current and is reused — by a fresh environment after `destroy` too — and a missing
+  one is baked by the restore that needs it (decision 0039). A fired rule only says
+  the environment's data may come from another template: the datastore is reloaded
+  when `env.templates` names a different one. Only `--pristine` drops the current
+  templates (of that datastore, every preset) so they are baked again.
+  `@rebake-template` is the one upkeep built-in.
 - Toolchain-level bumps (global.json, .nvmrc) are env-recycle events, not upkeep —
   unless the repo manages toolchains declaratively (mise/asdf) via its own rule.
   runly never installs SDKs on its own initiative.
@@ -397,7 +419,11 @@ build/start:
 A datastore is the manifest's `create:` / `drop:` / `url:` commands plus an optional
 `template_restore:` (sqlite: `template: true`); see [`driver-spec.md`](driver-spec.md).
 `create:` bakes a template once per template key and preset (§7); after that, data
-states are restored from templates in seconds (Postgres: native
+states are restored from templates in seconds. Template changes hold a per-stack
+readers-writer lock (`withBakeLock` exclusive for bake, rebake, retention and doctor;
+`withTemplateRead` shared for every restore), so restores run side by side and nothing
+drops a template mid-restore. A failed restore is logged (`kind: template`) and retried;
+a second failure rebakes, unless the marker changed meanwhile (decision 0039) (Postgres: native
 `CREATE DATABASE … TEMPLATE`; MSSQL: backup/restore; SQLite: file copy; Redis-class
 stores: `ephemeral: true` — `drop:` is the flush, run on reset; `create:` runs only on
 first bind; no presets or templates).
@@ -413,8 +439,9 @@ first bind; no presets or templates).
 Two consecutive bind failures on the same warm environment auto-escalate the next bind
 to `pristine` (a per-env `failStreak` in the journal, cleared by any successful bind) —
 the standard defense against stale-cache heisenbugs. A service that flaps past its
-restart budget marks its environment `degraded`: skipped by acquisition, recycled by
-the sweeper. **Warm is a cache, not a home**: the pool stays honest only while
+restart budget marks an UNLEASED environment `degraded`: skipped by acquisition, recycled
+by the sweeper. In a leased environment it is stopped and reported `failed` instead
+(decision 0039). **Warm is a cache, not a home**: the pool stays honest only while
 discarding any environment is cheap.
 
 `reset-data` is also exposed mid-lease as a verb: replay your repro against pristine
@@ -426,7 +453,8 @@ data after twenty minutes of debugging mutation.
 instant and authoritative; no PID-reparenting guesswork, no port-health inference.
 Readiness is probed (`http`, `log`, or command); declared `fatal_logs` markers fail a
 boot in seconds instead of polling a dead port to timeout. Session services restart
-with bounded backoff; flapping marks the environment degraded, and the sweeper recycles it.
+with bounded backoff; flapping stops the service and reports it `failed` in a leased
+environment, and marks an unleased one degraded for the sweeper to recycle (decision 0039).
 A crash mid-bind fails the bind explicitly — never a silently wrong answer.
 
 Every failure is classified — the field an agent branches on mechanically:
@@ -461,9 +489,10 @@ Every failure is classified — the field an agent branches on mechanically:
   it. The pattern that produces this is `BACKLOT_HOLDER_PID=$$ runly up` from an agent
   harness, where every command gets a fresh shell, so `$$` is already gone.
 - **A lease does not exempt a service from its idle clock** (decision 0035). Each service
-  stops after `BACKLOT_SERVICE_IDLE_MS` without a runly verb on its environment or a client
-  byte on its port; the lease, data and ports survive, and the next connection or `up`
-  starts it again. A live agent is not activity.
+  stops after `BACKLOT_SERVICE_IDLE_MS` without a runly verb that uses its environment or a
+  client byte on its port; the lease, data and ports survive, and the next connection or
+  `up` starts it again. A live agent is not activity, and neither is an agent polling
+  `ctx`, `ps`, `plan`, `logs` or `status` (decision 0039).
 - **Leases need no heartbeat** because losing a lease is designed to be worthless: an
   explicit `up` refreshes the TTL (`reset-data` and read-only verbs deliberately do not,
   so an idle agent that only polls `ctx` does not hold an environment forever); expiry
@@ -512,6 +541,7 @@ runly status | doctor                          # daemon, environments, budget | 
 runly appliance ls|start|stop [name]           # shared backing servers
 runly pool ls|recycle [<env-id>] [--force]|reconcile|gc|doctor [--fix]   # doctor: orphans, dry run unless --fix
 runly daemon stop                              # waits up to 60 s (BACKLOT_DAEMON_STOP_TIMEOUT_MS) until the daemon and its services are gone
+runly daemon install [--print] | uninstall     # supervise the daemon (systemd user unit / launchd agent), decision 0039
 runly update [--check] [--force]               # run the INSTALLED build (below)
 runly --version
 # lease and copy verbs take --holder <name> (default: the caller's directory)
@@ -556,7 +586,8 @@ after the fact by the bind's own result: `up --json` and `reset-data --json` car
 `bindDiagnostics` — `durationMs`, `phasesMs` (queue, prepare, appliances, upkeep, stop,
 data, build, ready, finalize), `reuse` (`reused` | `restarted` | `rebound`) with
 `restarted`, `started`, `reloaded` and the `reasons` for a full bind, upkeep counts, and
-per build its duration, whether it restarted its service and why. No command output or
+per build its duration, whether it restarted its service and why. On a full bind the
+data and build phases overlap (decision 0039), each reported with its own wall time. No command output or
 caller input values appear in it.
 
 `ctx` returns one blob with everything a consumer needs: service URLs (stable per
@@ -582,10 +613,16 @@ its drop (the templated command and where to run it, or its directory under
 `<state>/dbs`). The sweeper (and recovery) drops a copy whose holder process is
 gone (the same `holderGone` check a lease gets), whose worktree is gone or now
 another stack, or whose creation or drop never finished; a failed drop stays on
-record with a backoff. No TTL, no pool cap. `runly ps` lists services (state,
+record with a backoff. `db with` runs its command with the copy's tag
+(`BACKLOT_DB_COPY`) and records its pid, start time and — without a terminal, where
+it gets its own process group — its group on the row (`child`); every drop stops
+what still runs against the copy first (the verified group or pid, and on Linux
+every tagged process), and a `db with` copy whose CLI died goes at the next sweep,
+without the tether grace (decision 0039). No TTL, no pool cap. `runly ps` lists services (state,
 public and internal port, pid, idle time, when it stops for idleness, RSS from the
-tagged processes; states `running`, `starting`, `idle`, `stopped`, `down`) and copies,
-for the caller's worktree or `--all`.
+tagged processes; states `running`, `starting`, `idle`, `failed`, `stopped`, `down`) and
+copies, for the caller's worktree or `--all`. A datastore marked `copies_only` is never
+provisioned for an environment and exists only as copies (decision 0039).
 
 **Public preview (decision 0027).** `runly preview <service>` publishes one leased
 service through a preview **publisher** adapter (default: a Cloudflare quick tunnel via
@@ -645,6 +682,7 @@ reads is ignored.
 | `BACKLOT_RETENTION_MS` | — | 10 min (disk retention cadence) |
 | `BACKLOT_RPC_TIMEOUT_MS` | — | 15 min — how long the CLI waits for one daemon answer |
 | `BACKLOT_DAEMON_STOP_TIMEOUT_MS` | — | 60 s — how long `daemon stop` waits for the daemon to exit |
+| `BACKLOT_SYSTEMCTL`, `BACKLOT_LAUNCHCTL` | — | `systemctl` / `launchctl` off `PATH` — what `runly daemon install` and the CLI's unit start run |
 
 **Advertised host.** Service URLs advertise `http://localhost:…` while port
 probing guarantees the IPv4 side (127.0.0.1 + wildcard). On dual-stack machines

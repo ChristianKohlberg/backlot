@@ -63,7 +63,31 @@ const MAX_HELD = 512;
 interface Waiter {
   socket: Socket;
   timer: NodeJS.Timeout;
+  /** A connection being retried after its service reset it: what it already sent, to replay. */
+  carry?: Carry;
 }
+
+/**
+ * What a connection sent before its service answered with a single byte —
+ * kept so that a service that dies under it (accepted, then reset or closed
+ * before replying) can be replaced transparently: the bytes are replayed to
+ * the next process. Bounded; past the bound the connection is no longer
+ * retryable and behaves like a plain pipe.
+ */
+interface Carry {
+  chunks: Buffer[];
+  bytes: number;
+  /** The client half-closed: the replay ends with a FIN too. */
+  ended: boolean;
+  /** Retries while the target still said `up` (a service that closes on purpose must not loop). */
+  resets: number;
+  deadline: number;
+}
+
+/** Client bytes kept for a replay; a request larger than this is not retried. */
+const MAX_REPLAY_BYTES = 1024 * 1024;
+/** Resets tolerated while the target is still `up` (the supervisor has not seen the exit yet). */
+const MAX_UP_RESETS = 5;
 
 class Target {
   servers: Server[] = [];
@@ -112,7 +136,7 @@ class Target {
     this.hold(client);
   }
 
-  private hold(client: Socket): void {
+  private hold(client: Socket, carry?: Carry): void {
     if (this.waiters.length >= MAX_HELD) {
       client.destroy();
       return;
@@ -122,10 +146,11 @@ class Target {
     client.pause();
     const waiter: Waiter = {
       socket: client,
+      carry,
       timer: setTimeout(() => {
         this.dropWaiter(waiter);
         client.destroy();
-      }, HOLD_MS()),
+      }, carry ? Math.max(0, carry.deadline - Date.now()) : HOLD_MS()),
     };
     waiter.timer.unref();
     client.once('close', () => this.dropWaiter(waiter));
@@ -145,71 +170,149 @@ class Target {
     for (const w of waiters) {
       clearTimeout(w.timer);
       if (w.socket.destroyed) continue;
-      if (this.state === 'up' && this.internalPort !== undefined) this.forward(w.socket, this.internalPort);
+      if (this.state === 'up' && this.internalPort !== undefined) this.forward(w.socket, this.internalPort, w.carry);
       else w.socket.destroy();
     }
   }
 
-  private forward(client: Socket, internalPort: number, deadline?: number): void {
+  /**
+   * Pipe `client` to the service on `internalPort`.
+   *
+   * Until the service sends its first byte back, the client's bytes are also
+   * kept (`carry`): a service that dies in the window before the supervisor
+   * notices — the kernel accepted the connection, then the process exited and
+   * the socket was reset or closed with nothing written — is indistinguishable
+   * from a refused connect for the client, and is handled the same way (decision
+   * 0035: a refused forward is retried and held). Without this the client got
+   * an empty reply in the first ~50 ms after a crash, and during the stop an
+   * `up` does before restarting a service.
+   */
+  private forward(client: Socket, internalPort: number, carry?: Carry): void {
     if (!this.open.has(client)) {
       this.open.add(client);
       client.once('close', () => this.open.delete(client));
     }
+    const replay: Carry = carry ?? { chunks: [], bytes: 0, ended: false, resets: 0, deadline: Date.now() + HOLD_MS() };
     connectInternal(internalPort, (err, upstream) => {
       if (err || !upstream) {
-        this.refused(client, deadline ?? Date.now() + HOLD_MS());
+        this.refused(client, replay);
         return;
       }
       if (client.destroyed) {
         upstream.destroy();
         return;
       }
-      upstream.on('error', () => client.destroy());
-      client.on('error', () => upstream.destroy());
-      // Count before piping: both listeners receive every chunk.
-      client.on('data', (chunk: Buffer) => {
+      let answered = false;
+      let retryable = replay.bytes <= MAX_REPLAY_BYTES;
+      let settled = false;
+      // Bytes the client sent while it waited (or before a reset) go first.
+      for (const chunk of replay.chunks) upstream.write(chunk);
+      if (replay.ended) upstream.end();
+      const onData = (chunk: Buffer) => {
+        // Count before forwarding.
         this.clientBytes += chunk.length;
         this.lastActivityAt = Date.now();
         this.hub.noteActivity(this.envId, this.key);
+        if (!answered && retryable) {
+          replay.chunks.push(chunk);
+          replay.bytes += chunk.length;
+          if (replay.bytes > MAX_REPLAY_BYTES) {
+            retryable = false;
+            replay.chunks = [];
+          }
+        }
+        if (!upstream.write(chunk)) client.pause();
+      };
+      const onDrain = () => client.resume();
+      const onEnd = () => {
+        replay.ended = true;
+        upstream.end();
+      };
+      const onClientClose = () => upstream.destroy();
+      const detach = () => {
+        client.off('data', onData);
+        client.off('end', onEnd);
+        client.off('close', onClientClose);
+        upstream.off('drain', onDrain);
+        upstream.unpipe(client);
+      };
+      // The service went away before it said anything: retry like a refusal.
+      const lost = () => {
+        if (settled) return;
+        settled = true;
+        detach();
+        upstream.destroy();
+        if (client.destroyed) return;
+        client.pause();
+        this.refused(client, replay, true);
+      };
+      upstream.once('data', () => {
+        answered = true;
+        replay.chunks = [];
       });
-      client.pipe(upstream);
-      upstream.pipe(client);
-      // Half-closes travel through pipe(); a full close of either side ends the pair.
-      client.once('close', () => upstream.destroy());
-      upstream.once('close', () => {
+      upstream.on('error', () => {
+        if (!answered && retryable) lost();
+        else client.destroy();
+      });
+      upstream.on('drain', onDrain);
+      client.on('data', onData);
+      client.on('end', onEnd);
+      client.on('close', onClientClose);
+      upstream.pipe(client, { end: false });
+      // Half-closes travel on (the service's FIN ends the client's side), and
+      // a full close of either side ends the pair — unless the service closed
+      // before it said anything, which is a lost connection, retried above.
+      const finish = (closed: boolean) => {
+        if (!answered && retryable && !client.destroyed) {
+          lost();
+          return;
+        }
+        if (settled) return;
         if (!client.destroyed) client.end();
+        if (!closed) return;
+        settled = true;
         setTimeout(() => client.destroy(), 10_000).unref();
-      });
+      };
+      upstream.once('end', () => finish(false));
+      upstream.once('close', () => finish(true));
       client.resume();
     });
   }
 
   /**
-   * The service did not accept: it may have just crashed, with the
-   * supervisor about to relaunch it (the self-restart gap, decision 0035).
-   * The connection is held — retried while the target still says `up`, held
-   * while it is `starting`, woken when it went `down` — until the hold
-   * deadline; only then is it closed.
+   * The service did not accept, or accepted and went away before answering:
+   * it may have just crashed, with the supervisor about to relaunch it (the
+   * self-restart gap, decision 0035). The connection is held — retried while
+   * the target still says `up`, held while it is `starting`, woken when it
+   * went `down` — until the hold deadline; only then is it closed. A service
+   * that keeps closing connections unanswered while it is `up` is believed
+   * after a few tries: that is its answer, not a crash.
    */
-  private refused(client: Socket, deadline: number): void {
+  private refused(client: Socket, carry: Carry, reset = false): void {
     if (client.destroyed) return;
-    if (Date.now() >= deadline) {
+    if (Date.now() >= carry.deadline) {
       client.destroy();
       return;
     }
     if (this.state === 'starting') {
-      this.hold(client);
+      this.hold(client, carry);
       return;
     }
     if (this.state === 'down') {
-      if (this.hub.wake(this.envId, this.key)) this.hold(client);
+      if (this.hub.wake(this.envId, this.key)) this.hold(client, carry);
       else client.destroy();
+      return;
+    }
+    if (reset && ++carry.resets > MAX_UP_RESETS) {
+      // Up all along and still closing on us: pass its close on.
+      client.end();
+      setTimeout(() => client.destroy(), 10_000).unref();
       return;
     }
     setTimeout(() => {
       if (client.destroyed) return;
-      if (this.state === 'up' && this.internalPort !== undefined) this.forward(client, this.internalPort, deadline);
-      else this.refused(client, deadline);
+      if (this.state === 'up' && this.internalPort !== undefined) this.forward(client, this.internalPort, carry);
+      else this.refused(client, carry);
     }, 200).unref();
   }
 

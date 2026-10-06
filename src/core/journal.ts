@@ -194,6 +194,24 @@ export interface DbCopyRow {
   nextDropAt: number;
   /** The template it was restored from (`<stack>/<marker>`), so retention keeps it (decision 0037). */
   template?: string;
+  /**
+   * `runly db with`'s command (decision 0039): its pid and start time, and its
+   * process group when it runs in its own. A copy dropped while the command
+   * still runs — its CLI was killed — takes the command down first, so
+   * nothing keeps working against a dropped database.
+   */
+  child?: { pid: number; start?: number; pgid?: number };
+}
+
+function parseChild(raw: unknown): DbCopyRow['child'] {
+  if (typeof raw !== 'string') return undefined;
+  try {
+    const c = JSON.parse(raw) as { pid?: unknown; start?: unknown; pgid?: unknown };
+    if (typeof c.pid !== 'number') return undefined;
+    return { pid: c.pid, ...(typeof c.start === 'number' ? { start: c.start } : {}), ...(typeof c.pgid === 'number' ? { pgid: c.pgid } : {}) };
+  } catch {
+    return undefined;
+  }
 }
 
 export class Journal {
@@ -306,7 +324,7 @@ export class Journal {
     }
     // 0.16 (decisions 0035, 0037): additive — an older daemon ignores them and
     // reads everything else correctly, so they are no schema bump.
-    for (const [table, col] of [['envs', 'activity TEXT'], ['envs', 'drop_recipes TEXT'], ['envs', 'templates TEXT'], ['db_copies', 'template TEXT']] as const) {
+    for (const [table, col] of [['envs', 'activity TEXT'], ['envs', 'drop_recipes TEXT'], ['envs', 'templates TEXT'], ['db_copies', 'template TEXT'], ['db_copies', 'child TEXT']] as const) {
       try {
         this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${col}`);
       } catch (err) {
@@ -454,6 +472,7 @@ export class Journal {
       dropAttempts: (r.drop_attempts as number) ?? 0,
       nextDropAt: (r.next_drop_at as number) ?? 0,
       template: (r.template as string | null) ?? undefined,
+      child: parseChild(r.child),
     };
   }
 
@@ -461,15 +480,16 @@ export class Journal {
     this.db
       .prepare(
         `INSERT INTO db_copies (name, stack, stack_root, datastore, preset, ns, url, state, holder, holder_pid, holder_start,
-           drop_cmd, drop_cwd, drop_path, created_at, drop_attempts, next_drop_at, template)
-         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+           drop_cmd, drop_cwd, drop_path, created_at, drop_attempts, next_drop_at, template, child)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
          ON CONFLICT(name) DO UPDATE SET state=excluded.state, drop_attempts=excluded.drop_attempts,
-           next_drop_at=excluded.next_drop_at, template=COALESCE(excluded.template, db_copies.template)`,
+           next_drop_at=excluded.next_drop_at, template=COALESCE(excluded.template, db_copies.template),
+           child=COALESCE(excluded.child, db_copies.child)`,
       )
       .run(
         c.name, c.stack, c.stackRoot, c.datastore, c.preset, c.ns, c.url, c.state, c.holder,
         c.holderPid ?? null, c.holderStart ?? null, c.dropCmd ?? null, c.dropCwd ?? null, c.dropPath ?? null,
-        c.createdAt, c.dropAttempts, c.nextDropAt, c.template ?? null,
+        c.createdAt, c.dropAttempts, c.nextDropAt, c.template ?? null, c.child ? JSON.stringify(c.child) : null,
       );
   }
 

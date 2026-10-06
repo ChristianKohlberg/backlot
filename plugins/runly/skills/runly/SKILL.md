@@ -46,12 +46,17 @@ Without them data is kept.
 fresh seeded copy (`RUNLY_DB_URL`, `RUNLY_DB_NAME`), drops it afterwards and
 exits with the command's code. Copies need no lease and run in parallel; don't
 start your own database container. `runly db new main` keeps one until
-`runly db drop <name>`.
+`runly db drop <name>`. A datastore marked `copies_only` exists only this way:
+environments never get one and `ctx` does not list it.
 
 **See what runs.** `runly ps` (this worktree; `--all` for the box): each service's
-state (`running`, `starting`, `idle`, `stopped`, `down`), ports, pid, idle time,
-memory, and the database copies. `runly ctx --json` has the full context,
+state (`running`, `starting`, `idle`, `failed`, `stopped`, `down`), ports, pid, idle
+time, memory, and the database copies. `runly ctx --json` has the full context,
 including `allLogins`.
+
+**A service crash-loops.** It is stopped and shown `failed` with its last exit
+code; the environment, its data, the other services and the logs stay. Read
+`runly logs <svc>`, fix the cause, then `runly up` starts it again.
 
 **Will an `up` start now?** `runly plan [svc...]` says "starts now" or what it
 would wait for in the box's load budget. A waiting `up` queues and fails with
@@ -74,7 +79,9 @@ last start.
 
 **Hand back.** `runly release` ends the lease and leaves the environment for the
 next `up`. `runly destroy` tears down everything this worktree holds (services,
-data, copies, ports); run it before handing a worktree back to a pool.
+data, copies, ports); run it before handing a worktree back to a pool. The baked
+templates and the worktree's upkeep records stay, so the next `up` is not a
+cold rebake.
 
 ## How long it lives
 
@@ -87,8 +94,9 @@ data, copies, ports); run it before handing a worktree back to a pool.
   is already dead and runly refuses it (exit 64).
 - **Idle services stop and wake.** A service with no runly verb and no client
   byte for 10 minutes is stopped (`ps` says `idle`); its URL, data and lease
-  stay, and the next request starts it and waits until it is ready. Don't keep
-  it warm with polling.
+  stay, and the next request starts it and waits until it is ready. Only verbs
+  that use the environment count (`up`, `exec`, `token`, `reset-data`); polling
+  `ps`, `ctx` or `logs` does not keep it warm.
 - **A deleted worktree takes its environment with it.**
 
 ## Don't

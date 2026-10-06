@@ -1,6 +1,6 @@
 # 0009. A per-machine auto-spawned daemon; no central service; disk is truth
 
-- Status: Accepted — the pid-based half of recovery amended by [0019](0019-service-ownership-by-tag-not-pid.md): ownership is proven by tag and process group
+- Status: Accepted — the pid-based half of recovery amended by [0019](0019-service-ownership-by-tag-not-pid.md): ownership is proven by tag and process group; amended by [0039](0039-teardown-keeps-templates-a-leased-environment-survives-a-crash-loop.md): the daemon may run under a systemd user unit or launchd agent (`runly daemon install`), which the CLI then starts instead of spawning one
 
 ## Decision
 

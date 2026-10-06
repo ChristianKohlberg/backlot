@@ -429,6 +429,11 @@
           "default": false,
           "description": "No presets or templates; `create` runs on first bind and a reset runs `drop` as the flush (Redis-class)."
         },
+        "copies_only": {
+          "type": "boolean",
+          "default": false,
+          "description": "Never provisioned for an environment: the datastore exists only as the source of `runly db new|with` copies (its template is baked on the first copy and reused after). No service may template it, `ctx` and `ctx --env` do not list it, and `up --preset` / `reset-data` cannot name it."
+        },
         "list": {
           "type": "string",
           "description": "Repo command printing the namespaces ({{ns}} values) of this datastore that exist on its server, one per line. Read only by `runly pool doctor`: a listed name in runly's naming (backlot_...) that no journal row or template marker references is an orphan, which `--fix` drops with `drop:` (decision 0037)."

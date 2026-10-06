@@ -199,7 +199,8 @@ describe('template identity in datastore drivers', () => {
     const drops = readFileSync(log, 'utf8').trim().split('\n').filter(Boolean);
     expect(drops).toHaveLength(1);
     expect(drops[0]).toMatch(/^dropped-backlot_tpl_stack5_dev_/);
-    expect(existsSync(markerDirFor('stack5'))).toBe(false);
+    // Only this datastore's current templates go (decision 0039).
+    expect(readdirSync(markerDirFor('stack5')).filter((f) => f.endsWith('.baked'))).toEqual([]);
   });
 });
 

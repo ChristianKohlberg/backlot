@@ -1,6 +1,6 @@
 # 0007. Hygiene levels: reuse / reset-data / pristine, with auto-escalation
 
-- Status: Accepted — amended by [0032](0032-environments-run-in-the-callers-worktree.md): `reset-data` restores data only, and `pristine` re-runs every upkeep rule in place instead of deleting a tree (builds run on every bind anyway); amended by [0034](0034-additive-up-database-copies-and-ps.md): a reset restores each datastore with the preset it holds, and `pristine` keeps that record
+- Status: Accepted — amended by [0032](0032-environments-run-in-the-callers-worktree.md): `reset-data` restores data only, and `pristine` re-runs every upkeep rule in place instead of deleting a tree (builds run on every bind anyway); amended by [0034](0034-additive-up-database-copies-and-ps.md): a reset restores each datastore with the preset it holds, and `pristine` keeps that record; amended by [0039](0039-teardown-keeps-templates-a-leased-environment-survives-a-crash-loop.md): a crash loop degrades (and recycles) only an unleased environment — in a leased one the service is stopped and reported failed
 
 ## Decision
 

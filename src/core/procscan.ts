@@ -209,6 +209,40 @@ export function scanTagged(stateRoot: string): TaggedProc[] {
   return found;
 }
 
+/** Carried by `runly db with`'s command and its descendants: the copy it runs against (decision 0039). */
+export const DB_COPY_TAG = 'BACKLOT_DB_COPY';
+
+/** The environment `runly db with` runs its command with, so the daemon can find it again. */
+export function dbCopyTag(copy: string, stateRoot: string): Record<string, string> {
+  return { [DB_COPY_TAG]: copy, [ROOT_TAG]: stateRoot };
+}
+
+/**
+ * Every live process of this state root running against database copy
+ * `copy` — `runly db with`'s command and whatever it started (the tag is
+ * inherited). Linux only, like `scanTagged`; elsewhere the recorded pid is
+ * all there is.
+ */
+export function scanDbCopy(copy: string, stateRoot: string): Array<{ pid: number; startTime: number }> {
+  if (!procScanSupported()) return [];
+  const found: Array<{ pid: number; startTime: number }> = [];
+  let entries: string[];
+  try {
+    entries = readdirSync('/proc');
+  } catch {
+    return [];
+  }
+  for (const entry of entries) {
+    const pid = Number(entry);
+    if (!Number.isInteger(pid) || pid <= 0 || pid === process.pid) continue;
+    const env = readEnviron(pid);
+    if (!env || env[ROOT_TAG] !== stateRoot || env[DB_COPY_TAG] !== copy) continue;
+    const st = startTime(pid);
+    if (st !== undefined) found.push({ pid, startTime: st });
+  }
+  return found;
+}
+
 /**
  * Field 7 of /proc/<pid>/stat: the controlling terminal, 0 for none.
  *

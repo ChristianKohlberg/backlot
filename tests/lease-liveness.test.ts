@@ -171,11 +171,12 @@ describe('a leased environment still gives up its services when nothing uses it 
     const envId = String(up.json?.envId);
 
     // lastUsedAt only moved on BIND before this change, so an agent running
-    // exec/ctx/logs for an hour looked completely idle — and would have had its
-    // services stopped underneath it.
+    // exec for an hour looked completely idle — and would have had its
+    // services stopped underneath it. (Reading — ctx, ps, logs — is not using
+    // it, decision 0039: tests/bench-findings.test.ts.)
     for (let i = 0; i < 6; i++) {
       await settle(700);
-      await cli(['ctx', '--json']);
+      await cli(['exec', 'true']);
     }
 
     expect(journal().getEnv(envId)?.state, 'an actively used environment was quiesced').toBe('hot');

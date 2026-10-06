@@ -1,6 +1,6 @@
 # 0034. `up` is additive and `down` stops what it names; a preset reloads one datastore; a database alone is a `runly db` copy; `runly ps` shows both
 
-- Status: Accepted — amended by [0035](0035-services-idle-on-their-own-clock-and-wake-on-demand.md): a holder is believed dead after a 1-minute grace and its death tears its environment down (copies are dropped as before); `ps` gains the `idle` state
+- Status: Accepted — amended by [0035](0035-services-idle-on-their-own-clock-and-wake-on-demand.md): a holder is believed dead after a 1-minute grace and its death tears its environment down (copies are dropped as before); `ps` gains the `idle` state; amended by [0039](0039-teardown-keeps-templates-a-leased-environment-survives-a-crash-loop.md): `db with` stops its command with its copy; a datastore may be `copies_only`
 - Date: 2026-10
 - Supersedes: [0023](0023-data-only-leases.md) (`up --data-only`) and
   [0025](0025-data-only-environments-are-priced-separately.md) (the data-only
