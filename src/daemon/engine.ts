@@ -1593,7 +1593,12 @@ export class Engine {
     const b = buildOf(spec) ?? { run: cmd };
     const key = b.when ? await buildInputsKey(stack.root, stack.manifest, cmd, b.when) : sha256(`${cmd}\nalways`);
     if (opts.rebuild) return { run: true, key };
-    if (b.when && buildIsCurrent(stack.id, name, key)) return { run: false, key, reason: 'when: unchanged' };
+    if (b.when) {
+      // A skip also needs the outputs that build left: deleted or overwritten
+      // outputs would leave the service with nothing (or the wrong thing) to run.
+      const outputs = await this.outputsPrint(stack, spec);
+      if (outputs !== '' && buildIsCurrent(stack.id, name, key, outputs)) return { run: false, key, reason: 'when: unchanged' };
+    }
     if (!b.when && opts.mode === 'wake' && everBuilt(stack.id, name)) return { run: false, key, reason: 'a wake resumes the last build' };
     return { run: true, key };
   }
@@ -1615,8 +1620,19 @@ export class Engine {
     // Dropped before it runs: a build that fails half-way vouches for nothing.
     forgetBuild(stack.id, stack.root, name);
     await this.runServiceBuild(name, cmd, stack.root, say, env ? this.envDirs(env.id).logs : undefined);
-    recordBuild(stack.id, stack.root, name, decision.key);
+    recordBuild(stack.id, stack.root, name, decision.key, await this.outputsPrint(stack, spec));
     return { ran: true, durationMs: performance.now() - started };
+  }
+
+  /**
+   * A stat print of a service's declared outputs, as the build ledger keeps
+   * it: undefined when it declares none, '' when none exist on disk.
+   */
+  private async outputsPrint(stack: Stack, spec: ServiceSpec): Promise<string | undefined> {
+    const declared = outputsOf(spec);
+    if (declared.paths.length === 0) return undefined;
+    const snap = await snapshotOutputs(stack.root, declared.paths, 'stat');
+    return snap === '' ? '' : sha256(snap);
   }
 
   /** The upkeep rules' output of this bind, in `upkeep.build.log` (decision 0038), begun by the first rule that runs. */

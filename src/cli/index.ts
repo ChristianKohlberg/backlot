@@ -31,7 +31,8 @@ Usage:
                           worktree as it is now: the due upkeep rules, then the
                           build: of every service it runs — except a
                           build: {run, when: [globs]} whose matched files are
-                          unchanged since its last successful build
+                          unchanged since its last successful build and
+                          whose outputs: are still what it left
                           ('build <svc>: skipped (when: unchanged)'); --rebuild
                           runs every build regardless.
                           A running service whose build OUTPUT changed (its

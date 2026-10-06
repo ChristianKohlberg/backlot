@@ -58,7 +58,7 @@ run under `sh` in the worktree; write POSIX sh.
 | --- | --- |
 | `name` | Stack name (`a-z0-9-`). Required. |
 | `services.<svc>.run` | The supervised command. Required. |
-| `services.<svc>.build` | Command run before the service starts, on every `up`. `{ run, when: [globs], serial }`: `when` skips it while the matched files are unchanged since the last successful build; `serial: true` runs it alone. |
+| `services.<svc>.build` | Command run before the service starts, on every `up`. `{ run, when: [globs], serial }`: `when` skips it while the matched files are unchanged since the last successful build and its `outputs:` are still what that build left; `serial: true` runs it alone. |
 | `services.<svc>.outputs` | Globs the build produces; a running service restarts only when they changed. `{ paths, compare: stat \| content }`. None declared = restart after every build. |
 | `services.<svc>.port` | Symbolic port name. Omit for a portless worker. |
 | `services.<svc>.env` | Environment variables; values may use templates (below). |

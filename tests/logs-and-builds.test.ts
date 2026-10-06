@@ -5,7 +5,7 @@
  * compared by content.
  */
 import { describe, it, expect, afterAll } from 'vitest';
-import { existsSync, mkdtempSync, readFileSync, statSync, writeFileSync, utimesSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync, utimesSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { LogWriter, readLog, sinceLastStart, startMarker } from '../src/core/logs.js';
@@ -203,6 +203,37 @@ services:
     expect((await c.cli(['up', '--json'], wt)).code).toBe(0);
     expect(count(wt)).toBe(2);
   }, 60_000);
+
+  it('a when: build is not skipped when its declared outputs are missing or were changed since', async () => {
+    const c = ctx();
+    const wt = c.worktree({
+      'runly.yml': STACK_WHEN.replace('echo built >> builds.txt', 'echo built >> builds.txt && mkdir -p out && cp src/a.txt out/a.txt')
+        + '    outputs: ["out/**"]\n',
+      'server.mjs': SERVER, 'src/a.txt': 'one', '.gitignore': 'builds.txt\nout/\n',
+    });
+    expect((await c.cli(['up', '--json'], wt)).code).toBe(0);
+    expect(count(wt)).toBe(1);
+    // Inputs and outputs untouched: skipped.
+    expect((await c.cli(['up', '--json'], wt)).json.bindDiagnostics.builds[0].reason).toBe('when-unchanged');
+    expect(count(wt)).toBe(1);
+
+    // Outputs deleted (rm -rf dist, git clean): the build runs again.
+    rmSync(join(wt, 'out'), { recursive: true, force: true });
+    expect((await c.cli(['up', '--json'], wt)).code).toBe(0);
+    expect(count(wt)).toBe(2);
+    expect(existsSync(join(wt, 'out/a.txt'))).toBe(true);
+
+    // Outputs overwritten by something else: the build runs again too.
+    await sleep(20);
+    writeFileSync(join(wt, 'out/a.txt'), 'tampered');
+    expect((await c.cli(['up', '--json'], wt)).code).toBe(0);
+    expect(count(wt)).toBe(3);
+    expect(readFileSync(join(wt, 'out/a.txt'), 'utf8')).toBe('one');
+
+    // And skipped again once they are back as the build left them.
+    expect((await c.cli(['up', '--json'], wt)).json.bindDiagnostics.builds[0].reason).toBe('when-unchanged');
+    expect(count(wt)).toBe(3);
+  }, 90_000);
 
   it('outputs compare: content restarts only when the built bytes changed; stat restarts on a new mtime', async () => {
     const yaml = (compare: string) => `name: out
