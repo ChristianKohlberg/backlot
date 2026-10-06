@@ -1,6 +1,6 @@
 # 0009. A per-machine auto-spawned daemon; no central service; disk is truth
 
-- Status: Accepted
+- Status: Accepted — the pid-based half of recovery amended by [0019](0019-service-ownership-by-tag-not-pid.md): ownership is proven by tag and process group
 
 ## Decision
 

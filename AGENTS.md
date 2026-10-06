@@ -265,11 +265,20 @@ does not touch the CLI build). Layout:
 - `plugins/runly/.claude-plugin/plugin.json` — the plugin manifest; **bump its
   `version` when the skill changes** (independent of `package.json`'s CLI version).
 - `plugins/runly/skills/runly/SKILL.md` — the **upstream canonical** runly
-  skill. Keep it generic/stack-agnostic; never hardcode a consuming repo's
-  services or presets. `README.md` is the source of truth for its content.
+  skill. Keep it short, task-oriented and generic; never hardcode a consuming
+  repo's services or presets. It must not contradict `README.md`.
 
 runly is CLI-only: the plugin ships **only the skill — no `.mcp.json`.** Install
-is `/plugin marketplace add ChristianKohlberg/runly && /plugin install runly`.
+is `/plugin marketplace add ChristianKohlberg/backlot && /plugin install runly`.
+
+## Docs
+
+`README.md` is only the manifest and command reference plus a quickstart;
+`docs/overview.md` is the user guide (lifecycle, ports, testing, data, budget,
+previews, security); `docs/architecture.md` is the design and the configuration
+table. Describe current behaviour only — no upgrade notes or version history (git
+and `docs/decisions/` keep it). `ctx --env` and `up --env` print `export` lines,
+so examples use `eval "$(runly ctx --env)" && <tests>`.
 
 ## Maintaining this file
 

@@ -2,7 +2,7 @@
 
 > The MCP portion of this historical decision is superseded by [0029](0029-cli-only-agent-interface.md).
 
-- Status: Accepted
+- Status: Accepted — its MCP remarks superseded by [0029](0029-cli-only-agent-interface.md)
 - Date: 2026-07
 - Context: the CLI spawns the daemon from its own `dist/` (decision 0009), so
   upgrading backlot replaces the files on disk but never the daemon already in

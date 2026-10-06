@@ -1,6 +1,6 @@
 # 0003. Environments are durable; leases are disposable
 
-- Status: Accepted
+- Status: Accepted — amended by [0032](0032-environments-run-in-the-callers-worktree.md): an environment belongs to its worktree (one per worktree), not to a fixed-size pool; amended by [0035](0035-services-idle-on-their-own-clock-and-wake-on-demand.md): idle is per service, and a lease tied to a holder process that dies tears its environment down (a TTL lapse still only ends the lease)
 
 ## Decision
 

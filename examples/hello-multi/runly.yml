@@ -3,7 +3,8 @@
 # The multi-service variant fixture: everything hello-web deliberately doesn't
 # exercise — two HTTP services wired by {{services.*.url}}, depends_on ordering,
 # a PORTLESS worker with log-marker readiness, fatal_logs fail-fast, three
-# presets, an upkeep rule with an engine built-in, and artifact collection.
+# presets with a non-default creation preset, and an upkeep rule with the
+# engine built-in that rebakes the data template when the seed changes.
 name: hello-multi
 
 services:
@@ -35,10 +36,11 @@ datastores:
     driver: sqlite
     create: node seed.mjs {{ns}} {{preset}}
     presets: [dev, demo, empty]
-    default_preset: { run: dev, session: demo }
+    default_preset: { session: demo }   # new datastores are created with demo
     template: true
 
 upkeep:
   - { when: seed.mjs, run: "@rebake-template main" }
 
-# The smoke test is the repo's own: eval "$(runly ctx --env)" && node smoke.test.mjs
+# The smoke test is the repo's own:
+#   eval "$(runly ctx --env)" && node smoke.test.mjs

@@ -1,3 +1,6 @@
+> Historical (2026-07): a handoff prompt for backlot before decision 0032. It describes
+> verbs and concepts (sync, checks, verdicts) that no longer exist.
+
 # Handoff prompt — diagnose backlot's two macOS-only CI failures
 
 Paste everything below the line into a fresh Claude Code session **on a Mac**.

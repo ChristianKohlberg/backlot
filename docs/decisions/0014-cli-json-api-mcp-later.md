@@ -1,7 +1,7 @@
 # 0014. The CLI with --json is the v1 agent API; MCP is a v1.1 wrapper
 
 > The MCP portion of this historical decision is superseded by [0029](0029-cli-only-agent-interface.md).
-- Status: Accepted
+- Status: Accepted — the MCP portion superseded by [0029](0029-cli-only-agent-interface.md): agents use the CLI
 
 ## Decision
 

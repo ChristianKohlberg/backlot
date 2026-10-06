@@ -1,7 +1,7 @@
 # 0019. Service ownership is proven by tag and group, not by a recorded pid
 
 - Status: Accepted
-- Supersedes the pid-based half of [0009](0009-journal-is-truth-daemon-is-cache.md) recovery
+- Supersedes the pid-based half of [0009](0009-local-daemon-no-central-service.md) recovery
 
 ## Decision
 

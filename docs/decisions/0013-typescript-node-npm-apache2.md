@@ -1,6 +1,6 @@
 # 0013. TypeScript on Node ≥ 22, one npm package, Apache-2.0
 
-- Status: Accepted
+- Status: Accepted — the package name amended by [0030](0030-rename-backlot-to-runly.md): the npm package is `runly`
 
 ## Decision
 
