@@ -142,7 +142,9 @@ was down), and the move is reported.
    `build: { serial: true }` runs one build alone. runly keeps no build cache:
    the build tool decides what is current. A `build: { run, when: [globs] }` is
    skipped while the matched files are unchanged since its last successful build
-   (`build api: skipped (when: unchanged)`); `--rebuild` forces it.
+   and its declared `outputs:` are still what that build left (deleted or
+   overwritten outputs build again) (`build api: skipped (when: unchanged)`);
+   `--rebuild` forces it.
 3. Restarts a running service only when its build changed its `outputs:` (path,
    size and mtime, or bytes with `compare: content`). A service with a build and
    no `outputs:` restarts after every build; one without a build keeps running

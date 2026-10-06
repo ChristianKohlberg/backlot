@@ -213,7 +213,7 @@
               }
             }
           ],
-          "description": "String form: runs on every `up` that starts or keeps this service, and on every `runly warm` \u2014 runly keeps no build cache; the build tool decides what is current. Object form `{run, when, serial}`: skipped while its `when:` files are unchanged since the last successful build; `serial: true` runs it alone. Builds otherwise run in depends_on waves (see top-level `builds`). Runs under `sh` (dash on Ubuntu, bash-as-sh on macOS) \u2014 write POSIX sh, no bashisms."
+          "description": "String form: runs on every `up` that starts or keeps this service, and on every `runly warm` \u2014 runly keeps no build cache; the build tool decides what is current. Object form `{run, when, serial}`: skipped while its `when:` files are unchanged since the last successful build and its `outputs:` are still what that build left; `serial: true` runs it alone. Builds otherwise run in depends_on waves (see top-level `builds`). Runs under `sh` (dash on Ubuntu, bash-as-sh on macOS) \u2014 write POSIX sh, no bashisms."
         },
         "outputs": {
           "oneOf": [
