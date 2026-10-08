@@ -31,6 +31,8 @@ services:
   web: { run: node server.mjs, port: web, env: { PORT: "{{ports.web}}" }, ready: { http: /, timeout: 20 } }
 upkeep:
   - { when: server.mjs, run: "echo progress-secret-token", timeout: 20 }
+auth:
+  token: "sleep 4; echo tok"
 `,
 );
 execFileSync('git', ['init', '-q'], { cwd: wt });
@@ -95,7 +97,7 @@ describe('progress while queued behind a busy environment', () => {
     // freed — a legitimate wait was indistinguishable from a hang.
     const up = await run(['up', '--json']);
     expect(up.code, up.stdout).toBe(0);
-    const slow = run(['exec', 'sleep', '4']); // holds the env lock
+    const slow = run(['token']); // a 4 s token command holds the env lock (exec no longer does: decision 0040)
     await new Promise((r) => setTimeout(r, 500));
     const queued = await run(['up', '--progress', '--json']);
     expect(queued.code, queued.stdout).toBe(0);

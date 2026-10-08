@@ -1,6 +1,7 @@
 /**
- * exec/token against a lease whose services died with the previous daemon
- * (engine.assertUsable's 'warm' branch).
+ * exec/token against a lease whose services died with the previous daemon.
+ * Since 0.19 the verb starts them again (engine.resumeForVerb) rather than
+ * refusing; the history below is why the refusal existed.
  *
  * A daemon restart downgrades every hot env to warm: the lease SURVIVES in the
  * journal but the services do not. Before the guard, `exec` then ran against a
@@ -20,7 +21,7 @@
  */
 import { describe, it, expect, afterAll } from 'vitest';
 import { execFile, execFileSync } from 'node:child_process';
-import { mkdtempSync, rmSync, writeFileSync, readFileSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { disposeStateSync } from './support/leaks.js';
@@ -98,18 +99,18 @@ describe('a surviving lease on a restarted daemon', () => {
     }
 
     // The next exec auto-spawns a fresh daemon. Recovery keeps the lease but
-    // the services are gone — running the command anyway would blame the code.
+    // the services are gone. 0.19: exec starts them (as a connection to their
+    // port would) instead of refusing, then runs the command against them.
     // --json goes right after the verb: exec passes everything after it
     // through verbatim, so a trailing --json would ride into the command.
-    const refused = await cli(['exec', '--json', 'true']);
-    expect(refused.code).toBe(2); // env-error, per the exit-code contract
-    const error = (refused.json as { error: { class: string; message: string } }).error;
-    expect(error.class).toBe('env-error');
-    expect(error.message).toMatch(/runly up/); // names the actual fix
-    expect(error.message).toMatch(/daemon restarted|not running/i);
+    const resumed = await cli(['exec', '--json', 'true']);
+    expect(resumed.code, resumed.stdout).toBe(0);
+    const ps = await cli(['ps', '--json']);
+    const web = (ps.json as { services: Array<{ service: string; state: string; env: string }> }).services.find((s) => s.service === 'web');
+    expect(web?.env).toBe(envId);
+    expect(web?.state).toBe('running');
 
-    // The advised recovery must complete the loop: rebind the SAME env
-    // (the lease survived, decision 0009), then exec works again.
+    // `up` still rebinds the SAME env (the lease survived, decision 0009).
     const reup = await cli(['up', '--json']);
     expect(reup.code).toBe(0);
     expect((reup.json as { state: string }).state).toBe('hot');

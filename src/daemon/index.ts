@@ -74,8 +74,10 @@ async function dispatch(verb: string, args: Record<string, unknown>, emit: (phas
       return engine.ctx(cwd, holder);
     case 'reset-data':
       return engine.resetData(cwd, holder, emit, args.presets);
-    case 'exec':
-      return engine.exec(cwd, String(args.cmd), holder);
+    case 'exec-env':
+      return engine.execEnv(cwd, holder);
+    case 'exec-touch':
+      return engine.execTouch(String(args.envId ?? ''));
     case 'logs':
       return engine.logs(cwd, String(args.service), Number(args.lines ?? 40), holder);
     case 'logs-spec':

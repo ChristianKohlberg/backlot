@@ -694,17 +694,18 @@ async function main(): Promise<void> {
         console.error('runly exec: no command given');
         process.exit(64);
       }
-      res = await rpc('exec', { cwd, holder, cmd });
-      if (res.ok) {
-        const d = res.data as { exitCode: number; stdout: string; stderr: string };
-        if (json) console.log(JSON.stringify({ ok: d.exitCode === 0, ...d }));
-        else {
-          if (d.stdout) process.stdout.write(d.stdout);
-          if (d.stderr) process.stderr.write(d.stderr);
-        }
-        process.exit(d.exitCode === 0 ? 0 : 1);
+      // The daemon resumes the environment and hands back its variables; the
+      // command runs HERE (decision 0040): the caller's stdio and environment,
+      // its real exit code, and no lock on the environment while it runs.
+      res = await rpc('exec-env', { cwd, holder });
+      if (!res.ok) break;
+      const d = res.data as { envId: string; root: string; vars: Record<string, string> };
+      const r = await runExec(parts, cmd, d, json);
+      if (r.timedOutS !== undefined) {
+        errExit({ class: 'work-error', message: `exec timed out after ${r.timedOutS}s (its process group was killed; BACKLOT_CMD_TIMEOUT_S sets the deadline)`, source: 'exec', logExcerpt: r.stderr?.slice(-800) });
       }
-      break;
+      if (json) console.log(JSON.stringify({ ok: r.code === 0, exitCode: r.code, stdout: r.stdout, stderr: r.stderr }));
+      return process.exit(r.code);
     }
     case 'logs': {
       const rawLines = flagValue('--lines');
@@ -1147,6 +1148,73 @@ async function daemonUnitVerb(sub: 'install' | 'uninstall'): Promise<void> {
       ? `the daemon now runs under ${plan.kind === 'systemd' ? `${plan.name}.service` : plan.name}`
       : `the unit is installed; the next runly verb starts the daemon through it`;
   out({ kind: plan.kind, name: plan.name, path: plan.path, installed: true, started, steps: r.steps, next, environment });
+}
+
+/**
+ * Run `runly exec`'s command in the worktree (decision 0040). One token is a
+ * shell string, several keep the caller's word splits. The environment is the
+ * caller's own plus the environment's variables and the exec tag. Plain: the
+ * caller's stdio, nothing buffered or cut. `--json`: stdout and stderr are
+ * collected whole for the JSON answer. The exit code is the command's (128+n
+ * for a signal). No deadline unless BACKLOT_CMD_TIMEOUT_S is set; while the
+ * command runs, the environment is touched every minute (it is in use).
+ */
+async function runExec(
+  parts: string[], cmd: string, d: { envId: string; root: string; vars: Record<string, string> }, json: boolean,
+): Promise<{ code: number; stdout?: string; stderr?: string; timedOutS?: number }> {
+  const { spawn } = await import('node:child_process');
+  const { constants } = await import('node:os');
+  const env = { ...process.env, ...d.vars };
+  const fromTerminal = process.stdin.isTTY === true || process.stdout.isTTY === true || process.stderr.isTTY === true;
+  // Without a terminal the command leads a group of its own, so a deadline or
+  // a signal reaches everything it started; at a terminal it stays in ours.
+  const ownGroup = !fromTerminal;
+  const stdio: ('inherit' | 'pipe')[] = json ? ['inherit', 'pipe', 'pipe'] : ['inherit', 'inherit', 'inherit'];
+  const child = parts.length === 1
+    ? spawn(cmd, { cwd: d.root, env, stdio, shell: true, detached: ownGroup })
+    : spawn(parts[0]!, parts.slice(1), { cwd: d.root, env, stdio, detached: ownGroup });
+  const out: Buffer[] = [];
+  const err: Buffer[] = [];
+  child.stdout?.on('data', (b: Buffer) => out.push(b));
+  child.stderr?.on('data', (b: Buffer) => err.push(b));
+  const signalAll = (sig: NodeJS.Signals) => {
+    try {
+      if (ownGroup && child.pid !== undefined) process.kill(-child.pid, sig);
+      else child.kill(sig);
+    } catch {
+      /* already gone */
+    }
+  };
+  const onInt = fromTerminal ? () => undefined : () => signalAll('SIGINT');
+  const onTerm = () => signalAll('SIGTERM');
+  const onHup = () => signalAll('SIGHUP');
+  process.on('SIGINT', onInt);
+  process.on('SIGTERM', onTerm);
+  process.on('SIGHUP', onHup);
+  const heartbeat = setInterval(() => void rpc('exec-touch', { envId: d.envId }).catch(() => null), 60_000);
+  heartbeat.unref();
+  const raw = process.env.BACKLOT_CMD_TIMEOUT_S;
+  const deadlineS = raw !== undefined && raw !== '' && Number(raw) > 0 ? Number(raw) : undefined;
+  let timedOut = false;
+  const timer = deadlineS === undefined ? undefined : setTimeout(() => {
+    timedOut = true;
+    signalAll('SIGKILL');
+  }, deadlineS * 1000);
+  const code = await new Promise<number>((resolve) => {
+    child.on('error', (e) => {
+      console.error(`runly exec: could not start '${parts[0]}': ${e.message}`);
+      resolve(127);
+    });
+    child.on('close', (c, signal) => resolve(c ?? (signal ? 128 + (constants.signals[signal] ?? 0) : 1)));
+  });
+  if (timer) clearTimeout(timer);
+  clearInterval(heartbeat);
+  process.off('SIGINT', onInt);
+  process.off('SIGTERM', onTerm);
+  process.off('SIGHUP', onHup);
+  const stdout = json ? Buffer.concat(out).toString() : undefined;
+  const stderr = json ? Buffer.concat(err).toString() : undefined;
+  return { code, stdout, stderr, timedOutS: timedOut ? deadlineS : undefined };
 }
 
 /**

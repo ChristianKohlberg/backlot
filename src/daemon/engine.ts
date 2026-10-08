@@ -23,7 +23,7 @@ import { connect as netConnect } from 'node:net';
 import { dbCopiesRoot, envsRoot, stateRoot, templatesRoot, worktreesRoot } from '../core/paths.js';
 import { BrokerError, commandFailure, template, templateEnv, now, sha256, shortId } from '../core/util.js';
 import { callerEnvSpec, requireCallerEnv, selectCallerEnv, serviceCallerEnv, validateCallerEnv } from '../core/caller-env.js';
-import { cmdTimeoutS, runBounded, runBoundedIO, LONG_CMD_TIMEOUT_S } from '../core/exec.js';
+import { cmdTimeoutS, runBounded, LONG_CMD_TIMEOUT_S } from '../core/exec.js';
 import { makeDatastore, parseBakedMarker, withBakeLock, type DsHandle } from '../drivers/datastores.js';
 import { ensureAppliance, stopAppliance, probeTcp } from '../drivers/appliances.js';
 import { DEFAULT_PREVIEW_PUBLISHER, resolvePreviewPublisher } from '../drivers/preview.js';
@@ -2423,51 +2423,54 @@ export class Engine {
     return fresh;
   }
 
-  async exec(cwd: string, cmd: string, holder?: string) {
+  /**
+   * What `runly exec` runs with (decision 0040): the environment's variables,
+   * with idle-stopped services (and, after a daemon restart, every wanted
+   * service) started first and the activity clock touched. The CLI spawns the
+   * command itself — inherited stdio, the caller's own environment, the real
+   * exit code — so nothing here holds the environment's lock while it runs.
+   */
+  async execEnv(cwd: string, holder?: string) {
     const stack = loadStack(cwd);
     const h = this.callerHolder(cwd, holder, stack);
     const lease = this.journal.leaseForHolder(h, stack.id);
     if (!lease) throw new BrokerError('env-error', `no active lease — run 'runly up' first`, 'lease');
     const env = this.envForLease(lease);
     const ctx = this.templateCtx(stack, env);
-    const extra: Record<string, string> = { BACKLOT_ENV_ID: env.id };
-    for (const [name, port] of Object.entries(env.ports)) extra[`BACKLOT_PORT_${name.toUpperCase()}`] = String(port);
+    const vars: Record<string, string> = { BACKLOT_ENV_ID: env.id };
+    for (const [name, port] of Object.entries(env.ports)) vars[`BACKLOT_PORT_${name.toUpperCase()}`] = String(port);
     // Match ctx: on a subset env only the services that are actually up get a
     // URL, so an exec'd command doesn't dereference a service the agent was told
     // is down (the port is stable but nothing is listening on it).
     const activeSet = env.activeServices ? new Set(env.activeServices) : null;
     for (const [name, s] of Object.entries(ctx.services)) {
       if (activeSet && !activeSet.has(name)) continue;
-      extra[`BACKLOT_URL_${name.toUpperCase()}`] = s.url;
+      vars[`BACKLOT_URL_${name.toUpperCase()}`] = s.url;
     }
-    for (const [name, d] of Object.entries(ctx.datastores)) extra[`BACKLOT_DS_${name.toUpperCase()}`] = d.url;
+    for (const [name, d] of Object.entries(ctx.datastores)) vars[`BACKLOT_DS_${name.toUpperCase()}`] = d.url;
     // The names `runly ctx --env` prints, so a script reads one set whether it
     // runs under `exec` or after `eval "$(runly ctx --env)"`.
-    Object.assign(extra, runlyEnvVars({
+    Object.assign(vars, runlyEnvVars({
       envId: env.id,
       ports: env.ports,
       urls: Object.fromEntries(Object.entries(ctx.services).filter(([n]) => !activeSet || activeSet.has(n)).map(([n, s]) => [n, s.url])),
       datastores: Object.fromEntries(Object.entries(ctx.datastores).map(([n, d]) => [n, { url: d.url, preset: env.datastoreNs[n] ? (env.presets[n] ?? null) : null }])),
       logins: normalizeLogins(stack.manifest.auth?.logins)[0] ?? null,
     }));
-    return this.envLocked(env.id, async () => {
+    await this.envLocked(env.id, async () => {
       await this.resumeForVerb(this.assertUsable(env.id, { resumable: true }), 'exec');
       this.touch(env.id);
-      // Bounded, detached, and tagged like a service: an exec blocking on stdin
-      // held the env's busy bit forever, and its untagged children were
-      // invisible to `pool gc` after a daemon crash.
-      const timeoutS = cmdTimeoutS(LONG_CMD_TIMEOUT_S);
-      // In the worktree, where the environment runs (decision 0032).
-      const r = await runBoundedIO(cmd, stack.root, timeoutS, {
-        ...process.env,
-        ...extra,
-        ...serviceTag(env.id, 'exec', stateRoot()),
-      });
-      if (r.timedOut) {
-        throw new BrokerError('work-error', `exec timed out after ${timeoutS}s (process group killed; set BACKLOT_CMD_TIMEOUT_S if legitimate)`, 'exec', r.stderr.slice(-800));
-      }
-      return { exitCode: r.code, stdout: r.stdout.slice(-8000), stderr: r.stderr.slice(-8000) };
     }, undefined, 'an exec');
+    // Tagged like a service, so `pool gc` can tell an exec's orphans from a stranger's.
+    return { envId: env.id, root: stack.root, vars: { ...vars, ...serviceTag(env.id, 'exec', stateRoot()) } };
+  }
+
+  /** A running `runly exec` is activity (decision 0039): the CLI calls this while the command runs. */
+  execTouch(envId: string): { touched: boolean } {
+    const env = this.journal.getEnv(envId);
+    if (!env || env.state === 'recycling') return { touched: false };
+    this.touch(envId);
+    return { touched: true };
   }
 
   /** Resolve auth.token with {{role}} and run it in the worktree the environment runs in. */
@@ -2489,12 +2492,21 @@ export class Engine {
       await this.resumeForVerb(this.assertUsable(env.id, { resumable: true }), 'token');
       this.touch(env.id);
       const timeoutS = cmdTimeoutS();
-      const r = await runBoundedIO(template(spec, ctx), stack.root, timeoutS, { ...process.env, RUNLY_ROLE: role });
+      // stdout is the token, stderr the diagnostics: kept apart.
+      let stdout = '';
+      let stderr = '';
+      const r = await runBounded(template(spec, ctx), stack.root, timeoutS, { ...process.env, RUNLY_ROLE: role }, {
+        data: (stream, chunk) => {
+          if (stream === 'out') stdout = (stdout + chunk).slice(-1_000_000);
+          else stderr = (stderr + chunk).slice(-64_000);
+        },
+        end: () => undefined,
+      });
       if (r.timedOut) {
-        throw new BrokerError('work-error', `auth.token command timed out after ${timeoutS}s (process group killed)`, 'auth', r.stderr.slice(-400));
+        throw new BrokerError('work-error', `auth.token command timed out after ${timeoutS}s (process group killed)`, 'auth', stderr.slice(-400));
       }
-      if (r.code !== 0) throw new BrokerError('work-error', `auth.token command failed`, 'auth', r.stderr.slice(-400));
-      return { token: r.stdout.trim(), role };
+      if (r.code !== 0) throw new BrokerError('work-error', `auth.token command failed`, 'auth', stderr.slice(-400));
+      return { token: stdout.trim(), role };
     }, undefined, 'a token command');
   }
 
@@ -4632,9 +4644,8 @@ export class Engine {
    * `exec` and `token` run against the environment as the lease left it. A
    * service the idle clock stopped (decision 0035) is started first — under
    * the lock these verbs hold, where a connection-triggered wake would only
-   * queue behind them until the proxy's hold ran out. What stopped for
-   * another reason (a daemon restart) is refused as before: `runly up`
-   * rebinds it, and a failed bind is redone by `up`, never by a verb.
+   * queue behind them until the proxy's hold ran out. So is what a daemon
+   * restart stopped (0.19). A failed bind is refused: `up` redoes it.
    */
   private async resumeForVerb(env: EnvRow, verb: string): Promise<void> {
     const lease = this.journal.leaseForEnv(env.id);
@@ -4649,13 +4660,13 @@ export class Engine {
     // A failed service (decision 0039) is not resumed by a verb: `up` retries it.
     const stopped = [...this.desiredServices(stack, env)].filter((n) => !running.has(n) && !this.blockedByFailure(stack, env.id, n));
     if (stopped.length === 0) return;
-    const unexplained = stopped.filter((n) => !this.idleStopped.has(`${env.id}\0${n}`));
-    if (unexplained.length > 0 || (env.failStreak ?? 0) > 0) {
+    // A failed bind is redone by `up`, never by a verb. Anything else that is
+    // stopped — idle-stopped, or stopped by a daemon restart (0.19: that used
+    // to be refused) — is started the way a connection would wake it.
+    if ((env.failStreak ?? 0) > 0) {
       throw new BrokerError(
         'env-error',
-        (env.failStreak ?? 0) > 0
-          ? `environment ${env.id} holds your lease but its last 'runly up' failed and ${stopped.map((n) => `'${n}'`).join(', ')} ${stopped.length === 1 ? 'is' : 'are'} not running — run 'runly up' before ${verb}`
-          : `environment ${env.id} holds your lease but its services are not running (the daemon restarted) — run 'runly up' to rebind before exec/token`,
+        `environment ${env.id} holds your lease but its last 'runly up' failed and ${stopped.map((n) => `'${n}'`).join(', ')} ${stopped.length === 1 ? 'is' : 'are'} not running — run 'runly up' before ${verb}`,
         'lease',
       );
     }
