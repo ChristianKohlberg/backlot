@@ -257,6 +257,23 @@ export function hasOtherTemplateOwner(full: string, ns: string): boolean {
   return false;
 }
 
+/**
+ * Record which worktree a stack's templates were baked for (`.root` next to
+ * them, 0.19), so retention can tell a stack whose worktree is gone from one
+ * that merely has no environment right now — after its worktree records were
+ * pruned, nothing else said.
+ */
+function recordTemplateRoot(stackId: string, root: string): void {
+  const file = join(templatesRoot(), stackId, '.root');
+  try {
+    if (readFileSync(file, 'utf8').trim() === root) return;
+  } catch {
+    /* first bake of this stack */
+  }
+  mkdirSync(dirname(file), { recursive: true });
+  writeFileSync(file, `${root}\n`);
+}
+
 // ---------------------------------------------------------------- sqlite
 
 class SqliteDs implements DsDriver {
@@ -328,7 +345,9 @@ class SqliteDs implements DsDriver {
         // Double-checked: the exclusive lock only when there is a bake to do.
         if (!existsSync(tpl)) {
           await withDatastoreLock(this.stackId, this.name, true, async () => {
-            if (!existsSync(tpl)) await this.runCreate(h.cwd, tpl, preset); // bake once
+            if (existsSync(tpl)) return;
+            recordTemplateRoot(this.stackId, h.cwd);
+            await this.runCreate(h.cwd, tpl, preset); // bake once
           });
         }
         // Restores share the lock: several copies at once, but never while a
@@ -514,6 +533,7 @@ class CommandDs implements DsDriver {
       const marker = this.bakedMarker(preset);
       const bake = async (why?: string) => {
         if (why) logEvent({ level: 'warn', kind: 'template', envId: h.envId, detail: `rebaking template ${tpl} of '${this.name}' (${preset}): ${why}` });
+        recordTemplateRoot(this.stackId, h.cwd);
         await shQuiet(this.spec.drop ? template(this.spec.drop, { ns: tpl }) : 'true', h.cwd);
         await sh(template(create, { ns: tpl, preset }), h.cwd, `template bake failed for '${this.name}' preset '${preset}'${why ? ` (${why})` : ''}`);
         const baked: BakedMarker = {

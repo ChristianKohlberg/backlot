@@ -3487,7 +3487,7 @@ export class Engine {
             try {
               const marker = f.endsWith('.baked') ? parseBakedMarker(readFileSync(join(dir, f), 'utf8')) : null;
               if (marker?.drop) {
-                const r = await runBounded(marker.drop, stateRoot(), cmdTimeoutS());
+                const r = await runBounded(marker.drop, refs.dropCwd?.(stackDir) ?? stateRoot(), cmdTimeoutS());
                 if (r.code !== 0 || r.timedOut) throw new Error(`drop exited ${r.timedOut ? 'by timeout' : r.code}: ${r.output.slice(-200)}`);
               }
               rmSync(join(dir, f), { force: true });

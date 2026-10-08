@@ -202,15 +202,6 @@ describe('L3 a start during a crash backoff', () => {
   }, 15_000);
 });
 
-function readSafe(p: string): boolean {
-  try {
-    readFileSync(p);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
 describe('W4 truncated namespaces are recorded', () => {
   it('records a 63-byte name with its stack, and only such names', async () => {
     const prev = process.env.BACKLOT_STATE_DIR;
