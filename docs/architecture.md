@@ -225,8 +225,10 @@ operation ends. `runly plan` runs the same computation without acting.
 
 **Cleanup** ([decision 0037](decisions/0037-cleanup-by-reference-and-pool-doctor.md)).
 Drop recipes are recorded on the environment row before a datastore is created;
-templates restored from are recorded on rows and kept, the newest per datastore and
-preset too, everything else goes after a grace; `runly pool doctor [--fix]` lists and
+templates restored from are recorded on rows (and, per worktree, in
+`worktrees/<stack>/templates.json`) and kept, the newest per datastore and preset too,
+everything else goes after a grace (a `<name>@shared` dir counts as alive while any
+worktree of that name does — decision 0044); `runly pool doctor [--fix]` lists and
 removes orphans that are provably runly's own.
 
 **One environment per worktree, a machine-wide cap, and eviction.** A stack (one
@@ -388,6 +390,18 @@ build/start:
   when `env.templates` names a different one. Only `--pristine` drops the current
   templates (of that datastore, every preset) so they are baked again.
   `@rebake-template` is the one upkeep built-in.
+- **A content-keyed template is shared per manifest name** (decision 0044): with an
+  `@rebake-template` key the identity is (name, datastore, preset, create command,
+  trigger content) and holds nothing of the worktree path, so it lives in
+  `templates/<name>@shared/`, its database is `backlot_tpl_<name>_shared_…`, and its
+  lock is keyed by that dir — every worktree of the name bakes it once and restores
+  from it side by side. Without a key (or with `share_templates: false`) templates stay
+  in `templates/<stack id>/`. `--pristine` on a shared datastore bakes
+  `<ds>-<preset>@<key>.own.baked` in the worktree's own dir, which outranks the shared
+  one for that worktree while it exists. A per-worktree template with the shared one's
+  file name (pre-0.20) is adopted instead of baking — its marker is copied, naming the
+  same database — and is then a duplicate retention collects (the database stays while
+  another marker names it; a bake never drops a database another marker names).
 - Toolchain-level bumps (global.json, .nvmrc) are env-recycle events, not upkeep —
   unless the repo manages toolchains declaratively (mise/asdf) via its own rule.
   runly never installs SDKs on its own initiative.
@@ -617,8 +631,11 @@ service through a preview **publisher** adapter (default: a Cloudflare quick tun
 `cloudflared`, an env-error when absent) and reports the URL in `ctx.previewUrls`;
 `runly preview stop` ends it. It is opt-in per invocation and **scoped to the lease,
 not to the service incarnation** — a restarting `up`, a rebind or an idle quiesce leaves the
-tunnel up, while `release`, TTL lapse, teardown, `shutdown` and crash recovery all reap
-it. Exceptions and `previewNotice` reporting are defined by
+tunnel up, while `release`, TTL lapse and teardown reap it. `shutdown` and crash
+recovery reap the tunnel but not the publication: the lease row keeps what was
+published (`preview_restore`: service, URL, public port, publisher, the settings that
+pin its address), and `recover()` publishes it again once the proxy holds the ports
+(decision 0045); a failure is an event and `ctx.previewRestore`. Exceptions and `previewNotice` reporting are defined by
 [preview reconciliation](decisions/0027-lease-scoped-public-preview.md).
 The URL is **public and unauthenticated** — see the
 [security model](overview.md#security-model).

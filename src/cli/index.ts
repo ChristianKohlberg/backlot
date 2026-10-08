@@ -44,7 +44,11 @@ Usage:
                           that datastore from its template and restarts the
                           running services that use it. --reset-data restores
                           every datastore; --pristine also re-runs every upkeep
-                          rule and build (it never deletes worktree files).
+                          rule and build (it never deletes worktree files) and
+                          bakes the templates again — a template shared with
+                          other worktrees of this stack name (an
+                          @rebake-template key) is left to them, and this
+                          worktree gets a private one.
                           A service idle for 10 minutes (no runly verb on the
                           environment, no bytes through its port; idle: per
                           service) is stopped, its port kept; the next
@@ -143,7 +147,12 @@ Usage:
                           With preview.publisher: tailscale it is served on this
                           machine's tailnet name instead (tailnet only);
                           --https-port pins that port for this publish.
-  runly preview stop      stop the preview tunnel on your lease
+                          It lasts as long as the lease: a daemon restart
+                          publishes it again (same address where the publisher
+                          can keep one; ctx --json: previewRestore says how
+                          that went)
+  runly preview stop      stop the preview tunnel on your lease (also one a
+                          restart could not publish again)
   runly status            daemon, environments, the load budget and recent
                           warnings (--json: everything)
   runly appliance ls|start|stop [name]

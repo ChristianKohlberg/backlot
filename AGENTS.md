@@ -324,3 +324,10 @@ Keep this file for knowledge useful to almost every future agent session in this
 Do not repeat what the codebase already shows; point to the authoritative file or command instead.
 Prefer rewriting or pruning existing entries over appending new ones.
 When updating this file, preserve this bar for all agents and keep entries concise.
+
+## Shared templates (decision 0044) and preview restore (decision 0045)
+
+- A datastore with an `@rebake-template` key and without `share_templates: false` keeps its templates in `templates/<name>@shared/`; every other in `templates/<stack id>/`. Always build the driver with `templateScope(stack, bakeKeys, ds)` in the engine — a bare bake key means "per stack" (what unit tests use).
+- Restores read the database name from the MARKER (`parseBakedMarker(...).ns`), never recompute it: an adopted pre-0.20 template keeps its old name, and a bake whose name another marker holds appends a nonce. A bake never drops a database another marker names; retention and doctor remove such a marker without its database.
+- Retention and `pool doctor` share one classifier, `templateVerdicts` (`src/core/retention.ts`); change it there, not in one of them. `worktrees/<stack>/templates.json` (written at each restore) is a reference.
+- `leases.preview_restore` is written only by `setLeasePreviewRestore`, never by `saveLease` (a stale lease snapshot would erase it). Ending a preview on purpose must call `forgetPreview`; reaping a tunnel (shutdown, recover) must not. `tests/shared-templates.test.ts` and the restart block of `tests/preview-tailscale.test.ts` are the regression tests.

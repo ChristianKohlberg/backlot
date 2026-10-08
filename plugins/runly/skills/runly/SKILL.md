@@ -87,7 +87,10 @@ last start.
 next `up`. `runly destroy` tears down everything this worktree holds (services,
 data, copies, ports); run it before handing a worktree back to a pool. The baked
 templates stay, so the next `up` is not a cold rebake; upkeep rules without
-`outputs:` run again.
+`outputs:` run again. Templates keyed by an `@rebake-template` rule are shared
+by every worktree of the stack: a fresh worktree with the same seeds restores
+instead of baking. `--pristine` bakes one private to your worktree and leaves
+the shared one to the others.
 
 ## How long it lives
 
@@ -117,7 +120,9 @@ templates stay, so the next `up` is not a cold rebake; upkeep rules without
 - `runly update --force`: on a shared box it interrupts someone else's bind. If
   a verb fails with infra-error naming two versions, run `runly update`.
 - Preview without being asked: `runly preview <svc>` publishes an
-  unauthenticated URL. End it with `runly preview stop`.
+  unauthenticated URL. It lasts as long as the lease, across daemon restarts
+  (`ctx --json` `previewRestore` reports a re-publish that failed). End it with
+  `runly preview stop`.
 
 ## Other verbs
 

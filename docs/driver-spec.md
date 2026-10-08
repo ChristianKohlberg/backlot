@@ -48,12 +48,14 @@ because the sqlite driver's namespace is a file path derived from the environmen
 | `drop(h)` | Best-effort removal (recycle) — the manifest's `drop:` command, or `rm` for sqlite. |
 | `dropRecipe(h)` / `dropCommand(h)` | The drop as data, recorded on the environment or copy row before the namespace is created, so it can be dropped later without the manifest (decisions 0034, 0037). |
 | `templateRef(preset)` | The template a restore uses, so retention keeps every referenced one (decision 0037). |
-| `rebake()` | Invalidate baked templates (the `@rebake-template` upkeep built-in). |
+| `rebake()` | `--pristine`: drop this datastore's current templates so the next restore bakes; for a shared one, only the worktree's private template (decision 0044). |
 
 Template behavior (via `template_restore:` for server drivers, `template: true` for
 sqlite): bake once per preset, keyed by the **`create:` command string** plus the
 trigger content of an `@rebake-template` rule (architecture §7), then restore per
-environment and per copy. `ephemeral: true` (Redis-class): no
+environment and per copy. With such a rule the template is shared by every worktree
+of the manifest name (`templates/<name>@shared/`, unless `share_templates: false`;
+decision 0044); `makeDatastore` takes that scope (`{ bakeKey, project, privateBake }`). `ephemeral: true` (Redis-class): no
 presets/templates; `drop:` is the flush on reset, `create:` runs only on first bind.
 
 **Namespace-drop safety:** the sqlite driver rejects keys containing `/`, `\`, or `..`,
