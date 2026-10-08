@@ -2,7 +2,7 @@
  * The engine: pool + lease + bind + run orchestration, owning all policy
  * (drivers own transport/storage; the manifest owns repo knowledge).
  */
-import { mkdirSync, rmSync, readdirSync, existsSync, readFileSync, statSync } from 'node:fs';
+import { mkdirSync, rmSync, readdirSync, existsSync, readFileSync } from 'node:fs';
 import { isAbsolute, join, relative, sep } from 'node:path';
 import { Journal, JOURNAL_SCHEMA_VERSION, type DbCopyRow, type DropRecipe, type EnvRow, type LeaseRow } from '../core/journal.js';
 import { BUILD, VERSION, compareVersions, versionSkew } from '../core/version.js';
@@ -14,7 +14,7 @@ import { buildInputsKey, buildIsCurrent, clearBuilds, everBuilt, forgetBuild, re
 import { LogWriter, UPKEEP_LOG, beginBuildLog, buildLogOf, logFileOf, readLog } from '../core/logs.js';
 import { formatDuration, parseDuration } from '../core/units.js';
 import { BudgetRefusal, LoadBudget, costsOf, needOf, total, type Committed, type Need, type NeedItem, type Reservation } from './budget.js';
-import { clearTreeLedger, forgetRulesWithoutOutputs, pickEnvKeys, pickTreeKeys, readTreeLedger, worktreeStateDir, writeTreeLedger } from '../core/tree-ledger.js';
+import { clearTreeLedger, forgetRulesWithoutOutputs, pickEnvKeys, pickTreeKeys, readTreeLedger, recordWorktreeTemplate, worktreeStateDir, writeTreeLedger } from '../core/tree-ledger.js';
 import { defaultPresetFor, presetToRestore, validatePresetRequest } from '../core/presets.js';
 import { ruleKey, runUpkeep, templateBakeKeys, triggerSet, type UpkeepStep } from '../core/upkeep.js';
 import { allocateInBlock, blockConflicts, ephemeralRange, inBlock, internalBlock, publicBlock, tunnelBlock } from '../core/ports.js';
@@ -24,14 +24,14 @@ import { dbCopiesRoot, envsRoot, stateRoot, templatesRoot, worktreesRoot } from 
 import { BrokerError, commandFailure, template, templateEnv, now, sha256, shortId } from '../core/util.js';
 import { callerEnvSpec, requireCallerEnv, selectCallerEnv, serviceCallerEnv, validateCallerEnv } from '../core/caller-env.js';
 import { cmdTimeoutS, runBounded, LONG_CMD_TIMEOUT_S } from '../core/exec.js';
-import { makeDatastore, parseBakedMarker, withBakeLock, type DsHandle } from '../drivers/datastores.js';
+import { hasOtherTemplateOwner, makeDatastore, parseBakedMarker, sharesTemplates, withBakeLock, type DsHandle, type TemplateScope } from '../drivers/datastores.js';
 import { ensureAppliance, stopAppliance, probeTcp } from '../drivers/appliances.js';
 import { DEFAULT_PREVIEW_PUBLISHER, resolvePreviewPublisher } from '../drivers/preview.js';
 import { EnvSupervisor, killGroupVerified, killPidVerified, reapPids, mergeServicePids, serviceGroups, type ServiceExit } from './supervisor.js';
 import { EXEC_SERVICE, groupAlive, isAlive, processGroup, procScanSupported, sameProcess, scanByCwd, scanDbCopy, scanTagged, serviceTag, startTime, type TaggedProc } from '../core/procscan.js';
 import { policy } from '../core/policy.js';
 import { kernelSleepGap, readKernelSleepRecord } from '../core/sleep.js';
-import { retentionSweep, templateRefs } from '../core/retention.js';
+import { retentionSweep, sharedFilesFor, templateFiles, templateRefs, templateVerdicts } from '../core/retention.js';
 import { logEvent, recentEvents } from '../core/events.js';
 import { BindTrace, type BindDiagnostics } from '../core/diagnostics.js';
 import type { Hygiene, LeaseKind, ServicePid } from '../core/types.js';
@@ -130,6 +130,11 @@ class ServiceFailure extends BrokerError {}
  * an agent that crashed kept its environment until the TTL expired. A pid plus
  * its start time can be checked cheaply and survives pid reuse.
  */
+/** A datastore's template scope in this stack (decision 0044): its bake key, shared per manifest name. */
+function templateScope(stack: Stack, bakeKeys: Record<string, string>, name: string, privateBake = false): TemplateScope {
+  return { bakeKey: bakeKeys[name], project: stack.manifest.name, ...(privateBake ? { privateBake } : {}) };
+}
+
 function holderIdentity(pid?: number): { holderPid?: number; holderStart?: number } {
   if (!pid || !Number.isInteger(pid) || pid <= 0) return {};
   return { holderPid: pid, holderStart: startTime(pid) };
@@ -1141,13 +1146,14 @@ export class Engine {
     bakeKeys: Record<string, string>,
     plan: Array<{ name: string; force: boolean; preset?: string }>,
     say: Progress,
+    privateBakes: ReadonlySet<string> = new Set(),
   ): Promise<string[]> {
     const dsHandle: DsHandle = { envId: env.id, cwd: stack.root, dataDir: this.envDirs(env.id).data };
     const restored: string[] = [];
     const one = async (step: (typeof plan)[number]): Promise<void> => {
       const spec = stack.manifest.datastores?.[step.name];
       if (!spec) return;
-      const ds = makeDatastore(step.name, spec, stack.id, bakeKeys[step.name]);
+      const ds = makeDatastore(step.name, spec, stack.id, templateScope(stack, bakeKeys, step.name, privateBakes.has(step.name)));
       await ds.probe();
       const held = env.presets[step.name];
       const exists = Boolean(env.datastoreNs[step.name]);
@@ -1170,6 +1176,9 @@ export class Engine {
         if (ref) templates[step.name] = ref;
         else delete templates[step.name];
         env.templates = templates;
+        // The worktree's current template, which retention keeps while the
+        // worktree exists — with or without an environment (decision 0044).
+        if (ref) recordWorktreeTemplate(stack.id, stack.root, `${step.name}/${preset}`, ref);
       }
       // Merge into the live row so a supervisor update is not overwritten.
       const current = this.journal.getEnv(env.id);
@@ -1365,10 +1374,16 @@ export class Engine {
     // one that is missing is baked by the restore that needs it. Rebaking it
     // on every fresh environment cost a destroyed worktree 90-110 s per `up`.
     // Only `--pristine` (nothing is trusted) drops the current templates.
+    // A SHARED template (decision 0044) serves other worktrees: `--pristine`
+    // drops only this worktree's private one and bakes a new private one.
+    const privateBakes = new Set<string>();
     if (hygiene === 'pristine') {
       for (const dsName of upkeep.rebakeTemplates) {
         const spec = stack.manifest.datastores?.[dsName];
-        if (spec) await makeDatastore(dsName, spec, stack.id, bakeKeys[dsName]).rebake(stack.root);
+        if (!spec) continue;
+        const scope = templateScope(stack, bakeKeys, dsName);
+        if (sharesTemplates(spec, scope)) privateBakes.add(dsName);
+        await makeDatastore(dsName, spec, stack.id, scope).rebake(stack.root);
       }
     }
     // Which datastores hold data from a template other than the current one:
@@ -1377,7 +1392,7 @@ export class Engine {
     const staleTemplate = (name: string): boolean => {
       const spec = stack.manifest.datastores?.[name];
       if (!spec || !upkeep.rebakeTemplates.includes(name)) return false;
-      const ref = makeDatastore(name, spec, stack.id, bakeKeys[name]).templateRef(presetToRestore(name, spec, env.presets[name]));
+      const ref = makeDatastore(name, spec, stack.id, templateScope(stack, bakeKeys, name)).templateRef(presetToRestore(name, spec, env.presets[name]));
       return ref === null || env.templates?.[name] !== ref;
     };
 
@@ -1496,7 +1511,7 @@ export class Engine {
       }
       if (reloads.length > 0) {
         trace.phase('data');
-        await this.prepareDatastores(stack, env, bakeKeys, reloads.map((name) => ({ name, force: true, preset: reloadPresets[name] })), say);
+        await this.prepareDatastores(stack, env, bakeKeys, reloads.map((name) => ({ name, force: true, preset: reloadPresets[name] })), say, privateBakes);
       }
       trace.phase('ready');
       await startSlice(new Set([...toRestart, ...missing]));
@@ -1528,7 +1543,7 @@ export class Engine {
           name,
           force: reloadPresets[name] !== undefined || hygiene !== 'reuse' || staleTemplate(name),
           preset: reloadPresets[name],
-        })), say);
+        })), say, privateBakes);
       } finally {
         phaseMs.data = performance.now() - t0;
       }
@@ -3087,7 +3102,7 @@ export class Engine {
     // cache is written atomically, so this needs no worktree lock — a copy
     // never waits for a bind's builds.
     const bakeKeys = templateBakeKeys(stack.manifest, stack.root, await triggerSet(stack.root, stack.manifest, worktreeStateDir(stack.id)));
-    const ds = makeDatastore(opts.datastore, spec, stack.id, bakeKeys[opts.datastore]);
+    const ds = makeDatastore(opts.datastore, spec, stack.id, templateScope(stack, bakeKeys, opts.datastore));
     const dir = join(dbCopiesRoot(), name);
     const h: DsHandle = { envId: `${stack.id}-db-${short}`, cwd: stack.root, dataDir: dir };
     const dropCmd = ds.dropCommand(h);
@@ -3113,6 +3128,7 @@ export class Engine {
       await ds.ensure(h, preset, true, false);
       row.state = 'ready';
       row.template = ds.templateRef(preset) ?? undefined;
+      if (row.template) recordWorktreeTemplate(stack.id, stack.root, `${opts.datastore}/${preset}`, row.template);
       this.journal.saveDbCopy(row);
       logEvent({ level: 'info', kind: 'db', detail: `created database copy ${name} of '${opts.datastore}' (${preset}) for ${holder}${row.holderPid ? ` (pid ${row.holderPid})` : ''}` });
       return this.dbCopyView(row);
@@ -3537,31 +3553,31 @@ export class Engine {
     for (const stackDir of existsSync(templatesRoot()) ? readdirSync(templatesRoot()) : []) {
       await withBakeLock(stackDir, async () => {
         const dir = join(templatesRoot(), stackDir);
-        let files: string[];
-        try { files = readdirSync(dir); } catch { return; }
-        const alive = refs.stackAlive(stackDir);
-        const seen = new Map<string, number>();
-        const ordered = files.filter((f) => !f.startsWith('.'))
-          .map((f) => ({ f, m: (() => { try { return statSync(join(dir, f)).mtimeMs; } catch { return 0; } })() }))
-          .sort((a, b) => b.m - a.m);
-        for (const { f } of ordered) {
-          const group = f.lastIndexOf('@') > 0 ? f.slice(0, f.lastIndexOf('@')) : '';
-          const rank = seen.get(group) ?? 0;
-          seen.set(group, rank + 1);
+        if (!existsSync(dir)) return;
+        // The same verdicts as retention (decisions 0037, 0044), without the grace.
+        for (const v of templateVerdicts(stackDir, templateFiles(dir), refs, Math.max(1, policy().templatesKeep), 0, sharedFilesFor(stackDir))) {
+          const f = v.f;
           let ns: string | undefined;
           if (f.endsWith('.baked')) {
             try { ns = parseBakedMarker(readFileSync(join(dir, f), 'utf8')).ns; } catch { ns = undefined; }
           }
-          const keep = (alive && rank < Math.max(1, policy().templatesKeep)) || refs.referenced.has(`${stackDir}/${f}`);
-          if (keep) {
+          if (v.keep) {
             if (ns) markerNs.add(ns);
             continue;
           }
-          const finding: (typeof findings)[number] = { kind: 'template', what: join(dir, f), detail: alive ? 'superseded, and no environment or copy was restored from it' : 'its stack can never be bound again (worktree gone, no rows)' };
+          const detail = {
+            superseded: 'superseded, and no environment, copy or live worktree was restored from it',
+            dead: 'its stack can never be bound again (worktree gone, no rows)',
+            private: 'a --pristine template no environment or copy uses any more',
+            duplicate: 'a per-worktree copy of a shared template that nothing references',
+          }[v.why];
+          const finding: (typeof findings)[number] = { kind: 'template', what: join(dir, f), detail };
           if (fix) {
             try {
               const marker = f.endsWith('.baked') ? parseBakedMarker(readFileSync(join(dir, f), 'utf8')) : null;
-              if (marker?.drop) {
+              // Another marker naming the same database (a shared template
+              // adopted from this one): only the marker goes.
+              if (marker?.drop && !hasOtherTemplateOwner(join(dir, f), marker.ns)) {
                 const r = await runBounded(marker.drop, refs.dropCwd?.(stackDir) ?? stateRoot(), cmdTimeoutS());
                 if (r.code !== 0 || r.timedOut) throw new Error(`drop exited ${r.timedOut ? 'by timeout' : r.code}: ${r.output.slice(-200)}`);
               }

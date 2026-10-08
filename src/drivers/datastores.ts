@@ -11,11 +11,16 @@
  * Template model: bake once per seed-content hash into a template ns, then
  * restore per environment (postgres: `createdb -T`; mssql: the repo's
  * backup/restore script). Templates are machine-global and immutable-keyed
- * (decision 0006/0008).
+ * (decision 0006/0008). A content-keyed template (one with an
+ * `@rebake-template` key) is shared by every worktree of the same manifest
+ * name on this daemon (decision 0044): it lives under `<name>@shared/`
+ * instead of `<stack id>/`.
  */
 import {
   copyFileSync,
   mkdirSync,
+  statSync,
+  utimesSync,
   rmSync,
   existsSync,
   readdirSync,
@@ -219,6 +224,12 @@ export interface BakedMarker {
    */
   bakedAt?: number;
   nonce?: string;
+  /** In `<name>@shared/` (0.20, decision 0044). */
+  shared?: boolean;
+  /** A `--pristine` bake private to one worktree of a shared datastore (0.20). */
+  private?: boolean;
+  /** The stack dir a shared marker was adopted from, naming its database (0.20). */
+  adoptedFrom?: string;
 }
 
 export function parseBakedMarker(content: string): BakedMarker {
@@ -258,6 +269,129 @@ export function hasOtherTemplateOwner(full: string, ns: string): boolean {
 }
 
 /**
+ * Shared templates (decision 0044). A template whose key folds in the content
+ * of its `@rebake-template` trigger files is a function of (manifest name,
+ * datastore, preset, create command, trigger content) — never of the worktree
+ * path — so every worktree of one manifest name on this daemon can restore
+ * from the same one. They live in `<name>@shared/` next to the per-stack dirs
+ * (`<name>-<8 chars>`); a manifest name cannot contain `@`, so the two never
+ * collide.
+ */
+export const SHARED_TEMPLATE_SUFFIX = '@shared';
+export const sharedTemplateDir = (project: string): string => `${project}${SHARED_TEMPLATE_SUFFIX}`;
+export const isSharedTemplateDir = (dir: string): boolean => dir.endsWith(SHARED_TEMPLATE_SUFFIX);
+/** The manifest name a templates dir belongs to: `<name>@shared`, or a stack id `<name>-<8-char hash>`. */
+export function templateProject(dir: string): string {
+  return isSharedTemplateDir(dir) ? dir.slice(0, -SHARED_TEMPLATE_SUFFIX.length) : dir.slice(0, -9);
+}
+/**
+ * A template baked by `--pristine` for one worktree of a shared datastore
+ * (decision 0044): `<ds>-<preset>@<key>.own.<ext>` in the stack's own dir. It
+ * outranks the shared one for that worktree while it exists, and retention
+ * keeps it only while a row references it.
+ */
+export const PRIVATE_TEMPLATE_TAG = '.own';
+export const isPrivateTemplateFile = (file: string): boolean => {
+  const at = file.lastIndexOf('@');
+  return at > 0 && file.slice(at).includes(`${PRIVATE_TEMPLATE_TAG}.`);
+};
+
+/** How a datastore's templates are scoped. */
+export interface TemplateScope {
+  /** Content bake key: the `@rebake-template` trigger content (vetbill-1i49). */
+  bakeKey?: string;
+  /**
+   * The manifest name. With a bake key and without `share_templates: false`,
+   * the templates are shared by every worktree of this name (decision 0044).
+   * Omitted: per stack, as before 0.20.
+   */
+  project?: string;
+  /** `--pristine` on a shared datastore: bake a template private to this worktree instead of dropping the shared one. */
+  privateBake?: boolean;
+}
+
+/** Where one template lives: `<dir>/<file>` under the templates root. */
+interface TemplateSlot {
+  dir: string;
+  file: string;
+  private: boolean;
+  shared: boolean;
+}
+
+/**
+ * The template slots of one datastore: where a restore at `preset` reads from
+ * and a bake writes to. Shared datastores read a private (pristine) template
+ * of this worktree first, else the shared one.
+ */
+class TemplateSlots {
+  constructor(
+    private readonly name: string,
+    private readonly stackId: string,
+    private readonly scope: TemplateScope,
+    private readonly sharing: boolean,
+    private readonly ext: string,
+    private readonly key12: () => string,
+  ) {}
+
+  get shared(): boolean {
+    return this.sharing;
+  }
+
+  file(preset: string, priv = false): string {
+    return `${this.name}-${preset}@${this.key12()}${priv ? PRIVATE_TEMPLATE_TAG : ''}${this.ext}`;
+  }
+
+  path(slot: TemplateSlot): string {
+    return join(templatesRoot(), slot.dir, slot.file);
+  }
+
+  resolve(preset: string): TemplateSlot {
+    if (!this.sharing) return { dir: this.stackId, file: this.file(preset), private: false, shared: false };
+    const own: TemplateSlot = { dir: this.stackId, file: this.file(preset, true), private: true, shared: false };
+    if (this.scope.privateBake || existsSync(this.path(own))) return own;
+    return { dir: sharedTemplateDir(this.scope.project!), file: this.file(preset), private: false, shared: true };
+  }
+
+  /**
+   * Migration (decision 0044): before a shared template is baked, a
+   * per-worktree template of the same project with the same file name — the
+   * same datastore, preset and key, so the same inputs — is adopted instead:
+   * the newest one is copied (a marker: its JSON, naming the existing
+   * database; a sqlite file: a clone), keeping its mtime so it does not jump
+   * retention's queue. The original stays where it is; retention collects it
+   * once nothing references it (a duplicate of a shared template is never
+   * "current"). Returns the source dir, or null when there was nothing to adopt.
+   */
+  adoptable(slot: TemplateSlot): { dir: string; full: string; mtime: number } | null {
+    if (!slot.shared) return null;
+    const project = this.scope.project!;
+    let best: { dir: string; full: string; mtime: number } | null = null;
+    let dirs: string[] = [];
+    try {
+      dirs = readdirSync(templatesRoot());
+    } catch {
+      return null;
+    }
+    for (const dir of dirs) {
+      if (isSharedTemplateDir(dir) || dir.length !== project.length + 9 || !dir.startsWith(`${project}-`)) continue;
+      const full = join(templatesRoot(), dir, slot.file);
+      try {
+        const mtime = statSync(full).mtimeMs;
+        if (!best || mtime > best.mtime) best = { dir, full, mtime };
+      } catch {
+        /* not baked there */
+      }
+    }
+    return best;
+  }
+}
+
+/** Whether a datastore's templates are shared across worktrees (decision 0044). */
+export function sharesTemplates(spec: DatastoreSpec, scope: TemplateScope): boolean {
+  return scope.project !== undefined && scope.bakeKey !== undefined && spec.share_templates !== false;
+}
+
+/**
  * Record which worktree a stack's templates were baked for (`.root` next to
  * them, 0.19), so retention can tell a stack whose worktree is gone from one
  * that merely has no environment right now — after its worktree records were
@@ -278,17 +412,20 @@ function recordTemplateRoot(stackId: string, root: string): void {
 
 class SqliteDs implements DsDriver {
   readonly fileBased = true;
+  private readonly slots: TemplateSlots;
   constructor(
     readonly name: string,
     private readonly spec: DatastoreSpec,
     private readonly stackId: string,
-    private readonly bakeKey?: string,
-  ) {}
+    private readonly scope: TemplateScope = {},
+  ) {
+    this.slots = new TemplateSlots(name, stackId, scope, sharesTemplates(spec, scope), '.db', () => this.contentKey().slice(0, 12));
+  }
 
   /** Template identity: create command + content bake key (vetbill-1i49). */
   private contentKey(): string {
     const base = this.spec.create ?? '';
-    return sha256(this.bakeKey ? `${base}\n@bake:${this.bakeKey}` : base);
+    return sha256(this.scope.bakeKey ? `${base}\n@bake:${this.scope.bakeKey}` : base);
   }
 
   ns(h: DsHandle): string {
@@ -307,18 +444,10 @@ class SqliteDs implements DsDriver {
     /* in-process — nothing external */
   }
 
-  private tplName(preset: string): string {
-    return `${this.name}-${preset}@${this.contentKey().slice(0, 12)}.db`;
-  }
-
-  private tplPath(preset: string): string {
-    const dir = join(templatesRoot(), this.stackId);
-    mkdirSync(dir, { recursive: true });
-    return join(dir, this.tplName(preset));
-  }
-
   templateRef(preset: string): string | null {
-    return this.spec.template === true ? `${this.stackId}/${this.tplName(preset)}` : null;
+    if (this.spec.template !== true) return null;
+    const slot = this.slots.resolve(preset);
+    return `${slot.dir}/${slot.file}`;
   }
 
   dropRecipe(h: DsHandle): { path: string } {
@@ -335,24 +464,37 @@ class SqliteDs implements DsDriver {
     const dbPath = this.ns(h);
     if (exists && !force && existsSync(dbPath)) return;
     if (this.spec.template === true) {
-      const tpl = this.tplPath(preset);
-      // Serialize bake AND restore-copy against rebake, on the STACK key:
-      // rebake deletes the whole stack template dir, so a per-template lock
-      // could not exclude it — an upkeep-triggered rebake from a sibling env
-      // used to rm the dir between this bake and the copy below (vetbill-1i49
-      // covered only the bake-vs-bake race).
+      const slot = this.slots.resolve(preset);
+      const tpl = this.slots.path(slot);
+      mkdirSync(dirname(tpl), { recursive: true });
+      // Serialize bake AND restore-copy against rebake, on the template's
+      // dir key (the stack, or `<name>@shared` — decision 0044): rebake
+      // deletes templates, so the copy below must not overlap one.
       for (let attempt = 0; ; attempt++) {
         // Double-checked: the exclusive lock only when there is a bake to do.
+        // One bake per key across every worktree sharing it: the others wait
+        // here and then restore.
         if (!existsSync(tpl)) {
-          await withDatastoreLock(this.stackId, this.name, true, async () => {
+          await withDatastoreLock(slot.dir, this.name, true, async () => {
             if (existsSync(tpl)) return;
-            recordTemplateRoot(this.stackId, h.cwd);
+            recordTemplateRoot(slot.dir, h.cwd);
+            const adopt = this.slots.adoptable(slot);
+            if (adopt) {
+              try {
+                copyFileSync(adopt.full, tpl, fsConstants.COPYFILE_FICLONE);
+                utimesSync(tpl, new Date(), new Date(adopt.mtime));
+                logEvent({ level: 'info', kind: 'template', envId: h.envId, detail: `adopted template ${adopt.dir}/${slot.file} of '${this.name}' (${preset}) as the shared one — no bake` });
+                return;
+              } catch {
+                rmSync(tpl, { force: true }); // retired meanwhile: bake instead
+              }
+            }
             await this.runCreate(h.cwd, tpl, preset); // bake once
           });
         }
         // Restores share the lock: several copies at once, but never while a
         // writer replaces or deletes the template.
-        const copied = await withDatastoreLock(this.stackId, this.name, false, async () => {
+        const copied = await withDatastoreLock(slot.dir, this.name, false, async () => {
           if (!existsSync(tpl)) return false; // retired between the bake and here: bake again
           // The sidecars MUST go before the .db is replaced. SQLite in WAL mode
           // recovers `-wal` frames onto whatever database file it finds, so a
@@ -382,15 +524,18 @@ class SqliteDs implements DsDriver {
     dropSidecars(db); // an orphaned -wal outlives its database and poisons the next one
   }
   templateBaked(preset: string): boolean {
-    return this.spec.template === true && existsSync(join(templatesRoot(), this.stackId, this.tplName(preset)));
+    return this.spec.template === true && existsSync(this.slots.path(this.slots.resolve(preset)));
   }
 
   rebake(_cwd?: string): Promise<void> {
-    // Exclusive on the stack: it must wait out any in-flight bake or restore.
-    // Only THIS datastore's current templates go — every other datastore's,
-    // and older keys (retention collects those), stay.
+    // Exclusive on this datastore: it must wait out any in-flight bake or
+    // restore. Only THIS datastore's current templates go — every other
+    // datastore's, and older keys (retention collects those), stay. A shared
+    // datastore drops only this worktree's private templates: the shared one
+    // serves other worktrees, and the bake that follows is private (0044).
+    const priv = this.slots.shared;
     return withDatastoreLock(this.stackId, this.name, true, async () => {
-      for (const preset of presetNames(this.spec)) rmSync(join(templatesRoot(), this.stackId, this.tplName(preset)), { force: true });
+      for (const preset of presetNames(this.spec)) rmSync(join(templatesRoot(), this.stackId, this.slots.file(preset, priv)), { force: true });
     });
   }
 }
@@ -411,15 +556,17 @@ function dropSidecars(dbPath: string): void {
 
 class CommandDs implements DsDriver {
   readonly fileBased = false;
+  private readonly slots: TemplateSlots;
   constructor(
     readonly name: string,
     private readonly spec: DatastoreSpec,
     private readonly stackId: string,
-    private readonly bakeKey?: string,
+    private readonly scope: TemplateScope = {},
   ) {
     if (!spec.url) {
       throw new BrokerError('work-error', `datastore '${name}' (driver ${spec.driver}) needs a url: template with {{ns}}`, 'manifest');
     }
+    this.slots = new TemplateSlots(name, stackId, scope, sharesTemplates(spec, scope), '.baked', () => this.contentKey().slice(0, 12));
   }
 
   get capabilities(): { template: boolean; ephemeral: boolean } {
@@ -471,32 +618,33 @@ class CommandDs implements DsDriver {
    */
   private contentKey(): string {
     const base = this.spec.create ?? '';
-    return sha256(this.bakeKey ? `${base}\n@bake:${this.bakeKey}` : base);
+    return sha256(this.scope.bakeKey ? `${base}\n@bake:${this.scope.bakeKey}` : base);
   }
-  private templateNs(preset: string): string {
+  /**
+   * The database a bake into `slot` creates: `backlot_tpl_<dir>_<preset>_<hash>`,
+   * where `<dir>` is the stack id, or `<name>@shared` for a shared template —
+   * never one worktree's id (decision 0044). A private (pristine) template
+   * carries `own`. `fresh` appends a nonce: a bake never drops a database
+   * another marker still names (an adopted template keeps its old name).
+   */
+  private templateNs(slot: TemplateSlot, preset: string, fresh = false): string {
     const hash = this.contentKey().slice(0, 8);
-    const raw = `backlot_tpl_${this.stackId}_${preset}_${hash}`.replace(/[^A-Za-z0-9_]/g, '_');
+    const nonce = fresh ? `_${Math.random().toString(36).slice(2, 8)}` : '';
+    const raw = `backlot_tpl_${slot.dir}_${slot.private ? 'own_' : ''}${preset}_${hash}${nonce}`.replace(/[^A-Za-z0-9_]/g, '_');
     // Postgres truncates identifiers at 63 bytes, and the DISAMBIGUATING hash
     // is at the end — so a long stack id silently cut it off and two different
     // templates collapsed onto one database. Trim the stack/preset middle
     // instead, and always keep the hash.
     const LIMIT = 63;
     if (raw.length <= LIMIT) return raw;
-    const suffix = `_${hash}`;
+    const suffix = `_${hash}${nonce}`;
     return raw.slice(0, LIMIT - suffix.length) + suffix;
-  }
-  private markerName(preset: string): string {
-    return `${this.name}-${preset}@${this.contentKey().slice(0, 12)}.baked`;
-  }
-
-  private bakedMarker(preset: string): string {
-    const dir = join(templatesRoot(), this.stackId);
-    mkdirSync(dir, { recursive: true });
-    return join(dir, this.markerName(preset));
   }
 
   templateRef(preset: string): string | null {
-    return this.spec.template_restore && !this.spec.ephemeral ? `${this.stackId}/${this.markerName(preset)}` : null;
+    if (!this.spec.template_restore || this.spec.ephemeral) return null;
+    const slot = this.slots.resolve(preset);
+    return `${slot.dir}/${slot.file}`;
   }
 
   dropRecipe(h: DsHandle): { cmd?: string; cwd?: string; ns?: string } {
@@ -528,12 +676,29 @@ class CommandDs implements DsDriver {
     const ns = this.ns(h);
     if (this.spec.drop) await shQuiet(template(this.spec.drop, { ns }), h.cwd); // clean slate, best-effort
     if (this.spec.template_restore) {
-      const tpl = this.templateNs(preset);
-      recordNamespace(tpl, this.stackId);
-      const marker = this.bakedMarker(preset);
+      // Where this restore reads from (decision 0044): this worktree's
+      // private template, the shared one, or the stack's own. The lock is
+      // keyed by that dir, so every worktree sharing a template bakes it once
+      // and restores from it side by side.
+      const slot = this.slots.resolve(preset);
+      const lockDir = slot.dir;
+      const marker = this.slots.path(slot);
+      mkdirSync(dirname(marker), { recursive: true });
       const bake = async (why?: string) => {
+        // The database this marker names now, if any: a rebake reuses it
+        // unless another marker names it too (an adopted template's other
+        // copy) — then it bakes into a fresh name and leaves that one alone.
+        let current: string | undefined;
+        try {
+          current = parseBakedMarker(readFileSync(marker, 'utf8')).ns || undefined;
+        } catch {
+          current = undefined;
+        }
+        let tpl = current ?? this.templateNs(slot, preset);
+        if (hasOtherTemplateOwner(marker, tpl)) tpl = this.templateNs(slot, preset, true);
+        recordNamespace(tpl, slot.dir);
         if (why) logEvent({ level: 'warn', kind: 'template', envId: h.envId, detail: `rebaking template ${tpl} of '${this.name}' (${preset}): ${why}` });
-        recordTemplateRoot(this.stackId, h.cwd);
+        recordTemplateRoot(slot.dir, h.cwd);
         await shQuiet(this.spec.drop ? template(this.spec.drop, { ns: tpl }) : 'true', h.cwd);
         await sh(template(create, { ns: tpl, preset }), h.cwd, `template bake failed for '${this.name}' preset '${preset}'${why ? ` (${why})` : ''}`);
         const baked: BakedMarker = {
@@ -543,8 +708,27 @@ class CommandDs implements DsDriver {
           ds: this.name,
           bakedAt: Date.now(),
           nonce: Math.random().toString(36).slice(2, 10),
+          ...(slot.shared ? { shared: true } : {}),
+          ...(slot.private ? { private: true } : {}),
         };
         writeFileSync(marker, JSON.stringify(baked));
+      };
+      // Migration (decision 0044): a per-worktree template with the same
+      // file name was baked from the same inputs — adopt it instead of baking.
+      const adopt = (): boolean => {
+        const src = this.slots.adoptable(slot);
+        if (!src) return false;
+        try {
+          const legacy = parseBakedMarker(readFileSync(src.full, 'utf8'));
+          if (!legacy.ns) return false;
+          const adopted: BakedMarker = { ...legacy, ds: legacy.ds ?? this.name, shared: true, adoptedFrom: src.dir };
+          writeFileSync(marker, JSON.stringify(adopted));
+          utimesSync(marker, new Date(), new Date(src.mtime));
+          logEvent({ level: 'info', kind: 'template', envId: h.envId, detail: `adopted template ${legacy.ns} (${src.dir}) of '${this.name}' (${preset}) as the shared one — no bake` });
+          return true;
+        } catch {
+          return false;
+        }
       };
       // One restore under the SHARED lock: no bake, rebake, prune or failed
       // sibling can drop the template while it is copied. `gone` = the marker
@@ -553,13 +737,16 @@ class CommandDs implements DsDriver {
       // RESTORE / CREATE DATABASE fail on "already exists").
       let tried = false;
       const restore = (): Promise<{ ok: true } | { gone: true } | { err: Error; seen: string }> =>
-        withDatastoreLock(this.stackId, this.name, false, async () => {
+        withDatastoreLock(lockDir, this.name, false, async () => {
           let seen: string;
           try {
             seen = readFileSync(marker, 'utf8');
           } catch {
             return { gone: true as const };
           }
+          // The marker names the database: an adopted or nonce-named template
+          // is not where the current naming would put it.
+          const tpl = parseBakedMarker(seen).ns || this.templateNs(slot, preset);
           if (tried && this.spec.drop) await shQuiet(template(this.spec.drop, { ns }), h.cwd);
           tried = true;
           try {
@@ -576,19 +763,20 @@ class CommandDs implements DsDriver {
         // twice, so a restore of an existing template never waits for (or
         // blocks) anyone with an exclusive lock.
         if (!existsSync(marker)) {
-          await withDatastoreLock(this.stackId, this.name, true, async () => {
-            if (!existsSync(marker)) await bake();
+          await withDatastoreLock(lockDir, this.name, true, async () => {
+            if (!existsSync(marker) && !adopt()) await bake();
           });
         }
         const r = await restore();
         if ('ok' in r) return;
         if ('gone' in r) continue;
+        const tplOf = parseBakedMarker(r.seen).ns;
         const detail = `${r.err.message}${r.err instanceof BrokerError && r.err.logExcerpt ? `: ${r.err.logExcerpt.trim().split('\n').slice(-3).join(' | ').slice(-400)}` : ''}`;
         if (failure === null) {
           // The first failure is retried as it is: a transient error (a lock
           // wait in the repo's restore script, a busy server) must not cost a
           // bake. It is never silent any more.
-          logEvent({ level: 'warn', kind: 'template', envId: h.envId, detail: `restoring '${this.name}' (${preset}) from template ${tpl} into ${ns} failed — retrying the restore: ${detail}` });
+          logEvent({ level: 'warn', kind: 'template', envId: h.envId, detail: `restoring '${this.name}' (${preset}) from template ${tplOf} into ${ns} failed — retrying the restore: ${detail}` });
           failure = r;
           continue;
         }
@@ -598,7 +786,7 @@ class CommandDs implements DsDriver {
         // template that no longer exists, so every bind would fail forever.
         // Rebake it — unless another restore already did (the marker changed).
         const lastErr = r.err;
-        await withDatastoreLock(this.stackId, this.name, true, async () => {
+        await withDatastoreLock(lockDir, this.name, true, async () => {
           let now: string | null = null;
           try {
             now = readFileSync(marker, 'utf8');
@@ -627,7 +815,7 @@ class CommandDs implements DsDriver {
     if (this.spec.drop) await shQuiet(template(this.spec.drop, { ns: this.ns(h) }), h.cwd);
   }
   templateBaked(preset: string): boolean {
-    return Boolean(this.spec.template_restore) && !this.spec.ephemeral && existsSync(join(templatesRoot(), this.stackId, this.markerName(preset)));
+    return Boolean(this.spec.template_restore) && !this.spec.ephemeral && existsSync(this.slots.path(this.slots.resolve(preset)));
   }
 
   async rebake(cwd?: string): Promise<void> {
@@ -642,10 +830,14 @@ class CommandDs implements DsDriver {
     //
     // Exclusive on this datastore: waits out its in-flight bakes and restores.
     // Only THIS datastore's current templates go (decision 0039); the others,
-    // and older keys of this one (retention collects those), stay.
+    // and older keys of this one (retention collects those), stay. A shared
+    // datastore drops only this worktree's PRIVATE templates (decision 0044):
+    // the shared one serves the other worktrees, and the bake that follows
+    // `--pristine` is a private one.
+    const priv = this.slots.shared;
     await withDatastoreLock(this.stackId, this.name, true, async () => {
       const dir = join(templatesRoot(), this.stackId);
-      const key = `@${this.contentKey().slice(0, 12)}.baked`;
+      const key = `@${this.contentKey().slice(0, 12)}${priv ? PRIVATE_TEMPLATE_TAG : ''}.baked`;
       const catalog = new Set(presetNames(this.spec));
       let files: string[] = [];
       try {
@@ -674,7 +866,12 @@ class CommandDs implements DsDriver {
 
 // ---------------------------------------------------------------- factory
 
-export function makeDatastore(name: string, spec: DatastoreSpec, stackId: string, bakeKey?: string): DsDriver {
+/**
+ * `scope` is the template scope; a bare string is the bake key alone (per
+ * stack, as before 0.20 — unit tests and callers that only read the url).
+ */
+export function makeDatastore(name: string, spec: DatastoreSpec, stackId: string, scope?: string | TemplateScope): DsDriver {
+  const sc: TemplateScope = typeof scope === 'string' ? { bakeKey: scope } : (scope ?? {});
   // The datastore KEY becomes part of a filename (sqlite database, .baked
   // marker), so a key with a separator or `..` would escape the state root.
   // Checked here for EVERY driver: the command family builds marker paths too,
@@ -684,12 +881,12 @@ export function makeDatastore(name: string, spec: DatastoreSpec, stackId: string
   }
   switch (spec.driver) {
     case 'sqlite':
-      return new SqliteDs(name, spec, stackId, bakeKey);
+      return new SqliteDs(name, spec, stackId, sc);
     case 'postgres':
     case 'mssql':
     case 'mysql':
     case 'redis':
-      return new CommandDs(name, spec, stackId, bakeKey);
+      return new CommandDs(name, spec, stackId, sc);
     default:
       throw new BrokerError('work-error', `unknown datastore driver '${(spec as { driver: string }).driver}'`, 'manifest');
   }

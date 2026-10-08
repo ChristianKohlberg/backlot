@@ -110,6 +110,14 @@ export interface DatastoreSpec {
    */
   copies_only?: boolean;
   /**
+   * Share this datastore's templates with every worktree of the same manifest
+   * name on this daemon (decision 0044). Default true; it applies only to a
+   * content-keyed template (an `@rebake-template` rule names the datastore).
+   * Set false when the baked content depends on the worktree beyond its
+   * trigger files (an absolute path written into the data, say).
+   */
+  share_templates?: boolean;
+  /**
    * Repo command printing the namespaces ({{ns}} values) of this datastore
    * that exist on its server, one per line. Only `runly pool doctor` reads it:
    * a listed name that matches runly's naming and no journal row references is

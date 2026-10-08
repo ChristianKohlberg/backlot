@@ -9,7 +9,8 @@ import { templatesRoot, envsRoot, worktreesRoot } from './paths.js';
 import { logEvent } from './events.js';
 import { cmdTimeoutS, runBounded } from './exec.js';
 import { rotateIfOver } from './logs.js';
-import { hasOtherTemplateOwner, parseBakedMarker, withBakeLock } from '../drivers/datastores.js';
+import { hasOtherTemplateOwner, isPrivateTemplateFile, isSharedTemplateDir, parseBakedMarker, sharedTemplateDir, templateProject, withBakeLock } from '../drivers/datastores.js';
+import { readWorktreeTemplates } from './tree-ledger.js';
 import type { Journal } from './journal.js';
 import type { Policy } from './policy.js';
 
@@ -68,14 +69,78 @@ const templateGroup = (file: string): string => {
   return at > 0 ? file.slice(0, at) : '';
 };
 
+export type TemplateVerdict =
+  | { f: string; keep: true; why: 'current' | 'referenced' | 'grace' }
+  | { f: string; keep: false; why: 'superseded' | 'dead' | 'private' | 'duplicate' };
+
 /**
- * Templates are collected by reference (decision 0037). In each stack, per
- * datastore and preset, the newest `templatesKeep` (default 1) stay — the
- * current seed content — and so does every template an environment or a copy
- * was restored from. Anything else is dropped once it is older than
- * `templateGraceMs`; for a stack that can never be bound again, nothing is
- * current. A marker for a server-side template is dropped WITH its database
- * (its persisted drop command), unless another marker still names it.
+ * What retention (and `pool doctor`, without the grace) does with each
+ * template in one templates dir (decisions 0037, 0044):
+ *
+ * - per datastore and preset, the newest `keep` are current — in a stack dir
+ *   that can be bound again, or in a `<name>@shared` dir while any worktree of
+ *   that name can;
+ * - a template a row or a live worktree's record references stays;
+ * - a private (`--pristine`) template is never "current": it stays only while
+ *   referenced;
+ * - a per-worktree template whose file name the shared dir also holds is a
+ *   duplicate of it (the migration adopted it), never "current" either;
+ * - anything else goes once older than `grace`.
+ */
+export function templateVerdicts(
+  dir: string,
+  files: Array<{ f: string; mtime: number }>,
+  refs: TemplateRefs,
+  keepNewest: number,
+  graceMs: number,
+  sharedFiles: ReadonlySet<string> = new Set(),
+): TemplateVerdict[] {
+  const alive = refs.stackAlive(dir);
+  const keep = alive ? keepNewest : 0;
+  const seen = new Map<string, number>();
+  const out: TemplateVerdict[] = [];
+  for (const { f, mtime } of [...files].sort((a, b) => b.mtime - a.mtime)) {
+    const priv = isPrivateTemplateFile(f);
+    const duplicate = !priv && !isSharedTemplateDir(dir) && sharedFiles.has(f);
+    let current = false;
+    if (!priv && !duplicate) {
+      const group = templateGroup(f);
+      const rank = seen.get(group) ?? 0;
+      seen.set(group, rank + 1);
+      current = rank < keep;
+    }
+    if (current) out.push({ f, keep: true, why: 'current' });
+    else if (refs.referenced.has(`${dir}/${f}`)) out.push({ f, keep: true, why: 'referenced' });
+    else if (Date.now() - mtime < graceMs) out.push({ f, keep: true, why: 'grace' });
+    else out.push({ f, keep: false, why: priv ? 'private' : duplicate ? 'duplicate' : alive ? 'superseded' : 'dead' });
+  }
+  return out;
+}
+
+/** The template files of one dir with their mtimes (dot-files — `.root` — excluded). */
+export function templateFiles(dir: string): Array<{ f: string; mtime: number }> {
+  return entriesOf(dir)
+    .filter((f) => !f.startsWith('.'))
+    .map((f) => {
+      try {
+        return { f, mtime: statSync(join(dir, f)).mtimeMs };
+      } catch {
+        return null;
+      }
+    })
+    .filter((x): x is { f: string; mtime: number } => x !== null);
+}
+
+/** The file names in the shared dir of `dir`'s project (empty for a shared dir itself). */
+export function sharedFilesFor(dir: string, root = templatesRoot()): Set<string> {
+  if (isSharedTemplateDir(dir)) return new Set();
+  return new Set(entriesOf(join(root, sharedTemplateDir(templateProject(dir)))));
+}
+
+/**
+ * Templates are collected by reference (decisions 0037, 0044): see
+ * `templateVerdicts`. A marker for a server-side template is dropped WITH its
+ * database (its persisted drop command), unless another marker still names it.
  */
 export async function pruneTemplates(
   p: Pick<Policy, 'templatesKeep'> & Partial<Pick<Policy, 'templateGraceMs'>>,
@@ -87,37 +152,22 @@ export async function pruneTemplates(
   for (const stackDir of entriesOf(root)) {
     const dir = join(root, stackDir);
     if (!existsSync(dir)) continue;
-    // The stack-scoped bake lock (the dir name IS the stack id): pruning was
-    // the one remaining writer mutating this dir outside it, reopening the
-    // deleted-mid-restore race the lock exists to close.
+    // The dir-scoped bake lock (the dir name IS the lock key — a stack id or
+    // `<name>@shared`): pruning was the one remaining writer mutating this
+    // dir outside it, reopening the deleted-mid-restore race the lock exists
+    // to close.
     pruned += await withBakeLock(stackDir, async () => {
-      const keep = refs.stackAlive(stackDir) ? p.templatesKeep : 0;
       let count = 0;
-      const files = entriesOf(dir)
-        .filter((f) => !f.startsWith('.'))
-        .map((f) => {
-          try {
-            return { f, mtime: statSync(join(dir, f)).mtimeMs };
-          } catch {
-            return null;
-          }
-        })
-        .filter((x): x is { f: string; mtime: number } => x !== null)
-        .sort((a, b) => b.mtime - a.mtime);
-      const seen = new Map<string, number>();
-      for (const { f, mtime } of files) {
-        const group = templateGroup(f);
-        const rank = seen.get(group) ?? 0;
-        seen.set(group, rank + 1);
-        if (rank < keep) continue; // the current one(s) of this datastore and preset
-        if (refs.referenced.has(`${stackDir}/${f}`)) continue; // an environment or copy holds it
-        if (Date.now() - mtime < grace) continue; // baked too recently: a restore may be about to reference it
+      for (const v of templateVerdicts(stackDir, templateFiles(dir), refs, p.templatesKeep, grace, sharedFilesFor(stackDir, root))) {
+        if (v.keep) continue;
+        const f = v.f;
         const full = join(dir, f);
         if (f.endsWith('.baked')) {
           try {
             const marker = parseBakedMarker(readFileSync(full, 'utf8'));
-            if (hasOtherTemplateOwner(full, marker.ns)) continue;
-            if (marker.drop) {
+            // Another marker naming the same database (an adopted template's
+            // other copy): only this marker goes, the database stays.
+            if (!hasOtherTemplateOwner(full, marker.ns) && marker.drop) {
               // This command came from a manifest that may no longer exist on
               // disk. Re-executing it silently is the part that deserves a
               // record, so the state dir stays auditable.
@@ -157,7 +207,7 @@ export function pruneWorktreeState(journal: Journal, root = worktreesRoot()): nu
   for (const stackId of entriesOf(root)) {
     const dir = join(root, stackId);
     try {
-      const recordedRoot = ['ledger.json', 'triggers.json', 'builds.json']
+      const recordedRoot = ['ledger.json', 'triggers.json', 'builds.json', 'templates.json']
         .map((f) => {
           try {
             return (JSON.parse(readFileSync(join(dir, f), 'utf8')) as { root?: unknown }).root;
@@ -185,6 +235,10 @@ export function pruneWorktreeState(journal: Journal, root = worktreesRoot()): nu
  * its templates. A stack with no record at all is NOT alive (0.19): its
  * worktree records were pruned because the worktree was gone, and treating it
  * as alive kept the templates of every pruned worktree forever.
+ *
+ * Shared templates (decision 0044): `<name>@shared` is alive while any stack
+ * of that name is; a live worktree's `templates.json` (the template each of
+ * its datastores was last restored from) counts as a reference.
  */
 export function templateRefs(journal: Journal, root = worktreesRoot(), templates = templatesRoot()): TemplateRefs {
   const referenced = new Set<string>();
@@ -197,29 +251,45 @@ export function templateRefs(journal: Journal, root = worktreesRoot(), templates
     named.add(copy.stack);
     if (copy.template) referenced.add(copy.template);
   }
-  const stackAlive = (stackId: string): boolean => {
-    if (named.has(stackId)) return true;
-    // No row names it: alive while the worktree it describes exists. No
-    // record at all means that worktree's records were pruned: not alive.
-    let recorded: string | undefined;
+  const recordedRootOf = (stackId: string): string | undefined => {
     try {
       const r = readFileSync(join(templates, stackId, '.root'), 'utf8').trim();
-      if (r) recorded = r;
+      if (r) return r;
     } catch {
       /* not recorded at bake time (an older runly) */
     }
-    for (const f of recorded === undefined ? ['ledger.json', 'triggers.json', 'builds.json'] : []) {
+    for (const f of ['ledger.json', 'triggers.json', 'builds.json', 'templates.json']) {
       try {
         const r = (JSON.parse(readFileSync(join(root, stackId, f), 'utf8')) as { root?: unknown }).root;
-        if (typeof r === 'string') {
-          recorded = r;
-          break;
-        }
+        if (typeof r === 'string') return r;
       } catch {
         /* next */
       }
     }
+    return undefined;
+  };
+  const stackAliveOne = (stackId: string): boolean => {
+    if (named.has(stackId)) return true;
+    // No row names it: alive while the worktree it describes exists. No
+    // record at all means that worktree's records were pruned: not alive.
+    const recorded = recordedRootOf(stackId);
     return recorded !== undefined && existsSync(recorded);
+  };
+  // A live worktree's current templates (decision 0044).
+  for (const stackId of entriesOf(root)) {
+    const rec = readWorktreeTemplates(stackId);
+    if (!rec || !existsSync(rec.root)) continue;
+    for (const ref of Object.values(rec.refs)) referenced.add(ref);
+  }
+  const projectStacks = (project: string): string[] => {
+    const ids = new Set<string>();
+    for (const id of named) if (templateProject(id) === project) ids.add(id);
+    for (const d of [root, templates]) for (const id of entriesOf(d)) if (!isSharedTemplateDir(id) && templateProject(id) === project) ids.add(id);
+    return [...ids];
+  };
+  const stackAlive = (stackId: string): boolean => {
+    if (!isSharedTemplateDir(stackId)) return stackAliveOne(stackId);
+    return projectStacks(templateProject(stackId)).some(stackAliveOne);
   };
   const ownRoot = (stackId: string): string | undefined => {
     for (const env of journal.allEnvs()) if (env.stack === stackId) return env.stackRoot;
@@ -232,12 +302,12 @@ export function templateRefs(journal: Journal, root = worktreesRoot(), templates
   const dropCwd = (stackId: string): string => {
     const own = ownRoot(stackId);
     if (own !== undefined && existsSync(own)) return own;
-    // Stack ids are `<manifest name>-<8-char hash of the root>`.
-    const project = stackId.slice(0, -9);
-    for (const env of journal.allEnvs()) if (env.stack.slice(0, -9) === project && existsSync(env.stackRoot)) return env.stackRoot;
-    for (const copy of journal.allDbCopies()) if (copy.stack.slice(0, -9) === project && existsSync(copy.stackRoot)) return copy.stackRoot;
+    // Stack ids are `<manifest name>-<8-char hash of the root>`; a shared dir is `<name>@shared`.
+    const project = templateProject(stackId);
+    for (const env of journal.allEnvs()) if (templateProject(env.stack) === project && existsSync(env.stackRoot)) return env.stackRoot;
+    for (const copy of journal.allDbCopies()) if (templateProject(copy.stack) === project && existsSync(copy.stackRoot)) return copy.stackRoot;
     for (const sibling of entriesOf(templates)) {
-      if (sibling === stackId || sibling.slice(0, -9) !== project) continue;
+      if (sibling === stackId || templateProject(sibling) !== project) continue;
       const r = ownRoot(sibling);
       if (r !== undefined && existsSync(r)) return r;
     }

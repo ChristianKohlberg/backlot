@@ -434,6 +434,11 @@
           "default": false,
           "description": "Never provisioned for an environment: the datastore exists only as the source of `runly db new|with` copies (its template is baked on the first copy and reused after). No service may template it, `ctx` and `ctx --env` do not list it, and `up --preset` / `reset-data` cannot name it."
         },
+        "share_templates": {
+          "type": "boolean",
+          "default": true,
+          "description": "Share this datastore's baked templates with every worktree of the same stack name on this daemon (decision 0044). Applies only to a content-keyed template — one an `@rebake-template` rule names, so its key is the create command plus the content of the rule's trigger files; without such a rule templates stay per worktree. Set false when the baked content depends on the worktree beyond those files (an absolute path written into the data, say)."
+        },
         "list": {
           "type": "string",
           "description": "Repo command printing the namespaces ({{ns}} values) of this datastore that exist on its server, one per line. Read only by `runly pool doctor`: a listed name in runly's naming (backlot_...) that no journal row or template marker references is an orphan, which `--fix` drops with `drop:` (decision 0037)."

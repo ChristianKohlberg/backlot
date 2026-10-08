@@ -57,6 +57,48 @@ export function forgetRulesWithoutOutputs(stackId: string, root: string, keep: (
   return dropped;
 }
 
+/**
+ * The template each datastore and preset of this worktree was last restored
+ * from (`worktrees/<stack>/templates.json`, decision 0044). Templates are
+ * shared by every worktree of a manifest name, so "the newest per datastore
+ * and preset" no longer says which one a given worktree uses; retention keeps
+ * every template a live worktree recorded here, with or without an
+ * environment — an `up` after `destroy` stays a restore, not a bake (0039).
+ * Written synchronously (no await between read and write), so the daemon's
+ * parallel datastore restores cannot lose each other's entries.
+ */
+export interface WorktreeTemplatesFile {
+  root: string;
+  /** `<datastore>/<preset>` → `<templates dir>/<file>`. */
+  refs: Record<string, string>;
+}
+const templatesPath = (stackId: string) => join(worktreeStateDir(stackId), 'templates.json');
+
+export function readWorktreeTemplates(stackId: string): WorktreeTemplatesFile | undefined {
+  try {
+    const raw = JSON.parse(readFileSync(templatesPath(stackId), 'utf8')) as Partial<WorktreeTemplatesFile>;
+    if (typeof raw.root !== 'string' || !raw.refs || typeof raw.refs !== 'object') return undefined;
+    return { root: raw.root, refs: { ...raw.refs } };
+  } catch {
+    return undefined;
+  }
+}
+
+export function recordWorktreeTemplate(stackId: string, root: string, key: string, ref: string): void {
+  const cur = readWorktreeTemplates(stackId);
+  if (cur?.root === root && cur.refs[key] === ref) return;
+  const refs = { ...(cur?.root === root ? cur.refs : {}), [key]: ref };
+  const dir = worktreeStateDir(stackId);
+  try {
+    mkdirSync(dir, { recursive: true });
+    const tmp = join(dir, `templates.json.${process.pid}.tmp`);
+    writeFileSync(tmp, JSON.stringify({ root, refs } satisfies WorktreeTemplatesFile));
+    renameSync(tmp, templatesPath(stackId));
+  } catch {
+    /* best effort: the template is then kept only while a row references it */
+  }
+}
+
 /** `--pristine`: forget what was applied, so every rule runs again. */
 export function clearTreeLedger(stackId: string): void {
   rmSync(ledgerPath(stackId), { force: true });
