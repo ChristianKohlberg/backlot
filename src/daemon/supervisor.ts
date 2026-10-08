@@ -46,8 +46,10 @@ export interface ServiceExit {
   /** Exit code of the last process, null when a signal ended it or it never spawned. */
   code: number | null;
   signal: string | null;
-  /** `crash-loop`, `daemonized` or `spawn-failed`. */
-  reason: 'crash-loop' | 'daemonized' | 'spawn-failed';
+  /** `crash-loop`, `daemonized`, `spawn-failed`, or `boot-failed` (it never became ready in a bind, 0.18.1). */
+  reason: 'crash-loop' | 'daemonized' | 'spawn-failed' | 'boot-failed';
+  /** For `boot-failed`: what the readiness check said. */
+  detail?: string;
 }
 
 /** What the engine learns about a service between starts (decision 0035). */
@@ -104,6 +106,11 @@ export class EnvSupervisor {
       if (r.proc?.pid && r.proc.exitCode === null) out[name] = { pid: r.proc.pid, startTime: r.startTime };
     }
     return out;
+  }
+
+  /** The exit code of a service's last process; null while it runs, or when a signal ended it. */
+  exitCodeOf(name: string): number | null {
+    return this.services.get(name)?.proc?.exitCode ?? null;
   }
 
   allHealthyPids(): boolean {

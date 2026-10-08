@@ -43,7 +43,7 @@ function makeContext(extraEnv: Record<string, string> = {}) {
 const envsOf = async (ctx: ReturnType<typeof makeContext>, cwd: string) =>
   ((await ctx.cli(['status', '--json'], cwd)).json!.envs ?? []) as Array<{ id: string; state: string; lease: unknown }>;
 
-describe('auto-escalation: two failures -> pristine bind heals a cache the ledger vouched for', () => {
+describe('no auto-escalation for a leased environment (0.18.1): the holder asks for pristine, which heals a cache the ledger vouched for', () => {
   const ctx = makeContext();
   const wt = mkdtempSync(join(tmpdir(), 'runly-esc-'));
   afterAll(() => {
@@ -51,7 +51,7 @@ describe('auto-escalation: two failures -> pristine bind heals a cache the ledge
     rmSync(wt, { recursive: true, force: true });
   });
 
-  it('fail, fail, auto-pristine, green', async () => {
+  it('fail, fail, fail (no escalation), --pristine, green', async () => {
     // Environments run in the worktree (decision 0032), and pristine never
     // deletes anything there. What it does is stop TRUSTING the worktree
     // ledger: an upkeep output wiped behind runly's back (the ledger still says
@@ -93,7 +93,12 @@ caches: [cache]
     expect((await ctx.cli(['up', '--reset-data', '--json'], wt)).exitCode).toBe(1); // strike 1 (work-error)
     expect((await ctx.cli(['up', '--json'], wt)).exitCode).toBe(1); // strike 2
 
-    const third = await ctx.cli(['up', '--json'], wt); // auto-escalated to pristine
+    // 0.18.1: a leased environment is never escalated to pristine on its own
+    // (pristine reloads its data, which is the holder's work) — and one failed
+    // service is not a failed bind anyway. The third plain `up` fails again …
+    expect((await ctx.cli(['up', '--json'], wt)).exitCode).toBe(1);
+    // … and the holder's own `--pristine` heals it.
+    const third = await ctx.cli(['up', '--pristine', '--json'], wt);
     expect(third.exitCode, `stdout: ${third.stdout ?? ''}\nstderr: ${third.stderr ?? ''}`).toBe(0);
     expect(third.json!.state).toBe('hot');
     expect(existsSync(join(wt, 'cache', 'dep'))).toBe(true); // the rule ran again, in place

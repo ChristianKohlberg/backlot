@@ -1,6 +1,7 @@
 # 0039. A teardown keeps the worktree's templates and records; a leased environment survives a crash loop; only verbs that use an environment are activity; the daemon may be supervised; a datastore may exist only as copies
 
-- Status: Accepted
+- Status: Accepted; corrected in 0.18.1 (the proxy replay rule and a service
+  that fails during a bind — see the two paragraphs marked 0.18.1)
 - Date: 2026-10
 - Amends: [0007](0007-hygiene-levels.md) — a crash loop degrades only an
   unleased environment; [0032](0032-environments-run-in-the-callers-worktree.md)
@@ -74,17 +75,39 @@ restart budget in a leased environment is stopped and reported `failed`: `ps`
 and `ctx` show it with its last exit and the hint `runly logs <svc>`, an event
 says the same, a connection does not wake it and `exec`/`token` do not resume
 it. The environment, its data, its other services and its logs stay; the next
-`up` starts it again. A bind during which a started service fails reports it
-(work-error) and leaves the rest running. An UNLEASED environment is still
-marked `degraded` and recycled. Logs go only with the environment.
+`up` starts it again. A bind during which a started service fails — it crash-loops,
+or (0.18.1) it never becomes ready because it exits, hits a `fatal_logs` marker
+or daemonizes during its boot — reports it (work-error, `up` exits non-zero
+naming it), stops only that service, does not start what `depends_on` it, and
+leaves the rest running, wakeable and usable by `exec`/`token`. One failed
+service is not a failed bind: it does not count toward `failStreak` (0007).
+And a LEASED environment is never escalated to `pristine` automatically, how
+many binds ever failed — pristine reloads its data, and its data is someone's
+work; they can ask for `--pristine`. An UNLEASED environment is still marked
+`degraded` and recycled. Logs go only with the environment.
 
-**The proxy retries a connection its service dropped unanswered.** Until a
-service sends its first byte back, the proxy keeps what the client sent (up to
-1 MB); a reset or close in that window is handled like a refused connect —
-held while the port is `starting`, woken when `down`, retried while still `up`
-(at most five times, then the close is passed on: that is the service's
-answer). Replaying is safe only before the service answered; after the first
-byte nothing is retried.
+**The proxy retries a connection its service dropped unanswered — when no
+process can have acted on it** (corrected in 0.18.1). Until a service sends its
+first byte back, the proxy keeps what the client sent (up to 1 MB). A reset or
+close in that window is handled like a refused connect — held while the port is
+`starting`, woken when `down`, retried while still `up` (at most five times,
+then the close is passed on: that is the service's answer) — only when:
+
+- nothing the client sent reached the process: the connect was refused, or the
+  connection was lost before the proxy wrote a byte upstream; or
+- the bytes reached it, the connection's first bytes are an HTTP request with
+  a method that is safe to repeat (`GET`, `HEAD`, `OPTIONS`), and they have not
+  been carried to a relaunch before — one connection's bytes reach at most two
+  processes, so a request that kills every process it reaches cannot burn the
+  restart budget.
+
+Anything else — `POST`, `PUT`, `PATCH`, `DELETE`, a database or TLS wire
+protocol — that reached a process is never replayed: the client sees the reset
+or close, as without a proxy. 0.18.0 said "replaying is safe only before the
+service answered"; that is wrong for a non-idempotent request — a handler that
+did its side effect and then crashed before replying ran it once per relaunch
+(four times), and the one request crash-looped the service into `failed`.
+After the service's first byte nothing is retried.
 
 **`runly db with` takes its command down with its copy.** The command carries
 the copy's tag (`BACKLOT_DB_COPY`, inherited by its descendants), its pid,
