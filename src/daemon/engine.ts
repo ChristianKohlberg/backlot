@@ -2,11 +2,11 @@
  * The engine: pool + lease + bind + run orchestration, owning all policy
  * (drivers own transport/storage; the manifest owns repo knowledge).
  */
-import { mkdirSync, rmSync, readdirSync, existsSync, readFileSync, writeFileSync, renameSync, statSync } from 'node:fs';
+import { mkdirSync, rmSync, readdirSync, existsSync, readFileSync, statSync } from 'node:fs';
 import { isAbsolute, join, relative, sep } from 'node:path';
 import { Journal, JOURNAL_SCHEMA_VERSION, type DbCopyRow, type DropRecipe, type EnvRow, type LeaseRow } from '../core/journal.js';
 import { BUILD, VERSION, compareVersions, versionSkew } from '../core/version.js';
-import { buildOf, canonicalDirectory, envDatastoreNames, outputsOf, stackIdentity, retiredStackIdentity, loadStack, normalizeLogins, manifestFileOf, type Manifest, type ServiceSpec, type Stack } from '../core/manifest.js';
+import { buildOf, canonicalDirectory, envDatastoreNames, outputsOf, loadStack, normalizeLogins, manifestFileOf, type Manifest, type ServiceSpec, type Stack } from '../core/manifest.js';
 import { snapshotOutputs } from '../core/worktree.js';
 import { forgetNamespace, recordedNamespaces } from '../core/namespaces.js';
 import { runlyEnvVars } from '../core/env-vars.js';
@@ -20,11 +20,11 @@ import { runUpkeep, templateBakeKeys, triggerSet, type UpkeepStep } from '../cor
 import { allocateInBlock, blockConflicts, ephemeralRange, inBlock, internalBlock, publicBlock, tunnelBlock } from '../core/ports.js';
 import { HOLD_MS, PortInUse, ProxyHub } from './proxy.js';
 import { connect as netConnect } from 'node:net';
-import { dbCopiesRoot, envsRoot, stateRoot, templatesRoot, retiredTemplatesRoot, worktreesRoot } from '../core/paths.js';
+import { dbCopiesRoot, envsRoot, stateRoot, templatesRoot, worktreesRoot } from '../core/paths.js';
 import { BrokerError, template, templateEnv, now, sha256, shortId } from '../core/util.js';
 import { callerEnvSpec, requireCallerEnv, selectCallerEnv, serviceCallerEnv, validateCallerEnv } from '../core/caller-env.js';
 import { cmdTimeoutS, runBounded, runBoundedIO, LONG_CMD_TIMEOUT_S } from '../core/exec.js';
-import { makeDatastore, parseBakedMarker, retireBakedTemplates, withBakeLock, tryWithBakeLock, type DsHandle } from '../drivers/datastores.js';
+import { makeDatastore, parseBakedMarker, withBakeLock, type DsHandle } from '../drivers/datastores.js';
 import { ensureAppliance, stopAppliance, probeTcp } from '../drivers/appliances.js';
 import { DEFAULT_PREVIEW_PUBLISHER, resolvePreviewPublisher } from '../drivers/preview.js';
 import { EnvSupervisor, killGroupVerified, killPidVerified, reapPids, mergeServicePids, serviceGroups, type ServiceExit } from './supervisor.js';
@@ -311,16 +311,6 @@ export class Engine {
 
   /** Recovery (decision 0009): reap recorded PIDs from a previous daemon life; hot -> warm. */
   async recover(): Promise<void> {
-    for (const env of this.journal.allEnvs()) {
-      try {
-        // Only migrate a proven lexical alias. Renamed manifests remain subject
-        // to ordinary orphan retention; an unreadable source proves nothing and
-        // is retried at every later bind and sweep boundary.
-        this.adoptLegacyAliases(loadStack(env.stackRoot));
-      } catch { /* leave unavailable or renamed projects unchanged */ }
-    }
-    for (const env of this.journal.allEnvs()) this.registerRetiredTemplates(env);
-    if (existsSync(templatesRoot())) for (const retired of readdirSync(templatesRoot())) this.relocateRetiredTemplates(retired);
     let envs = 0;
     let stranded = 0;
     for (const env of this.journal.allEnvs()) {
@@ -351,17 +341,6 @@ export class Engine {
       // Reaping awaits real kills, so this row may have been torn down while we
       // were working. Saving a snapshot of a deleted row resurrects it.
       if (!this.journal.getEnv(env.id)) continue;
-      // An older daemon projected a full copy of the worktree here. Nothing runs
-      // from it any more (decision 0032) — once its processes are confirmed
-      // gone, the copy is disk to give back. Its `@source` and build stamps
-      // described that copy and are dropped; command rules belong to the
-      // worktree's ledger, which starts empty, so they run once in place.
-      const legacyTree = this.envDirs(env.id).legacyTree;
-      if (Object.keys(survivors).length === 0 && existsSync(legacyTree) && this.isPrivateEnvDir(env)) {
-        rmSync(legacyTree, { recursive: true, force: true });
-        logEvent({ level: 'info', kind: 'retention', envId: env.id, detail: 'removed the projected source copy an older runly kept; services now run in the worktree (decision 0032)' });
-      }
-      env.fingerprints = pickEnvKeys(env.fingerprints);
       this.journal.saveEnv(env);
       envs++;
     }
@@ -379,31 +358,9 @@ export class Engine {
       kind: 'recover',
       detail: `reconciled ${envs} env(s)${stranded ? `, ${stranded} service(s) survived the reap` : ''}`,
     });
-    // Data-only environments are gone (decision 0034). A leased one becomes
-    // what it always was underneath — an environment whose lease wants no
-    // services — so its holder keeps the lease and the data. An unleased one is
-    // a test lane nobody holds any more; it is recycled, giving its datastores
-    // back, rather than taking a machine-wide slot it was never charged for.
-    for (const env of this.journal.allEnvs()) {
-      if (!env.dataOnly || env.state === 'recycling') continue;
-      env.dataOnly = false;
-      env.activeServices = [];
-      if (env.state === 'hot') env.state = 'warm';
-      if (this.journal.leaseForEnv(env.id)) {
-        this.journal.saveEnv(env);
-        logEvent({ level: 'info', kind: 'migrate', envId: env.id, detail: 'a data-only environment from an older runly is now an environment with no services wanted; its lease and data are kept (decision 0034)' });
-        continue;
-      }
-      env.state = 'recycling';
-      this.journal.saveEnv(env);
-      logEvent({ level: 'info', kind: 'migrate', envId: env.id, detail: 'an unleased data-only environment from an older runly is recycled (decision 0034: a database alone is a runly db copy)' });
-      void this.teardownClaimed(env).catch((err) =>
-        logEvent({ level: 'error', kind: 'teardown', envId: env.id, detail: `recycling a data-only environment failed: ${String((err as Error).message ?? err)}` }),
-      );
-    }
     // Anything the journal never knew about — the owner died before the pids
     // were ever written, or the env row is long gone — is only findable by tag.
-    const gc = await this.poolGc(false);
+    const gc = await this.poolGc();
     if (gc.reclaimed.length) {
       logEvent({ level: 'warn', kind: 'gc', detail: `reclaimed ${gc.reclaimed.length} orphaned process(es) at startup` });
     }
@@ -440,8 +397,7 @@ export class Engine {
    * to an env with an operation in flight, is left strictly alone — a bind
    * racing the sweep must not have its dev-server shot out from under it.
    */
-  async poolGc(retryRetiredTemplates = true): Promise<{ supported: boolean; reclaimed: Array<{ pid: number; envId: string; service: string }>; skipped: number }> {
-    if (retryRetiredTemplates) await this.retireLegacyTemplateBatch(true);
+  async poolGc(): Promise<{ supported: boolean; reclaimed: Array<{ pid: number; envId: string; service: string }>; skipped: number }> {
     if (!procScanSupported()) return { supported: false, reclaimed: [], skipped: 0 };
     const tagged = scanTagged(stateRoot());
     if (tagged.length === 0) return { supported: true, reclaimed: [], skipped: 0 };
@@ -499,13 +455,12 @@ export class Engine {
   // ---------------------------------------------------------------- pool
 
   /**
-   * An environment's PRIVATE state — data dir, logs. There is no tree here any
-   * more: services run in the caller's worktree (decision 0032). `legacyTree`
-   * names the projection copy older daemons kept, so it can be reclaimed.
+   * An environment's PRIVATE state — data dir, logs. There is no tree here:
+   * services run in the caller's worktree (decision 0032).
    */
   private envDirs(id: string) {
     const root = join(envsRoot(), id);
-    return { root, data: join(root, 'data'), logs: join(root, 'logs'), legacyTree: join(root, 'tree') };
+    return { root, data: join(root, 'data'), logs: join(root, 'logs') };
   }
 
   private async createEnv(stack: Stack): Promise<EnvRow> {
@@ -1325,7 +1280,6 @@ export class Engine {
       // again in place (builds run on every bind anyway). The datastores'
       // presets are KEPT: they say what each store is recreated with.
       rmSync(dirs.data, { recursive: true, force: true });
-      rmSync(dirs.legacyTree, { recursive: true, force: true });
       mkdirSync(dirs.data, { recursive: true });
       env.fingerprints = {};
       // Persist the cleared ledger NOW, not at the end of the bind. Appliances
@@ -1339,9 +1293,6 @@ export class Engine {
         // Nothing is trusted: every build runs again too (decision 0038).
         clearBuilds(stack.id);
       }, (s) => say(`waiting for another bind in this worktree … ${s}s`));
-    } else if (Object.keys(env.servicePids).length === 0 && existsSync(dirs.legacyTree)) {
-      // A projection copy from an older daemon: nothing runs from it any more.
-      rmSync(dirs.legacyTree, { recursive: true, force: true });
     }
 
     // Appliances first: shared backing servers must answer before anything
@@ -2024,124 +1975,20 @@ export class Engine {
   // ---------------------------------------------------------------- verbs
 
   /**
-   * A proven lexical alias: the row's identity is exactly what the current
-   * manifest name yields for the spelling it recorded, and that spelling still
-   * resolves to `stack`'s physical root. A renamed manifest, or a source that
-   * is unreadable or gone, proves nothing and is left alone.
+   * Who the caller is when it names no holder: its WORKTREE — the directory
+   * holding the manifest, found by searching upward — whichever subdirectory
+   * the verb runs from. `up` at the root and `ctx --env` from `src/app` are
+   * the same caller. A live lease an older runly keyed to a subdirectory is
+   * still honoured from that subdirectory until it ends.
    */
-  private legacyAlias(env: EnvRow, stack: Stack): { id: string; stack: string; root: string } | null {
-    if (env.stack === stack.id || stackIdentity(stack.manifest.name, env.stackRoot) !== env.stack) return null;
-    try {
-      if (canonicalDirectory(env.stackRoot) !== stack.root) return null;
-    } catch {
-      return null;
-    }
-    return { id: env.id, stack: stack.id, root: stack.root };
-  }
-
-  /**
-   * Migrate every proven alias of `stack` to its physical identity. Idempotent,
-   * and applied at every boundary that judges a row by identity — recovery, the
-   * holder verbs, the sweeper's orphan check — so a manifest that was merely
-   * unreadable when the daemon started can only defer the migration, never turn
-   * it into a reclaim or a duplicate environment once repaired.
-   */
-  private adoptLegacyAliases(stack: Stack): void {
-    const changes = this.journal.allEnvs().map((env) => this.legacyAlias(env, stack)).filter((c) => c !== null);
-    if (changes.length === 0) return;
-    this.journal.canonicalizeStacks(changes);
-    for (const change of changes) {
-      const migrated = this.journal.getEnv(change.id);
-      if (migrated) this.registerRetiredTemplates(migrated);
-      logEvent({ level: 'info', kind: 'retention', envId: change.id, detail: `stack identity migrated to '${change.stack}' (physical root ${change.root})` });
-    }
-  }
-
-  /** A durable descriptor keeps failed retirement discoverable after the last env is recycled. */
-  private registerRetiredTemplates(env: EnvRow): void {
-    if (!env.legacyStackRoot) return;
-    const retired = retiredStackIdentity(env.stack, env.legacyStackRoot);
-    const dir = join(templatesRoot(), retired);
-    if (retired === env.stack || !existsSync(dir)) return;
-    const record = join(dir, '.retired-stack.json');
-    if (!existsSync(record)) {
-      writeFileSync(`${record}.tmp`, JSON.stringify({
-        stack: env.stack, legacyRoot: env.legacyStackRoot, root: env.stackRoot,
-      }));
-      renameSync(`${record}.tmp`, record);
-    }
-    this.relocateRetiredTemplates(retired);
-  }
-
-  private relocateRetiredTemplates(retired: string): void {
-    tryWithBakeLock(retired, () => {
-      if (this.journal.envsForStack(retired).length > 0) return;
-      const dir = join(templatesRoot(), retired);
-      try {
-        const descriptor = JSON.parse(readFileSync(join(dir, '.retired-stack.json'), 'utf8'));
-        if (typeof descriptor.stack !== 'string' || typeof descriptor.legacyRoot !== 'string' || typeof descriptor.root !== 'string') return;
-        if (retiredStackIdentity(descriptor.stack, descriptor.legacyRoot) !== retired || descriptor.stack === retired) return;
-      } catch { return; }
-      mkdirSync(retiredTemplatesRoot(), { recursive: true });
-      const destination = join(retiredTemplatesRoot(), retired);
-      renameSync(dir, existsSync(destination) ? `${destination}.${shortId()}` : destination);
-    });
-  }
-
-  /** One bounded external drop, after ownership/reaping work; never part of recovery. */
-  private async retireLegacyTemplateBatch(force = false): Promise<void> {
-    for (const env of this.journal.allEnvs()) this.registerRetiredTemplates(env);
-    if (existsSync(templatesRoot())) for (const retired of readdirSync(templatesRoot())) this.relocateRetiredTemplates(retired);
-    let entries: string[];
-    try { entries = readdirSync(retiredTemplatesRoot()); } catch { return; }
-    for (const entry of entries) {
-      const dir = join(retiredTemplatesRoot(), entry);
-      let retired: string;
-      let descriptor: { stack: string; legacyRoot: string; root: string };
-      try {
-        descriptor = JSON.parse(readFileSync(join(dir, '.retired-stack.json'), 'utf8'));
-        if (typeof descriptor.stack !== 'string' || typeof descriptor.legacyRoot !== 'string' || typeof descriptor.root !== 'string') continue;
-        retired = retiredStackIdentity(descriptor.stack, descriptor.legacyRoot);
-        if ((entry !== retired && !entry.startsWith(retired + '.')) || descriptor.stack === retired) continue;
-      } catch { continue; }
-      // A skipped migration or an in-flight old bake still owns these templates.
-      if (this.journal.envsForStack(retired).length > 0) continue;
-      if (this.journal.envsForStack(descriptor.stack).some((row) => this.busy.has(row.id))) continue;
-      const attempted = await withBakeLock(descriptor.stack, () => withBakeLock(retired, async () => {
-        const { dropped, deferred, attempted } = await retireBakedTemplates(
-          dir, existsSync(descriptor.root) ? descriptor.root : templatesRoot(), force,
-        );
-        if (deferred > 0) {
-          if (attempted > 0) logEvent({ level: 'warn', kind: 'retention', detail: `retired templates for '${retired}' remain; failed drops retain .retirement.json records with bounded retries. Check the appliance, then run runly pool gc to retry.` });
-          return attempted > 0;
-        }
-        rmSync(dir, { recursive: true, force: true });
-        logEvent({ level: 'info', kind: 'retention', detail: `retired templates keyed by legacy stack identity '${retired}' (${dropped} server-side template(s) dropped)` });
-        return true;
-      }));
-      if (attempted) break;
-    }
-  }
-
   private callerHolder(cwd: string, holder: string | undefined, stack: Stack): string {
-    this.adoptLegacyAliases(stack);
     if (holder !== undefined) return holder;
     const canonical = canonicalDirectory(cwd);
-    const own = this.journal.leaseForHolder(canonical, stack.id);
-    if (own && own.expiresAt > now()) return canonical;
-    for (const env of this.journal.envsForStack(stack.id)) {
-      const lease = this.journal.leaseForEnv(env.id);
-      if (!lease || lease.expiresAt <= now() || !isAbsolute(lease.holder)) continue;
-      const legacyRoot = env.legacyStackRoot;
-      const legacyPathHolder = legacyRoot && (lease.holder === legacyRoot || lease.holder.startsWith(legacyRoot + sep));
-      let candidate: string | undefined;
-      try { candidate = canonicalDirectory(legacyPathHolder ? join(env.stackRoot, lease.holder.slice(legacyRoot.length)) : lease.holder); }
-      catch { candidate = undefined; }
-      if (candidate === undefined || canonical === candidate) {
-        throw new BrokerError('env-error', `a legacy path holder still owns ${env.id}; pass holder ${JSON.stringify(lease.holder)} (--holder on the CLI) to inspect or release that lease before using the canonical default holder`, 'lease');
-      }
+    if (canonical !== stack.root) {
+      const own = this.journal.leaseForHolder(canonical, stack.id);
+      if (own && own.expiresAt > now()) return canonical;
     }
-    return canonical;
+    return stack.root;
   }
 
   async up(opts: UpOptions) {
@@ -3571,7 +3418,7 @@ export class Engine {
         try { files = readdirSync(dir); } catch { return; }
         const alive = refs.stackAlive(stackDir);
         const seen = new Map<string, number>();
-        const ordered = files.filter((f) => !f.startsWith('.') && !f.endsWith('.retirement.json'))
+        const ordered = files.filter((f) => !f.startsWith('.'))
           .map((f) => ({ f, m: (() => { try { return statSync(join(dir, f)).mtimeMs; } catch { return 0; } })() }))
           .sort((a, b) => b.m - a.m);
         for (const { f } of ordered) {
@@ -3582,7 +3429,7 @@ export class Engine {
           if (f.endsWith('.baked')) {
             try { ns = parseBakedMarker(readFileSync(join(dir, f), 'utf8')).ns; } catch { ns = undefined; }
           }
-          const keep = (alive && rank < Math.max(1, policy().templatesKeep)) || refs.referenced.has(`${stackDir}/${f}`) || existsSync(join(dir, '.retired-stack.json'));
+          const keep = (alive && rank < Math.max(1, policy().templatesKeep)) || refs.referenced.has(`${stackDir}/${f}`);
           if (keep) {
             if (ns) markerNs.add(ns);
             continue;
@@ -3685,7 +3532,7 @@ export class Engine {
       const orphans = tagged.filter((p) => !live.has(p.envId) && !leasedPreviews.has(p.pid));
       for (const o of orphans) findings.push({ kind: 'process', what: `pid ${o.pid}`, detail: `'${o.service}' of ${envIds.has(o.envId) ? 'environment' : 'gone environment'} ${o.envId}, tagged with this state root` });
       if (fix && orphans.length > 0) {
-        const gc = await this.poolGc(false);
+        const gc = await this.poolGc();
         const reclaimed = new Set(gc.reclaimed.map((r) => r.pid));
         for (const f of findings) if (f.kind === 'process') f.fixed = reclaimed.has(Number(f.what.slice(4)));
       }
@@ -4933,7 +4780,7 @@ export class Engine {
     if (t - this.lastGc > Number(process.env.BACKLOT_GC_MS ?? 60_000)) {
       this.lastGc = t;
       try {
-        await this.poolGc(false);
+        await this.poolGc();
       } catch {
         /* best-effort */
       }
@@ -4943,15 +4790,7 @@ export class Engine {
     if (t - this.lastRetention > Number(process.env.BACKLOT_RETENTION_MS ?? 10 * 60_000)) {
       this.lastRetention = t;
       try {
-        const protectedStacks = new Set<string>();
-        for (const env of this.journal.allEnvs()) {
-          try {
-            const stack = loadStack(env.stackRoot);
-            this.adoptLegacyAliases(stack);
-            if (this.journal.getEnv(env.id)?.stack !== stack.id) protectedStacks.add(env.stack);
-          } catch { protectedStacks.add(env.stack); }
-        }
-        await retentionSweep(this.journal, policy(), protectedStacks);
+        await retentionSweep(this.journal, policy());
       } catch {
         /* best-effort */
       }
@@ -5055,8 +4894,7 @@ export class Engine {
       } else {
         try {
           const current = loadStack(env.stackRoot);
-          if (this.legacyAlias(env, current)) this.adoptLegacyAliases(current);
-          else if (current.id !== env.stack) orphanReason = `its worktree ${env.stackRoot} now resolves to '${current.id}', not '${env.stack}'`;
+          if (current.id !== env.stack) orphanReason = `its worktree ${env.stackRoot} now resolves to '${current.id}', not '${env.stack}'`;
         } catch {
           /* unreadable manifest — ambiguous, leave the env alone */
         }
@@ -5089,9 +4927,6 @@ export class Engine {
       await this.stopIdleServices(env);
     }
     await this.drainSurplusEnvs();
-    // Maintenance runs after ownership/expiry/reaping and does at most one
-    // bounded external drop per sweep. Recovery never waits for it.
-    await this.retireLegacyTemplateBatch();
   }
 
   async shutdown(): Promise<void> {

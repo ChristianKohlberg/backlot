@@ -23,12 +23,12 @@ import {
   writeFileSync,
   constants as fsConstants,
 } from 'node:fs';
-import { basename, dirname, join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { connect } from 'node:net';
 import { templatesRoot } from '../core/paths.js';
 import { recordNamespace } from '../core/namespaces.js';
 import { sha256, template, BrokerError } from '../core/util.js';
-import { runBounded, cmdTimeoutS, DEFAULT_CMD_TIMEOUT_S } from '../core/exec.js';
+import { runBounded, DEFAULT_CMD_TIMEOUT_S } from '../core/exec.js';
 import { defaultPreset, type DatastoreSpec } from '../core/manifest.js';
 import { logEvent } from '../core/events.js';
 
@@ -183,20 +183,6 @@ export function withTemplateRead<T>(key: string, fn: () => Promise<T>): Promise<
   return withTemplateLock(key, false, fn);
 }
 
-/** Run `fn` under the exclusive lock only if nobody holds or waits for it. */
-export function tryWithBakeLock(key: string, fn: () => void): boolean {
-  if (templateLocks.has(key)) return false;
-  const l = lockOf(key);
-  l.writer = true;
-  try {
-    fn();
-    return true;
-  } finally {
-    l.writer = false;
-    pump(key, l);
-  }
-}
-
 /**
  * Baked-template markers are self-describing (vetbill-1i49): they carry the
  * server-side template ns AND the already-templated drop command, so
@@ -225,10 +211,7 @@ export function parseBakedMarker(content: string): BakedMarker {
 
 export function hasOtherTemplateOwner(full: string, ns: string): boolean {
   if (!ns) return true;
-  const parent = dirname(dirname(full));
-  const roots = ['templates', 'retired-templates'].includes(basename(parent))
-    ? [join(dirname(parent), 'templates'), join(dirname(parent), 'retired-templates')]
-    : [parent];
+  const roots = [dirname(dirname(full))];
   try {
     for (const root of roots) {
       let entries;
@@ -250,86 +233,6 @@ export function hasOtherTemplateOwner(full: string, ns: string): boolean {
     }
   } catch { return true; }
   return false;
-}
-
-/** Drop every marker's server-side template DB in `dir`, best-effort. */
-export async function dropBakedTemplates(dir: string, cwd: string): Promise<number> {
-  let dropped = 0;
-  let entries: string[] = [];
-  try {
-    entries = readdirSync(dir);
-  } catch {
-    return 0;
-  }
-  for (const f of entries) {
-    if (!f.endsWith('.baked')) continue;
-    try {
-      const marker = parseBakedMarker(readFileSync(join(dir, f), 'utf8'));
-      if (marker.drop) {
-        await shQuiet(marker.drop, cwd);
-        dropped++;
-      }
-    } catch {
-      /* unreadable marker — file prune below still applies */
-    }
-  }
-  return dropped;
-}
-
-/**
- * Retire the markers in `dir`: a server-side template is dropped and its
- * marker removed only when the drop command actually succeeded, so a marker
- * whose appliance is unreachable stays behind for a later attempt instead of
- * leaking its database. Legacy bare-string markers have nothing to drop.
- */
-export async function retireBakedTemplates(dir: string, cwd: string, force = false): Promise<{ dropped: number; deferred: number; attempted: number }> {
-  let dropped = 0;
-  let deferred = 0;
-  let attempted = 0;
-  let entries: string[] = [];
-  try { entries = readdirSync(dir); } catch { return { dropped, deferred, attempted }; }
-  for (const f of entries) {
-    if (!f.endsWith('.baked')) continue;
-    const full = join(dir, f);
-    const failurePath = `${full}.retirement.json`;
-    let attempts = 0;
-    let nextAttemptAt = 0;
-    try {
-      const saved = JSON.parse(readFileSync(failurePath, 'utf8'));
-      attempts = Number(saved.attempts) || 0;
-      nextAttemptAt = Number(saved.nextAttemptAt) || 0;
-    } catch { /* first attempt */ }
-    if (!force && (attempts >= 3 || nextAttemptAt > Date.now())) { deferred++; continue; }
-    // One external command per batch bounds maintenance latency independently
-    // of how many retired markers a stack accumulated.
-    if (attempted > 0) { deferred++; continue; }
-    let drop: string | null = null;
-    try {
-      const marker = parseBakedMarker(readFileSync(full, 'utf8'));
-      if (hasOtherTemplateOwner(full, marker.ns)) { deferred++; continue; }
-      drop = marker.drop;
-    }
-    catch { deferred++; continue; }
-    attempted++;
-    if (drop) {
-      const r = await runBounded(drop, cwd, Math.min(2, cmdTimeoutS()));
-      if (r.code !== 0 || r.timedOut) {
-        attempts++;
-        writeFileSync(failurePath, JSON.stringify({
-          attempts,
-          nextAttemptAt: Date.now() + Math.min(3600000, 60000 * 2 ** Math.min(attempts - 1, 6)),
-          state: attempts >= 3 ? 'needs-attention' : 'retry-pending',
-          message: 'Drop unconfirmed; marker retained. Check the appliance and retry with runly pool gc.',
-        }));
-        deferred++;
-        continue;
-      }
-      dropped++;
-    }
-    rmSync(full, { force: true });
-    rmSync(failurePath, { force: true });
-  }
-  return { dropped, deferred, attempted };
 }
 
 // ---------------------------------------------------------------- sqlite

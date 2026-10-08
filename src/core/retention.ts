@@ -5,7 +5,7 @@
  */
 import { readdirSync, statSync, rmSync, readFileSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
-import { artifactsRoot, templatesRoot, envsRoot, worktreesRoot } from './paths.js';
+import { templatesRoot, envsRoot, worktreesRoot } from './paths.js';
 import { logEvent } from './events.js';
 import { runQuiet } from './util.js';
 import { rotateIfOver } from './logs.js';
@@ -21,17 +21,6 @@ const entriesOf = (dir: string): string[] => {
     return [];
   }
 };
-
-/**
- * Check artifacts are gone with `runly run` (decision 0032); an older runly
- * left them under the state root. Nothing reads them any more, so the whole
- * directory goes.
- */
-export function pruneArtifacts(root = artifactsRoot()): number {
-  const n = entriesOf(root).length;
-  if (n > 0 || existsSync(root)) rmSync(root, { recursive: true, force: true });
-  return n;
-}
 
 /**
  * Service logs past the cap are rotated once (decision 0038): `<name>.log`
@@ -83,7 +72,6 @@ const templateGroup = (file: string): string => {
 export async function pruneTemplates(
   p: Pick<Policy, 'templatesKeep'> & Partial<Pick<Policy, 'templateGraceMs'>>,
   root = templatesRoot(),
-  protectedStacks: ReadonlySet<string> = new Set(),
   refs: TemplateRefs = { referenced: new Set(), stackAlive: () => true },
 ): Promise<number> {
   let pruned = 0;
@@ -95,11 +83,10 @@ export async function pruneTemplates(
     // the one remaining writer mutating this dir outside it, reopening the
     // deleted-mid-restore race the lock exists to close.
     pruned += await withBakeLock(stackDir, async () => {
-      if (protectedStacks.has(stackDir) || existsSync(join(dir, '.retired-stack.json'))) return 0;
       const keep = refs.stackAlive(stackDir) ? p.templatesKeep : 0;
       let count = 0;
       const files = entriesOf(dir)
-        .filter((f) => !f.startsWith('.') && !f.endsWith('.retirement.json'))
+        .filter((f) => !f.startsWith('.'))
         .map((f) => {
           try {
             return { f, mtime: statSync(join(dir, f)).mtimeMs };
@@ -212,13 +199,11 @@ export function templateRefs(journal: Journal, root = worktreesRoot()): Template
 export async function retentionSweep(
   journal: Journal,
   p: Policy,
-  protectedStacks: ReadonlySet<string> = new Set(),
-): Promise<{ artifacts: number; logs: number; templates: number; worktrees: number }> {
+): Promise<{ logs: number; templates: number; worktrees: number }> {
   // Templates first: they read the worktree records pruneWorktreeState removes.
-  const templates = await pruneTemplates(p, templatesRoot(), protectedStacks, templateRefs(journal));
+  const templates = await pruneTemplates(p, templatesRoot(), templateRefs(journal));
   return {
     worktrees: pruneWorktreeState(journal),
-    artifacts: pruneArtifacts(),
     logs: truncateLogs(p),
     templates,
   };

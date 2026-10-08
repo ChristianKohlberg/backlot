@@ -82,10 +82,10 @@ describe('templates are collected by reference (decision 0037)', () => {
     at('main-demo@e.db', 400);  // current of ANOTHER preset: stays however old
     at('audit-dev@f.db', 500);  // current of another datastore: stays
     const refs = { referenced: new Set(['stk/main-dev@a.db']), stackAlive: () => true };
-    expect(await pruneTemplates({ templatesKeep: 1, templateGraceMs: 60 * 60_000 }, root, new Set(), refs)).toBe(1);
+    expect(await pruneTemplates({ templatesKeep: 1, templateGraceMs: 60 * 60_000 }, root, refs)).toBe(1);
     expect(readdirSync(dir).sort()).toEqual(['audit-dev@f.db', 'main-demo@e.db', 'main-dev@a.db', 'main-dev@c.db', 'main-dev@d.db']);
     // With no grace, the inside-grace one goes too; the referenced one never does.
-    expect(await pruneTemplates({ templatesKeep: 1, templateGraceMs: 0 }, root, new Set(), refs)).toBe(1);
+    expect(await pruneTemplates({ templatesKeep: 1, templateGraceMs: 0 }, root, refs)).toBe(1);
     expect(readdirSync(dir)).toContain('main-dev@a.db');
   });
 
@@ -94,7 +94,7 @@ describe('templates are collected by reference (decision 0037)', () => {
     at('main-dev@a.db', 300);
     at('main-dev@b.db', 200);
     const refs = { referenced: new Set<string>(), stackAlive: () => false };
-    expect(await pruneTemplates({ templatesKeep: 1, templateGraceMs: 60_000 }, root, new Set(), refs)).toBe(2);
+    expect(await pruneTemplates({ templatesKeep: 1, templateGraceMs: 60_000 }, root, refs)).toBe(2);
     expect(existsSync(join(root, 'stk'))).toBe(false);
   });
 });
