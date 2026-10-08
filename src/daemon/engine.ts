@@ -28,7 +28,7 @@ import { makeDatastore, parseBakedMarker, withBakeLock, type DsHandle } from '..
 import { ensureAppliance, stopAppliance, probeTcp } from '../drivers/appliances.js';
 import { DEFAULT_PREVIEW_PUBLISHER, resolvePreviewPublisher } from '../drivers/preview.js';
 import { EnvSupervisor, killGroupVerified, killPidVerified, reapPids, mergeServicePids, serviceGroups, type ServiceExit } from './supervisor.js';
-import { groupAlive, isAlive, processGroup, procScanSupported, sameProcess, scanByCwd, scanDbCopy, scanTagged, serviceTag, startTime, type TaggedProc } from '../core/procscan.js';
+import { EXEC_SERVICE, groupAlive, isAlive, processGroup, procScanSupported, sameProcess, scanByCwd, scanDbCopy, scanTagged, serviceTag, startTime, type TaggedProc } from '../core/procscan.js';
 import { policy } from '../core/policy.js';
 import { kernelSleepGap, readKernelSleepRecord } from '../core/sleep.js';
 import { retentionSweep, templateRefs } from '../core/retention.js';
@@ -2519,8 +2519,8 @@ export class Engine {
       await this.resumeForVerb(this.assertUsable(env.id, { resumable: true }), 'exec');
       this.touch(env.id);
     }, undefined, 'an exec');
-    // Tagged like a service, so `pool gc` can tell an exec's orphans from a stranger's.
-    return { envId: env.id, root: stack.root, vars: { ...vars, ...serviceTag(env.id, 'exec', stateRoot()) } };
+    // Tagged, so a process listing can tell an exec from a stranger; never reaped (procscan.scanTagged).
+    return { envId: env.id, root: stack.root, vars: { ...vars, ...serviceTag(env.id, EXEC_SERVICE, stateRoot()) } };
   }
 
   /** A running `runly exec` is activity (decision 0039): the CLI calls this while the command runs. */
@@ -5044,6 +5044,24 @@ export class Engine {
         await this.recycleOne(env.id, false);
         continue;
       }
+      // Unleased and idle past BACKLOT_UNLEASED_TTL (0.19, default 24h): the
+      // environment goes — services, data, ports — so a worktree nobody came
+      // back to stops holding a database. Its templates and the worktree's
+      // records (upkeep ledger, build ledger) stay: the next `up` there
+      // restores from a template and skips fresh upkeep.
+      const unleasedTtl = policy().unleasedTtlMs;
+      if (Number.isFinite(unleasedTtl) && !this.journal.leaseForEnv(env.id) && now() - this.envActivityAt(env) > unleasedTtl) {
+        const outcome = await this.recycleOne(env.id, false);
+        logEvent({
+          level: outcome === 'recycled' ? 'info' : 'warn',
+          kind: 'retention',
+          envId: env.id,
+          detail: outcome === 'recycled'
+            ? `unleased and unused for ${formatDuration(now() - this.envActivityAt(env))} (BACKLOT_UNLEASED_TTL ${formatDuration(unleasedTtl)}) — torn down; templates and worktree records kept`
+            : `unleased past BACKLOT_UNLEASED_TTL, but the teardown did not complete (${outcome}) — retried by the next sweep`,
+        });
+        if (outcome === 'recycled') continue;
+      }
       // Idle (decision 0035): each running service on its own clock — the
       // last client byte through its public port, the last runly verb on the
       // environment, its own start. Readiness probes bypass the proxy and
@@ -5084,10 +5102,8 @@ export class Engine {
       // that — never an assumption — is what the next daemon life inherits.
       const recorded = mergeServicePids(env.servicePids, survivors.get(env.id));
       // …except an in-flight operation, which is never interrupted — the rule
-      // claimForTeardown, the sweeper and pool gc all already keep. An `exec`
-      // runs DETACHED so it can outlive the daemon, and it carries this env's
-      // tag, so the tag scan inside reapEnvProcesses would kill the very
-      // process the caller is still waiting on.
+      // claimForTeardown, the sweeper and pool gc all already keep. (An
+      // `exec` is the CLI's own child since 0.19 and is never reaped.)
       const unreaped = this.busy.has(env.id) ? recorded : await this.reapEnvProcesses(env, recorded);
       const fresh = this.journal.getEnv(env.id);
       if (!fresh) continue; // recycled underneath us — nothing to write back
