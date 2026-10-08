@@ -54,6 +54,17 @@ const serviceIdleMs = (spec: ServiceSpec | undefined): number => parseDuration(s
 /** Streamed bind phases → human progress on stderr (never on the --json stdout). */
 export type Progress = (phase: string) => void;
 
+/**
+ * The build decisions one operation already made (0.19): `needFor` decides
+ * every build to price it, and the build phase of the SAME operation reuses
+ * those decisions instead of listing and stat'ing every `when:` file again.
+ * Valid only while runly has changed nothing in the worktree since: an
+ * upkeep rule that ran, or a build that finished (it may have written another
+ * build's inputs), clears it; so does a wait of more than DECISION_TTL_MS.
+ */
+type BuildDecisions = Map<string, { cmd: string; run: boolean; key: string; reason?: string; at: number }>;
+const DECISION_TTL_MS = 30_000;
+
 /** What one claim attempt found: an environment to bind, or nothing (capacity, or not this caller's turn). */
 type ClaimOutcome = { env: EnvRow; fresh: boolean } | null;
 
@@ -1184,14 +1195,15 @@ export class Engine {
     const base = freshClaim ? running : new Set([...this.desiredServices(stack, live), ...running]);
     const added = requestedServices === undefined ? new Set<string>() : this.resolveServiceClosure(stack, requestedServices);
     const active = new Set([...base, ...added].filter((n) => n in stack.manifest.services));
-    const need = await this.needFor(stack, live, new Set([...active].filter((n) => !running.has(n))), active, { rebuild: rebuild || hygiene === 'pristine', mode: 'bind' });
+    const decided: BuildDecisions = new Map();
+    const need = await this.needFor(stack, live, new Set([...active].filter((n) => !running.has(n))), active, { rebuild: rebuild || hygiene === 'pristine', mode: 'bind' }, decided);
     const reservation = await this.budget.admit(need, `up ${stack.manifest.name} (${live.id})`, {
       onWait: (position, etaMs, why) => say(`waiting for the load budget: position ${position}, about ${formatDuration(etaMs)} — ${why}`),
       source: 'budget',
       signal,
     });
     try {
-      return await this.bindAndStartInner(stack, envSnapshot, hygiene, onProgress, requestedServices, freshClaim, callerEnv, requestedPresets, rebuild, reservation);
+      return await this.bindAndStartInner(stack, envSnapshot, hygiene, onProgress, requestedServices, freshClaim, callerEnv, requestedPresets, rebuild, reservation, decided);
     } finally {
       reservation.release();
       // A public port marked `starting` whose service never became ready (a
@@ -1201,7 +1213,7 @@ export class Engine {
     }
   }
 
-  private async bindAndStartInner(stack: Stack, envSnapshot: EnvRow, hygiene: Hygiene, onProgress: Progress | undefined, requestedServices: string[] | undefined, freshClaim: boolean, callerEnv: unknown, requestedPresets: unknown, rebuild: boolean, reservation: Reservation): Promise<{ env: EnvRow; previewNotice?: string; bindDiagnostics: BindDiagnostics }> {
+  private async bindAndStartInner(stack: Stack, envSnapshot: EnvRow, hygiene: Hygiene, onProgress: Progress | undefined, requestedServices: string[] | undefined, freshClaim: boolean, callerEnv: unknown, requestedPresets: unknown, rebuild: boolean, reservation: Reservation, decided: BuildDecisions = new Map()): Promise<{ env: EnvRow; previewNotice?: string; bindDiagnostics: BindDiagnostics }> {
     const say = onProgress ?? (() => undefined);
     const trace = new BindTrace();
     // Re-read under the env lock: the snapshot captured during acquire may be
@@ -1324,6 +1336,8 @@ export class Engine {
       return { upkeep: out, files: triggers };
     }, waitTree);
     trace.result.upkeep = { ran: upkeep.ran.length, skipped: (stack.manifest.upkeep?.length ?? 0) - upkeep.ran.length };
+    // An upkeep rule that ran may have changed a build's inputs.
+    if (upkeep.ran.length > 0 || hygiene === 'pristine') decided.clear();
     // Content-derived template identity (vetbill-1i49): divergent
     // migrations/seeds in this worktree yield a different bake key and thus a
     // disjoint template name — two stacks can no longer silently share a
@@ -1396,13 +1410,15 @@ export class Engine {
         const spec = serviceOf(stack, name);
         // A service this `up` adds is built and started; nothing to compare.
         if (!running.has(name)) {
-          const b = await this.buildService(stack, env, name, spec, buildCtx, say, { rebuild, mode: 'bind' });
+          const b = await this.buildService(stack, env, name, spec, buildCtx, say, { rebuild, mode: 'bind', decided });
           trace.result.builds.push({ service: name, durationMs: b.durationMs, restart: false, reason: b.ran ? 'not-running' : 'when-unchanged' });
           return;
         }
         const declared = outputsOf(spec);
-        const before = declared.paths.length > 0 ? await snapshotOutputs(stack.root, declared.paths, declared.compare) : null;
-        const b = await this.buildService(stack, env, name, spec, buildCtx, say, { rebuild, mode: 'bind' });
+        // A build that will be skipped changes no outputs: no snapshot to take.
+        const due = await this.buildWillRun(stack, name, spec, buildCtx, { rebuild, mode: 'bind', decided });
+        const before = due && declared.paths.length > 0 ? await snapshotOutputs(stack.root, declared.paths, declared.compare) : null;
+        const b = await this.buildService(stack, env, name, spec, buildCtx, say, { rebuild, mode: 'bind', decided });
         if (!b.ran) {
           // Its inputs did not change, so its output did not either.
           trace.result.builds.push({ service: name, durationMs: b.durationMs, restart: false, reason: 'when-unchanged' });
@@ -1500,7 +1516,7 @@ export class Engine {
       const t0 = performance.now();
       try {
         await this.treeLocked(stack.id, () => this.inWaves(this.buildWaves(stack, active), async (name) => {
-          const b = await this.buildService(stack, env, name, serviceOf(stack, name), ctx, say, { rebuild, mode: 'bind' });
+          const b = await this.buildService(stack, env, name, serviceOf(stack, name), ctx, say, { rebuild, mode: 'bind', decided });
           trace.result.builds.push({ service: name, durationMs: b.durationMs, restart: true, reason: b.ran ? 'full-rebind' : 'when-unchanged' });
         }), waitTree);
       } finally {
@@ -1650,7 +1666,7 @@ export class Engine {
   }
 
   /** Build `names` (those that declare a build) in waves. MUST run under treeLocked. */
-  private runBuilds(stack: Stack, env: EnvRow | undefined, names: Iterable<string>, ctx: Record<string, unknown> | undefined, say: Progress, opts: { rebuild: boolean; mode: 'bind' | 'wake' | 'warm' }): Promise<void> {
+  private runBuilds(stack: Stack, env: EnvRow | undefined, names: Iterable<string>, ctx: Record<string, unknown> | undefined, say: Progress, opts: { rebuild: boolean; mode: 'bind' | 'wake' | 'warm'; decided?: BuildDecisions }): Promise<void> {
     return this.inWaves(this.buildWaves(stack, names), async (name) => {
       await this.buildService(stack, env, name, serviceOf(stack, name), ctx, say, opts);
     });
@@ -1695,7 +1711,15 @@ export class Engine {
    * string build always runs on a bind, and on a wake only when it never
    * succeeded here (a wake resumes what ran; `up` applies changes).
    */
-  private async buildDecision(stack: Stack, name: string, spec: ServiceSpec, cmd: string, opts: { rebuild: boolean; mode: 'bind' | 'wake' | 'warm' | 'plan' }): Promise<{ run: boolean; key: string; reason?: string }> {
+  private async buildDecision(stack: Stack, name: string, spec: ServiceSpec, cmd: string, opts: { rebuild: boolean; mode: 'bind' | 'wake' | 'warm' | 'plan'; decided?: BuildDecisions }): Promise<{ run: boolean; key: string; reason?: string }> {
+    const memo = opts.decided?.get(name);
+    if (memo && memo.cmd === cmd && now() - memo.at < DECISION_TTL_MS) return { run: memo.run, key: memo.key, ...(memo.reason ? { reason: memo.reason } : {}) };
+    const d = await this.decideBuild(stack, name, spec, cmd, opts);
+    opts.decided?.set(name, { cmd, ...d, at: now() });
+    return d;
+  }
+
+  private async decideBuild(stack: Stack, name: string, spec: ServiceSpec, cmd: string, opts: { rebuild: boolean; mode: 'bind' | 'wake' | 'warm' | 'plan' }): Promise<{ run: boolean; key: string; reason?: string }> {
     const b = buildOf(spec) ?? { run: cmd };
     const key = b.when ? await buildInputsKey(stack.root, stack.manifest, cmd, b.when) : sha256(`${cmd}\nalways`);
     if (opts.rebuild) return { run: true, key };
@@ -1712,7 +1736,7 @@ export class Engine {
   /** Build one service if its build is due; record a success. MUST run under treeLocked. */
   private async buildService(
     stack: Stack, env: EnvRow | undefined, name: string, spec: ServiceSpec, ctx: Record<string, unknown> | undefined, say: Progress,
-    opts: { rebuild: boolean; mode: 'bind' | 'wake' | 'warm' },
+    opts: { rebuild: boolean; mode: 'bind' | 'wake' | 'warm'; decided?: BuildDecisions },
   ): Promise<{ ran: boolean; durationMs: number }> {
     const b = buildOf(spec);
     if (!b) return { ran: false, durationMs: 0 };
@@ -1725,9 +1749,21 @@ export class Engine {
     const started = performance.now();
     // Dropped before it runs: a build that fails half-way vouches for nothing.
     forgetBuild(stack.id, stack.root, name);
-    await this.runServiceBuild(name, cmd, stack.root, say, env ? this.envDirs(env.id).logs : undefined);
+    try {
+      await this.runServiceBuild(name, cmd, stack.root, say, env ? this.envDirs(env.id).logs : undefined);
+    } finally {
+      // It may have written another build's inputs: later decisions are made afresh.
+      opts.decided?.clear();
+    }
     recordBuild(stack.id, stack.root, name, decision.key, await this.outputsPrint(stack, spec));
     return { ran: true, durationMs: performance.now() - started };
+  }
+
+  /** Would this service's build run now? (Recorded in `decided` for the build that follows.) */
+  private async buildWillRun(stack: Stack, name: string, spec: ServiceSpec, ctx: Record<string, unknown> | undefined, opts: { rebuild: boolean; mode: 'bind' | 'wake' | 'warm'; decided?: BuildDecisions }): Promise<boolean> {
+    const b = buildOf(spec);
+    if (!b) return false;
+    return (await this.buildDecision(stack, name, spec, ctx ? template(b.run, ctx) : b.run, opts)).run;
   }
 
   /**
@@ -1820,7 +1856,7 @@ export class Engine {
    * item by item: run resources per start, build resources per build that
    * will actually run, and run resources per appliance that is not up.
    */
-  private async needFor(stack: Stack, env: EnvRow | undefined, starts: Set<string>, builds: Set<string>, opts: { rebuild: boolean; mode: 'bind' | 'wake' | 'plan' }): Promise<Need> {
+  private async needFor(stack: Stack, env: EnvRow | undefined, starts: Set<string>, builds: Set<string>, opts: { rebuild: boolean; mode: 'bind' | 'wake' | 'plan' }, decided?: BuildDecisions): Promise<Need> {
     const b = policy().budget;
     const items: NeedItem[] = [];
     let ctx: Record<string, unknown> | undefined;
@@ -1840,7 +1876,7 @@ export class Engine {
         try {
           const raw = declaredBuild.run;
           const cmd = ctx ? template(raw, ctx) : raw;
-          const d = await this.buildDecision(stack, name, spec, cmd, { rebuild: opts.rebuild, mode: opts.mode === 'plan' ? 'bind' : opts.mode });
+          const d = await this.buildDecision(stack, name, spec, cmd, { rebuild: opts.rebuild, mode: opts.mode === 'plan' ? 'bind' : opts.mode, decided });
           if (!d.run) skipped = d.reason;
         } catch {
           /* an untemplatable line (no environment yet): it will run */
@@ -4563,7 +4599,8 @@ export class Engine {
     const running = new Set(Object.keys(sup.pids()));
     const values = this.leaseInputs.get(lease.id)?.values ?? selectCallerEnv(stack.manifest, {});
     requireCallerEnv(stack.manifest, closure, values);
-    const need = await this.needFor(stack, env, closure, closure, { rebuild: false, mode: 'wake' });
+    const decided: BuildDecisions = new Map();
+    const need = await this.needFor(stack, env, closure, closure, { rebuild: false, mode: 'wake' }, decided);
     // Resuming what ran a moment ago adds nothing the box did not just carry:
     // the CPU gate is skipped for it (the memory gates still apply).
     const recent = [...closure].every((n) => now() - (this.idleStoppedAt.get(`${env.id}\0${n}`) ?? -Infinity) < RECENT_RUN_MS);
@@ -4577,7 +4614,7 @@ export class Engine {
         await this.prepareDatastores(stack, env, bakeKeys, missing.map((n) => ({ name: n, force: false })), say);
       }
       const ctx = this.templateCtx(stack, env);
-      await this.treeLocked(stack.id, () => this.runBuilds(stack, env, closure, ctx, say, { rebuild: false, mode: 'wake' }));
+      await this.treeLocked(stack.id, () => this.runBuilds(stack, env, closure, ctx, say, { rebuild: false, mode: 'wake', decided }));
       reservation.releaseBuild();
       await this.startServices(stack, env, new Set([...running, ...closure]), closure, { values }, say, 'stop-these', reservation);
     } finally {

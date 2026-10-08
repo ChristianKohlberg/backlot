@@ -7,12 +7,12 @@
  * those files and nothing else (decision 0032). runly keeps no identity of the
  * rest of the worktree and no record of builds.
  */
-import { mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { cmdTimeoutS, runBounded } from './exec.js';
 import { existsSync } from 'node:fs';
 import { globToRegex, sha256, fileHash, BrokerError, commandFailure, safeJoin } from './util.js';
-import { enumerateSource } from './worktree.js';
+import { enumerateSource, enumerateSourceStats } from './worktree.js';
 import { upkeepOutputs, type Manifest } from './manifest.js';
 
 export interface UpkeepStep {
@@ -87,7 +87,11 @@ interface TriggerCacheEntry { hash: string; size: number; mtime: number }
 const RACY_WINDOW_MS = 2000;
 
 export async function triggerSet(root: string, manifest: Manifest, cacheDir?: string): Promise<TriggerSet> {
-  const files = await triggerFiles(root, manifest);
+  // The listing's own stat is the cache's check: one stat per trigger file.
+  const whens = (manifest.upkeep ?? []).map((rule) => rule.when);
+  const listed = whens.length === 0 ? [] : await enumerateSourceStats(root, manifest, whens);
+  const files = listed.map((f) => f.path);
+  const statOfListed = new Map(listed.map((f) => [f.path, f]));
   let cache: { writtenAt?: number; entries: Record<string, TriggerCacheEntry> } = { entries: {} };
   if (cacheDir) {
     try {
@@ -102,10 +106,8 @@ export async function triggerSet(root: string, manifest: Manifest, cacheDir?: st
   const hashes = new Map<string, string | null>();
   for (const rel of files) {
     const abs = join(root, rel);
-    let st: { size: number; mtimeMs: number };
-    try {
-      st = statSync(abs);
-    } catch {
+    const st = statOfListed.get(rel);
+    if (!st) {
       hashes.set(rel, null);
       continue;
     }

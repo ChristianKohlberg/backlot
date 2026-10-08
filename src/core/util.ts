@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { readFileSync, existsSync, statSync } from 'node:fs';
+import { readFileSync, statSync } from 'node:fs';
 import * as pathMod from 'node:path';
 import { cmdTimeoutS, runBounded } from './exec.js';
 
@@ -23,7 +23,10 @@ export const fileHash = (path: string): string | null => {
   }
 };
 
-export const isFile = (p: string): boolean => existsSync(p) && statSync(p).isFile();
+/** One stat, no throw: what a listing of tens of thousands of files can afford per file. */
+export const statOf = (p: string): import('node:fs').Stats | undefined => statSync(p, { throwIfNoEntry: false });
+
+export const isFile = (p: string): boolean => statOf(p)?.isFile() ?? false;
 
 /**
  * Minimal glob matcher for manifest patterns (caches, sync.include, outputs,
