@@ -584,6 +584,10 @@ async function main(): Promise<void> {
     case 'destroy':
       res = await rpc('destroy', { cwd }, progress);
       endProgress();
+      if (res.ok && !json) {
+        for (const line of destroyLines(res.data as DestroyData)) console.log(line);
+        return;
+      }
       break;
     case 'ps':
       res = await rpc('ps', { cwd, all: flags.has('--all') });
@@ -826,6 +830,10 @@ async function main(): Promise<void> {
     }
     case 'status':
       res = await rpc('status', {});
+      if (res.ok && !json) {
+        for (const line of statusLines(res.data as StatusData)) console.log(line);
+        return;
+      }
       break;
     case 'doctor':
       res = await rpc('doctor', { cliVersion: VERSION });
@@ -1049,6 +1057,7 @@ interface PsData {
   scope: string;
   services: Array<{ env: string; worktree?: string; service: string; state: string; publicPort: number | null; internalPort: number | null; pid: number | null; idleMs: number | null; idleStopInMs?: number | null; rssBytes: number | null; failure?: { detail: string; hint: string } | null }>;
   databases: DbCopy[];
+  failedUps?: Array<{ env: string; message: string; class: string | null; hint: string }>;
   budget?: { enabled: boolean; memoryBytes: number; cpu: number; committedMemoryBytes: number; committedCpu: number; waiting: number };
 }
 
@@ -1332,6 +1341,55 @@ function dbLines(copies: DbCopy[]): string[] {
   ]));
 }
 
+interface StatusData {
+  pid: number;
+  supervisor: string;
+  envs: Array<{ id: string; state: string; worktree: string; summary: string; idleMs: number; lease: { holder: string; expiresAt: number; holderPid?: number } | null }>;
+  poolMaxTotal: number;
+  ports: { conflicts: string[] };
+  budget: { enabled: boolean; memoryBytes: number; cpu: number; committedMemoryBytes: number; committedCpu: number; waiting: number };
+  events: Array<{ at: number; level: string; kind?: string; envId?: string; detail?: string }>;
+}
+
+/** The plain `status` (0.19): the daemon, each environment in a line, the budget, recent warnings. `--json` is the full blob. */
+function statusLines(d: StatusData): string[] {
+  const out = [`runly daemon pid ${d.pid} (${d.supervisor === 'autospawn' ? 'autospawned' : `under ${d.supervisor}`}), ${d.envs.length} of at most ${d.poolMaxTotal} environment(s)`];
+  if (d.envs.length) {
+    out.push('');
+    out.push(...table(['ENV', 'STATE', 'IDLE', 'WORKTREE', 'SUMMARY'], d.envs.map((e) => [e.id, e.state, ago(e.idleMs), e.worktree, e.summary])));
+  }
+  if (d.budget.enabled) {
+    out.push('');
+    out.push(`budget: ${formatSize(d.budget.committedMemoryBytes)} of ${formatSize(d.budget.memoryBytes)}, ${Math.round(d.budget.committedCpu * 10) / 10} of ${d.budget.cpu} cpu committed${d.budget.waiting ? `; ${d.budget.waiting} waiting` : ''}`);
+  }
+  for (const c of d.ports.conflicts) out.push(`port conflict: ${c}`);
+  const notable = d.events.filter((e) => e.level === 'warn' || e.level === 'error').slice(-5);
+  if (notable.length) {
+    out.push('');
+    out.push('recent warnings:');
+    for (const e of notable) out.push(`  ${ago(Date.now() - e.at)} ago ${e.level}${e.envId ? ` ${e.envId}` : ''}: ${e.detail ?? e.kind ?? ''}`);
+  }
+  out.push(`'runly status --json' for everything`);
+  return out;
+}
+
+interface DestroyData {
+  worktree: string;
+  environments: string[];
+  copies: string[];
+  copiesNotDropped: Array<string | { name: string; error?: string }>;
+  upkeepForgotten: number;
+}
+
+/** The plain `destroy` (0.19): what went, what could not. */
+function destroyLines(d: DestroyData): string[] {
+  const out = [d.environments.length ? `destroyed ${d.environments.join(', ')} (services, data, ports, lease)` : `no environment for ${d.worktree}`];
+  if (d.copies.length) out.push(`dropped database copies: ${d.copies.join(', ')}`);
+  for (const c of d.copiesNotDropped) out.push(`could not drop ${typeof c === 'string' ? c : `${c.name}${c.error ? `: ${c.error}` : ''}`} — 'runly pool doctor' lists it`);
+  if (d.upkeepForgotten) out.push(`forgot ${d.upkeepForgotten} upkeep rule(s) with no outputs: the next 'up' runs them again`);
+  return out;
+}
+
 function psLines(d: PsData, all: boolean): string[] {
   const out: string[] = [];
   if (d.services.length === 0) {
@@ -1345,8 +1403,9 @@ function psLines(d: PsData, all: boolean): string[] {
     ])));
     // A failed service says how it ended and where to look (decision 0039).
     for (const s of d.services) if (s.failure) out.push(`${s.service} ${s.failure.detail} — '${s.failure.hint}' shows why; the next 'runly up' retries it`);
+    for (const f of d.failedUps ?? []) out.push(`${f.env}: the last 'runly up' failed${f.class ? ` [${f.class}]` : ''}: ${f.message} — ${f.hint}`);
     const running = d.services.filter((s) => s.state === 'running' || s.state === 'starting').length;
-    if (running === 0) out.push(`nothing is running — ${d.services.length} service(s) idle, stopped or down; the next 'runly up' or connection starts what is wanted`);
+    if (running === 0 && (d.failedUps ?? []).length === 0) out.push(`nothing is running — ${d.services.length} service(s) idle, stopped or down; the next 'runly up' or connection starts what is wanted`);
   }
   if (d.budget?.enabled) {
     out.push('');
@@ -1372,6 +1431,7 @@ interface CtxView {
   previewUrls?: Record<string, string>;
   previewNotice?: string;
   bindDiagnostics?: { durationMs?: number; reuse?: string; started?: string[]; restarted?: string[]; reasons?: string[] };
+  lastUpFailed?: { message: string; class: string | null; hint: string } | null;
 }
 
 /** A full-rebind reason code (bindDiagnostics.reasons) in words. */
@@ -1407,7 +1467,8 @@ function ctxSummary(c: CtxView, verb: 'up' | 'ctx'): string[] {
     : '';
   out.push(`${c.stack} ${c.envId} ${c.state}${how}${until}`);
   // Why everything was stopped and started again (a full rebind), in words.
-  const why = verb === 'up' && d && (d.reuse === 'rebound' || !d.reuse) ? (d.reasons ?? []).map(rebindReason) : [];
+  // A new environment's first bind needs no explaining.
+  const why = verb === 'up' && d && (d.reuse === 'rebound' || !d.reuse) && !d.reasons?.includes('new-environment') ? (d.reasons ?? []).map(rebindReason) : [];
   if (why.length) out.push(`  full rebind: ${why.join('; ')}`);
   const names = Object.keys(c.services ?? c.urls ?? {});
   const width = Math.max(0, ...names.map((n) => n.length));
@@ -1417,6 +1478,7 @@ function ctxSummary(c: CtxView, verb: 'up' | 'ctx'): string[] {
     out.push(`  ${n.padEnd(width)}  ${state.padEnd(7)}  ${url}${c.previewUrls?.[n] ? `  (preview ${c.previewUrls[n]})` : ''}`.trimEnd());
   }
   for (const [n, f] of Object.entries(c.failures ?? {})) out.push(`  ${n} ${f.detail} — '${f.hint}' shows why; the next 'runly up' retries it`);
+  if (c.lastUpFailed) out.push(`  the last 'runly up' failed${c.lastUpFailed.class ? ` [${c.lastUpFailed.class}]` : ''}: ${c.lastUpFailed.message} — ${c.lastUpFailed.hint}`);
   for (const [n, ds] of Object.entries(c.datastores ?? {})) out.push(`  datastore ${n}: ${ds.url}${ds.preset ? ` (${ds.preset})` : ''}`);
   if (c.logins) out.push(`  login: ${c.logins.user} / ${c.logins.password}`);
   out.push(`  'runly ctx --env' for shell exports, --json for everything`);

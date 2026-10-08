@@ -12,13 +12,21 @@ export interface BindDiagnostics {
   reuse: 'reused' | 'restarted' | 'rebound';
   /**
    * The running services an `up` restarted: their build output changed, or
-   * they use a datastore this operation reloaded (decision 0034).
+   * they use a datastore this operation reloaded (decision 0034); on a full
+   * rebind, every one that was running (0.19).
    */
   restarted: string[];
-  /** Services this `up` added to the ones already running (decision 0034: `up` is additive). */
+  /** Services this `up` added to the ones already running (decision 0034: `up` is additive); on a full rebind, the ones not running before it (0.19). */
   started: string[];
   /** Datastores reloaded from their template because the caller named a preset for them (decision 0034). */
   reloaded: string[];
+  /**
+   * Why the full path ran (empty when it did not): `new-environment` (its
+   * first bind), `upkeep-required`, `environment-not-running`,
+   * `service-process-unhealthy`, `environment-inputs-changed`,
+   * `manifest-changed`, `hygiene-<reset-data|pristine>`, `public-port-moved`.
+   * The plain `up` summary prints them in words (0.19).
+   */
   reasons: string[];
   upkeep: { ran: number; skipped: number };
   /**

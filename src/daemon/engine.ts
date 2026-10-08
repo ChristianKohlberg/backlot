@@ -222,6 +222,8 @@ export class Engine {
   /** When each running service process was started — a fresh start is activity. */
   private startedAt = new Map<string, number>();
   /** Services stopped for idleness (ps shows them as `idle`). */
+  /** The last failed `up` per environment (0.19), for ctx and ps; cleared by a successful one. */
+  private readonly bindFailures = new Map<string, { at: number; class: string; message: string; source: string | null }>();
   private idleStopped = new Set<string>();
   /**
    * Services of a LEASED environment that crash-looped and were stopped
@@ -1397,6 +1399,8 @@ export class Engine {
     // A different set of services and a different preset are no longer reasons
     // for the full path: `up` is additive, and a preset reloads one datastore.
     const missing = [...active].filter((n) => !running.has(n));
+    // Its first bind: every other reason below is then a matter of course.
+    if (env.bindCount === 0) trace.result.reasons.push('new-environment');
     if (upkeep.ran.length > 0) trace.result.reasons.push('upkeep-required');
     if (env.state !== 'hot') trace.result.reasons.push('environment-not-running');
     if (!this.supervisor(env).allHealthyPids()) trace.result.reasons.push('service-process-unhealthy');
@@ -1614,6 +1618,7 @@ export class Engine {
     this.appliedInputSpecs.set(env.id, inputSpec);
     this.appliedManifests.set(env.id, manifestKey);
     env.failStreak = 0; // a successful bind clears the escalation counter
+    this.bindFailures.delete(env.id);
     this.journal.saveEnv(env);
     return {
       env,
@@ -2137,6 +2142,14 @@ export class Engine {
       if (fresh && !notABindFailure) {
         fresh.failStreak += 1;
         this.journal.saveEnv(fresh);
+        // ctx and ps say so (0.19): a first `up` that failed left an
+        // environment whose services read as merely "stopped".
+        this.bindFailures.set(env.id, {
+          at: now(),
+          class: err instanceof BrokerError ? err.klass : 'infra-error',
+          message: String((err as Error).message ?? err),
+          source: err instanceof BrokerError ? (err.source ?? null) : null,
+        });
       }
       throw err;
     }
@@ -2218,6 +2231,8 @@ export class Engine {
       services: this.serviceStates(stack, env),
       /** Services that crash-looped and were stopped (decision 0039), with their last exit; the next `up` retries them. */
       failures: this.serviceFailures(stack, env),
+      /** The last `up` failed and none succeeded since (0.19): what failed; null otherwise. */
+      lastUpFailed: this.bindFailureOf(env),
       /**
        * `logins` stays the PRIMARY login even for a stack that declares a list, so
        * a consumer reading `ctx.logins.user` is unaffected by the manifest growing
@@ -2258,6 +2273,21 @@ export class Engine {
       n,
       running.has(n) ? 'running' : !wanted.has(n) ? 'down' : this.failureOf(env.id, n) ? 'failed' : 'stopped',
     ]));
+  }
+
+  /**
+   * The last `up` of `env`, when it failed and none has succeeded since
+   * (0.19): what failed, and that `up` redoes it — neither a connection nor a
+   * verb starts its services meanwhile. After a daemon restart only the fact
+   * survives (the journal's fail streak), not the message.
+   */
+  private bindFailureOf(env: EnvRow): { at: number | null; class: string | null; message: string; source: string | null; hint: string } | null {
+    if ((env.failStreak ?? 0) === 0) return null;
+    const f = this.bindFailures.get(env.id);
+    const hint = `the next 'runly up' redoes it; until then nothing starts its services`;
+    return f
+      ? { ...f, hint }
+      : { at: null, class: null, message: `the last 'runly up' failed (before the daemon restarted)`, source: null, hint };
   }
 
   /** The failed services of `env` (decision 0039): how each last ended, and the log to read. */
@@ -3290,8 +3320,11 @@ export class Engine {
     const root = all ? undefined : this.callerWorktree(cwd);
     const rss = this.rssByService();
     const services: Array<Record<string, unknown>> = [];
+    const failedUps: Array<Record<string, unknown>> = [];
     for (const env of this.journal.allEnvs()) {
       if (root !== undefined && env.stackRoot !== root) continue;
+      const failedUp = this.bindFailureOf(env);
+      if (failedUp) failedUps.push({ env: env.id, worktree: env.stackRoot, ...failedUp });
       let stack: Stack | undefined;
       try { stack = loadStack(env.stackRoot); } catch { stack = undefined; }
       const pids = this.supervisors.get(env.id)?.pids() ?? {};
@@ -3342,6 +3375,8 @@ export class Engine {
     const b = policy().budget;
     return {
       scope: root ?? 'server', services, databases,
+      /** Environments whose last `up` failed (0.19), with what failed. */
+      failedUps,
       /** The server-wide load budget (decision 0036). */
       budget: { enabled: b.enabled, memoryBytes: b.memoryBytes, cpu: b.cpu, committedMemoryBytes: committed.memoryBytes, committedCpu: committed.cpu, waiting: this.budget.queueLength() },
     };
