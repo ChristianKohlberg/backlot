@@ -18,7 +18,7 @@ import { clearTreeLedger, forgetRulesWithoutOutputs, pickEnvKeys, pickTreeKeys, 
 import { defaultPresetFor, presetToRestore, validatePresetRequest } from '../core/presets.js';
 import { ruleKey, runUpkeep, templateBakeKeys, triggerSet, type UpkeepStep } from '../core/upkeep.js';
 import { allocateInBlock, blockConflicts, ephemeralRange, inBlock, internalBlock, publicBlock, tunnelBlock } from '../core/ports.js';
-import { HOLD_MS, PortInUse, ProxyHub } from './proxy.js';
+import { HOLD_MS, PortInUse, ProxyHub, replayCarriedBytes } from './proxy.js';
 import { connect as netConnect } from 'node:net';
 import { dbCopiesRoot, envsRoot, stateRoot, templatesRoot, worktreesRoot } from '../core/paths.js';
 import { BrokerError, commandFailure, template, templateEnv, now, sha256, shortId } from '../core/util.js';
@@ -3737,6 +3737,8 @@ export class Engine {
       envs, poolMaxTotal: POOL_MAX_TOTAL(), ports,
       /** The server-wide load budget (decision 0036). */
       budget: { ...b, committedMemoryBytes: committed.memoryBytes, committedCpu: committed.cpu, committed: committed.items, waiting: this.budget.queueLength() },
+      /** Client bytes every proxied connection holds for a replay right now; capped by BACKLOT_PROXY_REPLAY_CAP_BYTES (0.19, default 64 MiB). */
+      proxyReplayCarriedBytes: replayCarriedBytes(),
       events: recentEvents(15),
     };
   }

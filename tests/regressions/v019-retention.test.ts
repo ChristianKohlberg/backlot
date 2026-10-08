@@ -25,8 +25,10 @@ describe('Q3 template retention collects the templates of pruned worktrees', () 
     const state = tmp('v019-q3-state-');
     process.env.BACKLOT_STATE_DIR = state;
     const { Journal } = await import('../../src/core/journal.js');
-    const { pruneTemplates, templateRefs } = await import('../../src/core/retention.js');
-    const { templatesRoot, worktreesRoot } = await import('../../src/core/paths.js');
+    // The sweep's own entry point (same signature on 0.18.2), not its parts.
+    const { retentionSweep } = await import('../../src/core/retention.js');
+    const { policy } = await import('../../src/core/policy.js');
+    const { templatesRoot } = await import('../../src/core/paths.js');
     const journal = new Journal(join(state, 'journal.db'));
     const live = tmp('v019-q3-live-');
     const old = new Date(Date.now() - 3600_000);
@@ -45,9 +47,9 @@ describe('Q3 template retention collects the templates of pruned worktrees', () 
     // A live worktree: its current template stays.
     bake('proj-cccccccc', 'main-dev@k3.baked', 'tpl_live', live);
 
-    const pruned = await pruneTemplates({ templatesKeep: 1, templateGraceMs: 0 }, templatesRoot(), templateRefs(journal, worktreesRoot(), templatesRoot()));
+    const swept = await retentionSweep(journal, { ...policy(), templatesKeep: 1, templateGraceMs: 0 });
 
-    expect(pruned).toBe(2);
+    expect(swept.templates).toBe(2);
     expect(existsSync(join(templatesRoot(), 'proj-aaaaaaaa')), 'the orphan stack kept its template').toBe(false);
     expect(existsSync(join(templatesRoot(), 'proj-bbbbbbbb'))).toBe(false);
     expect(existsSync(join(templatesRoot(), 'proj-cccccccc', 'main-dev@k3.baked'))).toBe(true);
