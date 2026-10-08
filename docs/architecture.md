@@ -103,39 +103,12 @@ same stack, while separate Git worktree directories remain distinct. CLI calls
 resolve paths in the caller process before RPC. Explicit holder strings stay
 opaque; new implicit holders use the physical caller directory.
 
-On upgrade, verified legacy alias identities migrate without changing environment
-IDs, ports, datastore namespaces, data, lease IDs, or holder strings. Reconciliation
-runs at recovery, holder verbs, and before ordinary retention and orphan checks.
-An unreadable manifest delays migration and protects its template ownership from
-ordinary pruning; renamed or unavailable sources do not prove an alias.
+A verb run from a subdirectory of a worktree acts on the worktree's
+environment: the implicit holder is the stack root, unless the caller's own
+directory holds a live lease of its own (`callerHolder`).
 
-Old path-shaped holders are never guessed to be implicit or rewritten. A caller's
-own live canonical lease takes precedence. Otherwise, a legacy directory holder
-that resolves to the caller (including a symlinked subdirectory on an already
-canonical stack), or whose mapping cannot be resolved, blocks the default request
-with the exact `--holder` needed to inspect or release it. If aliases converge on
-several leases for the same holder, Backlot refuses ambiguity and names the
-environments. Recovery requires inspecting `runly status` and explicitly choosing
-`runly pool recycle <envId> --force`: this destroys the selected environment and
-its data and ends its lease.
-
-Proven obsolete template directories move atomically under the bake lock into
-`retired-templates/` in the state root, outside older daemons' ordinary retention.
-A `.retired-stack.json` descriptor keeps cleanup discoverable after the last
-environment is recycled. Retirement waits until no environment carries the old
-identity and no canonical environment is busy. Namespace ownership checks across
-both template roots preserve shared or ambiguous server templates, including
-truncated-name collisions; ordinary retention respects those owners too.
-
-Recovery performs no external retirement drops. Each sweep or explicit
-`runly pool gc` retirement batch attempts at most one external drop, capped at
-two seconds or the shorter configured command timeout. Unconfirmed drops retain
-their markers and `.retirement.json` records with durable backoff; automatic
-attempts stop after three failures. After repairing the appliance, run
-`runly pool gc` to retry retained records despite backoff or the attempt limit;
-repeat for additional pending markers. This still preserves shared or ambiguous
-ownership. Ordinary retention never prunes retirement descriptors or failure
-records.
+A journal stamped below schema 4 is refused with an infra-error that says to
+start runly 0.18 on it once first, which migrates it (decision 0042).
 
 ### The safety invariant
 
@@ -191,7 +164,9 @@ Local pools are convergence all the way down. Same verbs above the driver line.
   they always did); a CLI that finds no daemon then starts the unit rather than
   spawning one, and the election still guarantees a single daemon.
 - **Concurrency lives at the environment boundary**: a short pool lock serializes
-  claim/release bookkeeping; one lock per environment serializes bind/exec/reset on it.
+  claim/release bookkeeping; one lock per environment serializes bind/reset/token on it
+  (`exec` takes it only to resume and touch the environment; the command runs in the CLI,
+  decision 0040).
   A third, per-worktree lock serializes what writes into a worktree (upkeep, builds)
   between its one environment and `runly warm`, which can run with none;
   environment locks are always taken first. Different stacks bind in parallel; the
@@ -308,8 +283,7 @@ records `activeServices: []` for an environment whose lease wants no services
 (a schema 3 reader would boot the whole app) and adds the `db_copies` table (a
 schema 3 reader would never reap a copy), so a schema 3 daemon refuses it. Lease
 preset intent is no longer read: a datastore keeps what it holds unless a bind
-names a preset. Recovery turns any remaining data-only row into an environment with no services
-wanted (leased) or recycles it (unleased).
+names a preset.
 
 <a id="6-in-place--verbs-converge-watch-observes"></a><a id="6-sync--verbs-sync-watch-streams"></a>
 
@@ -534,10 +508,10 @@ runly destroy                                  # tear down everything this workt
 runly down [service...]                        # stop just these (none = all); lease, data, ports stay
 runly ctx [--env]                              # a summary; --json: the context blob (below); --env: export RUNLY_* lines
 runly ps [--all]                               # services and database copies (this worktree | server)
-runly db new <ds> [--preset p] | db with <ds> [--preset p] -- <cmd...> | db ls [--all] | db drop <name>
+runly db new <ds> [--preset p] | db with <ds> [--preset p] [--runly-exit N] -- <cmd...> | db ls [--all] | db drop <name>
                                                # database copies outside any environment (decision 0034)
 runly warm                                     # due upkeep + builds in this worktree, no lease
-runly exec <cmd...>                            # run anything in the worktree, with the lease's env
+runly exec <cmd...>                            # the CLI runs it in the worktree with your env + the lease's RUNLY_* (decision 0040); its exit code
 runly logs [service...] [--lines N] [--since up|<dur>] [--grep re] [-f [--until re] [--timeout s]] [--build]
                                                # interleaved, time-stamped service logs (decision 0038); --until (current process only): 0, --timeout: 124
 runly token [--role <r>] [--raw]               # mint a token via auth.token (role default admin)
@@ -547,10 +521,10 @@ runly status | doctor                          # daemon, environments, budget | 
 runly appliance ls|start|stop [name]           # shared backing servers
 runly pool ls|recycle [<env-id>] [--force]|reconcile|gc|doctor [--fix]   # doctor: orphans, dry run unless --fix
 runly daemon stop                              # waits up to 60 s (BACKLOT_DAEMON_STOP_TIMEOUT_MS) until the daemon and its services are gone
-runly daemon install [--print] | uninstall     # supervise the daemon (systemd user unit / launchd agent), decision 0039
+runly daemon install [--print] [--env NAME]... | uninstall   # supervise the daemon (systemd user unit / launchd agent), decisions 0039, 0043
 runly update [--check] [--force]               # run the INSTALLED build (below)
 runly --version
-# lease and copy verbs take --holder <name> (default: the caller's directory)
+# lease and copy verbs take --holder <name> (default: the caller's worktree, from any subdirectory of it)
 ```
 
 **Version skew, and `update` (decision 0024).** The CLI spawns the daemon from its
@@ -607,13 +581,21 @@ blob needs nothing else from runly. `ctx --env` prints the part a test command n
 single-quoted only when a shell needs it), each as an `export` line, so
 `eval "$(runly ctx --env)" && pnpm e2e` hands them to the test command. `up --env` prints
 the same lines after the bind, and `exec` sets the same variables. Without `--json` or
-`--env`, `up` and `ctx` print a short summary (services, URLs, datastores, login).
+`--env`, `up` and `ctx` print a short summary (services, URLs, datastores, login; a
+tethered lease as `held by agent <pid>`, else its deadline; after `up`, what started or
+restarted and the reasons for a full rebind; a failed last `up` from `lastUpFailed`).
+`status` and `destroy` print a summary too; `--json` is unchanged.
 
 **Database copies (decision 0034).** `runly db new <datastore>` restores a fresh
 copy from the environments' template (baking it if missing) and prints its name,
 url and preset; `runly db with <datastore> -- <cmd>` hands one to a command as
-`RUNLY_DB_URL`/`RUNLY_DB_NAME` and drops it when the command exits, with its exit
-code. A copy is a `db_copies` row — written as `creating` before the restore — that
+`RUNLY_DB_URL` (and `RUNLY_DB_DATABASE`, the database's name on its server;
+`RUNLY_DB_COPY`/`RUNLY_DB_NAME`, the handle) and drops it when the command exits,
+with its exit code. The command runs under `watchdog.js`, which holds the read end
+of a pipe from the CLI: the kernel closes it however the CLI dies, and the
+watchdog then stops the command (SIGTERM, SIGKILL after 3 s) — Node has no
+PR_SET_PDEATHSIG. runly's own failures are marked (`runly db with:` on stderr, a
+`{"runlyDbWith":…}` line with `--json`) and exit 1/2/3 or `--runly-exit N`. A copy is a `db_copies` row — written as `creating` before the restore — that
 carries its holder (worktree; `--holder-pid`, or `db with`'s own CLI process) and
 its drop (the templated command and where to run it, or its directory under
 `<state>/dbs`). The sweeper (and recovery) drops a copy whose holder process is
@@ -672,12 +654,14 @@ reads is ignored.
 | `BACKLOT_TEMPLATE_GRACE_MS` | `templateGraceMs` | 1 h — an unreferenced, superseded template is kept this long after it was baked |
 | `BACKLOT_LEASE_TTL_MS` | `sessionTtlMs` | 30 min — the lease TTL when `up` gives no `--ttl` |
 | `BACKLOT_IDLE_TTL_MS` | `idleTtlMs` | 30 min — an unleased environment's services stop after this at the latest, and an unleased environment idle this long may be evicted for a new one |
+| `BACKLOT_UNLEASED_TTL` | `unleasedTtl` | 24 h (`24h`, `90m`, seconds, or `off`) — an unleased environment nobody used this long is torn down by the sweep: services, data, ports; templates and the worktree's records stay (decision 0041) |
 | `BACKLOT_WAIT_MS` | `waitMs` | 60 s — how long a bind waits for an environment held by another holder, or for a slot at the machine-wide cap |
 | `BACKLOT_HOLDER_PID` | — | the holder process for `up` and `db new` (as `--holder-pid`) |
 | `BACKLOT_PORT_RANGE` | — | `20000-29999` — public ports |
 | `BACKLOT_INTERNAL_PORT_RANGE` | — | `30000-31999` — the ports services listen on |
 | `BACKLOT_TUNNEL_PORT_RANGE` | — | `32000-32767` — derived tailnet preview ports |
-| `BACKLOT_CMD_TIMEOUT_S` | — | unset — overrides every repo-command deadline (upkeep and datastore commands 300 s, builds and `exec` 600 s) |
+| `BACKLOT_CMD_TIMEOUT_S` | — | unset — overrides every repo-command deadline (upkeep and datastore commands 300 s, builds 600 s); also gives `exec`, which otherwise has none, a deadline (decision 0040) |
+| `BACKLOT_PROXY_REPLAY_CAP_BYTES` | — | 64 MiB — client bytes all proxied connections together may hold for a replay; past it a connection is not retried (`status --json` `proxyReplayCarriedBytes`) |
 | `BACKLOT_LOG_CAP_BYTES` | `logCapBytes` | 20 MB per log file, one rotation (`.log.1`) |
 | `BACKLOT_TEMPLATES_KEEP` | `templatesKeep` | 1 per datastore and preset, plus every template a row references (decision 0037) |
 | `BACKLOT_SWEEP_MS` | — | 15 s (lease/idle sweep cadence) |

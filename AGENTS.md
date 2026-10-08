@@ -150,11 +150,13 @@ For the successful-bind configuration ledger and refresh/reuse eligibility, see
 
 ## Physical stack identity
 
-See [physical stack identity](docs/architecture.md#physical-stack-identity) for
-canonical paths, legacy holder recovery, and template retirement safeguards.
-`callerHolder` / `adoptLegacyAliases` in `src/daemon/engine.ts` own identity
-reconciliation; `tests/stack-identity.test.ts` covers CLI alias compatibility,
-data preservation, deferred migration, and retirement (including old retention).
+See [physical stack identity](docs/architecture.md#physical-stack-identity).
+`callerHolder` in `src/daemon/engine.ts` resolves the implicit holder: the stack
+root, so a verb from a subdirectory finds the worktree's lease (0.19), unless the
+caller's own directory holds a live lease. The pre-0.16 migrations (alias
+adoption, retired templates, data-only rows, `artifacts/`) were removed in 0.19
+(decision 0042); `Journal` refuses a journal stamped below schema 4. Do not add a
+migration back for those shapes — point the user at 0.18.
 
 ## Leases: `--ttl` is the agent form, `--holder-pid` is not (Claude Code tethers itself)
 
@@ -169,8 +171,8 @@ Decision 0034. Sharp edges:
 - **`EnvRow.activeServices` is what the lease WANTS**, not what runs: undefined = every service, `[]` = none (`down` with no names). `desiredServices` falls back to every service only when a non-empty list has lost all its members to the manifest. A bind runs `running ∪ wanted ∪ closure(request)` for a continuing lease and `running ∪ closure(request)` for a fresh claim — it never stops a running service. `up`'s RPC sends `[]` for "the default set"; only reset-data passes `undefined` (adds nothing). `startSlice` counts a dependency that is not wanted as satisfied (the lease took it `down`).
 - **A preset is a one-off reload, not lease intent.** `validatePresetRequest` returns only the named stores; everything else keeps its data (`env.presets` = what the store holds; `presetToRestore` decides what a reset or a first creation restores). `pristine` keeps `env.presets`. On the incremental path the running services that template `{{datastores.<name>.…}}` are stopped around the reload (`datastoreUsers`; `null` = nobody references it = restart all). `leases.presets` is no longer read.
 - **Copies are `db_copies` rows** written `creating` before the restore, with the drop recorded (command + cwd, or a dir under `<state>/dbs` checked by `isPrivateDbDir`). `dbBusy` guards in-flight creates/drops from the reaper; `reapDbCopies` runs in every sweep and (not awaited) at the end of `recover()`. `holderGone` is the one liveness check for lease holders and copy holders — step 6's grace belongs there. A failed drop keeps the row (`dropping`) with a backoff; never delete a row whose drop did not confirm.
-- **`--data-only` is gone**: the CLI exits 64 before the daemon, the engine refuses `dataOnly` from any RPC client (`DATA_ONLY_REMOVED`), and `recover()` migrates `data_only=1` rows (leased → `activeServices: []`, unleased → recycled). The column stays for that read only.
-- `tests/additive-up-and-db.test.ts` covers additive up/down, preset reloads, copies and their reaping (holder death, worktree removal, daemon restart), `ps` and the data-only migration; `tests/survivor-ownership.test.ts` drives the survivor-retention cases through `down`.
+- **`--data-only` is gone**: the CLI exits 64 before the daemon and the engine refuses `dataOnly` from any RPC client (`DATA_ONLY_REMOVED`). The row migration went with the other pre-0.16 migrations (decision 0042).
+- `tests/additive-up-and-db.test.ts` covers additive up/down, preset reloads, copies and their reaping (holder death, worktree removal, daemon restart), and `ps`; `tests/survivor-ownership.test.ts` drives the survivor-retention cases through `down`.
 
 ## The load budget bounds load; the pool cap bounds held rows
 
@@ -194,8 +196,8 @@ Decision 0038. The supervisor's `LogWriter` (`src/core/logs.ts`) stamps whole li
 
 ## Templates, crash loops, activity, copies and supervision (decision 0039)
 
-- **A template whose key matches is reused.** `@rebake-template` firing on a bind no longer rebakes: only `--pristine` calls `ds.rebake()` (this datastore's current-key markers only). A fired rule reloads the datastore only when `env.templates[ds]` is not the current ref (`staleTemplate` in `bindAndStartInner`). `destroy` keeps `worktrees/<stack>/`. Do not reintroduce a rebake keyed on the environment's ledger — that was 90–110 s per `up` after a teardown.
-- **The template lock is readers-writer** (`withBakeLock` exclusive, `withTemplateRead` shared, per stack, FIFO). Every restore takes the read side; anything that drops or replaces a template takes the write side. A restore outside the lock is the B2 cascade (a sibling's rebake dropped the template mid-copy).
+- **A template whose key matches is reused.** `@rebake-template` firing on a bind no longer rebakes: only `--pristine` calls `ds.rebake()` (this datastore's current-key markers only). A fired rule reloads the datastore only when `env.templates[ds]` is not the current ref (`staleTemplate` in `bindAndStartInner`). `destroy` keeps `worktrees/<stack>/` but forgets the upkeep rules without `outputs:` (`forgetRulesWithoutOutputs`, 0.19): a pool's `git clean` after destroy removes what they made, and the ledger cannot tell. A rule with `outputs:` reruns when one is missing. Do not reintroduce a rebake keyed on the environment's ledger — that was 90–110 s per `up` after a teardown.
+- **The template lock is readers-writer and two-level** (0.19): `withDatastoreLock(stack, ds, write)` takes the stack lock SHARED and then the `<stack>/<ds>` lock (shared or exclusive), so datastores of one stack bake and restore in parallel while `withBakeLock` (stack, exclusive — pruning) still excludes all of them. Every restore takes the read side; anything that drops or replaces a template takes the write side. The bake check is double-checked: the marker is tested without the write lock and again under it, so restores of an existing template never queue behind an exclusive check. A restore that failed rebakes only if the marker still carries the `nonce` it restored from (a sibling's rebake writes a new one), and drops its half-made target before every retry. A restore outside the lock is the B2 cascade (a sibling's rebake dropped the template mid-copy).
 - **Data and builds overlap on a full bind** (`Promise.allSettled`, both settle before an error is thrown; data error first). `trace.overlapped` records their wall times.
 - **A crash loop in a LEASED environment is not `degraded`.** The supervisor's `onDegraded(service, exit)` → `serviceFailed` records `failedServices` (memory only), stops the service under the env lock, and `ps`/`ctx`/wake/`resumeForVerb` honour it; `startServices` clears it. Only unleased environments are degraded and recycled (sweeper skips leased degraded rows).
 - **Activity is only verbs that use the env** (`touch()` callers: exec, token, preview; binds and down set `lastUsedAt`). Never add `touch()` to a read-only verb.
@@ -203,6 +205,14 @@ Decision 0038. The supervisor's `LogWriter` (`src/core/logs.ts`) stamps whole li
 - **The proxy replays until the first byte back** (`Carry` in `proxy.ts`, 1 MB cap, 5 resets while `up`). Anything after the service answered is never retried.
 - **`runly daemon install`** (`src/cli/daemon-unit.ts`): one unit per state root; `ensureDaemon` starts it only when it runs THIS build (`unitRunsThisBuild`), else spawns as before. `BACKLOT_SYSTEMCTL`/`BACKLOT_LAUNCHCTL` exist for tests; never let a test touch the real user manager.
 - `tests/bench-findings.test.ts` and `tests/proxy-reset.test.ts` are the regression tests.
+
+## exec runs in the CLI; idle unleased environments expire; the unit's environment is an allowlist (0.19)
+
+- **`exec` is the CLI's child** (decision 0040): `exec-env` resumes and touches the environment under the env lock and returns its variables; the CLI spawns the command (inherited stdio, the caller's env, `serviceTag(env, EXEC_SERVICE)`) and heartbeats `exec-touch` every minute. `scanTagged` skips `EXEC_SERVICE`, so no gc, recycle or shutdown reaps it — do not move exec back into the daemon or drop that skip. No deadline unless `BACKLOT_CMD_TIMEOUT_S` is set. `runBoundedIO` is gone; `token` splits streams through `runBounded`'s `onOutput`.
+- **`resumeForVerb` starts what a daemon restart stopped**, like a wake; only a failed bind (`failStreak > 0`) is refused. `bindFailures` (memory) feeds `ctx.lastUpFailed` and `ps.failedUps`; after a restart only the fact survives.
+- **`BACKLOT_UNLEASED_TTL`** (decision 0041, 24 h): the sweep recycles an unleased env whose `envActivityAt` is older; `worktrees/<stack>/` and templates stay.
+- **Unit environment** (decision 0043): `captureEnvironment` in `daemon-unit.ts` — `CAPTURE_EXACT`, `CAPTURE_PREFIXES`, `BACKLOT_*`, manifest `$NAME` references, `--env NAME`; never `NEVER_CAPTURE` or an `env_from` input. `commandFailure`/`environmentHint` (`util.ts`) turn a missing-tool failure into an env-error that says how to fix the unit. WorkingDirectory=/append: paths are never quoted (`systemdPath`).
+- `tests/regressions/v019-*.test.ts` are the regression tests, one per finding.
 
 ## Version skew is a first-class failure, and the daemon outlives the install
 

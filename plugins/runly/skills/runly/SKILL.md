@@ -43,8 +43,10 @@ Names are upper-cased, other characters become `_` (`web-audit` →
 Without them data is kept.
 
 **Need only a database?** `runly db with main -- npm test` gives the command a
-fresh seeded copy (`RUNLY_DB_URL`, `RUNLY_DB_NAME`), drops it afterwards and
-exits with the command's code. Copies need no lease and run in parallel; don't
+fresh seeded copy (`RUNLY_DB_URL`; `RUNLY_DB_DATABASE` is the database's own
+name), drops it afterwards and exits with the command's code; runly's own
+failures say `runly db with:` on stderr (`--runly-exit 125` gives them a code of
+their own). Copies need no lease and run in parallel; don't
 start your own database container. `runly db new main` keeps one until
 `runly db drop <name>`. A datastore marked `copies_only` exists only this way:
 environments never get one and `ctx` does not list it.
@@ -56,7 +58,9 @@ including `allLogins`.
 
 **A service crash-loops.** It is stopped and shown `failed` with its last exit
 code; the environment, its data, the other services and the logs stay. Read
-`runly logs <svc>`, fix the cause, then `runly up` starts it again.
+`runly logs <svc>`, fix the cause, then `runly up` starts it again. An `up` that
+failed (a build, upkeep, data) is named by `ctx` and `ps` with its error; only
+`up` redoes it.
 
 **Will an `up` start now?** `runly plan [svc...]` says "starts now" or what it
 would wait for in the box's load budget. A waiting `up` queues and fails with
@@ -67,8 +71,10 @@ env-error after 10 minutes; check `runly ps --all` instead of retrying.
 ```bash
 runly logs api -f --until 'listening' --timeout 120   # 0 on match, 124 on timeout
 runly logs --since 10m --grep 'ERROR|WARN'                         # all services, interleaved
-runly logs --build                                                 # last build and upkeep output
+runly logs --build                                                 # upkeep and each last build, a section each
 ```
+
+`--grep` that matches nothing exits 1.
 
 `--until` only matches lines of the current process, never one from before the
 last start.
@@ -80,15 +86,15 @@ last start.
 **Hand back.** `runly release` ends the lease and leaves the environment for the
 next `up`. `runly destroy` tears down everything this worktree holds (services,
 data, copies, ports); run it before handing a worktree back to a pool. The baked
-templates and the worktree's upkeep records stay, so the next `up` is not a
-cold rebake.
+templates stay, so the next `up` is not a cold rebake; upkeep rules without
+`outputs:` run again.
 
 ## How long it lives
 
 - **Under Claude Code you are tethered.** `up` and `db new` tie the environment
   to your session (`CLAUDE_PID`). It lives as long as the session and is torn
-  down 60 s after the session ends. Nothing to renew. `BACKLOT_TETHER=off` opts
-  out.
+  down 60 s after the session ends. Nothing to renew; the summary says `held by
+  agent <pid>`. `BACKLOT_TETHER=off` (or `--ttl`) opts out.
 - **Elsewhere, use `--ttl <minutes>`** (default 30). Never
   `BACKLOT_HOLDER_PID=$$ runly up`: each command runs in a fresh shell, so `$$`
   is already dead and runly refuses it (exit 64).
@@ -97,7 +103,9 @@ cold rebake.
   stay, and the next request starts it and waits until it is ready. Only verbs
   that use the environment count (`up`, `exec`, `token`, `reset-data`); polling
   `ps`, `ctx` or `logs` does not keep it warm.
-- **A deleted worktree takes its environment with it.**
+- **A deleted worktree takes its environment with it**, and an unleased one
+  nobody used for 24 hours goes too (`BACKLOT_UNLEASED_TTL`); its templates stay.
+- **Verbs work from any subdirectory** of the worktree.
 
 ## Don't
 
@@ -114,7 +122,7 @@ cold rebake.
 ## Other verbs
 
 `runly warm` (due upkeep and builds, no lease), `runly exec <cmd>` (a command in
-the worktree with the `ctx --env` variables set; exits 0 or 1, `--json`
-has `exitCode`), `runly reset-data`, `runly status`, `runly doctor`,
+the worktree, on your terminal, with your environment plus the `ctx --env`
+variables; stopped services start first; its own exit code), `runly reset-data`, `runly status`, `runly doctor`,
 `runly appliance ls|start|stop`, `runly pool doctor [--fix]`,
 `runly update [--check]`. The README lists every verb and manifest field.

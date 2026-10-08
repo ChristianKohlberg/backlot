@@ -2,7 +2,8 @@
  * 0.19 regressions: one test per finding of the 0.18 bug hunt, the perf and
  * simplification batch and the real-usage list that is not covered by its own
  * v019-*.test.ts file. Each states the FIXED behaviour; each failed on 0.18.2
- * (origin/main d630f6c) except where noted.
+ * (origin/main d630f6c) except Q1, which pins the build skip the faster
+ * decision path must keep (its speed-up is measured by the perf bench).
  */
 import { describe, it, expect, afterAll } from 'vitest';
 import { spawn, execFileSync } from 'node:child_process';
