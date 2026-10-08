@@ -224,7 +224,7 @@ export class Engine {
    * it describes this daemon life; the lease row keeps what to re-publish.
    */
   private previewRestores = new Map<string, { service: string; url: string; state: 'restoring' | 'failed'; error?: string; at: number }>();
-  /** Settles once every recorded preview was re-published or reported (tests and shutdown wait on it). */
+  /** Settles once every recorded preview was re-published or reported; a restore that outlives a `shutdown` stops what it started. */
   previewsRestored: Promise<void> = Promise.resolve();
   private inputRevision = 0;
 

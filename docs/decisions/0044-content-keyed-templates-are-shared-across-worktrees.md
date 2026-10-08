@@ -45,8 +45,9 @@ drops the template other worktrees use: it drops this worktree's private
 template and bakes a new one, `<ds>-<preset>@<key>.own.baked` in the
 worktree's own dir (database `backlot_tpl_<stack>_own_…`). While it exists it
 outranks the shared one for that worktree (`--reset-data` restores from it);
-retention keeps it only while a row references it, after which the worktree
-returns to the shared template.
+retention keeps it only while something references it — a row, or the
+worktree's record of its last restore — and once the worktree restores from
+another key or goes, it is collected.
 
 **Retention.** Per templates dir and per datastore and preset, the newest
 `templatesKeep` stay — for `<name>@shared` while any worktree of the name can
