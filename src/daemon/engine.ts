@@ -1185,6 +1185,18 @@ export class Engine {
     return restored;
   }
 
+  /**
+   * What an additive `up` builds and may restart: every service it leaves
+   * running for a plain `up`; for `up <service…>` only the named services,
+   * their depends_on closure and what it (re)starts because it is not running
+   * (0.19). A full rebind still stops and starts everything — its reasons
+   * (an upkeep rule ran, the manifest changed, …) concern every service.
+   */
+  private bindScope(active: Set<string>, running: Set<string>, requested: string[] | undefined, added: Set<string>): Set<string> {
+    if (requested === undefined || requested.length === 0) return active;
+    return new Set([...active].filter((n) => added.has(n) || !running.has(n)));
+  }
+
   private async bindAndStart(stack: Stack, envSnapshot: EnvRow, hygiene: Hygiene, onProgress?: Progress, requestedServices?: string[], freshClaim = false, callerEnv?: unknown, requestedPresets?: unknown, rebuild = false, signal?: AbortSignal): Promise<{ env: EnvRow; previewNotice?: string; bindDiagnostics: BindDiagnostics }> {
     const say = onProgress ?? (() => undefined);
     // The load budget (decision 0036): state what this bind builds and starts
@@ -1196,7 +1208,7 @@ export class Engine {
     const added = requestedServices === undefined ? new Set<string>() : this.resolveServiceClosure(stack, requestedServices);
     const active = new Set([...base, ...added].filter((n) => n in stack.manifest.services));
     const decided: BuildDecisions = new Map();
-    const need = await this.needFor(stack, live, new Set([...active].filter((n) => !running.has(n))), active, { rebuild: rebuild || hygiene === 'pristine', mode: 'bind' }, decided);
+    const need = await this.needFor(stack, live, new Set([...active].filter((n) => !running.has(n))), this.bindScope(active, running, requestedServices, added), { rebuild: rebuild || hygiene === 'pristine', mode: 'bind' }, decided);
     const reservation = await this.budget.admit(need, `up ${stack.manifest.name} (${live.id})`, {
       onWait: (position, etaMs, why) => say(`waiting for the load budget: position ${position}, about ${formatDuration(etaMs)} — ${why}`),
       source: 'budget',
@@ -1244,6 +1256,7 @@ export class Engine {
     const base = freshClaim ? running : new Set([...this.desiredServices(stack, env), ...running]);
     const added = requestedServices === undefined ? new Set<string>() : this.resolveServiceClosure(stack, requestedServices);
     const active = new Set([...base, ...added].filter((n) => n in stack.manifest.services));
+    const scope = this.bindScope(active, running, requestedServices, added);
     const inputLease = this.journal.leaseForEnv(env.id);
     if (!inputLease) throw new BrokerError('env-error', 'lease ended before bind; run runly up again', 'lease');
     const previousInputs = this.leaseInputs.get(inputLease.id);
@@ -1408,6 +1421,12 @@ export class Engine {
       const toRestart = new Set<string>();
       await this.treeLocked(stack.id, () => this.inWaves(this.buildWaves(stack, active), async (name) => {
         const spec = serviceOf(stack, name);
+        // `up <service>` (0.19): a running service outside the named ones and
+        // their depends_on closure is left as it is — not built, not restarted.
+        if (!scope.has(name)) {
+          trace.result.builds.push({ service: name, durationMs: 0, restart: false, reason: 'not-named' });
+          return;
+        }
         // A service this `up` adds is built and started; nothing to compare.
         if (!running.has(name)) {
           const b = await this.buildService(stack, env, name, spec, buildCtx, say, { rebuild, mode: 'bind', decided });
@@ -1478,6 +1497,10 @@ export class Engine {
       trace.phase('ready');
       await startSlice(new Set([...toRestart, ...missing]));
     } else {
+    // What this full rebind starts that was not running, and what it stops
+    // and starts again — the same two lists the additive path reports.
+    trace.result.started = [...missing];
+    trace.result.restarted = [...active].filter((n) => running.has(n));
     // Services must not hold open handles across a data restore or code change.
     trace.phase('stop');
     this.markStarting(env, stack, [...active]);
@@ -2170,7 +2193,12 @@ export class Engine {
       stack: stack.manifest.name,
       envId: env.id,
       state: env.state,
-      lease: lease ? { id: lease.id, kind: lease.kind, hygiene: lease.hygiene, expiresAt: lease.expiresAt } : null,
+      /**
+       * `holderPid`: the process the lease is tethered to (decision 0035) —
+       * while it lives the lease does not expire, so `expiresAt` is only the
+       * renewal horizon. null for a lease that ends at `expiresAt`.
+       */
+      lease: lease ? { id: lease.id, kind: lease.kind, hygiene: lease.hygiene, expiresAt: lease.expiresAt, holderPid: lease.holderPid ?? null } : null,
       urls,
       /** The environment's PUBLIC ports by manifest key (`runly ctx --env` → RUNLY_PORT_<KEY>). */
       ports: { ...env.ports },

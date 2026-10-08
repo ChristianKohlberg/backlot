@@ -172,7 +172,9 @@ Holding an environment:
   BACKLOT_TETHER=off opts out.
 
   --ttl <minutes>          the lease length (default 30) — the form for other
-                           agents and scripts. up renews it.
+                           agents and scripts. up renews it. Only for an
+                           untethered lease: it skips the automatic tether, and
+                           is refused next to --holder-pid.
   --holder-pid <pid>       For an interactive shell, or any caller that OUTLIVES the
   (BACKLOT_HOLDER_PID)     command. Ties the environment to that process: a minute
                            after it exits, the environment is torn down (services,
@@ -517,7 +519,15 @@ async function main(): Promise<void> {
   // No explicit holder process: tether to the agent this CLI runs under, when
   // it can be found (decision 0035) — Claude Code's CLAUDE_PID, if it is a
   // live ancestor. BACKLOT_TETHER=off opts out.
-  if (holderPid === undefined && (verb === 'up' || (verb === 'db' && positional[0] === 'new'))) holderPid = autoTether();
+  // `--ttl` asks for a lease that ends at a deadline: it is the untethered
+  // form, so it opts out of the automatic tether, and next to an explicit
+  // holder process (which keeps the lease alive while it lives) it means
+  // nothing and is refused.
+  if (flagValue('--ttl') !== undefined && holderPid !== undefined && (verb === 'up' || verb === 'db')) {
+    console.error(`runly: --ttl sets the length of an untethered lease; a lease held by ${holderPidSource} ${holderPid} lives as long as that process — drop one of them`);
+    process.exit(64);
+  }
+  if (holderPid === undefined && flagValue('--ttl') === undefined && (verb === 'up' || (verb === 'db' && positional[0] === 'new'))) holderPid = autoTether();
 
   let res: RpcResponse | undefined;
   switch (verb) {
@@ -1352,7 +1362,7 @@ interface CtxView {
   stack: string;
   envId: string;
   state: string;
-  lease: { id: string; expiresAt: number } | null;
+  lease: { id: string; expiresAt: number; holderPid?: number | null } | null;
   urls?: Record<string, string>;
   ports?: Record<string, number>;
   services?: Record<string, 'running' | 'failed' | 'stopped' | 'down'>;
@@ -1361,7 +1371,21 @@ interface CtxView {
   logins?: { user: string; password: string } | null;
   previewUrls?: Record<string, string>;
   previewNotice?: string;
-  bindDiagnostics?: { durationMs?: number; reuse?: string; started?: string[]; restarted?: string[] };
+  bindDiagnostics?: { durationMs?: number; reuse?: string; started?: string[]; restarted?: string[]; reasons?: string[] };
+}
+
+/** A full-rebind reason code (bindDiagnostics.reasons) in words. */
+function rebindReason(code: string): string {
+  const words: Record<string, string> = {
+    'upkeep-required': 'an upkeep rule ran',
+    'environment-not-running': 'its services were not running',
+    'service-process-unhealthy': 'a service process was not healthy',
+    'environment-inputs-changed': 'the env_from inputs changed',
+    'manifest-changed': 'the manifest changed',
+    'public-port-moved': 'a public port moved',
+  };
+  if (code.startsWith('hygiene-')) return `--${code.slice('hygiene-'.length)} was asked for`;
+  return words[code] ?? code;
 }
 
 /**
@@ -1371,12 +1395,20 @@ interface CtxView {
  */
 function ctxSummary(c: CtxView, verb: 'up' | 'ctx'): string[] {
   const out: string[] = [];
-  const until = c.lease ? ` — lease until ${new Date(c.lease.expiresAt).toLocaleTimeString()}` : ' — no lease';
+  // A tethered lease lives as long as its agent: a deadline would be a lie.
+  const until = !c.lease
+    ? ' — no lease'
+    : c.lease.holderPid
+      ? ` — held by agent ${c.lease.holderPid}`
+      : ` — lease until ${new Date(c.lease.expiresAt).toLocaleTimeString()}`;
   const d = c.bindDiagnostics;
   const how = verb === 'up' && d
     ? ` (${d.reuse === 'rebound' || !d.reuse ? 'bound' : d.reuse}${d.durationMs !== undefined ? ` in ${formatDuration(d.durationMs)}` : ''}${d.started?.length ? `; started ${d.started.join(', ')}` : ''}${d.restarted?.length ? `; restarted ${d.restarted.join(', ')}` : ''})`
     : '';
   out.push(`${c.stack} ${c.envId} ${c.state}${how}${until}`);
+  // Why everything was stopped and started again (a full rebind), in words.
+  const why = verb === 'up' && d && (d.reuse === 'rebound' || !d.reuse) ? (d.reasons ?? []).map(rebindReason) : [];
+  if (why.length) out.push(`  full rebind: ${why.join('; ')}`);
   const names = Object.keys(c.services ?? c.urls ?? {});
   const width = Math.max(0, ...names.map((n) => n.length));
   for (const n of names) {
