@@ -73,17 +73,26 @@ Names are upper-cased and every other character becomes `_` (`web-audit` →
 
 A test lane that needs a database and not the application takes a **copy**:
 `runly db with main -- npm test` restores a fresh copy from the environments'
-template, runs the command with `RUNLY_DB_URL` and `RUNLY_DB_NAME`, drops the
-copy when it exits (also on failure and Ctrl-C) and exits with its code. Copies
-need no lease and run in parallel. If the `db with` process itself is killed
-(SIGKILL), the daemon drops the copy at its next sweep and stops the command
-first, with everything it started, so nothing keeps running against a dropped
-database.
+template, runs the command with `RUNLY_DB_URL` (the connection string),
+`RUNLY_DB_DATABASE` (the database's own name on its server, the file for
+sqlite) and `RUNLY_DB_COPY` (runly's handle for `db drop`; `RUNLY_DB_NAME` is
+the same), drops the copy when it exits (also on failure and Ctrl-C) and exits
+with its code. Copies need no lease and run in parallel. The command runs under
+a small watchdog tied to the CLI by a pipe: if the `db with` process itself is
+killed (SIGKILL, OOM, a kill of its process group the command escaped), the
+command is stopped within moments, and the daemon drops the copy at its next
+sweep. When runly itself fails (no such datastore, the restore failed), stderr
+says `runly db with:` (with `--json`, a `{"runlyDbWith":{…}}` line) and the exit
+is 1, 2 or 3 — or the code given with `--runly-exit N` (say 125), so a script can
+tell runly's failure from its own command's.
 
-`runly exec <cmd>` is the other way in: it runs a command in the worktree with
-the same `RUNLY_*` variables (plus `BACKLOT_URL_*`, `BACKLOT_PORT_*` and
-`BACKLOT_DS_*`) set and prints its output.
-It exits 0 or 1; `--json` reports the command's own `exitCode`.
+`runly exec <cmd>` is the other way in: the CLI runs the command in the
+worktree, on your terminal, with your environment plus the same `RUNLY_*`
+variables (and `BACKLOT_URL_*`, `BACKLOT_PORT_*`, `BACKLOT_DS_*`). It exits with
+the command's own code; `--json` collects `stdout`, `stderr` and `exitCode`
+whole. Services an idle stop or a daemon restart stopped are started first. The
+environment is not locked while the command runs, so an `up` next to a long
+`exec` is not queued behind it.
 
 ## An environment's life
 
@@ -96,7 +105,8 @@ It exits 0 or 1; `--json` reports the command's own `exitCode`.
 | The lease's TTL runs out (no holder process) | The lease ends; the environment stays for the worktree's next `up`. Its services stop after their idle time and are not woken by traffic. |
 | `release` | The same as a TTL end, now. |
 | The worktree is deleted | Everything goes, leased or not, also across a daemon restart. |
-| `destroy` | Everything goes now, the worktree's database copies included. For worktree pools that take a worktree back. The worktree's upkeep and build records and its templates stay, so the next `up` does not redo installs or bakes. |
+| `destroy` | Everything goes now, the worktree's database copies included. For worktree pools that take a worktree back. The worktree's build records, its templates and the upkeep rules that declare `outputs:` stay, so the next `up` does not redo bakes or installs whose output is still there; a rule without `outputs:` runs again (a pool's `git clean` may have removed what it made). |
+| No lease, and nothing used the environment for 24 h (`BACKLOT_UNLEASED_TTL`, `off` to keep it) | The environment goes: services, data, ports. Templates and the worktree's records stay, so the next `up` there restores rather than bakes. |
 | The box needs a slot (`BACKLOT_POOL_MAX_TOTAL`) | The least recently used unleased environment idle for 30 min (`BACKLOT_IDLE_TTL_MS`) is recycled. |
 | A service crashes past its restart budget (4 exits in quick succession) | Leased: that service is stopped and shown `failed` in `ps` and `ctx` with its last exit (`runly logs <svc>` says why); the environment, its data, its other services and its logs stay, and the next `up` starts it again. Unleased: the environment is marked `degraded` and recycled. |
 
@@ -111,7 +121,9 @@ out (the lease then lives by its TTL). An explicit `--holder-pid` wins.
 already exited, so runly refuses it (exit 64); use `--ttl` there.
 
 A daemon restart (`runly update`) keeps leases, data and ports; services stop and
-the next `up` starts them.
+the next `up`, `exec` or `token` — or a connection to their port — starts them.
+An `up` that failed is redone only by `up`: `ctx` and `ps` name the failure, and
+until then nothing starts its services.
 
 ### The daemon
 
@@ -128,8 +140,16 @@ runly daemon uninstall         # disable and remove it
 ```
 
 The unit restarts the daemon a second after it crashes and leaves its services
-alone when it stops. It runs with the `PATH` and `BACKLOT_*` settings of the
-shell that installed it; reinstall after changing them. Once it is installed, a
+alone when it stops. It runs with what `daemon install` captured from the shell
+that ran it, and prints that list (and how many variables it left out): `PATH`,
+an allowlist (`DOTNET_*`, `NODE_*`, `NVM_*`, `JAVA_HOME`, `DOCKER_HOST`,
+`DOCKER_CONTEXT`, `LANG`, `LC_*`, the proxy variables, `SSL_CERT_*`), every
+`BACKLOT_*` setting, the variables the manifest's commands reference (`$NAME`)
+when installed from a stack, and each `--env NAME`. An `env_from` input is never
+stored in the unit: each `up` brings it. Reinstall after changing them. A repo
+command that fails because a tool or runtime is missing (`command not found`, no
+.NET SDK) is reported as an env-error that says so and how to give the unit the
+variable. Once it is installed, a
 CLI that finds no daemon starts the unit rather than a daemon of its own, and
 `runly status` reports `supervisor: systemd` (or `launchd`). There is one unit
 per state root. runly never installs it by itself.
@@ -203,8 +223,9 @@ Tests see the live worktree: an edit made while they run is visible to the
 services. Parallel lanes need separate worktrees; a second holder of the same
 worktree waits for its environment.
 
-Upkeep and datastore commands time out after 300 s, builds and `exec` after
-600 s (an upkeep rule's `timeout:`; `BACKLOT_CMD_TIMEOUT_S` overrides all).
+Upkeep and datastore commands time out after 300 s, builds after 600 s (an
+upkeep rule's `timeout:`; `BACKLOT_CMD_TIMEOUT_S` overrides all, and also gives
+`exec`, which has no deadline otherwise, one).
 Every command runs under `sh` (dash on Ubuntu, bash as sh on macOS), so write
 POSIX sh.
 

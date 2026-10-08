@@ -460,6 +460,13 @@
           "type": "number",
           "exclusiveMinimum": 0,
           "description": "Command deadline in seconds (default 300). BACKLOT_CMD_TIMEOUT_S overrides this value."
+        },
+        "outputs": {
+          "oneOf": [
+            { "type": "string" },
+            { "type": "array", "items": { "type": "string" } }
+          ],
+          "description": "Paths (files or directories, relative to the stack root) the command leaves behind. A rule whose trigger files are unchanged runs again when any of them is missing (a `git clean -fdx` removed it). A rule without outputs is forgotten by `runly destroy`, so the next `up` after a pool reset runs it again."
         }
       }
     },

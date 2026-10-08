@@ -12,13 +12,21 @@ export interface BindDiagnostics {
   reuse: 'reused' | 'restarted' | 'rebound';
   /**
    * The running services an `up` restarted: their build output changed, or
-   * they use a datastore this operation reloaded (decision 0034).
+   * they use a datastore this operation reloaded (decision 0034); on a full
+   * rebind, every one that was running (0.19).
    */
   restarted: string[];
-  /** Services this `up` added to the ones already running (decision 0034: `up` is additive). */
+  /** Services this `up` added to the ones already running (decision 0034: `up` is additive); on a full rebind, the ones not running before it (0.19). */
   started: string[];
   /** Datastores reloaded from their template because the caller named a preset for them (decision 0034). */
   reloaded: string[];
+  /**
+   * Why the full path ran (empty when it did not): `new-environment` (its
+   * first bind), `upkeep-required`, `environment-not-running`,
+   * `service-process-unhealthy`, `environment-inputs-changed`,
+   * `manifest-changed`, `hygiene-<reset-data|pristine>`, `public-port-moved`.
+   * The plain `up` summary prints them in words (0.19).
+   */
   reasons: string[];
   upkeep: { ran: number; skipped: number };
   /**
@@ -26,11 +34,12 @@ export interface BindDiagnostics {
    * (decision 0032: runly keeps no build cache; the build tool decides what is
    * current) — and whether its service was restarted, with why:
    * `outputs-changed`, `outputs-unchanged`, `no-outputs-declared` (always
-   * restarted), `not-running` (a service this `up` adds), `full-rebind`, or
+   * restarted), `not-running` (a service this `up` adds), `full-rebind`,
+   * `not-named` (`up <service>` left this running one alone, 0.19), or
    * `when-unchanged` (decision 0038: a `build: { when: }` whose inputs did
    * not change since its last successful build — skipped, durationMs 0).
    */
-  builds: Array<{ service: string; durationMs: number; restart: boolean; reason: 'outputs-changed' | 'outputs-unchanged' | 'no-outputs-declared' | 'not-running' | 'full-rebind' | 'when-unchanged' }>;
+  builds: Array<{ service: string; durationMs: number; restart: boolean; reason: 'outputs-changed' | 'outputs-unchanged' | 'no-outputs-declared' | 'not-running' | 'full-rebind' | 'not-named' | 'when-unchanged' }>;
 }
 
 type BindPhase = 'queue' | 'prepare' | 'appliances' | 'upkeep' | 'stop' | 'data' | 'build' | 'ready' | 'finalize';

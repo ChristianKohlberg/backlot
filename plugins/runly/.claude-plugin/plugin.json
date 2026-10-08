@@ -1,6 +1,6 @@
 {
   "name": "runly",
-  "version": "0.12.2",
+  "version": "0.12.3",
   "description": "Teaches an agent to drive runly, the repo-aware environment broker, against any repo's runly.yml: additive up/down in your worktree, ctx --env for your own tests, database copies (db with), ps, plan, logs -f --until, idle services that wake on demand, the Claude Code session tether, and destroy. CLI-only, no MCP server; bundles the stack-agnostic runly skill.",
   "author": {
     "name": "ChristianKohlberg"

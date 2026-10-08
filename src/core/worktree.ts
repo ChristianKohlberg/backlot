@@ -21,7 +21,7 @@ import { createReadStream, existsSync, lstatSync, readdirSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { dirname, join } from 'node:path';
 import { promisify } from 'node:util';
-import { isFile, matchesAny, safeJoin } from './util.js';
+import { isFile, matchesAny, safeJoin, statOf } from './util.js';
 import type { Manifest } from './manifest.js';
 
 const execFileP = promisify(execFile);
@@ -105,6 +105,21 @@ export function globPathspecs(globs: string[]): string[] | null {
  * no gitlinks, and the second listing is skipped.
  */
 export async function enumerateSource(stackRoot: string, manifest: Manifest, only?: string[]): Promise<string[]> {
+  return (await enumerateSourceStats(stackRoot, manifest, only)).map((f) => f.path);
+}
+
+/** Files between two yields to the event loop while a listing is stat'ed. */
+const YIELD_EVERY = 2000;
+/** Let the proxy and every other request run between two slices of a long loop. */
+export const yieldLoop = (): Promise<void> => new Promise((r) => setImmediate(r));
+
+/**
+ * `enumerateSource` with each file's size and mtime — ONE stat per file,
+ * which the build key needs anyway (decision 0038). The stats run in slices,
+ * yielding the event loop between them: on a 35k-file worktree the stat loop
+ * alone held every proxied connection of every environment for 100+ ms.
+ */
+export async function enumerateSourceStats(stackRoot: string, manifest: Manifest, only?: string[]): Promise<Array<{ path: string; size: number; mtimeMs: number }>> {
   const pathspecs = only === undefined ? null : globPathspecs(only);
   const narrowed = pathspecs !== null && pathspecs.length > 0;
   const listed = (await gitFiles(stackRoot, narrowed ? pathspecs : undefined)) ?? walkAll(stackRoot);
@@ -143,11 +158,18 @@ export async function enumerateSource(stackRoot: string, manifest: Manifest, onl
   const caches = manifest.caches ?? [];
   const included = new Set(manifest.sync?.include ?? []);
   // Tracked-but-deleted files still appear in ls-files --cached.
-  return listed
+  const candidates = listed
     .filter((f) => only === undefined || matchesAny(f, only))
     .filter((f) => included.has(f) || caches.length === 0 || !matchesAny(f, caches))
-    .filter((f) => isFile(join(stackRoot, f)))
     .sort();
+  const out: Array<{ path: string; size: number; mtimeMs: number }> = [];
+  for (let i = 0; i < candidates.length; i++) {
+    if (i > 0 && i % YIELD_EVERY === 0) await yieldLoop();
+    const f = candidates[i] as string;
+    const st = statOf(join(stackRoot, f));
+    if (st?.isFile()) out.push({ path: f, size: st.size, mtimeMs: st.mtimeMs });
+  }
+  return out;
 }
 
 function walkAll(root: string, prefix = ''): string[] {
@@ -191,7 +213,10 @@ function walkAll(root: string, prefix = ''): string[] {
  */
 export async function snapshotOutputs(stackRoot: string, globs: string[], compare: 'stat' | 'content' = 'stat'): Promise<string> {
   const seen = new Map<string, { full: string; size: number; mtimeMs: number }>();
-  const walk = (dir: string, rel: string, all = false) => {
+  let visited = 0;
+  // Sliced like the source listing: a bin/ of thousands of files must not
+  // hold the daemon's event loop (and every proxied connection) for its walk.
+  const walk = async (dir: string, rel: string, all = false): Promise<void> => {
     let names: string[];
     try {
       names = readdirSync(dir);
@@ -200,6 +225,7 @@ export async function snapshotOutputs(stackRoot: string, globs: string[], compar
     }
     for (const name of names) {
       if (name === '.git') continue;
+      if (++visited % YIELD_EVERY === 0) await yieldLoop();
       const childRel = rel ? `${rel}/${name}` : name;
       const full = join(dir, name);
       let st;
@@ -208,7 +234,7 @@ export async function snapshotOutputs(stackRoot: string, globs: string[], compar
       } catch {
         continue; // vanished mid-walk
       }
-      if (st.isDirectory()) walk(full, childRel, all);
+      if (st.isDirectory()) await walk(full, childRel, all);
       else if (all || matchesAny(childRel, globs)) seen.set(childRel, { full, size: st.size, mtimeMs: st.mtimeMs });
     }
   };
@@ -228,13 +254,13 @@ export async function snapshotOutputs(stackRoot: string, globs: string[], compar
         const literal = safeJoin(stackRoot, parts.join('/'), 'outputs');
         const st = lstatSync(literal);
         if (st.isFile()) seen.set(parts.join('/'), { full: literal, size: st.size, mtimeMs: st.mtimeMs });
-        else if (st.isDirectory()) walk(join(stackRoot, parts.join('/')), parts.join('/'), true); // a directory: everything under it
+        else if (st.isDirectory()) await walk(join(stackRoot, parts.join('/')), parts.join('/'), true); // a directory: everything under it
       } catch {
         /* absent */
       }
       continue;
     }
-    walk(start, base);
+    await walk(start, base);
   }
   const entries = [...seen].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
   // `content` (decision 0038): a build tool that rewrites identical files

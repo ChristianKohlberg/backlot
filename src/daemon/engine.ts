@@ -2,11 +2,11 @@
  * The engine: pool + lease + bind + run orchestration, owning all policy
  * (drivers own transport/storage; the manifest owns repo knowledge).
  */
-import { mkdirSync, rmSync, readdirSync, existsSync, readFileSync, writeFileSync, renameSync, statSync } from 'node:fs';
+import { mkdirSync, rmSync, readdirSync, existsSync, readFileSync, statSync } from 'node:fs';
 import { isAbsolute, join, relative, sep } from 'node:path';
 import { Journal, JOURNAL_SCHEMA_VERSION, type DbCopyRow, type DropRecipe, type EnvRow, type LeaseRow } from '../core/journal.js';
 import { BUILD, VERSION, compareVersions, versionSkew } from '../core/version.js';
-import { buildOf, canonicalDirectory, envDatastoreNames, outputsOf, stackIdentity, retiredStackIdentity, loadStack, normalizeLogins, manifestFileOf, type Manifest, type ServiceSpec, type Stack } from '../core/manifest.js';
+import { buildOf, canonicalDirectory, envDatastoreNames, outputsOf, upkeepOutputs, loadStack, normalizeLogins, manifestFileOf, type Manifest, type ServiceSpec, type Stack } from '../core/manifest.js';
 import { snapshotOutputs } from '../core/worktree.js';
 import { forgetNamespace, recordedNamespaces } from '../core/namespaces.js';
 import { runlyEnvVars } from '../core/env-vars.js';
@@ -14,21 +14,21 @@ import { buildInputsKey, buildIsCurrent, clearBuilds, everBuilt, forgetBuild, re
 import { LogWriter, UPKEEP_LOG, beginBuildLog, buildLogOf, logFileOf, readLog } from '../core/logs.js';
 import { formatDuration, parseDuration } from '../core/units.js';
 import { BudgetRefusal, LoadBudget, costsOf, needOf, total, type Committed, type Need, type NeedItem, type Reservation } from './budget.js';
-import { clearTreeLedger, pickEnvKeys, pickTreeKeys, readTreeLedger, worktreeStateDir, writeTreeLedger } from '../core/tree-ledger.js';
+import { clearTreeLedger, forgetRulesWithoutOutputs, pickEnvKeys, pickTreeKeys, readTreeLedger, worktreeStateDir, writeTreeLedger } from '../core/tree-ledger.js';
 import { defaultPresetFor, presetToRestore, validatePresetRequest } from '../core/presets.js';
-import { runUpkeep, templateBakeKeys, triggerSet, type UpkeepStep } from '../core/upkeep.js';
+import { ruleKey, runUpkeep, templateBakeKeys, triggerSet, type UpkeepStep } from '../core/upkeep.js';
 import { allocateInBlock, blockConflicts, ephemeralRange, inBlock, internalBlock, publicBlock, tunnelBlock } from '../core/ports.js';
-import { HOLD_MS, PortInUse, ProxyHub } from './proxy.js';
+import { HOLD_MS, PortInUse, ProxyHub, replayCarriedBytes } from './proxy.js';
 import { connect as netConnect } from 'node:net';
-import { dbCopiesRoot, envsRoot, stateRoot, templatesRoot, retiredTemplatesRoot, worktreesRoot } from '../core/paths.js';
-import { BrokerError, template, templateEnv, now, sha256, shortId } from '../core/util.js';
+import { dbCopiesRoot, envsRoot, stateRoot, templatesRoot, worktreesRoot } from '../core/paths.js';
+import { BrokerError, commandFailure, template, templateEnv, now, sha256, shortId } from '../core/util.js';
 import { callerEnvSpec, requireCallerEnv, selectCallerEnv, serviceCallerEnv, validateCallerEnv } from '../core/caller-env.js';
-import { cmdTimeoutS, runBounded, runBoundedIO, LONG_CMD_TIMEOUT_S } from '../core/exec.js';
-import { makeDatastore, parseBakedMarker, retireBakedTemplates, withBakeLock, tryWithBakeLock, type DsHandle } from '../drivers/datastores.js';
+import { cmdTimeoutS, runBounded, LONG_CMD_TIMEOUT_S } from '../core/exec.js';
+import { makeDatastore, parseBakedMarker, withBakeLock, type DsHandle } from '../drivers/datastores.js';
 import { ensureAppliance, stopAppliance, probeTcp } from '../drivers/appliances.js';
 import { DEFAULT_PREVIEW_PUBLISHER, resolvePreviewPublisher } from '../drivers/preview.js';
 import { EnvSupervisor, killGroupVerified, killPidVerified, reapPids, mergeServicePids, serviceGroups, type ServiceExit } from './supervisor.js';
-import { groupAlive, isAlive, processGroup, procScanSupported, sameProcess, scanByCwd, scanDbCopy, scanTagged, serviceTag, startTime, type TaggedProc } from '../core/procscan.js';
+import { EXEC_SERVICE, groupAlive, isAlive, processGroup, procScanSupported, sameProcess, scanByCwd, scanDbCopy, scanTagged, serviceTag, startTime, type TaggedProc } from '../core/procscan.js';
 import { policy } from '../core/policy.js';
 import { kernelSleepGap, readKernelSleepRecord } from '../core/sleep.js';
 import { retentionSweep, templateRefs } from '../core/retention.js';
@@ -53,6 +53,17 @@ const serviceIdleMs = (spec: ServiceSpec | undefined): number => parseDuration(s
 
 /** Streamed bind phases → human progress on stderr (never on the --json stdout). */
 export type Progress = (phase: string) => void;
+
+/**
+ * The build decisions one operation already made (0.19): `needFor` decides
+ * every build to price it, and the build phase of the SAME operation reuses
+ * those decisions instead of listing and stat'ing every `when:` file again.
+ * Valid only while runly has changed nothing in the worktree since: an
+ * upkeep rule that ran, or a build that finished (it may have written another
+ * build's inputs), clears it; so does a wait of more than DECISION_TTL_MS.
+ */
+type BuildDecisions = Map<string, { cmd: string; run: boolean; key: string; reason?: string; at: number }>;
+const DECISION_TTL_MS = 30_000;
 
 /** What one claim attempt found: an environment to bind, or nothing (capacity, or not this caller's turn). */
 type ClaimOutcome = { env: EnvRow; fresh: boolean } | null;
@@ -211,6 +222,8 @@ export class Engine {
   /** When each running service process was started — a fresh start is activity. */
   private startedAt = new Map<string, number>();
   /** Services stopped for idleness (ps shows them as `idle`). */
+  /** The last failed `up` per environment (0.19), for ctx and ps; cleared by a successful one. */
+  private readonly bindFailures = new Map<string, { at: number; class: string; message: string; source: string | null }>();
   private idleStopped = new Set<string>();
   /**
    * Services of a LEASED environment that crash-looped and were stopped
@@ -311,16 +324,6 @@ export class Engine {
 
   /** Recovery (decision 0009): reap recorded PIDs from a previous daemon life; hot -> warm. */
   async recover(): Promise<void> {
-    for (const env of this.journal.allEnvs()) {
-      try {
-        // Only migrate a proven lexical alias. Renamed manifests remain subject
-        // to ordinary orphan retention; an unreadable source proves nothing and
-        // is retried at every later bind and sweep boundary.
-        this.adoptLegacyAliases(loadStack(env.stackRoot));
-      } catch { /* leave unavailable or renamed projects unchanged */ }
-    }
-    for (const env of this.journal.allEnvs()) this.registerRetiredTemplates(env);
-    if (existsSync(templatesRoot())) for (const retired of readdirSync(templatesRoot())) this.relocateRetiredTemplates(retired);
     let envs = 0;
     let stranded = 0;
     for (const env of this.journal.allEnvs()) {
@@ -351,17 +354,6 @@ export class Engine {
       // Reaping awaits real kills, so this row may have been torn down while we
       // were working. Saving a snapshot of a deleted row resurrects it.
       if (!this.journal.getEnv(env.id)) continue;
-      // An older daemon projected a full copy of the worktree here. Nothing runs
-      // from it any more (decision 0032) — once its processes are confirmed
-      // gone, the copy is disk to give back. Its `@source` and build stamps
-      // described that copy and are dropped; command rules belong to the
-      // worktree's ledger, which starts empty, so they run once in place.
-      const legacyTree = this.envDirs(env.id).legacyTree;
-      if (Object.keys(survivors).length === 0 && existsSync(legacyTree) && this.isPrivateEnvDir(env)) {
-        rmSync(legacyTree, { recursive: true, force: true });
-        logEvent({ level: 'info', kind: 'retention', envId: env.id, detail: 'removed the projected source copy an older runly kept; services now run in the worktree (decision 0032)' });
-      }
-      env.fingerprints = pickEnvKeys(env.fingerprints);
       this.journal.saveEnv(env);
       envs++;
     }
@@ -379,31 +371,9 @@ export class Engine {
       kind: 'recover',
       detail: `reconciled ${envs} env(s)${stranded ? `, ${stranded} service(s) survived the reap` : ''}`,
     });
-    // Data-only environments are gone (decision 0034). A leased one becomes
-    // what it always was underneath — an environment whose lease wants no
-    // services — so its holder keeps the lease and the data. An unleased one is
-    // a test lane nobody holds any more; it is recycled, giving its datastores
-    // back, rather than taking a machine-wide slot it was never charged for.
-    for (const env of this.journal.allEnvs()) {
-      if (!env.dataOnly || env.state === 'recycling') continue;
-      env.dataOnly = false;
-      env.activeServices = [];
-      if (env.state === 'hot') env.state = 'warm';
-      if (this.journal.leaseForEnv(env.id)) {
-        this.journal.saveEnv(env);
-        logEvent({ level: 'info', kind: 'migrate', envId: env.id, detail: 'a data-only environment from an older runly is now an environment with no services wanted; its lease and data are kept (decision 0034)' });
-        continue;
-      }
-      env.state = 'recycling';
-      this.journal.saveEnv(env);
-      logEvent({ level: 'info', kind: 'migrate', envId: env.id, detail: 'an unleased data-only environment from an older runly is recycled (decision 0034: a database alone is a runly db copy)' });
-      void this.teardownClaimed(env).catch((err) =>
-        logEvent({ level: 'error', kind: 'teardown', envId: env.id, detail: `recycling a data-only environment failed: ${String((err as Error).message ?? err)}` }),
-      );
-    }
     // Anything the journal never knew about — the owner died before the pids
     // were ever written, or the env row is long gone — is only findable by tag.
-    const gc = await this.poolGc(false);
+    const gc = await this.poolGc();
     if (gc.reclaimed.length) {
       logEvent({ level: 'warn', kind: 'gc', detail: `reclaimed ${gc.reclaimed.length} orphaned process(es) at startup` });
     }
@@ -440,8 +410,7 @@ export class Engine {
    * to an env with an operation in flight, is left strictly alone — a bind
    * racing the sweep must not have its dev-server shot out from under it.
    */
-  async poolGc(retryRetiredTemplates = true): Promise<{ supported: boolean; reclaimed: Array<{ pid: number; envId: string; service: string }>; skipped: number }> {
-    if (retryRetiredTemplates) await this.retireLegacyTemplateBatch(true);
+  async poolGc(): Promise<{ supported: boolean; reclaimed: Array<{ pid: number; envId: string; service: string }>; skipped: number }> {
     if (!procScanSupported()) return { supported: false, reclaimed: [], skipped: 0 };
     const tagged = scanTagged(stateRoot());
     if (tagged.length === 0) return { supported: true, reclaimed: [], skipped: 0 };
@@ -499,13 +468,12 @@ export class Engine {
   // ---------------------------------------------------------------- pool
 
   /**
-   * An environment's PRIVATE state — data dir, logs. There is no tree here any
-   * more: services run in the caller's worktree (decision 0032). `legacyTree`
-   * names the projection copy older daemons kept, so it can be reclaimed.
+   * An environment's PRIVATE state — data dir, logs. There is no tree here:
+   * services run in the caller's worktree (decision 0032).
    */
   private envDirs(id: string) {
     const root = join(envsRoot(), id);
-    return { root, data: join(root, 'data'), logs: join(root, 'logs'), legacyTree: join(root, 'tree') };
+    return { root, data: join(root, 'data'), logs: join(root, 'logs') };
   }
 
   private async createEnv(stack: Stack): Promise<EnvRow> {
@@ -1158,11 +1126,14 @@ export class Engine {
   }
 
   /**
-   * Create, keep or reload each datastore in `plan`, journalling every
-   * completed restore at once so a later failure still reports the earlier
-   * ones truthfully. A datastore not forced and already present is KEPT —
-   * whatever it holds, even a preset the catalog no longer offers (decision
-   * 0034: no preset means keep the data, never a silent reset to the default).
+   * Create, keep or reload each datastore in `plan` — all of them at once
+   * (0.19): each bakes and restores under its own datastore lock, so three
+   * datastores cost the slowest one, not their sum. Every completed restore is
+   * journalled at once, so a failure still reports the others truthfully, and
+   * the call settles only when every datastore has (the first error wins). A
+   * datastore not forced and already present is KEPT — whatever it holds, even
+   * a preset the catalog no longer offers (decision 0034: no preset means keep
+   * the data, never a silent reset to the default).
    */
   private async prepareDatastores(
     stack: Stack,
@@ -1173,9 +1144,9 @@ export class Engine {
   ): Promise<string[]> {
     const dsHandle: DsHandle = { envId: env.id, cwd: stack.root, dataDir: this.envDirs(env.id).data };
     const restored: string[] = [];
-    for (const step of plan) {
+    const one = async (step: (typeof plan)[number]): Promise<void> => {
       const spec = stack.manifest.datastores?.[step.name];
-      if (!spec) continue;
+      if (!spec) return;
       const ds = makeDatastore(step.name, spec, stack.id, bakeKeys[step.name]);
       await ds.probe();
       const held = env.presets[step.name];
@@ -1209,8 +1180,23 @@ export class Engine {
         if (env.templates) current.templates = env.templates;
         this.journal.saveEnv(current);
       }
-    }
+    };
+    const settled = await Promise.allSettled(plan.map(one));
+    const failed = settled.find((r): r is PromiseRejectedResult => r.status === 'rejected');
+    if (failed) throw failed.reason;
     return restored;
+  }
+
+  /**
+   * What an additive `up` builds and may restart: every service it leaves
+   * running for a plain `up`; for `up <service…>` only the named services,
+   * their depends_on closure and what it (re)starts because it is not running
+   * (0.19). A full rebind still stops and starts everything — its reasons
+   * (an upkeep rule ran, the manifest changed, …) concern every service.
+   */
+  private bindScope(active: Set<string>, running: Set<string>, requested: string[] | undefined, added: Set<string>): Set<string> {
+    if (requested === undefined || requested.length === 0) return active;
+    return new Set([...active].filter((n) => added.has(n) || !running.has(n)));
   }
 
   private async bindAndStart(stack: Stack, envSnapshot: EnvRow, hygiene: Hygiene, onProgress?: Progress, requestedServices?: string[], freshClaim = false, callerEnv?: unknown, requestedPresets?: unknown, rebuild = false, signal?: AbortSignal): Promise<{ env: EnvRow; previewNotice?: string; bindDiagnostics: BindDiagnostics }> {
@@ -1223,14 +1209,15 @@ export class Engine {
     const base = freshClaim ? running : new Set([...this.desiredServices(stack, live), ...running]);
     const added = requestedServices === undefined ? new Set<string>() : this.resolveServiceClosure(stack, requestedServices);
     const active = new Set([...base, ...added].filter((n) => n in stack.manifest.services));
-    const need = await this.needFor(stack, live, new Set([...active].filter((n) => !running.has(n))), active, { rebuild: rebuild || hygiene === 'pristine', mode: 'bind' });
+    const decided: BuildDecisions = new Map();
+    const need = await this.needFor(stack, live, new Set([...active].filter((n) => !running.has(n))), this.bindScope(active, running, requestedServices, added), { rebuild: rebuild || hygiene === 'pristine', mode: 'bind' }, decided);
     const reservation = await this.budget.admit(need, `up ${stack.manifest.name} (${live.id})`, {
       onWait: (position, etaMs, why) => say(`waiting for the load budget: position ${position}, about ${formatDuration(etaMs)} — ${why}`),
       source: 'budget',
       signal,
     });
     try {
-      return await this.bindAndStartInner(stack, envSnapshot, hygiene, onProgress, requestedServices, freshClaim, callerEnv, requestedPresets, rebuild, reservation);
+      return await this.bindAndStartInner(stack, envSnapshot, hygiene, onProgress, requestedServices, freshClaim, callerEnv, requestedPresets, rebuild, reservation, decided);
     } finally {
       reservation.release();
       // A public port marked `starting` whose service never became ready (a
@@ -1240,7 +1227,7 @@ export class Engine {
     }
   }
 
-  private async bindAndStartInner(stack: Stack, envSnapshot: EnvRow, hygiene: Hygiene, onProgress: Progress | undefined, requestedServices: string[] | undefined, freshClaim: boolean, callerEnv: unknown, requestedPresets: unknown, rebuild: boolean, reservation: Reservation): Promise<{ env: EnvRow; previewNotice?: string; bindDiagnostics: BindDiagnostics }> {
+  private async bindAndStartInner(stack: Stack, envSnapshot: EnvRow, hygiene: Hygiene, onProgress: Progress | undefined, requestedServices: string[] | undefined, freshClaim: boolean, callerEnv: unknown, requestedPresets: unknown, rebuild: boolean, reservation: Reservation, decided: BuildDecisions = new Map()): Promise<{ env: EnvRow; previewNotice?: string; bindDiagnostics: BindDiagnostics }> {
     const say = onProgress ?? (() => undefined);
     const trace = new BindTrace();
     // Re-read under the env lock: the snapshot captured during acquire may be
@@ -1271,6 +1258,7 @@ export class Engine {
     const base = freshClaim ? running : new Set([...this.desiredServices(stack, env), ...running]);
     const added = requestedServices === undefined ? new Set<string>() : this.resolveServiceClosure(stack, requestedServices);
     const active = new Set([...base, ...added].filter((n) => n in stack.manifest.services));
+    const scope = this.bindScope(active, running, requestedServices, added);
     const inputLease = this.journal.leaseForEnv(env.id);
     if (!inputLease) throw new BrokerError('env-error', 'lease ended before bind; run runly up again', 'lease');
     const previousInputs = this.leaseInputs.get(inputLease.id);
@@ -1325,7 +1313,6 @@ export class Engine {
       // again in place (builds run on every bind anyway). The datastores'
       // presets are KEPT: they say what each store is recreated with.
       rmSync(dirs.data, { recursive: true, force: true });
-      rmSync(dirs.legacyTree, { recursive: true, force: true });
       mkdirSync(dirs.data, { recursive: true });
       env.fingerprints = {};
       // Persist the cleared ledger NOW, not at the end of the bind. Appliances
@@ -1339,9 +1326,6 @@ export class Engine {
         // Nothing is trusted: every build runs again too (decision 0038).
         clearBuilds(stack.id);
       }, (s) => say(`waiting for another bind in this worktree … ${s}s`));
-    } else if (Object.keys(env.servicePids).length === 0 && existsSync(dirs.legacyTree)) {
-      // A projection copy from an older daemon: nothing runs from it any more.
-      rmSync(dirs.legacyTree, { recursive: true, force: true });
     }
 
     // Appliances first: shared backing servers must answer before anything
@@ -1367,6 +1351,8 @@ export class Engine {
       return { upkeep: out, files: triggers };
     }, waitTree);
     trace.result.upkeep = { ran: upkeep.ran.length, skipped: (stack.manifest.upkeep?.length ?? 0) - upkeep.ran.length };
+    // An upkeep rule that ran may have changed a build's inputs.
+    if (upkeep.ran.length > 0 || hygiene === 'pristine') decided.clear();
     // Content-derived template identity (vetbill-1i49): divergent
     // migrations/seeds in this worktree yield a different bake key and thus a
     // disjoint template name — two stacks can no longer silently share a
@@ -1413,6 +1399,8 @@ export class Engine {
     // A different set of services and a different preset are no longer reasons
     // for the full path: `up` is additive, and a preset reloads one datastore.
     const missing = [...active].filter((n) => !running.has(n));
+    // Its first bind: every other reason below is then a matter of course.
+    if (env.bindCount === 0) trace.result.reasons.push('new-environment');
     if (upkeep.ran.length > 0) trace.result.reasons.push('upkeep-required');
     if (env.state !== 'hot') trace.result.reasons.push('environment-not-running');
     if (!this.supervisor(env).allHealthyPids()) trace.result.reasons.push('service-process-unhealthy');
@@ -1437,15 +1425,23 @@ export class Engine {
       const toRestart = new Set<string>();
       await this.treeLocked(stack.id, () => this.inWaves(this.buildWaves(stack, active), async (name) => {
         const spec = serviceOf(stack, name);
+        // `up <service>` (0.19): a running service outside the named ones and
+        // their depends_on closure is left as it is — not built, not restarted.
+        if (!scope.has(name)) {
+          trace.result.builds.push({ service: name, durationMs: 0, restart: false, reason: 'not-named' });
+          return;
+        }
         // A service this `up` adds is built and started; nothing to compare.
         if (!running.has(name)) {
-          const b = await this.buildService(stack, env, name, spec, buildCtx, say, { rebuild, mode: 'bind' });
+          const b = await this.buildService(stack, env, name, spec, buildCtx, say, { rebuild, mode: 'bind', decided });
           trace.result.builds.push({ service: name, durationMs: b.durationMs, restart: false, reason: b.ran ? 'not-running' : 'when-unchanged' });
           return;
         }
         const declared = outputsOf(spec);
-        const before = declared.paths.length > 0 ? await snapshotOutputs(stack.root, declared.paths, declared.compare) : null;
-        const b = await this.buildService(stack, env, name, spec, buildCtx, say, { rebuild, mode: 'bind' });
+        // A build that will be skipped changes no outputs: no snapshot to take.
+        const due = await this.buildWillRun(stack, name, spec, buildCtx, { rebuild, mode: 'bind', decided });
+        const before = due && declared.paths.length > 0 ? await snapshotOutputs(stack.root, declared.paths, declared.compare) : null;
+        const b = await this.buildService(stack, env, name, spec, buildCtx, say, { rebuild, mode: 'bind', decided });
         if (!b.ran) {
           // Its inputs did not change, so its output did not either.
           trace.result.builds.push({ service: name, durationMs: b.durationMs, restart: false, reason: 'when-unchanged' });
@@ -1505,6 +1501,10 @@ export class Engine {
       trace.phase('ready');
       await startSlice(new Set([...toRestart, ...missing]));
     } else {
+    // What this full rebind starts that was not running, and what it stops
+    // and starts again — the same two lists the additive path reports.
+    trace.result.started = [...missing];
+    trace.result.restarted = [...active].filter((n) => running.has(n));
     // Services must not hold open handles across a data restore or code change.
     trace.phase('stop');
     this.markStarting(env, stack, [...active]);
@@ -1543,11 +1543,15 @@ export class Engine {
       const t0 = performance.now();
       try {
         await this.treeLocked(stack.id, () => this.inWaves(this.buildWaves(stack, active), async (name) => {
-          const b = await this.buildService(stack, env, name, serviceOf(stack, name), ctx, say, { rebuild, mode: 'bind' });
+          const b = await this.buildService(stack, env, name, serviceOf(stack, name), ctx, say, { rebuild, mode: 'bind', decided });
           trace.result.builds.push({ service: name, durationMs: b.durationMs, restart: true, reason: b.ran ? 'full-rebind' : 'when-unchanged' });
         }), waitTree);
       } finally {
         phaseMs.build = performance.now() - t0;
+        // The build share goes back when the BUILDS end, not when the data
+        // phase they overlap does: a short build next to a long bake held its
+        // (large) build reservation for the whole bake.
+        reservation.releaseBuild();
       }
     };
     const phaseMs = { data: 0, build: 0 };
@@ -1555,7 +1559,6 @@ export class Engine {
     // running behind the caller's back, and the data error (if any) wins.
     const [dataDone, buildsDone] = await Promise.allSettled([data(), builds()]);
     trace.overlapped(phaseMs);
-    reservation.releaseBuild();
     if (dataDone.status === 'rejected') throw dataDone.reason;
     if (buildsDone.status === 'rejected') throw buildsDone.reason;
 
@@ -1615,6 +1618,7 @@ export class Engine {
     this.appliedInputSpecs.set(env.id, inputSpec);
     this.appliedManifests.set(env.id, manifestKey);
     env.failStreak = 0; // a successful bind clears the escalation counter
+    this.bindFailures.delete(env.id);
     this.journal.saveEnv(env);
     return {
       env,
@@ -1690,7 +1694,7 @@ export class Engine {
   }
 
   /** Build `names` (those that declare a build) in waves. MUST run under treeLocked. */
-  private runBuilds(stack: Stack, env: EnvRow | undefined, names: Iterable<string>, ctx: Record<string, unknown> | undefined, say: Progress, opts: { rebuild: boolean; mode: 'bind' | 'wake' | 'warm' }): Promise<void> {
+  private runBuilds(stack: Stack, env: EnvRow | undefined, names: Iterable<string>, ctx: Record<string, unknown> | undefined, say: Progress, opts: { rebuild: boolean; mode: 'bind' | 'wake' | 'warm'; decided?: BuildDecisions }): Promise<void> {
     return this.inWaves(this.buildWaves(stack, names), async (name) => {
       await this.buildService(stack, env, name, serviceOf(stack, name), ctx, say, opts);
     });
@@ -1722,7 +1726,7 @@ export class Engine {
         throw new BrokerError('work-error', `build for service '${name}' timed out after ${buildTimeoutS}s (process group killed; set BACKLOT_CMD_TIMEOUT_S if legitimate)`, name, r.output.slice(-800));
       }
       log?.line(`-- runly: build ${name} exited ${r.code} after ${formatDuration(now() - buildStart)} --`);
-      if (r.code !== 0) throw new BrokerError('work-error', `build failed for service '${name}' ('runly logs ${name} --build' has its output)`, name, r.output.slice(-800));
+      if (r.code !== 0) throw commandFailure(`build failed for service '${name}' ('runly logs ${name} --build' has its output)`, name, r.output);
     } finally {
       clearInterval(beat);
     }
@@ -1735,7 +1739,15 @@ export class Engine {
    * string build always runs on a bind, and on a wake only when it never
    * succeeded here (a wake resumes what ran; `up` applies changes).
    */
-  private async buildDecision(stack: Stack, name: string, spec: ServiceSpec, cmd: string, opts: { rebuild: boolean; mode: 'bind' | 'wake' | 'warm' | 'plan' }): Promise<{ run: boolean; key: string; reason?: string }> {
+  private async buildDecision(stack: Stack, name: string, spec: ServiceSpec, cmd: string, opts: { rebuild: boolean; mode: 'bind' | 'wake' | 'warm' | 'plan'; decided?: BuildDecisions }): Promise<{ run: boolean; key: string; reason?: string }> {
+    const memo = opts.decided?.get(name);
+    if (memo && memo.cmd === cmd && now() - memo.at < DECISION_TTL_MS) return { run: memo.run, key: memo.key, ...(memo.reason ? { reason: memo.reason } : {}) };
+    const d = await this.decideBuild(stack, name, spec, cmd, opts);
+    opts.decided?.set(name, { cmd, ...d, at: now() });
+    return d;
+  }
+
+  private async decideBuild(stack: Stack, name: string, spec: ServiceSpec, cmd: string, opts: { rebuild: boolean; mode: 'bind' | 'wake' | 'warm' | 'plan' }): Promise<{ run: boolean; key: string; reason?: string }> {
     const b = buildOf(spec) ?? { run: cmd };
     const key = b.when ? await buildInputsKey(stack.root, stack.manifest, cmd, b.when) : sha256(`${cmd}\nalways`);
     if (opts.rebuild) return { run: true, key };
@@ -1752,7 +1764,7 @@ export class Engine {
   /** Build one service if its build is due; record a success. MUST run under treeLocked. */
   private async buildService(
     stack: Stack, env: EnvRow | undefined, name: string, spec: ServiceSpec, ctx: Record<string, unknown> | undefined, say: Progress,
-    opts: { rebuild: boolean; mode: 'bind' | 'wake' | 'warm' },
+    opts: { rebuild: boolean; mode: 'bind' | 'wake' | 'warm'; decided?: BuildDecisions },
   ): Promise<{ ran: boolean; durationMs: number }> {
     const b = buildOf(spec);
     if (!b) return { ran: false, durationMs: 0 };
@@ -1765,9 +1777,21 @@ export class Engine {
     const started = performance.now();
     // Dropped before it runs: a build that fails half-way vouches for nothing.
     forgetBuild(stack.id, stack.root, name);
-    await this.runServiceBuild(name, cmd, stack.root, say, env ? this.envDirs(env.id).logs : undefined);
+    try {
+      await this.runServiceBuild(name, cmd, stack.root, say, env ? this.envDirs(env.id).logs : undefined);
+    } finally {
+      // It may have written another build's inputs: later decisions are made afresh.
+      opts.decided?.clear();
+    }
     recordBuild(stack.id, stack.root, name, decision.key, await this.outputsPrint(stack, spec));
     return { ran: true, durationMs: performance.now() - started };
+  }
+
+  /** Would this service's build run now? (Recorded in `decided` for the build that follows.) */
+  private async buildWillRun(stack: Stack, name: string, spec: ServiceSpec, ctx: Record<string, unknown> | undefined, opts: { rebuild: boolean; mode: 'bind' | 'wake' | 'warm'; decided?: BuildDecisions }): Promise<boolean> {
+    const b = buildOf(spec);
+    if (!b) return false;
+    return (await this.buildDecision(stack, name, spec, ctx ? template(b.run, ctx) : b.run, opts)).run;
   }
 
   /**
@@ -1860,7 +1884,7 @@ export class Engine {
    * item by item: run resources per start, build resources per build that
    * will actually run, and run resources per appliance that is not up.
    */
-  private async needFor(stack: Stack, env: EnvRow | undefined, starts: Set<string>, builds: Set<string>, opts: { rebuild: boolean; mode: 'bind' | 'wake' | 'plan' }): Promise<Need> {
+  private async needFor(stack: Stack, env: EnvRow | undefined, starts: Set<string>, builds: Set<string>, opts: { rebuild: boolean; mode: 'bind' | 'wake' | 'plan' }, decided?: BuildDecisions): Promise<Need> {
     const b = policy().budget;
     const items: NeedItem[] = [];
     let ctx: Record<string, unknown> | undefined;
@@ -1880,7 +1904,7 @@ export class Engine {
         try {
           const raw = declaredBuild.run;
           const cmd = ctx ? template(raw, ctx) : raw;
-          const d = await this.buildDecision(stack, name, spec, cmd, { rebuild: opts.rebuild, mode: opts.mode === 'plan' ? 'bind' : opts.mode });
+          const d = await this.buildDecision(stack, name, spec, cmd, { rebuild: opts.rebuild, mode: opts.mode === 'plan' ? 'bind' : opts.mode, decided });
           if (!d.run) skipped = d.reason;
         } catch {
           /* an untemplatable line (no environment yet): it will run */
@@ -2024,124 +2048,20 @@ export class Engine {
   // ---------------------------------------------------------------- verbs
 
   /**
-   * A proven lexical alias: the row's identity is exactly what the current
-   * manifest name yields for the spelling it recorded, and that spelling still
-   * resolves to `stack`'s physical root. A renamed manifest, or a source that
-   * is unreadable or gone, proves nothing and is left alone.
+   * Who the caller is when it names no holder: its WORKTREE — the directory
+   * holding the manifest, found by searching upward — whichever subdirectory
+   * the verb runs from. `up` at the root and `ctx --env` from `src/app` are
+   * the same caller. A live lease an older runly keyed to a subdirectory is
+   * still honoured from that subdirectory until it ends.
    */
-  private legacyAlias(env: EnvRow, stack: Stack): { id: string; stack: string; root: string } | null {
-    if (env.stack === stack.id || stackIdentity(stack.manifest.name, env.stackRoot) !== env.stack) return null;
-    try {
-      if (canonicalDirectory(env.stackRoot) !== stack.root) return null;
-    } catch {
-      return null;
-    }
-    return { id: env.id, stack: stack.id, root: stack.root };
-  }
-
-  /**
-   * Migrate every proven alias of `stack` to its physical identity. Idempotent,
-   * and applied at every boundary that judges a row by identity — recovery, the
-   * holder verbs, the sweeper's orphan check — so a manifest that was merely
-   * unreadable when the daemon started can only defer the migration, never turn
-   * it into a reclaim or a duplicate environment once repaired.
-   */
-  private adoptLegacyAliases(stack: Stack): void {
-    const changes = this.journal.allEnvs().map((env) => this.legacyAlias(env, stack)).filter((c) => c !== null);
-    if (changes.length === 0) return;
-    this.journal.canonicalizeStacks(changes);
-    for (const change of changes) {
-      const migrated = this.journal.getEnv(change.id);
-      if (migrated) this.registerRetiredTemplates(migrated);
-      logEvent({ level: 'info', kind: 'retention', envId: change.id, detail: `stack identity migrated to '${change.stack}' (physical root ${change.root})` });
-    }
-  }
-
-  /** A durable descriptor keeps failed retirement discoverable after the last env is recycled. */
-  private registerRetiredTemplates(env: EnvRow): void {
-    if (!env.legacyStackRoot) return;
-    const retired = retiredStackIdentity(env.stack, env.legacyStackRoot);
-    const dir = join(templatesRoot(), retired);
-    if (retired === env.stack || !existsSync(dir)) return;
-    const record = join(dir, '.retired-stack.json');
-    if (!existsSync(record)) {
-      writeFileSync(`${record}.tmp`, JSON.stringify({
-        stack: env.stack, legacyRoot: env.legacyStackRoot, root: env.stackRoot,
-      }));
-      renameSync(`${record}.tmp`, record);
-    }
-    this.relocateRetiredTemplates(retired);
-  }
-
-  private relocateRetiredTemplates(retired: string): void {
-    tryWithBakeLock(retired, () => {
-      if (this.journal.envsForStack(retired).length > 0) return;
-      const dir = join(templatesRoot(), retired);
-      try {
-        const descriptor = JSON.parse(readFileSync(join(dir, '.retired-stack.json'), 'utf8'));
-        if (typeof descriptor.stack !== 'string' || typeof descriptor.legacyRoot !== 'string' || typeof descriptor.root !== 'string') return;
-        if (retiredStackIdentity(descriptor.stack, descriptor.legacyRoot) !== retired || descriptor.stack === retired) return;
-      } catch { return; }
-      mkdirSync(retiredTemplatesRoot(), { recursive: true });
-      const destination = join(retiredTemplatesRoot(), retired);
-      renameSync(dir, existsSync(destination) ? `${destination}.${shortId()}` : destination);
-    });
-  }
-
-  /** One bounded external drop, after ownership/reaping work; never part of recovery. */
-  private async retireLegacyTemplateBatch(force = false): Promise<void> {
-    for (const env of this.journal.allEnvs()) this.registerRetiredTemplates(env);
-    if (existsSync(templatesRoot())) for (const retired of readdirSync(templatesRoot())) this.relocateRetiredTemplates(retired);
-    let entries: string[];
-    try { entries = readdirSync(retiredTemplatesRoot()); } catch { return; }
-    for (const entry of entries) {
-      const dir = join(retiredTemplatesRoot(), entry);
-      let retired: string;
-      let descriptor: { stack: string; legacyRoot: string; root: string };
-      try {
-        descriptor = JSON.parse(readFileSync(join(dir, '.retired-stack.json'), 'utf8'));
-        if (typeof descriptor.stack !== 'string' || typeof descriptor.legacyRoot !== 'string' || typeof descriptor.root !== 'string') continue;
-        retired = retiredStackIdentity(descriptor.stack, descriptor.legacyRoot);
-        if ((entry !== retired && !entry.startsWith(retired + '.')) || descriptor.stack === retired) continue;
-      } catch { continue; }
-      // A skipped migration or an in-flight old bake still owns these templates.
-      if (this.journal.envsForStack(retired).length > 0) continue;
-      if (this.journal.envsForStack(descriptor.stack).some((row) => this.busy.has(row.id))) continue;
-      const attempted = await withBakeLock(descriptor.stack, () => withBakeLock(retired, async () => {
-        const { dropped, deferred, attempted } = await retireBakedTemplates(
-          dir, existsSync(descriptor.root) ? descriptor.root : templatesRoot(), force,
-        );
-        if (deferred > 0) {
-          if (attempted > 0) logEvent({ level: 'warn', kind: 'retention', detail: `retired templates for '${retired}' remain; failed drops retain .retirement.json records with bounded retries. Check the appliance, then run runly pool gc to retry.` });
-          return attempted > 0;
-        }
-        rmSync(dir, { recursive: true, force: true });
-        logEvent({ level: 'info', kind: 'retention', detail: `retired templates keyed by legacy stack identity '${retired}' (${dropped} server-side template(s) dropped)` });
-        return true;
-      }));
-      if (attempted) break;
-    }
-  }
-
   private callerHolder(cwd: string, holder: string | undefined, stack: Stack): string {
-    this.adoptLegacyAliases(stack);
     if (holder !== undefined) return holder;
     const canonical = canonicalDirectory(cwd);
-    const own = this.journal.leaseForHolder(canonical, stack.id);
-    if (own && own.expiresAt > now()) return canonical;
-    for (const env of this.journal.envsForStack(stack.id)) {
-      const lease = this.journal.leaseForEnv(env.id);
-      if (!lease || lease.expiresAt <= now() || !isAbsolute(lease.holder)) continue;
-      const legacyRoot = env.legacyStackRoot;
-      const legacyPathHolder = legacyRoot && (lease.holder === legacyRoot || lease.holder.startsWith(legacyRoot + sep));
-      let candidate: string | undefined;
-      try { candidate = canonicalDirectory(legacyPathHolder ? join(env.stackRoot, lease.holder.slice(legacyRoot.length)) : lease.holder); }
-      catch { candidate = undefined; }
-      if (candidate === undefined || canonical === candidate) {
-        throw new BrokerError('env-error', `a legacy path holder still owns ${env.id}; pass holder ${JSON.stringify(lease.holder)} (--holder on the CLI) to inspect or release that lease before using the canonical default holder`, 'lease');
-      }
+    if (canonical !== stack.root) {
+      const own = this.journal.leaseForHolder(canonical, stack.id);
+      if (own && own.expiresAt > now()) return canonical;
     }
-    return canonical;
+    return stack.root;
   }
 
   async up(opts: UpOptions) {
@@ -2222,6 +2142,14 @@ export class Engine {
       if (fresh && !notABindFailure) {
         fresh.failStreak += 1;
         this.journal.saveEnv(fresh);
+        // ctx and ps say so (0.19): a first `up` that failed left an
+        // environment whose services read as merely "stopped".
+        this.bindFailures.set(env.id, {
+          at: now(),
+          class: err instanceof BrokerError ? err.klass : 'infra-error',
+          message: String((err as Error).message ?? err),
+          source: err instanceof BrokerError ? (err.source ?? null) : null,
+        });
       }
       throw err;
     }
@@ -2278,7 +2206,12 @@ export class Engine {
       stack: stack.manifest.name,
       envId: env.id,
       state: env.state,
-      lease: lease ? { id: lease.id, kind: lease.kind, hygiene: lease.hygiene, expiresAt: lease.expiresAt } : null,
+      /**
+       * `holderPid`: the process the lease is tethered to (decision 0035) —
+       * while it lives the lease does not expire, so `expiresAt` is only the
+       * renewal horizon. null for a lease that ends at `expiresAt`.
+       */
+      lease: lease ? { id: lease.id, kind: lease.kind, hygiene: lease.hygiene, expiresAt: lease.expiresAt, holderPid: lease.holderPid ?? null } : null,
       urls,
       /** The environment's PUBLIC ports by manifest key (`runly ctx --env` → RUNLY_PORT_<KEY>). */
       ports: { ...env.ports },
@@ -2298,6 +2231,8 @@ export class Engine {
       services: this.serviceStates(stack, env),
       /** Services that crash-looped and were stopped (decision 0039), with their last exit; the next `up` retries them. */
       failures: this.serviceFailures(stack, env),
+      /** The last `up` failed and none succeeded since (0.19): what failed; null otherwise. */
+      lastUpFailed: this.bindFailureOf(env),
       /**
        * `logins` stays the PRIMARY login even for a stack that declares a list, so
        * a consumer reading `ctx.logins.user` is unaffected by the manifest growing
@@ -2338,6 +2273,21 @@ export class Engine {
       n,
       running.has(n) ? 'running' : !wanted.has(n) ? 'down' : this.failureOf(env.id, n) ? 'failed' : 'stopped',
     ]));
+  }
+
+  /**
+   * The last `up` of `env`, when it failed and none has succeeded since
+   * (0.19): what failed, and that `up` redoes it — neither a connection nor a
+   * verb starts its services meanwhile. After a daemon restart only the fact
+   * survives (the journal's fail streak), not the message.
+   */
+  private bindFailureOf(env: EnvRow): { at: number | null; class: string | null; message: string; source: string | null; hint: string } | null {
+    if ((env.failStreak ?? 0) === 0) return null;
+    const f = this.bindFailures.get(env.id);
+    const hint = `the next 'runly up' redoes it; until then nothing starts its services`;
+    return f
+      ? { ...f, hint }
+      : { at: null, class: null, message: `the last 'runly up' failed (before the daemon restarted)`, source: null, hint };
   }
 
   /** The failed services of `env` (decision 0039): how each last ended, and the log to read. */
@@ -2531,51 +2481,54 @@ export class Engine {
     return fresh;
   }
 
-  async exec(cwd: string, cmd: string, holder?: string) {
+  /**
+   * What `runly exec` runs with (decision 0040): the environment's variables,
+   * with idle-stopped services (and, after a daemon restart, every wanted
+   * service) started first and the activity clock touched. The CLI spawns the
+   * command itself — inherited stdio, the caller's own environment, the real
+   * exit code — so nothing here holds the environment's lock while it runs.
+   */
+  async execEnv(cwd: string, holder?: string) {
     const stack = loadStack(cwd);
     const h = this.callerHolder(cwd, holder, stack);
     const lease = this.journal.leaseForHolder(h, stack.id);
     if (!lease) throw new BrokerError('env-error', `no active lease — run 'runly up' first`, 'lease');
     const env = this.envForLease(lease);
     const ctx = this.templateCtx(stack, env);
-    const extra: Record<string, string> = { BACKLOT_ENV_ID: env.id };
-    for (const [name, port] of Object.entries(env.ports)) extra[`BACKLOT_PORT_${name.toUpperCase()}`] = String(port);
+    const vars: Record<string, string> = { BACKLOT_ENV_ID: env.id };
+    for (const [name, port] of Object.entries(env.ports)) vars[`BACKLOT_PORT_${name.toUpperCase()}`] = String(port);
     // Match ctx: on a subset env only the services that are actually up get a
     // URL, so an exec'd command doesn't dereference a service the agent was told
     // is down (the port is stable but nothing is listening on it).
     const activeSet = env.activeServices ? new Set(env.activeServices) : null;
     for (const [name, s] of Object.entries(ctx.services)) {
       if (activeSet && !activeSet.has(name)) continue;
-      extra[`BACKLOT_URL_${name.toUpperCase()}`] = s.url;
+      vars[`BACKLOT_URL_${name.toUpperCase()}`] = s.url;
     }
-    for (const [name, d] of Object.entries(ctx.datastores)) extra[`BACKLOT_DS_${name.toUpperCase()}`] = d.url;
+    for (const [name, d] of Object.entries(ctx.datastores)) vars[`BACKLOT_DS_${name.toUpperCase()}`] = d.url;
     // The names `runly ctx --env` prints, so a script reads one set whether it
     // runs under `exec` or after `eval "$(runly ctx --env)"`.
-    Object.assign(extra, runlyEnvVars({
+    Object.assign(vars, runlyEnvVars({
       envId: env.id,
       ports: env.ports,
       urls: Object.fromEntries(Object.entries(ctx.services).filter(([n]) => !activeSet || activeSet.has(n)).map(([n, s]) => [n, s.url])),
       datastores: Object.fromEntries(Object.entries(ctx.datastores).map(([n, d]) => [n, { url: d.url, preset: env.datastoreNs[n] ? (env.presets[n] ?? null) : null }])),
       logins: normalizeLogins(stack.manifest.auth?.logins)[0] ?? null,
     }));
-    return this.envLocked(env.id, async () => {
+    await this.envLocked(env.id, async () => {
       await this.resumeForVerb(this.assertUsable(env.id, { resumable: true }), 'exec');
       this.touch(env.id);
-      // Bounded, detached, and tagged like a service: an exec blocking on stdin
-      // held the env's busy bit forever, and its untagged children were
-      // invisible to `pool gc` after a daemon crash.
-      const timeoutS = cmdTimeoutS(LONG_CMD_TIMEOUT_S);
-      // In the worktree, where the environment runs (decision 0032).
-      const r = await runBoundedIO(cmd, stack.root, timeoutS, {
-        ...process.env,
-        ...extra,
-        ...serviceTag(env.id, 'exec', stateRoot()),
-      });
-      if (r.timedOut) {
-        throw new BrokerError('work-error', `exec timed out after ${timeoutS}s (process group killed; set BACKLOT_CMD_TIMEOUT_S if legitimate)`, 'exec', r.stderr.slice(-800));
-      }
-      return { exitCode: r.code, stdout: r.stdout.slice(-8000), stderr: r.stderr.slice(-8000) };
     }, undefined, 'an exec');
+    // Tagged, so a process listing can tell an exec from a stranger; never reaped (procscan.scanTagged).
+    return { envId: env.id, root: stack.root, vars: { ...vars, ...serviceTag(env.id, EXEC_SERVICE, stateRoot()) } };
+  }
+
+  /** A running `runly exec` is activity (decision 0039): the CLI calls this while the command runs. */
+  execTouch(envId: string): { touched: boolean } {
+    const env = this.journal.getEnv(envId);
+    if (!env || env.state === 'recycling') return { touched: false };
+    this.touch(envId);
+    return { touched: true };
   }
 
   /** Resolve auth.token with {{role}} and run it in the worktree the environment runs in. */
@@ -2597,12 +2550,21 @@ export class Engine {
       await this.resumeForVerb(this.assertUsable(env.id, { resumable: true }), 'token');
       this.touch(env.id);
       const timeoutS = cmdTimeoutS();
-      const r = await runBoundedIO(template(spec, ctx), stack.root, timeoutS, { ...process.env, RUNLY_ROLE: role });
+      // stdout is the token, stderr the diagnostics: kept apart.
+      let stdout = '';
+      let stderr = '';
+      const r = await runBounded(template(spec, ctx), stack.root, timeoutS, { ...process.env, RUNLY_ROLE: role }, {
+        data: (stream, chunk) => {
+          if (stream === 'out') stdout = (stdout + chunk).slice(-1_000_000);
+          else stderr = (stderr + chunk).slice(-64_000);
+        },
+        end: () => undefined,
+      });
       if (r.timedOut) {
-        throw new BrokerError('work-error', `auth.token command timed out after ${timeoutS}s (process group killed)`, 'auth', r.stderr.slice(-400));
+        throw new BrokerError('work-error', `auth.token command timed out after ${timeoutS}s (process group killed)`, 'auth', stderr.slice(-400));
       }
-      if (r.code !== 0) throw new BrokerError('work-error', `auth.token command failed`, 'auth', r.stderr.slice(-400));
-      return { token: r.stdout.trim(), role };
+      if (r.code !== 0) throw new BrokerError('work-error', `auth.token command failed`, 'auth', stderr.slice(-400));
+      return { token: stdout.trim(), role };
     }, undefined, 'a token command');
   }
 
@@ -3358,8 +3320,11 @@ export class Engine {
     const root = all ? undefined : this.callerWorktree(cwd);
     const rss = this.rssByService();
     const services: Array<Record<string, unknown>> = [];
+    const failedUps: Array<Record<string, unknown>> = [];
     for (const env of this.journal.allEnvs()) {
       if (root !== undefined && env.stackRoot !== root) continue;
+      const failedUp = this.bindFailureOf(env);
+      if (failedUp) failedUps.push({ env: env.id, worktree: env.stackRoot, ...failedUp });
       let stack: Stack | undefined;
       try { stack = loadStack(env.stackRoot); } catch { stack = undefined; }
       const pids = this.supervisors.get(env.id)?.pids() ?? {};
@@ -3410,6 +3375,8 @@ export class Engine {
     const b = policy().budget;
     return {
       scope: root ?? 'server', services, databases,
+      /** Environments whose last `up` failed (0.19), with what failed. */
+      failedUps,
       /** The server-wide load budget (decision 0036). */
       budget: { enabled: b.enabled, memoryBytes: b.memoryBytes, cpu: b.cpu, committedMemoryBytes: committed.memoryBytes, committedCpu: committed.cpu, waiting: this.budget.queueLength() },
     };
@@ -3461,9 +3428,11 @@ export class Engine {
    * goes now — its environment (services, data, preview, ports, lease) and its
    * database copies. What a worktree pool calls when it takes a worktree back;
    * the sweeper does the same by itself when the worktree is removed or its
-   * agent's tether dies. The worktree's upkeep and build records, and the
-   * baked templates, stay (decision 0039): the next `up` finds its installs
-   * and templates current instead of redoing them.
+   * agent's tether dies. The baked templates and the build records stay
+   * (decision 0039; a build's `outputs:` are checked before it is skipped).
+   * Of the upkeep ledger only the rules that declare `outputs:` stay: the pool
+   * usually resets the worktree next (`git clean -fdx`), which removes what
+   * the other rules produced, and nothing else could tell.
    */
   async destroy(cwd: string) {
     const stack = loadStack(cwd);
@@ -3489,13 +3458,14 @@ export class Engine {
         this.dbBusy.delete(c.name);
       }
     }
-    // The worktree's own records (upkeep ledger, trigger cache, build ledger)
-    // STAY (decision 0039): they describe files in the worktree, which destroy
-    // never touches, so forgetting them only made the next `up` re-run every
-    // upkeep rule and build for nothing. `up --pristine` forgets them; the
-    // sweeper removes them once the worktree itself is gone.
-    logEvent({ level: 'info', kind: 'destroy', detail: `destroyed ${stack.root}: ${envs.length} environment(s), ${copies.length} copy(ies)${failed.length ? `, ${failed.length} copy drop(s) failed (retried by the sweeper)` : ''}` });
-    return { worktree: stack.root, environments: envs, copies, copiesNotDropped: failed };
+    // The trigger cache and the build ledger stay (a skipped build checks its
+    // outputs first). Upkeep rules without `outputs:` are forgotten: nothing
+    // could tell that a reset removed what they produced (rules with outputs
+    // are checked at every bind instead).
+    const withOutputs = new Set((stack.manifest.upkeep ?? []).filter((r) => upkeepOutputs(r).length > 0).map(ruleKey));
+    const upkeepForgotten = await this.treeLocked(stack.id, async () => forgetRulesWithoutOutputs(stack.id, stack.root, (k) => withOutputs.has(k)));
+    logEvent({ level: 'info', kind: 'destroy', detail: `destroyed ${stack.root}: ${envs.length} environment(s), ${copies.length} copy(ies), ${upkeepForgotten} upkeep rule(s) forgotten${failed.length ? `, ${failed.length} copy drop(s) failed (retried by the sweeper)` : ''}` });
+    return { worktree: stack.root, environments: envs, copies, copiesNotDropped: failed, upkeepForgotten };
   }
 
   /**
@@ -3571,7 +3541,7 @@ export class Engine {
         try { files = readdirSync(dir); } catch { return; }
         const alive = refs.stackAlive(stackDir);
         const seen = new Map<string, number>();
-        const ordered = files.filter((f) => !f.startsWith('.') && !f.endsWith('.retirement.json'))
+        const ordered = files.filter((f) => !f.startsWith('.'))
           .map((f) => ({ f, m: (() => { try { return statSync(join(dir, f)).mtimeMs; } catch { return 0; } })() }))
           .sort((a, b) => b.m - a.m);
         for (const { f } of ordered) {
@@ -3582,7 +3552,7 @@ export class Engine {
           if (f.endsWith('.baked')) {
             try { ns = parseBakedMarker(readFileSync(join(dir, f), 'utf8')).ns; } catch { ns = undefined; }
           }
-          const keep = (alive && rank < Math.max(1, policy().templatesKeep)) || refs.referenced.has(`${stackDir}/${f}`) || existsSync(join(dir, '.retired-stack.json'));
+          const keep = (alive && rank < Math.max(1, policy().templatesKeep)) || refs.referenced.has(`${stackDir}/${f}`);
           if (keep) {
             if (ns) markerNs.add(ns);
             continue;
@@ -3592,7 +3562,7 @@ export class Engine {
             try {
               const marker = f.endsWith('.baked') ? parseBakedMarker(readFileSync(join(dir, f), 'utf8')) : null;
               if (marker?.drop) {
-                const r = await runBounded(marker.drop, stateRoot(), cmdTimeoutS());
+                const r = await runBounded(marker.drop, refs.dropCwd?.(stackDir) ?? stateRoot(), cmdTimeoutS());
                 if (r.code !== 0 || r.timedOut) throw new Error(`drop exited ${r.timedOut ? 'by timeout' : r.code}: ${r.output.slice(-200)}`);
               }
               rmSync(join(dir, f), { force: true });
@@ -3685,7 +3655,7 @@ export class Engine {
       const orphans = tagged.filter((p) => !live.has(p.envId) && !leasedPreviews.has(p.pid));
       for (const o of orphans) findings.push({ kind: 'process', what: `pid ${o.pid}`, detail: `'${o.service}' of ${envIds.has(o.envId) ? 'environment' : 'gone environment'} ${o.envId}, tagged with this state root` });
       if (fix && orphans.length > 0) {
-        const gc = await this.poolGc(false);
+        const gc = await this.poolGc();
         const reclaimed = new Set(gc.reclaimed.map((r) => r.pid));
         for (const f of findings) if (f.kind === 'process') f.fixed = reclaimed.has(Number(f.what.slice(4)));
       }
@@ -3758,13 +3728,17 @@ export class Engine {
       pid: process.pid,
       /**
        * Who restarts this daemon when it crashes (decision 0039): `systemd` or
-       * `launchd` after `runly daemon install`, `autospawn` (the next CLI
-       * command) otherwise.
+       * `launchd` after `runly daemon install` (the unit sets
+       * RUNLY_SUPERVISOR), `autospawn` (the next CLI command) otherwise. Not
+       * INVOCATION_ID: a daemon autospawned from anything under ANY systemd
+       * service inherits that.
        */
-      supervisor: process.env.INVOCATION_ID ? 'systemd' : (process.env.XPC_SERVICE_NAME ?? '').startsWith('dev.runly.daemon') ? 'launchd' : 'autospawn',
+      supervisor: process.env.RUNLY_SUPERVISOR === 'systemd' || process.env.RUNLY_SUPERVISOR === 'launchd' ? process.env.RUNLY_SUPERVISOR : 'autospawn',
       envs, poolMaxTotal: POOL_MAX_TOTAL(), ports,
       /** The server-wide load budget (decision 0036). */
       budget: { ...b, committedMemoryBytes: committed.memoryBytes, committedCpu: committed.cpu, committed: committed.items, waiting: this.budget.queueLength() },
+      /** Client bytes every proxied connection holds for a replay right now; capped by BACKLOT_PROXY_REPLAY_CAP_BYTES (0.19, default 64 MiB). */
+      proxyReplayCarriedBytes: replayCarriedBytes(),
       events: recentEvents(15),
     };
   }
@@ -4702,7 +4676,8 @@ export class Engine {
     const running = new Set(Object.keys(sup.pids()));
     const values = this.leaseInputs.get(lease.id)?.values ?? selectCallerEnv(stack.manifest, {});
     requireCallerEnv(stack.manifest, closure, values);
-    const need = await this.needFor(stack, env, closure, closure, { rebuild: false, mode: 'wake' });
+    const decided: BuildDecisions = new Map();
+    const need = await this.needFor(stack, env, closure, closure, { rebuild: false, mode: 'wake' }, decided);
     // Resuming what ran a moment ago adds nothing the box did not just carry:
     // the CPU gate is skipped for it (the memory gates still apply).
     const recent = [...closure].every((n) => now() - (this.idleStoppedAt.get(`${env.id}\0${n}`) ?? -Infinity) < RECENT_RUN_MS);
@@ -4716,7 +4691,7 @@ export class Engine {
         await this.prepareDatastores(stack, env, bakeKeys, missing.map((n) => ({ name: n, force: false })), say);
       }
       const ctx = this.templateCtx(stack, env);
-      await this.treeLocked(stack.id, () => this.runBuilds(stack, env, closure, ctx, say, { rebuild: false, mode: 'wake' }));
+      await this.treeLocked(stack.id, () => this.runBuilds(stack, env, closure, ctx, say, { rebuild: false, mode: 'wake', decided }));
       reservation.releaseBuild();
       await this.startServices(stack, env, new Set([...running, ...closure]), closure, { values }, say, 'stop-these', reservation);
     } finally {
@@ -4734,9 +4709,8 @@ export class Engine {
    * `exec` and `token` run against the environment as the lease left it. A
    * service the idle clock stopped (decision 0035) is started first — under
    * the lock these verbs hold, where a connection-triggered wake would only
-   * queue behind them until the proxy's hold ran out. What stopped for
-   * another reason (a daemon restart) is refused as before: `runly up`
-   * rebinds it, and a failed bind is redone by `up`, never by a verb.
+   * queue behind them until the proxy's hold ran out. So is what a daemon
+   * restart stopped (0.19). A failed bind is refused: `up` redoes it.
    */
   private async resumeForVerb(env: EnvRow, verb: string): Promise<void> {
     const lease = this.journal.leaseForEnv(env.id);
@@ -4751,13 +4725,13 @@ export class Engine {
     // A failed service (decision 0039) is not resumed by a verb: `up` retries it.
     const stopped = [...this.desiredServices(stack, env)].filter((n) => !running.has(n) && !this.blockedByFailure(stack, env.id, n));
     if (stopped.length === 0) return;
-    const unexplained = stopped.filter((n) => !this.idleStopped.has(`${env.id}\0${n}`));
-    if (unexplained.length > 0 || (env.failStreak ?? 0) > 0) {
+    // A failed bind is redone by `up`, never by a verb. Anything else that is
+    // stopped — idle-stopped, or stopped by a daemon restart (0.19: that used
+    // to be refused) — is started the way a connection would wake it.
+    if ((env.failStreak ?? 0) > 0) {
       throw new BrokerError(
         'env-error',
-        (env.failStreak ?? 0) > 0
-          ? `environment ${env.id} holds your lease but its last 'runly up' failed and ${stopped.map((n) => `'${n}'`).join(', ')} ${stopped.length === 1 ? 'is' : 'are'} not running — run 'runly up' before ${verb}`
-          : `environment ${env.id} holds your lease but its services are not running (the daemon restarted) — run 'runly up' to rebind before exec/token`,
+        `environment ${env.id} holds your lease but its last 'runly up' failed and ${stopped.map((n) => `'${n}'`).join(', ')} ${stopped.length === 1 ? 'is' : 'are'} not running — run 'runly up' before ${verb}`,
         'lease',
       );
     }
@@ -4933,7 +4907,7 @@ export class Engine {
     if (t - this.lastGc > Number(process.env.BACKLOT_GC_MS ?? 60_000)) {
       this.lastGc = t;
       try {
-        await this.poolGc(false);
+        await this.poolGc();
       } catch {
         /* best-effort */
       }
@@ -4943,15 +4917,7 @@ export class Engine {
     if (t - this.lastRetention > Number(process.env.BACKLOT_RETENTION_MS ?? 10 * 60_000)) {
       this.lastRetention = t;
       try {
-        const protectedStacks = new Set<string>();
-        for (const env of this.journal.allEnvs()) {
-          try {
-            const stack = loadStack(env.stackRoot);
-            this.adoptLegacyAliases(stack);
-            if (this.journal.getEnv(env.id)?.stack !== stack.id) protectedStacks.add(env.stack);
-          } catch { protectedStacks.add(env.stack); }
-        }
-        await retentionSweep(this.journal, policy(), protectedStacks);
+        await retentionSweep(this.journal, policy());
       } catch {
         /* best-effort */
       }
@@ -5055,8 +5021,7 @@ export class Engine {
       } else {
         try {
           const current = loadStack(env.stackRoot);
-          if (this.legacyAlias(env, current)) this.adoptLegacyAliases(current);
-          else if (current.id !== env.stack) orphanReason = `its worktree ${env.stackRoot} now resolves to '${current.id}', not '${env.stack}'`;
+          if (current.id !== env.stack) orphanReason = `its worktree ${env.stackRoot} now resolves to '${current.id}', not '${env.stack}'`;
         } catch {
           /* unreadable manifest — ambiguous, leave the env alone */
         }
@@ -5081,6 +5046,24 @@ export class Engine {
         await this.recycleOne(env.id, false);
         continue;
       }
+      // Unleased and idle past BACKLOT_UNLEASED_TTL (0.19, default 24h): the
+      // environment goes — services, data, ports — so a worktree nobody came
+      // back to stops holding a database. Its templates and the worktree's
+      // records (upkeep ledger, build ledger) stay: the next `up` there
+      // restores from a template and skips fresh upkeep.
+      const unleasedTtl = policy().unleasedTtlMs;
+      if (Number.isFinite(unleasedTtl) && !this.journal.leaseForEnv(env.id) && now() - this.envActivityAt(env) > unleasedTtl) {
+        const outcome = await this.recycleOne(env.id, false);
+        logEvent({
+          level: outcome === 'recycled' ? 'info' : 'warn',
+          kind: 'retention',
+          envId: env.id,
+          detail: outcome === 'recycled'
+            ? `unleased and unused for ${formatDuration(now() - this.envActivityAt(env))} (BACKLOT_UNLEASED_TTL ${formatDuration(unleasedTtl)}) — torn down; templates and worktree records kept`
+            : `unleased past BACKLOT_UNLEASED_TTL, but the teardown did not complete (${outcome}) — retried by the next sweep`,
+        });
+        if (outcome === 'recycled') continue;
+      }
       // Idle (decision 0035): each running service on its own clock — the
       // last client byte through its public port, the last runly verb on the
       // environment, its own start. Readiness probes bypass the proxy and
@@ -5089,9 +5072,6 @@ export class Engine {
       await this.stopIdleServices(env);
     }
     await this.drainSurplusEnvs();
-    // Maintenance runs after ownership/expiry/reaping and does at most one
-    // bounded external drop per sweep. Recovery never waits for it.
-    await this.retireLegacyTemplateBatch();
   }
 
   async shutdown(): Promise<void> {
@@ -5124,10 +5104,8 @@ export class Engine {
       // that — never an assumption — is what the next daemon life inherits.
       const recorded = mergeServicePids(env.servicePids, survivors.get(env.id));
       // …except an in-flight operation, which is never interrupted — the rule
-      // claimForTeardown, the sweeper and pool gc all already keep. An `exec`
-      // runs DETACHED so it can outlive the daemon, and it carries this env's
-      // tag, so the tag scan inside reapEnvProcesses would kill the very
-      // process the caller is still waiting on.
+      // claimForTeardown, the sweeper and pool gc all already keep. (An
+      // `exec` is the CLI's own child since 0.19 and is never reaped.)
       const unreaped = this.busy.has(env.id) ? recorded : await this.reapEnvProcesses(env, recorded);
       const fresh = this.journal.getEnv(env.id);
       if (!fresh) continue; // recycled underneath us — nothing to write back

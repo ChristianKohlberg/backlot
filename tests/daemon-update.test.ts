@@ -438,7 +438,7 @@ describe('journal schema stamping', () => {
     }
   });
 
-  it('adopts a pre-stamp journal rather than refusing it', () => {
+  it('refuses a pre-stamp journal: the migrations from before 0.16 are retired (decision 0042)', () => {
     const dir = mkdtempSync(join(tmpdir(), 'runly-schema-old-'));
     try {
       const path = join(dir, 'journal.db');
@@ -446,15 +446,7 @@ describe('journal schema stamping', () => {
       const db = new DatabaseSync(path);
       db.exec('PRAGMA user_version = 0'); // as every journal written before 0.9.0 is
       db.close();
-      expect(() => new Journal(path)).not.toThrow();
-      const check = new DatabaseSync(path);
-      try {
-        expect((check.prepare('PRAGMA user_version').get() as { user_version: number }).user_version).toBe(
-          JOURNAL_SCHEMA_VERSION,
-        );
-      } finally {
-        check.close();
-      }
+      expect(() => new Journal(path)).toThrow(/upgrade through runly 0\.18 first/);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

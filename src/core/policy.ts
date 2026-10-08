@@ -6,7 +6,7 @@ import { readFileSync } from 'node:fs';
 import { cpus, totalmem } from 'node:os';
 import { join } from 'node:path';
 import { stateRoot } from './paths.js';
-import { parseSize } from './units.js';
+import { parseDuration, parseSize } from './units.js';
 
 export interface Policy {
   /** Machine-wide ceiling across ALL stacks (the memory heuristic is per host). */
@@ -24,6 +24,13 @@ export interface Policy {
   serviceIdleMs: number;
   /** A dead tether is believed only after this long (decision 0035). */
   tetherGraceMs: number;
+  /**
+   * An environment nobody leases is torn down (services, data, ports) after
+   * this long without activity (0.19, BACKLOT_UNLEASED_TTL, default 24h,
+   * `off` never). Templates and the worktree's records stay, so the next
+   * `up` there restores rather than bakes and skips fresh upkeep.
+   */
+  unleasedTtlMs: number;
   /** The server-wide load budget (decision 0036). */
   budget: Budget;
 }
@@ -60,6 +67,8 @@ export interface Budget {
 interface ConfigFile {
   serviceIdleMs?: number;
   tetherGraceMs?: number;
+  /** A duration (`24h`, `90m`, seconds as a number) or `off`. */
+  unleasedTtl?: string | number;
   templateGraceMs?: number;
   budget?: Partial<Budget> & { memory?: string | number; reserve?: string | number };
   poolMaxTotal?: number;
@@ -111,6 +120,15 @@ const num = (envVar: string, fileVal: number | undefined, fallback: number): num
   if (e !== undefined && e !== '') return Number(e);
   if (fileVal !== undefined) return fileVal;
   return fallback;
+};
+
+/** A duration knob: env var or config value as `24h`/`90m`/seconds, or `off` (Infinity). */
+const duration = (envVar: string, fileVal: string | number | undefined, fallback: number): number => {
+  const e = process.env[envVar];
+  const fromEnv = e !== undefined && e !== '' ? parseDuration(e) : undefined;
+  if (fromEnv !== undefined) return fromEnv;
+  const fromFile = fileVal !== undefined ? parseDuration(fileVal) : undefined;
+  return fromFile ?? fallback;
 };
 
 /** A size knob: env var or config value as bytes or `2G`. */
@@ -169,6 +187,7 @@ export function policy(): Policy {
     templateGraceMs: num('BACKLOT_TEMPLATE_GRACE_MS', f.templateGraceMs, 60 * 60_000),
     serviceIdleMs: num('BACKLOT_SERVICE_IDLE_MS', f.serviceIdleMs, 10 * 60_000),
     tetherGraceMs: num('BACKLOT_TETHER_GRACE_MS', f.tetherGraceMs, 60_000),
+    unleasedTtlMs: duration('BACKLOT_UNLEASED_TTL', f.unleasedTtl, 24 * 3_600_000),
     budget: budgetPolicy(f),
   };
 }

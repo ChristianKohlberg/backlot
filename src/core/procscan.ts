@@ -38,6 +38,9 @@ export interface TaggedProc {
 }
 
 /** The environment every supervised service is spawned with. */
+/** The service name `runly exec`'s command is tagged with; never reaped (see scanTagged). */
+export const EXEC_SERVICE = 'exec';
+
 export function serviceTag(envId: string, service: string, stateRoot: string): Record<string, string> {
   return { [ENV_TAG]: envId, [SERVICE_TAG]: service, [ROOT_TAG]: stateRoot };
 }
@@ -202,6 +205,10 @@ export function scanTagged(stateRoot: string): TaggedProc[] {
     if (env[ROOT_TAG] !== stateRoot) continue;
     const envId = env[ENV_TAG];
     if (!envId) continue;
+    // `runly exec`'s command (decision 0040) carries the tag so it can be told
+    // apart, but it is the CALLER's process, run by the CLI: no daemon path
+    // (gc, recycle, shutdown) may reap it as an environment's orphan.
+    if (env[SERVICE_TAG] === EXEC_SERVICE) continue;
     const st = startTime(pid);
     if (st === undefined) continue; // exited between the two reads
     found.push({ pid, envId, service: env[SERVICE_TAG] ?? '?', startTime: st });

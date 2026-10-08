@@ -309,7 +309,7 @@ describe('runly db: copies outside any environment', () => {
     // Human output names exactly what a script needs.
     const human = await ctx.cli(['db', 'new', 'audit'], wt);
     expect(human.code, human.stderr).toBe(0);
-    expect(human.stdout).toMatch(/^name=audit-\w+\nurl=\S+audit\.db\npreset=dev\n$/);
+    expect(human.stdout).toMatch(/^name=audit-\w+\nurl=\S+audit\.db\ndatabase=\S+audit\.db\npreset=dev\n$/);
     // Many in parallel.
     const many = await Promise.all([0, 1, 2, 3].map(() => ctx.cli(['db', 'new', 'audit', '--json'], wt)));
     expect(many.every((r) => r.code === 0)).toBe(true);
@@ -503,38 +503,4 @@ describe('--data-only is gone', () => {
     expect(ctx.daemonPid()).toBeUndefined();
   }, 60_000);
 
-  it('migrates a leased data-only environment to one with no services, and recycles an unleased one', async () => {
-    const leased = await ctx.cli(['up', '--json'], wt);
-    expect(leased.code, leased.stdout + leased.stderr).toBe(0);
-    mutate(leased.json.datastores.main.url, 'precious');
-    const free = await ctx.cli(['up', '--json'], other);
-    expect(free.code, free.stdout + free.stderr).toBe(0);
-    await ctx.cli(['release', '--json'], other);
-    await ctx.stopDaemon(wt);
-    // What an older runly left behind: two data-only rows.
-    const j = ctx.journal();
-    for (const id of [leased.json.envId, free.json.envId]) {
-      const row = j.getEnv(id)!;
-      row.dataOnly = true;
-      row.activeServices = undefined;
-      row.state = 'warm';
-      j.saveEnv(row);
-    }
-    const after = await ctx.cli(['ctx', '--json'], wt);
-    expect(after.code, after.stdout + after.stderr).toBe(0);
-    expect(after.json.envId).toBe(leased.json.envId);
-    expect(after.json.lease.id).toBe(leased.json.lease.id);
-    expect(after.json.services).toEqual({ a: 'down', b: 'down' });
-    expect(marker(after.json.datastores.main.url)).toBe('precious');
-    const row = ctx.journal().getEnv(leased.json.envId)!;
-    expect(row.dataOnly).toBe(false);
-    expect(row.activeServices).toEqual([]);
-    for (let i = 0; i < 100 && ctx.journal().getEnv(free.json.envId); i++) await sleep(100);
-    expect(ctx.journal().getEnv(free.json.envId)).toBeUndefined();
-    // The migrated environment binds like any other: up brings the services.
-    const up = await ctx.cli(['up', '--json'], wt);
-    expect(up.code, up.stdout + up.stderr).toBe(0);
-    expect(up.json.services).toEqual({ a: 'running', b: 'running' });
-    expect(marker(up.json.datastores.main.url)).toBe('precious');
-  }, 120_000);
 });

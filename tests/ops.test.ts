@@ -50,18 +50,12 @@ describe('pool policy precedence (unit)', () => {
 });
 
 describe('retention sweep (unit)', () => {
-  it('removes the legacy artifacts dir, truncates fat logs, keeps newest templates', async () => {
+  it('truncates fat logs, keeps newest templates', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'runly-ret-'));
     process.env.BACKLOT_STATE_DIR = dir;
-    const { pruneArtifacts, truncateLogs, pruneTemplates } = await import('../src/core/retention.js');
+    const { truncateLogs, pruneTemplates } = await import('../src/core/retention.js');
     const { policy } = await import('../src/core/policy.js');
     const p = { ...policy(), logCapBytes: 1000, templatesKeep: 2 };
-
-    // Verdict artifacts went with `runly run` (decision 0032): whatever an
-    // older daemon left behind is removed whole.
-    mkdirSync(join(dir, 'artifacts', 'env1', 'job-1'), { recursive: true });
-    expect(pruneArtifacts()).toBe(1);
-    expect(existsSync(join(dir, 'artifacts'))).toBe(false);
 
     // A fat log is rotated once (decision 0038): it becomes web.log.1.
     const logs = join(dir, 'envs', 'env1', 'logs');

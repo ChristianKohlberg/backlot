@@ -14,19 +14,13 @@ import type { EnvState, Hygiene, LeaseKind, ServicePid } from './types.js';
  * every additive column: a bump is unnecessary when an old daemon selecting
  * a known subset of columns still reads the journal correctly.
  *
- * Schema 2 separates lease-intended presets (`leases.presets`) from completed
- * restores (`envs.presets`). Older daemons would inherit actual data as intent
- * after a failed bind or pristine wipe. Existing leases migrate from their
- * environment's recorded choices; tests/preset-selection.test.ts covers the
- * retry and restart invariant.
- *
- * Schema 3's survivor-group compatibility barrier is documented in
- * docs/architecture.md#journal-upgrade-barrier.
+ * Schemas 1-3 belong to runly before 0.16 and are refused: their migrations
+ * were retired in 0.19 (upgrade through 0.18 first).
  *
  * Schema 4 (decision 0034): `active_services = '[]'` means "no services are
  * wanted" (an older daemon reads an empty list as the whole app and would boot
  * it), the `db_copies` table holds database copies an older daemon would never
- * reap, and data-only environments are migrated away at the first recovery.
+ * reap, and data-only environments are gone (0.18 migrated them away).
  *
  * What this exists to stop is the DOWNGRADE, which has already cost once. The
  * sha256 env-id migration stranded pre-upgrade rows that then counted against
@@ -77,8 +71,6 @@ export interface EnvRow {
   id: string;
   stack: string;
   stackRoot: string;
-  /** Retains the old default-holder spelling without rewriting opaque holder IDs. */
-  legacyStackRoot?: string;
   state: EnvState;
   root: string;
   ports: Record<string, number>;
@@ -100,13 +92,6 @@ export interface EnvRow {
    * keeps, and the next `up` restores.
    */
   activeServices?: string[];
-  /**
-   * Read only to migrate it away: an older runly bound environments for their
-   * datastores alone (`up --data-only`, decisions 0023/0025, removed by 0034).
-   * Recovery turns a leased one into an environment with no services wanted
-   * and recycles an unleased one; nothing else reads it.
-   */
-  dataOnly?: boolean;
   /**
    * When each public port last carried a client byte (decision 0035), by port
    * key. Persisted (throttled) so a daemon restart does not reset every idle
@@ -135,7 +120,6 @@ export interface DropRecipe {
 }
 
 export interface LeaseRow {
-  presets?: Record<string, string>;
   id: string;
   envId: string;
   kind: LeaseKind;
@@ -239,6 +223,19 @@ export class Journal {
         'journal',
       );
     }
+    // Journals older than schema 4 (runly before 0.16) carried data-only
+    // environments, path-spelled stack identities and the projected worktree
+    // copies whose migrations lived here until 0.18. They are gone: such a
+    // journal is refused untouched rather than half-read.
+    const hasTables = this.db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'envs'").get() !== undefined;
+    if (hasTables && stamped < JOURNAL_SCHEMA_VERSION) {
+      throw new BrokerError(
+        'infra-error',
+        `journal at ${path} has schema ${stamped}, older than this build reads (${JOURNAL_SCHEMA_VERSION}) — ` +
+          `upgrade through runly 0.18 first (it migrates the journal), or point BACKLOT_STATE_DIR at a fresh state root`,
+        'journal',
+      );
+    }
     this.db.exec('PRAGMA journal_mode = WAL');
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS envs (
@@ -250,12 +247,13 @@ export class Journal {
         created_at INTEGER NOT NULL, last_used_at INTEGER NOT NULL,
         service_pids TEXT NOT NULL DEFAULT '{}',
         fail_streak INTEGER NOT NULL DEFAULT 0,
-        active_services TEXT
+        active_services TEXT, activity TEXT, drop_recipes TEXT, templates TEXT
       );
       CREATE TABLE IF NOT EXISTS leases (
         id TEXT PRIMARY KEY, env_id TEXT NOT NULL, kind TEXT NOT NULL,
         holder TEXT NOT NULL, hygiene TEXT NOT NULL, expires_at INTEGER NOT NULL,
-        holder_pid INTEGER, holder_start INTEGER
+        holder_pid INTEGER, holder_start INTEGER,
+        preview_service TEXT, preview_url TEXT, preview_pid INTEGER, preview_start INTEGER, preview_port INTEGER
       );
       CREATE TABLE IF NOT EXISTS counters (
         stack TEXT PRIMARY KEY, next_env INTEGER NOT NULL DEFAULT 1
@@ -266,64 +264,11 @@ export class Journal {
         state TEXT NOT NULL, holder TEXT NOT NULL, holder_pid INTEGER, holder_start INTEGER,
         drop_cmd TEXT, drop_cwd TEXT, drop_path TEXT,
         created_at INTEGER NOT NULL, drop_attempts INTEGER NOT NULL DEFAULT 0,
-        next_drop_at INTEGER NOT NULL DEFAULT 0
+        next_drop_at INTEGER NOT NULL DEFAULT 0, template TEXT, child TEXT
       );
     `);
-    // Migrations for journals created before holder identity existed.
-    for (const col of ['holder_pid INTEGER', 'holder_start INTEGER']) {
-      try {
-        this.db.exec(`ALTER TABLE leases ADD COLUMN ${col}`);
-      } catch (err) {
-        if (!/duplicate column name/i.test(String((err as Error).message ?? err))) throw err;
-      }
-    }
-    for (const col of ['preview_service TEXT', 'preview_url TEXT', 'preview_pid INTEGER', 'preview_start INTEGER', 'preview_port INTEGER']) {
-      try {
-        this.db.exec(`ALTER TABLE leases ADD COLUMN ${col}`);
-      } catch (err) {
-        if (!/duplicate column name/i.test(String((err as Error).message ?? err))) throw err;
-      }
-    }
-    try {
-      this.db.exec('ALTER TABLE leases ADD COLUMN presets TEXT');
-      this.db.exec("UPDATE leases SET presets = COALESCE((SELECT presets FROM envs WHERE envs.id = leases.env_id), '{}')");
-    } catch (err) {
-      if (!/duplicate column name/i.test(String((err as Error).message ?? err))) throw err;
-    }
-    // Migration for journals created before fail_streak existed. Swallowing
-    // EVERY error here hid real failures (a corrupt journal, a locked file) as
-    // "column already exists", so the daemon carried on against a schema it did
-    // not actually have. Only the duplicate-column case is benign.
-    try {
-      this.db.exec('ALTER TABLE envs ADD COLUMN fail_streak INTEGER NOT NULL DEFAULT 0');
-    } catch (err) {
-      const msg = String((err as Error).message ?? err);
-      if (!/duplicate column name/i.test(msg)) throw err;
-    }
-    // Migration for journals created before selective service startup. NULL
-    // (the default for existing rows) means "the whole app is up".
-    try {
-      this.db.exec('ALTER TABLE envs ADD COLUMN active_services TEXT');
-    } catch (err) {
-      const msg = String((err as Error).message ?? err);
-      if (!/duplicate column name/i.test(msg)) throw err;
-    }
-    // Migration for journals created before data-only binds. 0 (the default for
-    // existing rows) is correct: every environment that already existed was
-    // bound with its services.
-    try {
-      this.db.exec('ALTER TABLE envs ADD COLUMN data_only INTEGER NOT NULL DEFAULT 0');
-    } catch (err) {
-      const msg = String((err as Error).message ?? err);
-      if (!/duplicate column name/i.test(msg)) throw err;
-    }
-    try {
-      this.db.exec('ALTER TABLE envs ADD COLUMN legacy_stack_root TEXT');
-    } catch (err) {
-      if (!/duplicate column name/i.test(String((err as Error).message ?? err))) throw err;
-    }
-    // 0.16 (decisions 0035, 0037): additive — an older daemon ignores them and
-    // reads everything else correctly, so they are no schema bump.
+    // A schema-4 journal written by 0.16 or 0.17 lacks the columns added since
+    // (additive: no schema bump). Only the duplicate-column case is benign.
     for (const [table, col] of [['envs', 'activity TEXT'], ['envs', 'drop_recipes TEXT'], ['envs', 'templates TEXT'], ['db_copies', 'template TEXT'], ['db_copies', 'child TEXT']] as const) {
       try {
         this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${col}`);
@@ -331,11 +276,6 @@ export class Journal {
         if (!/duplicate column name/i.test(String((err as Error).message ?? err))) throw err;
       }
     }
-    // Stamp LAST: every migration above has run, so the stamp means "this
-    // journal has the schema that number describes" rather than "a build with
-    // that number opened it". 0 covers both a fresh journal and one written
-    // before stamping existed, and the idempotent ALTERs above bring either to
-    // 1 — so there is nothing to do for it beyond recording the fact.
     if (stamped < JOURNAL_SCHEMA_VERSION) this.db.exec(`PRAGMA user_version = ${JOURNAL_SCHEMA_VERSION}`);
   }
 
@@ -369,7 +309,6 @@ export class Journal {
       id: r.id as string,
       stack: r.stack as string,
       stackRoot: r.stack_root as string,
-      legacyStackRoot: (r.legacy_stack_root as string | null) ?? undefined,
       state: r.state as EnvState,
       root: r.root as string,
       ports: JSON.parse(r.ports as string),
@@ -382,7 +321,6 @@ export class Journal {
       servicePids: parseServicePids(r.service_pids as string),
       failStreak: (r.fail_streak as number) ?? 0,
       activeServices: r.active_services ? (JSON.parse(r.active_services as string) as string[]) : undefined,
-      dataOnly: Boolean(r.data_only),
       activity: parseJson(r.activity),
       dropRecipes: parseJson(r.drop_recipes),
       templates: parseJson(r.templates),
@@ -392,14 +330,13 @@ export class Journal {
   saveEnv(e: EnvRow): void {
     this.db
       .prepare(
-        `INSERT INTO envs (id, stack, stack_root, state, root, ports, datastore_ns, fingerprints, presets, bind_count, created_at, last_used_at, service_pids, fail_streak, active_services, data_only, drop_recipes, templates)
-         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        `INSERT INTO envs (id, stack, stack_root, state, root, ports, datastore_ns, fingerprints, presets, bind_count, created_at, last_used_at, service_pids, fail_streak, active_services, drop_recipes, templates)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
          ON CONFLICT(id) DO UPDATE SET state=excluded.state, ports=excluded.ports,
            datastore_ns=excluded.datastore_ns, fingerprints=excluded.fingerprints,
            presets=excluded.presets, bind_count=excluded.bind_count,
            last_used_at=excluded.last_used_at, service_pids=excluded.service_pids,
            fail_streak=excluded.fail_streak, active_services=excluded.active_services,
-           data_only=excluded.data_only,
            drop_recipes=COALESCE(excluded.drop_recipes, envs.drop_recipes),
            templates=COALESCE(excluded.templates, envs.templates)`,
       )
@@ -407,7 +344,7 @@ export class Journal {
         e.id, e.stack, e.stackRoot, e.state, e.root,
         JSON.stringify(e.ports), JSON.stringify(e.datastoreNs), JSON.stringify(e.fingerprints),
         JSON.stringify(e.presets), e.bindCount, e.createdAt, e.lastUsedAt, JSON.stringify(e.servicePids),
-        e.failStreak, e.activeServices ? JSON.stringify(e.activeServices) : null, e.dataOnly ? 1 : 0,
+        e.failStreak, e.activeServices ? JSON.stringify(e.activeServices) : null,
         e.dropRecipes ? JSON.stringify(e.dropRecipes) : null, e.templates ? JSON.stringify(e.templates) : null,
       );
   }
@@ -440,16 +377,6 @@ export class Journal {
     return (this.db.prepare('SELECT * FROM envs ORDER BY id').all() as Record<string, unknown>[]).map((r) =>
       this.rowToEnv(r),
     );
-  }
-
-  /** Normalize identity metadata atomically; env IDs, namespaces, leases and counters stay intact. */
-  canonicalizeStacks(changes: Array<{ id: string; stack: string; root: string }>): void {
-    this.withTx(() => {
-      const update = this.db.prepare(`UPDATE envs SET stack = ?,
-        legacy_stack_root = COALESCE(legacy_stack_root, CASE WHEN stack_root != ? THEN stack_root END),
-        stack_root = ? WHERE id = ?`);
-      for (const change of changes) update.run(change.stack, change.root, change.root, change.id);
-    });
   }
 
   private rowToDbCopy(r: Record<string, unknown>): DbCopyRow {
@@ -548,13 +475,13 @@ export class Journal {
     this.db
       .prepare(
         `INSERT INTO leases (id, env_id, kind, holder, hygiene, expires_at, holder_pid, holder_start,
-           preview_service, preview_url, preview_pid, preview_start, preview_port, presets)
-         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+           preview_service, preview_url, preview_pid, preview_start, preview_port)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
          ON CONFLICT(id) DO UPDATE SET expires_at=excluded.expires_at, hygiene=excluded.hygiene,
            holder_pid=excluded.holder_pid, holder_start=excluded.holder_start,
            preview_service=excluded.preview_service, preview_url=excluded.preview_url,
            preview_pid=excluded.preview_pid, preview_start=excluded.preview_start,
-           preview_port=excluded.preview_port, presets=excluded.presets`,
+           preview_port=excluded.preview_port`,
       )
       .run(
         l.id,
@@ -570,7 +497,6 @@ export class Journal {
         l.previewPid ?? null,
         l.previewStart ?? null,
         l.previewPort ?? null,
-        l.presets === undefined ? null : JSON.stringify(l.presets),
       );
   }
 
@@ -597,7 +523,6 @@ export class Journal {
     return {
       id: r.id as string,
       envId: r.env_id as string,
-      presets: r.presets == null ? undefined : JSON.parse(r.presets as string),
       kind: 'session' as LeaseKind,
       holder: r.holder as string,
       hygiene: r.hygiene as Hygiene,

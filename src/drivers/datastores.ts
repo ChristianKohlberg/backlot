@@ -23,12 +23,12 @@ import {
   writeFileSync,
   constants as fsConstants,
 } from 'node:fs';
-import { basename, dirname, join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { connect } from 'node:net';
 import { templatesRoot } from '../core/paths.js';
 import { recordNamespace } from '../core/namespaces.js';
-import { sha256, template, BrokerError } from '../core/util.js';
-import { runBounded, cmdTimeoutS, DEFAULT_CMD_TIMEOUT_S } from '../core/exec.js';
+import { sha256, template, BrokerError, commandFailure } from '../core/util.js';
+import { runBounded, DEFAULT_CMD_TIMEOUT_S } from '../core/exec.js';
 import { defaultPreset, type DatastoreSpec } from '../core/manifest.js';
 import { logEvent } from '../core/events.js';
 
@@ -106,7 +106,7 @@ const sh = async (cmd: string, cwd: string, errCtx: string): Promise<void> => {
       r.output.slice(-800),
     );
   }
-  if (r.code !== 0) throw new BrokerError('work-error', errCtx, 'datastore', r.output.slice(-800));
+  if (r.code !== 0) throw commandFailure(errCtx, 'datastore', r.output);
 };
 
 /** Best-effort variant: failures are expected (clean-slate drops) and ignored. */
@@ -115,12 +115,17 @@ const shQuiet = async (cmd: string, cwd: string): Promise<void> => {
 };
 
 /**
- * In-process template locking, per stack (vetbill-1i49). All binds and copies
- * flow through the single daemon, so an in-memory lock is complete.
+ * In-process template locking (vetbill-1i49). All binds and copies flow
+ * through the single daemon, so an in-memory lock is complete.
  *
- * It is a readers-writer lock. WRITERS (`withBakeLock`) change what a
- * template is: a bake, a rebake, retention and doctor dropping one. READERS
- * (`withTemplateRead`) restore FROM a template, and may run side by side.
+ * Two levels of readers-writer locks. Per STACK: what walks or drops a whole
+ * stack's templates — retention, `pool doctor` — takes it exclusive
+ * (`withBakeLock(stack)`); every operation on ONE datastore's templates takes
+ * it shared. Per DATASTORE (`<stack>/<datastore>`, inside the stack lock):
+ * WRITERS (`withDatastoreLock(…, true)`) change what a template is — a bake, a
+ * rebake; READERS restore FROM one, side by side. So the datastores of one
+ * environment bake and restore in parallel, and a restore takes no exclusive
+ * lock at all while its template exists (decision 0039, 0.19).
  * Before 0.18 a restore held nothing: a sibling's rebake, prune or failed
  * restore could drop the template database while it was being copied, the
  * restore failed, and its own fallback rebake then dropped the template under
@@ -183,18 +188,14 @@ export function withTemplateRead<T>(key: string, fn: () => Promise<T>): Promise<
   return withTemplateLock(key, false, fn);
 }
 
-/** Run `fn` under the exclusive lock only if nobody holds or waits for it. */
-export function tryWithBakeLock(key: string, fn: () => void): boolean {
-  if (templateLocks.has(key)) return false;
-  const l = lockOf(key);
-  l.writer = true;
-  try {
-    fn();
-    return true;
-  } finally {
-    l.writer = false;
-    pump(key, l);
-  }
+/**
+ * One datastore's templates: the stack lock shared, then this datastore's lock
+ * — exclusive (`write`) to bake or drop one, shared to restore from one. The
+ * order is always stack, then datastore, and nothing waits for the stack lock
+ * while holding a datastore lock, so the two levels cannot deadlock.
+ */
+export function withDatastoreLock<T>(stackId: string, ds: string, write: boolean, fn: () => Promise<T>): Promise<T> {
+  return withTemplateLock(stackId, false, () => withTemplateLock(`${stackId}/${ds}`, write, fn));
 }
 
 /**
@@ -211,6 +212,13 @@ export interface BakedMarker {
   drop: string | null;
   /** The datastore it was baked for (0.18+), so a rebake drops only that datastore's. */
   ds?: string;
+  /**
+   * When, and by which bake (0.19): two bakes of one key write different
+   * markers, so a restore that failed can tell a sibling's rebake from the
+   * template it failed on — the content alone is deterministic.
+   */
+  bakedAt?: number;
+  nonce?: string;
 }
 
 export function parseBakedMarker(content: string): BakedMarker {
@@ -225,10 +233,7 @@ export function parseBakedMarker(content: string): BakedMarker {
 
 export function hasOtherTemplateOwner(full: string, ns: string): boolean {
   if (!ns) return true;
-  const parent = dirname(dirname(full));
-  const roots = ['templates', 'retired-templates'].includes(basename(parent))
-    ? [join(dirname(parent), 'templates'), join(dirname(parent), 'retired-templates')]
-    : [parent];
+  const roots = [dirname(dirname(full))];
   try {
     for (const root of roots) {
       let entries;
@@ -252,84 +257,21 @@ export function hasOtherTemplateOwner(full: string, ns: string): boolean {
   return false;
 }
 
-/** Drop every marker's server-side template DB in `dir`, best-effort. */
-export async function dropBakedTemplates(dir: string, cwd: string): Promise<number> {
-  let dropped = 0;
-  let entries: string[] = [];
-  try {
-    entries = readdirSync(dir);
-  } catch {
-    return 0;
-  }
-  for (const f of entries) {
-    if (!f.endsWith('.baked')) continue;
-    try {
-      const marker = parseBakedMarker(readFileSync(join(dir, f), 'utf8'));
-      if (marker.drop) {
-        await shQuiet(marker.drop, cwd);
-        dropped++;
-      }
-    } catch {
-      /* unreadable marker — file prune below still applies */
-    }
-  }
-  return dropped;
-}
-
 /**
- * Retire the markers in `dir`: a server-side template is dropped and its
- * marker removed only when the drop command actually succeeded, so a marker
- * whose appliance is unreachable stays behind for a later attempt instead of
- * leaking its database. Legacy bare-string markers have nothing to drop.
+ * Record which worktree a stack's templates were baked for (`.root` next to
+ * them, 0.19), so retention can tell a stack whose worktree is gone from one
+ * that merely has no environment right now — after its worktree records were
+ * pruned, nothing else said.
  */
-export async function retireBakedTemplates(dir: string, cwd: string, force = false): Promise<{ dropped: number; deferred: number; attempted: number }> {
-  let dropped = 0;
-  let deferred = 0;
-  let attempted = 0;
-  let entries: string[] = [];
-  try { entries = readdirSync(dir); } catch { return { dropped, deferred, attempted }; }
-  for (const f of entries) {
-    if (!f.endsWith('.baked')) continue;
-    const full = join(dir, f);
-    const failurePath = `${full}.retirement.json`;
-    let attempts = 0;
-    let nextAttemptAt = 0;
-    try {
-      const saved = JSON.parse(readFileSync(failurePath, 'utf8'));
-      attempts = Number(saved.attempts) || 0;
-      nextAttemptAt = Number(saved.nextAttemptAt) || 0;
-    } catch { /* first attempt */ }
-    if (!force && (attempts >= 3 || nextAttemptAt > Date.now())) { deferred++; continue; }
-    // One external command per batch bounds maintenance latency independently
-    // of how many retired markers a stack accumulated.
-    if (attempted > 0) { deferred++; continue; }
-    let drop: string | null = null;
-    try {
-      const marker = parseBakedMarker(readFileSync(full, 'utf8'));
-      if (hasOtherTemplateOwner(full, marker.ns)) { deferred++; continue; }
-      drop = marker.drop;
-    }
-    catch { deferred++; continue; }
-    attempted++;
-    if (drop) {
-      const r = await runBounded(drop, cwd, Math.min(2, cmdTimeoutS()));
-      if (r.code !== 0 || r.timedOut) {
-        attempts++;
-        writeFileSync(failurePath, JSON.stringify({
-          attempts,
-          nextAttemptAt: Date.now() + Math.min(3600000, 60000 * 2 ** Math.min(attempts - 1, 6)),
-          state: attempts >= 3 ? 'needs-attention' : 'retry-pending',
-          message: 'Drop unconfirmed; marker retained. Check the appliance and retry with runly pool gc.',
-        }));
-        deferred++;
-        continue;
-      }
-      dropped++;
-    }
-    rmSync(full, { force: true });
-    rmSync(failurePath, { force: true });
+function recordTemplateRoot(stackId: string, root: string): void {
+  const file = join(templatesRoot(), stackId, '.root');
+  try {
+    if (readFileSync(file, 'utf8').trim() === root) return;
+  } catch {
+    /* first bake of this stack */
   }
-  return { dropped, deferred, attempted };
+  mkdirSync(dirname(file), { recursive: true });
+  writeFileSync(file, `${root}\n`);
 }
 
 // ---------------------------------------------------------------- sqlite
@@ -400,12 +342,17 @@ class SqliteDs implements DsDriver {
       // used to rm the dir between this bake and the copy below (vetbill-1i49
       // covered only the bake-vs-bake race).
       for (let attempt = 0; ; attempt++) {
-        await withBakeLock(this.stackId, async () => {
-          if (!existsSync(tpl)) await this.runCreate(h.cwd, tpl, preset); // bake once
-        });
-        // Restores share the lock (withTemplateRead): several copies at once,
-        // but never while a writer replaces or deletes the template.
-        const copied = await withTemplateRead(this.stackId, async () => {
+        // Double-checked: the exclusive lock only when there is a bake to do.
+        if (!existsSync(tpl)) {
+          await withDatastoreLock(this.stackId, this.name, true, async () => {
+            if (existsSync(tpl)) return;
+            recordTemplateRoot(this.stackId, h.cwd);
+            await this.runCreate(h.cwd, tpl, preset); // bake once
+          });
+        }
+        // Restores share the lock: several copies at once, but never while a
+        // writer replaces or deletes the template.
+        const copied = await withDatastoreLock(this.stackId, this.name, false, async () => {
           if (!existsSync(tpl)) return false; // retired between the bake and here: bake again
           // The sidecars MUST go before the .db is replaced. SQLite in WAL mode
           // recovers `-wal` frames onto whatever database file it finds, so a
@@ -442,7 +389,7 @@ class SqliteDs implements DsDriver {
     // Exclusive on the stack: it must wait out any in-flight bake or restore.
     // Only THIS datastore's current templates go — every other datastore's,
     // and older keys (retention collects those), stay.
-    return withBakeLock(this.stackId, async () => {
+    return withDatastoreLock(this.stackId, this.name, true, async () => {
       for (const preset of presetNames(this.spec)) rmSync(join(templatesRoot(), this.stackId, this.tplName(preset)), { force: true });
     });
   }
@@ -586,6 +533,7 @@ class CommandDs implements DsDriver {
       const marker = this.bakedMarker(preset);
       const bake = async (why?: string) => {
         if (why) logEvent({ level: 'warn', kind: 'template', envId: h.envId, detail: `rebaking template ${tpl} of '${this.name}' (${preset}): ${why}` });
+        recordTemplateRoot(this.stackId, h.cwd);
         await shQuiet(this.spec.drop ? template(this.spec.drop, { ns: tpl }) : 'true', h.cwd);
         await sh(template(create, { ns: tpl, preset }), h.cwd, `template bake failed for '${this.name}' preset '${preset}'${why ? ` (${why})` : ''}`);
         const baked: BakedMarker = {
@@ -593,20 +541,27 @@ class CommandDs implements DsDriver {
           ns: tpl,
           drop: this.spec.drop ? template(this.spec.drop, { ns: tpl }) : null,
           ds: this.name,
+          bakedAt: Date.now(),
+          nonce: Math.random().toString(36).slice(2, 10),
         };
         writeFileSync(marker, JSON.stringify(baked));
       };
       // One restore under the SHARED lock: no bake, rebake, prune or failed
       // sibling can drop the template while it is copied. `gone` = the marker
-      // was retired between the bake and the restore.
+      // was retired between the bake and the restore. A retry first drops
+      // what the failed attempt may have left (a half-created database makes
+      // RESTORE / CREATE DATABASE fail on "already exists").
+      let tried = false;
       const restore = (): Promise<{ ok: true } | { gone: true } | { err: Error; seen: string }> =>
-        withTemplateRead(this.stackId, async () => {
+        withDatastoreLock(this.stackId, this.name, false, async () => {
           let seen: string;
           try {
             seen = readFileSync(marker, 'utf8');
           } catch {
             return { gone: true as const };
           }
+          if (tried && this.spec.drop) await shQuiet(template(this.spec.drop, { ns }), h.cwd);
+          tried = true;
           try {
             await sh(template(this.spec.template_restore!, { template: tpl, ns }), h.cwd, `template restore failed for '${this.name}' preset '${preset}'`);
             return { ok: true as const };
@@ -617,10 +572,14 @@ class CommandDs implements DsDriver {
       let failure: { err: Error; seen: string } | null = null;
       for (let attempt = 0; attempt < 6; attempt++) {
         // Bake under the exclusive lock, once per template key (decision
-        // 0039): a marker whose key matches IS the current template.
-        await withBakeLock(this.stackId, async () => {
-          if (!existsSync(marker)) await bake();
-        });
+        // 0039): a marker whose key matches IS the current template. Checked
+        // twice, so a restore of an existing template never waits for (or
+        // blocks) anyone with an exclusive lock.
+        if (!existsSync(marker)) {
+          await withDatastoreLock(this.stackId, this.name, true, async () => {
+            if (!existsSync(marker)) await bake();
+          });
+        }
         const r = await restore();
         if ('ok' in r) return;
         if ('gone' in r) continue;
@@ -639,7 +598,7 @@ class CommandDs implements DsDriver {
         // template that no longer exists, so every bind would fail forever.
         // Rebake it — unless another restore already did (the marker changed).
         const lastErr = r.err;
-        await withBakeLock(this.stackId, async () => {
+        await withDatastoreLock(this.stackId, this.name, true, async () => {
           let now: string | null = null;
           try {
             now = readFileSync(marker, 'utf8');
@@ -681,10 +640,10 @@ class CommandDs implements DsDriver {
     // in templatesRoot() made it fail, and shQuiet swallows failures — so the
     // leak fix silently did nothing. Fall back only when no root is known.
     //
-    // Exclusive on the stack: waits out every in-flight bake and restore. Only
-    // THIS datastore's current templates go (decision 0039); the others, and
-    // older keys of this one (retention collects those), stay.
-    await withBakeLock(this.stackId, async () => {
+    // Exclusive on this datastore: waits out its in-flight bakes and restores.
+    // Only THIS datastore's current templates go (decision 0039); the others,
+    // and older keys of this one (retention collects those), stay.
+    await withDatastoreLock(this.stackId, this.name, true, async () => {
       const dir = join(templatesRoot(), this.stackId);
       const key = `@${this.contentKey().slice(0, 12)}.baked`;
       const catalog = new Set(presetNames(this.spec));

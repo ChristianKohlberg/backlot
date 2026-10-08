@@ -20,10 +20,10 @@
  * clean`, a manual `rm -rf dist`, another tool) would otherwise leave the
  * service with nothing, or the wrong thing, to run.
  */
-import { mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { sha256 } from './util.js';
-import { enumerateSource } from './worktree.js';
+import { enumerateSourceStats } from './worktree.js';
 import { worktreeStateDir } from './tree-ledger.js';
 import type { Manifest } from './manifest.js';
 
@@ -56,16 +56,9 @@ function write(stackId: string, root: string, builds: BuildLedgerFile['builds'])
  * and mtime of every file its `when:` globs match.
  */
 export async function buildInputsKey(root: string, manifest: Manifest, cmd: string, when: string[]): Promise<string> {
-  const files = await enumerateSource(root, manifest, when);
-  const lines = files.map((f) => {
-    try {
-      const st = statSync(join(root, f));
-      return `${f}:${st.size}:${st.mtimeMs}`;
-    } catch {
-      return `${f}:gone`;
-    }
-  });
-  return sha256(`${cmd}\n${lines.join('\n')}`);
+  // The listing stats every file once, and this key is made of those stats.
+  const files = await enumerateSourceStats(root, manifest, when);
+  return sha256(`${cmd}\n${files.map((f) => `${f.path}:${f.size}:${f.mtimeMs}`).join('\n')}`);
 }
 
 /**

@@ -13,7 +13,7 @@
  */
 import { describe, it, expect, afterAll } from 'vitest';
 import { execFile, execFileSync } from 'node:child_process';
-import { mkdtempSync, rmSync, writeFileSync, mkdirSync, readFileSync, utimesSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, mkdirSync, readFileSync, utimesSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { disposeStateSync } from './support/leaks.js';
@@ -94,6 +94,8 @@ describe('exec is bounded and cannot wedge the environment', () => {
     const { cli } = mkStack(IDLE);
     expect((await cli(['up'])).code).toBe(0);
 
+    // BACKLOT_CMD_TIMEOUT_S=2 here. The CLI runs the command (decision 0040)
+    // and enforces the deadline itself: a work-error, the group killed.
     const hung = await cli(['exec', 'sleep', '60']);
     expect(hung.code, hung.stdout).toBe(1);
     expect(hung.elapsedMs).toBeLessThan(15_000);
@@ -173,7 +175,10 @@ describe('template pruning survives a hung persisted drop command (unit)', () =>
       writeFileSync(join(root, 'stk', 'main-dev@def.baked'), JSON.stringify({ v: 1, ns: 'tpl_y', drop: null }));
       const started = Date.now();
       const pruned = await pruneTemplates({ ...policy(), templatesKeep: 1, templateGraceMs: 0 }, root);
-      expect(pruned).toBe(1);
+      // 0.19: a drop that fails or times out keeps its marker, so a later sweep
+      // retries it instead of leaking the server-side database as foreign.
+      expect(pruned).toBe(0);
+      expect(existsSync(marker)).toBe(true);
       expect(Date.now() - started).toBeLessThan(10_000); // bounded, not 600s
     } finally {
       if (saved === undefined) delete process.env.BACKLOT_CMD_TIMEOUT_S;

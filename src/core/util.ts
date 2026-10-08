@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { readFileSync, existsSync, statSync } from 'node:fs';
+import { readFileSync, statSync } from 'node:fs';
 import * as pathMod from 'node:path';
 import { cmdTimeoutS, runBounded } from './exec.js';
 
@@ -23,7 +23,10 @@ export const fileHash = (path: string): string | null => {
   }
 };
 
-export const isFile = (p: string): boolean => existsSync(p) && statSync(p).isFile();
+/** One stat, no throw: what a listing of tens of thousands of files can afford per file. */
+export const statOf = (p: string): import('node:fs').Stats | undefined => statSync(p, { throwIfNoEntry: false });
+
+export const isFile = (p: string): boolean => statOf(p)?.isFile() ?? false;
 
 /**
  * Minimal glob matcher for manifest patterns (caches, sync.include, outputs,
@@ -138,6 +141,32 @@ export function safeJoin(base: string, rel: string, what: string): string {
     throw new BrokerError('work-error', `${what} '${rel}' escapes its directory — path traversal is not allowed`, 'manifest');
   }
   return abs;
+}
+
+/**
+ * The output of a failed command that reads as a missing tool or runtime — the
+ * DAEMON's environment, not the repo's code. Under a unit it is the
+ * environment `runly daemon install` captured; a missing DOTNET_ROOT once made
+ * every template bake fail there, reported as the code's fault.
+ */
+const ENVIRONMENTAL = /command not found|: not found\b|You must install or update \.NET|\.NET location: Not found|DOTNET_ROOT|spawn \S+ ENOENT|exec format error|cannot execute binary|env: '?[^\s']+'?: No such file or directory/i;
+
+/** A hint naming the daemon's environment when `output` looks like one, else undefined. */
+export function environmentHint(output: string): string | undefined {
+  if (!ENVIRONMENTAL.test(output)) return undefined;
+  const sup = process.env.RUNLY_SUPERVISOR;
+  return sup === 'systemd' || sup === 'launchd'
+    ? ` — this looks like the daemon's environment, not the code: a tool or runtime was not found. The daemon runs under its ${sup} unit with the environment 'runly daemon install' captured (it prints it); re-run the install from a shell that has the tool, or add a variable with --env NAME, then 'runly daemon stop' — the next verb starts it again`
+    : ` — this looks like the daemon's environment, not the code: a tool or runtime was not found. The daemon kept the environment of the shell that started it; 'runly daemon stop', and the next verb starts it from yours`;
+}
+
+/**
+ * A failed repo command as an error: env-error with the hint when it reads as
+ * a missing tool or runtime, else `klass` (work-error: the code's fault).
+ */
+export function commandFailure(message: string, source: string | undefined, output: string, klass: 'work-error' | 'env-error' = 'work-error'): BrokerError {
+  const hint = environmentHint(output);
+  return new BrokerError(hint ? 'env-error' : klass, `${message}${hint ?? ''}`, source, output.slice(-800));
 }
 
 export const now = (): number => Date.now();

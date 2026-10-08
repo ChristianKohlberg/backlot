@@ -7,12 +7,13 @@
  * those files and nothing else (decision 0032). runly keeps no identity of the
  * rest of the worktree and no record of builds.
  */
-import { mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { cmdTimeoutS, runBounded } from './exec.js';
-import { globToRegex, sha256, fileHash, BrokerError } from './util.js';
-import { enumerateSource } from './worktree.js';
-import type { Manifest } from './manifest.js';
+import { existsSync } from 'node:fs';
+import { globToRegex, sha256, fileHash, BrokerError, commandFailure, safeJoin } from './util.js';
+import { enumerateSource, enumerateSourceStats } from './worktree.js';
+import { upkeepOutputs, type Manifest } from './manifest.js';
 
 export interface UpkeepStep {
   /** 1-based position in the manifest's upkeep list — progress never names the command. */
@@ -86,7 +87,11 @@ interface TriggerCacheEntry { hash: string; size: number; mtime: number }
 const RACY_WINDOW_MS = 2000;
 
 export async function triggerSet(root: string, manifest: Manifest, cacheDir?: string): Promise<TriggerSet> {
-  const files = await triggerFiles(root, manifest);
+  // The listing's own stat is the cache's check: one stat per trigger file.
+  const whens = (manifest.upkeep ?? []).map((rule) => rule.when);
+  const listed = whens.length === 0 ? [] : await enumerateSourceStats(root, manifest, whens);
+  const files = listed.map((f) => f.path);
+  const statOfListed = new Map(listed.map((f) => [f.path, f]));
   let cache: { writtenAt?: number; entries: Record<string, TriggerCacheEntry> } = { entries: {} };
   if (cacheDir) {
     try {
@@ -101,10 +106,8 @@ export async function triggerSet(root: string, manifest: Manifest, cacheDir?: st
   const hashes = new Map<string, string | null>();
   for (const rel of files) {
     const abs = join(root, rel);
-    let st: { size: number; mtimeMs: number };
-    try {
-      st = statSync(abs);
-    } catch {
+    const st = statOfListed.get(rel);
+    if (!st) {
       hashes.set(rel, null);
       continue;
     }
@@ -177,10 +180,14 @@ export async function runUpkeep(
       continue;
     }
     const hash = triggerHash(root, files, rule.when);
-    if (previous[key] === hash) {
+    // Its trigger is unchanged — but a rule that declares what it leaves
+    // behind is due again when that is gone (a pool's `git clean -fdx`).
+    const missing = rule.run.startsWith('@') ? undefined : upkeepOutputs(rule).find((o) => !existsSync(safeJoin(root, o, 'upkeep outputs')));
+    if (previous[key] === hash && missing === undefined) {
       outcome.steps.push({ index: position, when: rule.when, status: 'fresh', durationMs: 0 });
       continue;
     }
+    if (previous[key] === hash) onProgress?.(`upkeep rule ${position}: its output ${missing} is missing — running it again`);
 
     const started = Date.now();
     if (rule.run.startsWith('@')) {
@@ -219,7 +226,7 @@ export async function runUpkeep(
       if (r.code !== 0) {
         onProgress?.(`${label}: failed (${Math.floor((Date.now() - started) / 1000)}s elapsed)`);
         // Triggered by the binding's own change -> work-error by default (decision 0008).
-        throw new BrokerError('work-error', `upkeep rule failed: ${rule.run}`, rule.when, r.output.slice(-800));
+        throw commandFailure(`upkeep rule failed: ${rule.run}`, rule.when, r.output);
       }
       onProgress?.(`${label}: finished (${Math.floor((Date.now() - started) / 1000)}s elapsed)`);
     }

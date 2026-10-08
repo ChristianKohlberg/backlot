@@ -5,9 +5,9 @@
  */
 import { readdirSync, statSync, rmSync, readFileSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
-import { artifactsRoot, templatesRoot, envsRoot, worktreesRoot } from './paths.js';
+import { templatesRoot, envsRoot, worktreesRoot } from './paths.js';
 import { logEvent } from './events.js';
-import { runQuiet } from './util.js';
+import { cmdTimeoutS, runBounded } from './exec.js';
 import { rotateIfOver } from './logs.js';
 import { hasOtherTemplateOwner, parseBakedMarker, withBakeLock } from '../drivers/datastores.js';
 import type { Journal } from './journal.js';
@@ -21,17 +21,6 @@ const entriesOf = (dir: string): string[] => {
     return [];
   }
 };
-
-/**
- * Check artifacts are gone with `runly run` (decision 0032); an older runly
- * left them under the state root. Nothing reads them any more, so the whole
- * directory goes.
- */
-export function pruneArtifacts(root = artifactsRoot()): number {
-  const n = entriesOf(root).length;
-  if (n > 0 || existsSync(root)) rmSync(root, { recursive: true, force: true });
-  return n;
-}
 
 /**
  * Service logs past the cap are rotated once (decision 0038): `<name>.log`
@@ -63,6 +52,14 @@ export interface TemplateRefs {
   referenced: ReadonlySet<string>;
   /** False when the stack can never be bound again. */
   stackAlive: (stackId: string) => boolean;
+  /**
+   * Where a template's recorded drop command runs: it comes from the
+   * manifest and is written to run in the repo (`node scripts/db.cjs drop …`).
+   * The stack's own worktree while it exists, else a live worktree of the same
+   * project (same manifest name; from the journal or a sibling's `.root`),
+   * else the templates root.
+   */
+  dropCwd?: (stackId: string) => string;
 }
 
 /** The group a template file belongs to: `<datastore>-<preset>` before the content key. */
@@ -83,7 +80,6 @@ const templateGroup = (file: string): string => {
 export async function pruneTemplates(
   p: Pick<Policy, 'templatesKeep'> & Partial<Pick<Policy, 'templateGraceMs'>>,
   root = templatesRoot(),
-  protectedStacks: ReadonlySet<string> = new Set(),
   refs: TemplateRefs = { referenced: new Set(), stackAlive: () => true },
 ): Promise<number> {
   let pruned = 0;
@@ -95,11 +91,10 @@ export async function pruneTemplates(
     // the one remaining writer mutating this dir outside it, reopening the
     // deleted-mid-restore race the lock exists to close.
     pruned += await withBakeLock(stackDir, async () => {
-      if (protectedStacks.has(stackDir) || existsSync(join(dir, '.retired-stack.json'))) return 0;
       const keep = refs.stackAlive(stackDir) ? p.templatesKeep : 0;
       let count = 0;
       const files = entriesOf(dir)
-        .filter((f) => !f.startsWith('.') && !f.endsWith('.retirement.json'))
+        .filter((f) => !f.startsWith('.'))
         .map((f) => {
           try {
             return { f, mtime: statSync(join(dir, f)).mtimeMs };
@@ -127,7 +122,13 @@ export async function pruneTemplates(
               // disk. Re-executing it silently is the part that deserves a
               // record, so the state dir stays auditable.
               logEvent({ level: 'info', kind: 'retention', detail: `dropping baked template via persisted command from ${f}` });
-              await runQuiet(marker.drop, root);
+              const r = await runBounded(marker.drop, refs.dropCwd?.(stackDir) ?? root, Math.min(60, cmdTimeoutS()));
+              if (r.code !== 0 || r.timedOut) {
+                // The marker is the only record that names the database: keep it
+                // for the next sweep, and for 'runly pool doctor' to show.
+                logEvent({ level: 'warn', kind: 'retention', detail: `the drop of template ${marker.ns} (${f}) did not confirm (${r.timedOut ? 'timed out' : `exit ${r.code}`}) — its marker stays: ${r.output.slice(-200)}` });
+                continue;
+              }
             }
           } catch {
             /* unreadable marker — still prune the file */
@@ -136,8 +137,8 @@ export async function pruneTemplates(
         rmSync(full, { force: true });
         count++;
       }
-      // A stack dir with nothing left goes too.
-      if (entriesOf(dir).length === 0) rmSync(dir, { recursive: true, force: true });
+      // A stack dir with nothing left goes too (its `.root` record with it).
+      if (entriesOf(dir).every((f) => f.startsWith('.'))) rmSync(dir, { recursive: true, force: true });
       return count;
     });
   }
@@ -176,8 +177,16 @@ export function pruneWorktreeState(journal: Journal, root = worktreesRoot()): nu
   return pruned;
 }
 
-/** What the journal says about templates (decision 0037): the ones rows reference, and which stacks are alive. */
-export function templateRefs(journal: Journal, root = worktreesRoot()): TemplateRefs {
+/**
+ * What the journal says about templates (decision 0037): the ones rows
+ * reference, and which stacks are alive. A stack no row names is alive while
+ * the worktree it was recorded for exists — recorded by its worktree state
+ * (`worktrees/<stack>/*.json`) or by the `.root` its first bake wrote next to
+ * its templates. A stack with no record at all is NOT alive (0.19): its
+ * worktree records were pruned because the worktree was gone, and treating it
+ * as alive kept the templates of every pruned worktree forever.
+ */
+export function templateRefs(journal: Journal, root = worktreesRoot(), templates = templatesRoot()): TemplateRefs {
   const referenced = new Set<string>();
   const named = new Set<string>();
   for (const env of journal.allEnvs()) {
@@ -191,9 +200,15 @@ export function templateRefs(journal: Journal, root = worktreesRoot()): Template
   const stackAlive = (stackId: string): boolean => {
     if (named.has(stackId)) return true;
     // No row names it: alive while the worktree it describes exists. No
-    // record at all proves nothing, so it is treated as alive.
+    // record at all means that worktree's records were pruned: not alive.
     let recorded: string | undefined;
-    for (const f of ['ledger.json', 'triggers.json', 'builds.json']) {
+    try {
+      const r = readFileSync(join(templates, stackId, '.root'), 'utf8').trim();
+      if (r) recorded = r;
+    } catch {
+      /* not recorded at bake time (an older runly) */
+    }
+    for (const f of recorded === undefined ? ['ledger.json', 'triggers.json', 'builds.json'] : []) {
       try {
         const r = (JSON.parse(readFileSync(join(root, stackId, f), 'utf8')) as { root?: unknown }).root;
         if (typeof r === 'string') {
@@ -204,21 +219,41 @@ export function templateRefs(journal: Journal, root = worktreesRoot()): Template
         /* next */
       }
     }
-    return recorded === undefined || existsSync(recorded);
+    return recorded !== undefined && existsSync(recorded);
   };
-  return { referenced, stackAlive };
+  const ownRoot = (stackId: string): string | undefined => {
+    for (const env of journal.allEnvs()) if (env.stack === stackId) return env.stackRoot;
+    try {
+      const r = readFileSync(join(templates, stackId, '.root'), 'utf8').trim();
+      if (r) return r;
+    } catch { /* none recorded */ }
+    return undefined;
+  };
+  const dropCwd = (stackId: string): string => {
+    const own = ownRoot(stackId);
+    if (own !== undefined && existsSync(own)) return own;
+    // Stack ids are `<manifest name>-<8-char hash of the root>`.
+    const project = stackId.slice(0, -9);
+    for (const env of journal.allEnvs()) if (env.stack.slice(0, -9) === project && existsSync(env.stackRoot)) return env.stackRoot;
+    for (const copy of journal.allDbCopies()) if (copy.stack.slice(0, -9) === project && existsSync(copy.stackRoot)) return copy.stackRoot;
+    for (const sibling of entriesOf(templates)) {
+      if (sibling === stackId || sibling.slice(0, -9) !== project) continue;
+      const r = ownRoot(sibling);
+      if (r !== undefined && existsSync(r)) return r;
+    }
+    return templates;
+  };
+  return { referenced, stackAlive, dropCwd };
 }
 
 export async function retentionSweep(
   journal: Journal,
   p: Policy,
-  protectedStacks: ReadonlySet<string> = new Set(),
-): Promise<{ artifacts: number; logs: number; templates: number; worktrees: number }> {
+): Promise<{ logs: number; templates: number; worktrees: number }> {
   // Templates first: they read the worktree records pruneWorktreeState removes.
-  const templates = await pruneTemplates(p, templatesRoot(), protectedStacks, templateRefs(journal));
+  const templates = await pruneTemplates(p, templatesRoot(), templateRefs(journal));
   return {
     worktrees: pruneWorktreeState(journal),
-    artifacts: pruneArtifacts(),
     logs: truncateLogs(p),
     templates,
   };

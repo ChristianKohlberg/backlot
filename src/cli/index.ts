@@ -53,8 +53,11 @@ Usage:
                           wave); builds: serial / build: {serial: true} opt out.
                           Waits in the server-wide load budget's queue when the
                           box is full ('runly plan' says whether it would).
-                          Prints a short summary (--json: the context blob);
-                          --env prints the 'ctx --env' lines instead.
+                          With services named, the other running services are
+                          left alone (not built, not restarted).
+                          Prints a short summary — what started or restarted,
+                          and why a full rebind happened (--json: the context
+                          blob); --env prints the 'ctx --env' lines instead.
   runly down [service...] stop just these services (none named = all of them).
                           The lease, the data and the public ports stay
   runly plan [service...] [--rebuild]
@@ -63,7 +66,8 @@ Usage:
                           it starts now or would wait (and for what)
   runly ctx [--env]       a short summary of the environment (URLs, service
                           states, datastores and the preset each holds, the
-                          login); --json for the full context blob.
+                          login, a failed last up); --json for the full context
+                          blob.
                           --env prints 'export KEY=value' lines instead:
                           RUNLY_ENV_ID, RUNLY_PORT_<PORT>, RUNLY_URL_<SERVICE>,
                           RUNLY_DATASTORE_<NAME>_URL, RUNLY_DATASTORE_<NAME>_PRESET,
@@ -77,24 +81,32 @@ Usage:
   runly db new <datastore> [--preset NAME] [--holder-pid <pid>]
                           a fresh copy of a datastore from the same template the
                           environments use — no lease, no ports, no services.
-                          Prints its name, url and preset. It is dropped when
+                          Prints its name, url, database and preset. It is
+                          dropped when
                           its holder process exits (--holder-pid, or the Claude
                           Code session), when this worktree goes away, or by
                           'db drop'
-  runly db with <datastore> [--preset NAME] -- <cmd...>
-                          run a command against a fresh copy (RUNLY_DB_URL,
-                          RUNLY_DB_NAME), drop the copy when it exits, and exit
-                          with its exit code
+  runly db with <datastore> [--preset NAME] [--runly-exit N] -- <cmd...>
+                          run a command against a fresh copy (RUNLY_DB_URL; the
+                          database's own name in RUNLY_DB_DATABASE; runly's
+                          handle in RUNLY_DB_COPY), drop the copy when it
+                          exits, and exit with its exit code. The command dies
+                          with this CLI however it dies. runly's own failures
+                          are marked 'runly db with:' on stderr (with --json a
+                          {"runlyDbWith":…} line) and exit 1/2/3, or N with
+                          --runly-exit N
   runly db ls [--all]     this worktree's database copies (--all: every one)
   runly db drop <name>    drop one copy now
   runly warm              run this worktree's due upkeep rules and its service
                           builds now — no lease, no services. For an idle worktree
                           just moved to a new commit
-  runly exec <cmd...>     run a command in the worktree with the lease's ports,
-                          URLs and connection strings in its environment
-                          (the RUNLY_* names of 'ctx --env', and BACKLOT_PORT_*,
-                          BACKLOT_URL_*, BACKLOT_DS_*). Exits 0 or 1; --json
-                          reports the command's own exitCode
+  runly exec <cmd...>     run a command in the worktree, on this terminal, with
+                          your environment plus the lease's ports, URLs and
+                          connection strings (the RUNLY_* names of 'ctx --env',
+                          and BACKLOT_PORT_*, BACKLOT_URL_*, BACKLOT_DS_*).
+                          Stopped services start first. Exits with the
+                          command's code; --json collects stdout, stderr and
+                          exitCode. No deadline unless BACKLOT_CMD_TIMEOUT_S
   runly logs [service...] [--lines N] [--since up|<duration>] [--grep <re>]
              [-f|--follow [--until <re>] [--timeout <s>]] [--build]
                           the services' output (last 40 lines), interleaved by
@@ -104,8 +116,10 @@ Usage:
                           following; --until exits 0 at the first matching line
                           of each service's current process (lines before its
                           last start never match); --timeout exits 124 when it
-                          runs out. --build: the output of each service's last
-                          build (and of upkeep)
+                          runs out. --grep that matches nothing exits 1.
+                          --build: the output of upkeep and of each service's
+                          last build, a section each with its own last N lines
+                          and a header saying what was cut
   runly reset-data [--preset [DATASTORE=]NAME]...
                           restore the data of the current lease, each datastore
                           with the preset it holds (or the one named)
@@ -118,8 +132,9 @@ Usage:
   runly release           end the current lease; the environment stays for the
                           next up
   runly destroy           tear down everything runly holds for this worktree
-                          now: services, data, copies, ports, lease, records.
-                          For a worktree pool taking a worktree back
+                          now: services, data, copies, ports, lease, and the
+                          upkeep rules without outputs:. For a worktree pool
+                          taking a worktree back
   runly preview <service> [--ttl <minutes>] [--https-port N]
                           publish a service from your lease on a public quick
                           tunnel (Cloudflare by default). The URL is unauthenticated
@@ -129,7 +144,8 @@ Usage:
                           machine's tailnet name instead (tailnet only);
                           --https-port pins that port for this publish.
   runly preview stop      stop the preview tunnel on your lease
-  runly status            daemon, environments, leases and the load budget
+  runly status            daemon, environments, the load budget and recent
+                          warnings (--json: everything)
   runly appliance ls|start|stop [name]
                           shared backing servers: probe, ensure up, explicit stop
   runly pool ls|recycle [<env-id>] [--force]|reconcile|gc|doctor [--fix]
@@ -145,11 +161,16 @@ Usage:
   runly daemon stop       stop the daemon and wait for it (60 s,
                           BACKLOT_DAEMON_STOP_TIMEOUT_MS); environments are
                           recovered on next use
-  runly daemon install [--print]
+  runly daemon install [--print] [--env NAME]...
                           supervise the daemon: a systemd user unit (Linux) or
                           launchd agent (macOS) that restarts it within seconds
                           when it crashes; the CLI then starts the daemon
                           through it. --print shows the unit without writing it.
+                          The unit carries PATH, an allowlist (DOTNET_*, NODE_*,
+                          JAVA_HOME, DOCKER_*, LANG/LC_*, proxies, SSL_CERT_*),
+                          BACKLOT_*, what the manifest's commands reference and
+                          each --env NAME — never an env_from input; it prints
+                          what it captured and left out.
                           A daemon already running moves under it on 'runly update'
   runly daemon uninstall  disable and remove that unit
   runly update [--check] [--force]
@@ -172,7 +193,9 @@ Holding an environment:
   BACKLOT_TETHER=off opts out.
 
   --ttl <minutes>          the lease length (default 30) — the form for other
-                           agents and scripts. up renews it.
+                           agents and scripts. up renews it. Only for an
+                           untethered lease: it skips the automatic tether, and
+                           is refused next to --holder-pid.
   --holder-pid <pid>       For an interactive shell, or any caller that OUTLIVES the
   (BACKLOT_HOLDER_PID)     command. Ties the environment to that process: a minute
                            after it exits, the environment is torn down (services,
@@ -191,7 +214,7 @@ other one keeps its data. ctx reports the preset each datastore holds. db new an
 db with take --preset NAME for their one datastore.
 
 Verbs that act on a lease or a copy take --holder <name> to act for another
-holder than the caller's directory.
+holder than the caller's worktree (any subdirectory of it counts).
 
 Every verb accepts --json. Long verbs (up/warm/reset-data) show live progress
 on a terminal (stderr); force with --progress, silence with --quiet. stdout stays clean.
@@ -208,11 +231,13 @@ const verb = rawArgv[0];
 // flag's value is never mis-bound as a positional (and an inner command's own
 // flags survive) — the F1 class of argv bugs. Everything after a lone `--`, and
 // EVERYTHING for `exec`, is treated as a raw passthrough command.
-const VALUE_FLAGS = new Set(['--holder', '--holder-pid', '--ttl', '--role', '--lines', '--ref', '--spec', '--preset', '--https-port', '--since', '--grep', '--until', '--timeout']);
+const VALUE_FLAGS = new Set(['--holder', '--holder-pid', '--ttl', '--role', '--lines', '--ref', '--spec', '--preset', '--https-port', '--since', '--grep', '--until', '--timeout', '--runly-exit']);
 const BOOL_FLAGS = new Set(['--print', '--json', '--env', '--watch', '--reset-data', '--pristine', '--pull', '--detach', '--all', '--force', '--raw', '--data-only', '--progress', '--quiet', '--check', '--rebuild', '--follow', '--build', '--fix']);
 
 const flagVals = new Map<string, string>();
 const presetArgs: string[] = [];
+/** `daemon install --env NAME` (repeatable): a variable to capture into the unit beyond the allowlist. */
+const unitEnvNames: string[] = [];
 const flags = new Set<string>();
 const positional: string[] = [];
 let passthrough: string[] | null = null; // for `exec` / after `--`
@@ -231,6 +256,17 @@ let passthrough: string[] | null = null; // for `exec` / after `--`
     if (a === '--') {
       passthrough = body.slice(i + 1);
       break;
+    }
+    // `--env` is a switch for ctx/up, and takes a NAME for `daemon install`.
+    if (a === '--env' && verb === 'daemon') {
+      const v = body[i + 1];
+      if (v === undefined || v.startsWith('--') || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(v)) {
+        console.error(`runly daemon install: --env needs a variable name, got '${v ?? ''}'`);
+        process.exit(64);
+      }
+      unitEnvNames.push(v);
+      i++;
+      continue;
     }
     if (VALUE_FLAGS.has(a)) {
       const v = body[i + 1];
@@ -504,7 +540,15 @@ async function main(): Promise<void> {
   // No explicit holder process: tether to the agent this CLI runs under, when
   // it can be found (decision 0035) — Claude Code's CLAUDE_PID, if it is a
   // live ancestor. BACKLOT_TETHER=off opts out.
-  if (holderPid === undefined && (verb === 'up' || (verb === 'db' && positional[0] === 'new'))) holderPid = autoTether();
+  // `--ttl` asks for a lease that ends at a deadline: it is the untethered
+  // form, so it opts out of the automatic tether, and next to an explicit
+  // holder process (which keeps the lease alive while it lives) it means
+  // nothing and is refused.
+  if (flagValue('--ttl') !== undefined && holderPid !== undefined && (verb === 'up' || verb === 'db')) {
+    console.error(`runly: --ttl sets the length of an untethered lease; a lease held by ${holderPidSource} ${holderPid} lives as long as that process — drop one of them`);
+    process.exit(64);
+  }
+  if (holderPid === undefined && flagValue('--ttl') === undefined && (verb === 'up' || (verb === 'db' && positional[0] === 'new'))) holderPid = autoTether();
 
   let res: RpcResponse | undefined;
   switch (verb) {
@@ -561,6 +605,10 @@ async function main(): Promise<void> {
     case 'destroy':
       res = await rpc('destroy', { cwd }, progress);
       endProgress();
+      if (res.ok && !json) {
+        for (const line of destroyLines(res.data as DestroyData)) console.log(line);
+        return;
+      }
       break;
     case 'ps':
       res = await rpc('ps', { cwd, all: flags.has('--all') });
@@ -576,24 +624,41 @@ async function main(): Promise<void> {
         endProgress();
         if (res.ok && !json) {
           const d = res.data as DbCopy;
-          console.log(`name=${shellValue(d.name)}\nurl=${shellValue(d.url)}\npreset=${shellValue(d.preset)}`);
+          console.log(`name=${shellValue(d.name)}\nurl=${shellValue(d.url)}\ndatabase=${shellValue(d.ns)}\npreset=${shellValue(d.preset)}`);
           return;
         }
         break;
       }
       if (sub === 'with') {
+        // stdout is the command's: everything runly says goes to stderr,
+        // prefixed `runly db with:` (with --json, one JSON line at the end).
+        // runly's own failures exit 1/2/3 like every verb — or --runly-exit N
+        // (125, say, as docker run does), so a caller can tell them from the
+        // command's own codes, which always pass through unchanged.
+        const own = flagValue('--runly-exit');
+        const ownCode = own === undefined ? undefined : Number(own);
+        if (own !== undefined && (!Number.isInteger(ownCode) || ownCode! < 1 || ownCode! > 255)) {
+          console.error(`runly db with: --runly-exit expects an exit code (1-255), got '${own}'`);
+          process.exit(64);
+        }
+        const report = (r: Record<string, unknown>) => { if (json) console.error(JSON.stringify({ runlyDbWith: r })); };
         // The copy is tethered to THIS process: the CLI outlives the command,
         // so if it is killed the daemon's reaper drops the copy.
         const created = await rpc('db-new', { cwd, holder, holderPid: process.pid, datastore: positional[1], preset: dbPreset }, progress);
         endProgress();
         if (!created.ok) {
-          errExit(created.error);
-          return;
+          const e = created.error;
+          const code = ownCode ?? (e.class === 'work-error' ? 1 : e.class === 'infra-error' ? 3 : 2);
+          console.error(`runly db with: [${e.class ?? 'error'}] ${e.message}${e.source ? ` (${e.source})` : ''}`);
+          if (e.logExcerpt) console.error(`--- log excerpt ---\n${e.logExcerpt}`);
+          report({ from: 'runly', exitCode: code, error: e });
+          process.exit(code);
         }
         const copy = created.data as DbCopy;
         const code = await runWithCopy(passthrough!, copy);
-        const dropped = await rpc('db-drop', { name: copy.name });
+        const dropped = await rpc('db-drop', { name: copy.name }).catch((err: Error) => ({ ok: false as const, error: { message: err.message } as RpcError }));
         if (!dropped.ok) console.error(`runly db with: dropping ${copy.name} failed (${dropped.error.message}) — the sweeper retries it`);
+        report({ from: 'command', exitCode: code, copy: copy.name, database: copy.ns, dropped: dropped.ok });
         process.exit(code);
       }
       if (sub === 'ls') {
@@ -664,17 +729,18 @@ async function main(): Promise<void> {
         console.error('runly exec: no command given');
         process.exit(64);
       }
-      res = await rpc('exec', { cwd, holder, cmd });
-      if (res.ok) {
-        const d = res.data as { exitCode: number; stdout: string; stderr: string };
-        if (json) console.log(JSON.stringify({ ok: d.exitCode === 0, ...d }));
-        else {
-          if (d.stdout) process.stdout.write(d.stdout);
-          if (d.stderr) process.stderr.write(d.stderr);
-        }
-        process.exit(d.exitCode === 0 ? 0 : 1);
+      // The daemon resumes the environment and hands back its variables; the
+      // command runs HERE (decision 0040): the caller's stdio and environment,
+      // its real exit code, and no lock on the environment while it runs.
+      res = await rpc('exec-env', { cwd, holder });
+      if (!res.ok) break;
+      const d = res.data as { envId: string; root: string; vars: Record<string, string> };
+      const r = await runExec(parts, cmd, d, json);
+      if (r.timedOutS !== undefined) {
+        errExit({ class: 'work-error', message: `exec timed out after ${r.timedOutS}s (its process group was killed; BACKLOT_CMD_TIMEOUT_S sets the deadline)`, source: 'exec', logExcerpt: r.stderr?.slice(-800) });
       }
-      break;
+      if (json) console.log(JSON.stringify({ ok: r.code === 0, exitCode: r.code, stdout: r.stdout, stderr: r.stderr }));
+      return process.exit(r.code);
     }
     case 'logs': {
       const rawLines = flagValue('--lines');
@@ -785,6 +851,10 @@ async function main(): Promise<void> {
     }
     case 'status':
       res = await rpc('status', {});
+      if (res.ok && !json) {
+        for (const line of statusLines(res.data as StatusData)) console.log(line);
+        return;
+      }
       break;
     case 'doctor':
       res = await rpc('doctor', { cliVersion: VERSION });
@@ -994,6 +1064,8 @@ interface DbCopy {
   datastore: string;
   preset: string;
   url: string;
+  /** The database's own name on its server (the file path for sqlite). */
+  ns: string;
   state: string;
   worktree: string;
   holder: string;
@@ -1006,6 +1078,7 @@ interface PsData {
   scope: string;
   services: Array<{ env: string; worktree?: string; service: string; state: string; publicPort: number | null; internalPort: number | null; pid: number | null; idleMs: number | null; idleStopInMs?: number | null; rssBytes: number | null; failure?: { detail: string; hint: string } | null }>;
   databases: DbCopy[];
+  failedUps?: Array<{ env: string; message: string; class: string | null; hint: string }>;
   budget?: { enabled: boolean; memoryBytes: number; cpu: number; committedMemoryBytes: number; committedCpu: number; waiting: number };
 }
 
@@ -1062,14 +1135,26 @@ function doctorLines(d: PoolDoctorData): string[] {
  * removes it; a running daemon keeps running, unsupervised.
  */
 async function daemonUnitVerb(sub: 'install' | 'uninstall'): Promise<void> {
-  const plan = unitPlan();
+  const plan = unitPlan(undefined, unitEnvNames);
   if (!plan) {
     errExit({ class: 'work-error', message: `runly daemon ${sub}: no supervisor for ${process.platform} (systemd user units on Linux, launchd on macOS)`, source: 'daemon' });
     return;
   }
+  const e = plan.environment;
+  const environment = { captured: e.captured, notSet: e.notSet, excludedInputs: e.excluded, leftOut: e.leftOut };
+  // What the unit carries, and what it does not, said before anything is written.
+  const sayEnvironment = () => {
+    console.error(`runly daemon install: the unit's environment — captured from this shell: ${e.captured.join(', ') || 'nothing'}`);
+    if (e.notSet.length) console.error(`  referenced by the manifest or --env but not set in this shell (not captured): ${e.notSet.join(', ')}`);
+    if (e.excluded.length) console.error(`  env_from inputs, never stored in a unit (each 'up' supplies them): ${e.excluded.join(', ')}`);
+    console.error(`  ${e.leftOut} other variable(s) of this shell were left out; add one with --env NAME`);
+  };
   if (sub === 'install' && flags.has('--print')) {
-    if (json) out({ kind: plan.kind, name: plan.name, path: plan.path, content: plan.content });
-    else process.stdout.write(plan.content);
+    if (json) out({ kind: plan.kind, name: plan.name, path: plan.path, content: plan.content, environment });
+    else {
+      sayEnvironment();
+      process.stdout.write(plan.content);
+    }
     return;
   }
   if (sub === 'uninstall') {
@@ -1082,6 +1167,7 @@ async function daemonUnitVerb(sub: 'install' | 'uninstall'): Promise<void> {
     out({ kind: plan.kind, name: plan.name, path: plan.path, removed: true, steps: r.steps, detail: 'the running daemon (if any) keeps running without a supervisor; the next verb that finds none autospawns one' });
     return;
   }
+  if (sub === 'install' && !json) sayEnvironment();
   const r = installUnit(plan);
   if (r.error) {
     errExit({ class: 'infra-error', message: `runly daemon install: ${r.error}`, source: 'daemon', logExcerpt: r.steps.join('\n') });
@@ -1101,7 +1187,74 @@ async function daemonUnitVerb(sub: 'install' | 'uninstall'): Promise<void> {
     : started
       ? `the daemon now runs under ${plan.kind === 'systemd' ? `${plan.name}.service` : plan.name}`
       : `the unit is installed; the next runly verb starts the daemon through it`;
-  out({ kind: plan.kind, name: plan.name, path: plan.path, installed: true, started, steps: r.steps, next });
+  out({ kind: plan.kind, name: plan.name, path: plan.path, installed: true, started, steps: r.steps, next, environment });
+}
+
+/**
+ * Run `runly exec`'s command in the worktree (decision 0040). One token is a
+ * shell string, several keep the caller's word splits. The environment is the
+ * caller's own plus the environment's variables and the exec tag. Plain: the
+ * caller's stdio, nothing buffered or cut. `--json`: stdout and stderr are
+ * collected whole for the JSON answer. The exit code is the command's (128+n
+ * for a signal). No deadline unless BACKLOT_CMD_TIMEOUT_S is set; while the
+ * command runs, the environment is touched every minute (it is in use).
+ */
+async function runExec(
+  parts: string[], cmd: string, d: { envId: string; root: string; vars: Record<string, string> }, json: boolean,
+): Promise<{ code: number; stdout?: string; stderr?: string; timedOutS?: number }> {
+  const { spawn } = await import('node:child_process');
+  const { constants } = await import('node:os');
+  const env = { ...process.env, ...d.vars };
+  const fromTerminal = process.stdin.isTTY === true || process.stdout.isTTY === true || process.stderr.isTTY === true;
+  // Without a terminal the command leads a group of its own, so a deadline or
+  // a signal reaches everything it started; at a terminal it stays in ours.
+  const ownGroup = !fromTerminal;
+  const stdio: ('inherit' | 'pipe')[] = json ? ['inherit', 'pipe', 'pipe'] : ['inherit', 'inherit', 'inherit'];
+  const child = parts.length === 1
+    ? spawn(cmd, { cwd: d.root, env, stdio, shell: true, detached: ownGroup })
+    : spawn(parts[0]!, parts.slice(1), { cwd: d.root, env, stdio, detached: ownGroup });
+  const out: Buffer[] = [];
+  const err: Buffer[] = [];
+  child.stdout?.on('data', (b: Buffer) => out.push(b));
+  child.stderr?.on('data', (b: Buffer) => err.push(b));
+  const signalAll = (sig: NodeJS.Signals) => {
+    try {
+      if (ownGroup && child.pid !== undefined) process.kill(-child.pid, sig);
+      else child.kill(sig);
+    } catch {
+      /* already gone */
+    }
+  };
+  const onInt = fromTerminal ? () => undefined : () => signalAll('SIGINT');
+  const onTerm = () => signalAll('SIGTERM');
+  const onHup = () => signalAll('SIGHUP');
+  process.on('SIGINT', onInt);
+  process.on('SIGTERM', onTerm);
+  process.on('SIGHUP', onHup);
+  const heartbeat = setInterval(() => void rpc('exec-touch', { envId: d.envId }).catch(() => null), 60_000);
+  heartbeat.unref();
+  const raw = process.env.BACKLOT_CMD_TIMEOUT_S;
+  const deadlineS = raw !== undefined && raw !== '' && Number(raw) > 0 ? Number(raw) : undefined;
+  let timedOut = false;
+  const timer = deadlineS === undefined ? undefined : setTimeout(() => {
+    timedOut = true;
+    signalAll('SIGKILL');
+  }, deadlineS * 1000);
+  const code = await new Promise<number>((resolve) => {
+    child.on('error', (e) => {
+      console.error(`runly exec: could not start '${parts[0]}': ${e.message}`);
+      resolve(127);
+    });
+    child.on('close', (c, signal) => resolve(c ?? (signal ? 128 + (constants.signals[signal] ?? 0) : 1)));
+  });
+  if (timer) clearTimeout(timer);
+  clearInterval(heartbeat);
+  process.off('SIGINT', onInt);
+  process.off('SIGTERM', onTerm);
+  process.off('SIGHUP', onHup);
+  const stdout = json ? Buffer.concat(out).toString() : undefined;
+  const stderr = json ? Buffer.concat(err).toString() : undefined;
+  return { code, stdout, stderr, timedOutS: timedOut ? deadlineS : undefined };
 }
 
 /**
@@ -1110,25 +1263,34 @@ async function daemonUnitVerb(sub: 'install' | 'uninstall'): Promise<void> {
  * SIGINT/SIGTERM/SIGHUP are passed on, so the copy is dropped after the
  * command stops.
  *
- * If THIS process dies without that chance (SIGKILL, OOM), the daemon drops
- * the copy — and must take the command down first, or it goes on working
- * against a dropped database (decision 0039). So the command carries the
- * copy's tag (`BACKLOT_DB_COPY`, inherited by everything it starts: Linux
- * finds them all by it), its pid and start time are recorded on the copy, and
- * without a terminal it runs in its own process group, which the daemon
- * signals as a whole. At a terminal it stays in ours, so job control (Ctrl-C,
- * reading the terminal) behaves as before; there the daemon signals the
- * recorded pid and, on Linux, every tagged process.
+ * The command runs under a watchdog (`watchdog.js`) that holds a pipe from
+ * this process: when the CLI dies without the chance to stop it (SIGKILL,
+ * OOM, a kill of its process group that the command's own group escaped),
+ * the pipe closes and the watchdog takes the command down — it must not go on
+ * working against a copy the daemon is about to drop (decision 0039). The
+ * daemon backs it up: the command carries the copy's tag (`BACKLOT_DB_COPY`,
+ * inherited by everything it starts: Linux finds them all by it), and the
+ * watchdog's pid and start time are recorded on the copy. Without a terminal
+ * it leads its own process group, which is signalled as a whole; at a
+ * terminal it stays in ours, so job control (Ctrl-C, reading the terminal)
+ * behaves as before.
  */
 async function runWithCopy(parts: string[], copy: DbCopy): Promise<number> {
   const { spawn } = await import('node:child_process');
   const { constants } = await import('node:os');
-  const env = { ...process.env, RUNLY_DB_URL: copy.url, RUNLY_DB_NAME: copy.name, ...dbCopyTag(copy.name, stateRoot()) };
+  const { fileURLToPath } = await import('node:url');
+  const { dirname } = await import('node:path');
+  const env = { ...process.env, ...dbVars(copy), ...dbCopyTag(copy.name, stateRoot()) };
   const fromTerminal = process.stdin.isTTY === true || process.stdout.isTTY === true || process.stderr.isTTY === true;
   const ownGroup = !fromTerminal;
-  const child = parts.length === 1
-    ? spawn(parts[0]!, { stdio: 'inherit', env, shell: true, detached: ownGroup })
-    : spawn(parts[0]!, parts.slice(1), { stdio: 'inherit', env, detached: ownGroup });
+  const watchdog = join(dirname(fileURLToPath(import.meta.url)), 'watchdog.js');
+  const child = spawn(process.execPath, [watchdog, parts.length === 1 ? 'shell' : 'argv', ownGroup ? 'group' : 'nogroup', ...parts], {
+    stdio: ['inherit', 'inherit', 'inherit', 'pipe'],
+    env,
+    detached: ownGroup,
+  });
+  // The tie: this end closes when this process dies, however it dies.
+  (child.stdio[3] as unknown as { unref?: () => void } | null)?.unref?.();
   // Listen before anything is awaited: a command that ends while the
   // attach RPC is in flight must not be missed.
   const ended = new Promise<number>((resolve) => {
@@ -1146,8 +1308,8 @@ async function runWithCopy(parts: string[], copy: DbCopy): Promise<number> {
   }
   const forward = (sig: NodeJS.Signals) => () => {
     try {
-      // In its own group, the whole group: `sh -c` forks, and the real
-      // command is its child.
+      // In its own group, the whole group: the watchdog, the shell and the
+      // real command beneath it.
       if (ownGroup && child.pid !== undefined) process.kill(-child.pid, sig);
       else child.kill(sig);
     } catch {
@@ -1171,6 +1333,16 @@ async function runWithCopy(parts: string[], copy: DbCopy): Promise<number> {
   return code;
 }
 
+/**
+ * What `db with`'s command reads (and `db new` prints): RUNLY_DB_URL to
+ * connect; RUNLY_DB_DATABASE, the database's own name on its server (the file
+ * for sqlite); RUNLY_DB_COPY, runly's handle for `db drop`. RUNLY_DB_NAME is
+ * the handle too, kept for the scripts that read it.
+ */
+function dbVars(copy: DbCopy): Record<string, string> {
+  return { RUNLY_DB_URL: copy.url, RUNLY_DB_DATABASE: copy.ns, RUNLY_DB_COPY: copy.name, RUNLY_DB_NAME: copy.name };
+}
+
 /** A plain, aligned table; `-` for an empty cell. */
 function table(header: string[], rows: string[][]): string[] {
   const widths = header.map((h, i) => Math.max(h.length, ...rows.map((r) => (r[i] ?? '').length)));
@@ -1190,6 +1362,55 @@ function dbLines(copies: DbCopy[]): string[] {
   ]));
 }
 
+interface StatusData {
+  pid: number;
+  supervisor: string;
+  envs: Array<{ id: string; state: string; worktree: string; summary: string; idleMs: number; lease: { holder: string; expiresAt: number; holderPid?: number } | null }>;
+  poolMaxTotal: number;
+  ports: { conflicts: string[] };
+  budget: { enabled: boolean; memoryBytes: number; cpu: number; committedMemoryBytes: number; committedCpu: number; waiting: number };
+  events: Array<{ at: number; level: string; kind?: string; envId?: string; detail?: string }>;
+}
+
+/** The plain `status` (0.19): the daemon, each environment in a line, the budget, recent warnings. `--json` is the full blob. */
+function statusLines(d: StatusData): string[] {
+  const out = [`runly daemon pid ${d.pid} (${d.supervisor === 'autospawn' ? 'autospawned' : `under ${d.supervisor}`}), ${d.envs.length} of at most ${d.poolMaxTotal} environment(s)`];
+  if (d.envs.length) {
+    out.push('');
+    out.push(...table(['ENV', 'STATE', 'IDLE', 'WORKTREE', 'SUMMARY'], d.envs.map((e) => [e.id, e.state, ago(e.idleMs), e.worktree, e.summary])));
+  }
+  if (d.budget.enabled) {
+    out.push('');
+    out.push(`budget: ${formatSize(d.budget.committedMemoryBytes)} of ${formatSize(d.budget.memoryBytes)}, ${Math.round(d.budget.committedCpu * 10) / 10} of ${d.budget.cpu} cpu committed${d.budget.waiting ? `; ${d.budget.waiting} waiting` : ''}`);
+  }
+  for (const c of d.ports.conflicts) out.push(`port conflict: ${c}`);
+  const notable = d.events.filter((e) => e.level === 'warn' || e.level === 'error').slice(-5);
+  if (notable.length) {
+    out.push('');
+    out.push('recent warnings:');
+    for (const e of notable) out.push(`  ${ago(Date.now() - e.at)} ago ${e.level}${e.envId ? ` ${e.envId}` : ''}: ${e.detail ?? e.kind ?? ''}`);
+  }
+  out.push(`'runly status --json' for everything`);
+  return out;
+}
+
+interface DestroyData {
+  worktree: string;
+  environments: string[];
+  copies: string[];
+  copiesNotDropped: Array<string | { name: string; error?: string }>;
+  upkeepForgotten: number;
+}
+
+/** The plain `destroy` (0.19): what went, what could not. */
+function destroyLines(d: DestroyData): string[] {
+  const out = [d.environments.length ? `destroyed ${d.environments.join(', ')} (services, data, ports, lease)` : `no environment for ${d.worktree}`];
+  if (d.copies.length) out.push(`dropped database copies: ${d.copies.join(', ')}`);
+  for (const c of d.copiesNotDropped) out.push(`could not drop ${typeof c === 'string' ? c : `${c.name}${c.error ? `: ${c.error}` : ''}`} — 'runly pool doctor' lists it`);
+  if (d.upkeepForgotten) out.push(`forgot ${d.upkeepForgotten} upkeep rule(s) with no outputs: the next 'up' runs them again`);
+  return out;
+}
+
 function psLines(d: PsData, all: boolean): string[] {
   const out: string[] = [];
   if (d.services.length === 0) {
@@ -1203,8 +1424,9 @@ function psLines(d: PsData, all: boolean): string[] {
     ])));
     // A failed service says how it ended and where to look (decision 0039).
     for (const s of d.services) if (s.failure) out.push(`${s.service} ${s.failure.detail} — '${s.failure.hint}' shows why; the next 'runly up' retries it`);
+    for (const f of d.failedUps ?? []) out.push(`${f.env}: the last 'runly up' failed${f.class ? ` [${f.class}]` : ''}: ${f.message} — ${f.hint}`);
     const running = d.services.filter((s) => s.state === 'running' || s.state === 'starting').length;
-    if (running === 0) out.push(`nothing is running — ${d.services.length} service(s) idle, stopped or down; the next 'runly up' or connection starts what is wanted`);
+    if (running === 0 && (d.failedUps ?? []).length === 0) out.push(`nothing is running — ${d.services.length} service(s) idle, stopped or down; the next 'runly up' or connection starts what is wanted`);
   }
   if (d.budget?.enabled) {
     out.push('');
@@ -1220,7 +1442,7 @@ interface CtxView {
   stack: string;
   envId: string;
   state: string;
-  lease: { id: string; expiresAt: number } | null;
+  lease: { id: string; expiresAt: number; holderPid?: number | null } | null;
   urls?: Record<string, string>;
   ports?: Record<string, number>;
   services?: Record<string, 'running' | 'failed' | 'stopped' | 'down'>;
@@ -1229,7 +1451,22 @@ interface CtxView {
   logins?: { user: string; password: string } | null;
   previewUrls?: Record<string, string>;
   previewNotice?: string;
-  bindDiagnostics?: { durationMs?: number; reuse?: string; started?: string[]; restarted?: string[] };
+  bindDiagnostics?: { durationMs?: number; reuse?: string; started?: string[]; restarted?: string[]; reasons?: string[] };
+  lastUpFailed?: { message: string; class: string | null; hint: string } | null;
+}
+
+/** A full-rebind reason code (bindDiagnostics.reasons) in words. */
+function rebindReason(code: string): string {
+  const words: Record<string, string> = {
+    'upkeep-required': 'an upkeep rule ran',
+    'environment-not-running': 'its services were not running',
+    'service-process-unhealthy': 'a service process was not healthy',
+    'environment-inputs-changed': 'the env_from inputs changed',
+    'manifest-changed': 'the manifest changed',
+    'public-port-moved': 'a public port moved',
+  };
+  if (code.startsWith('hygiene-')) return `--${code.slice('hygiene-'.length)} was asked for`;
+  return words[code] ?? code;
 }
 
 /**
@@ -1239,12 +1476,21 @@ interface CtxView {
  */
 function ctxSummary(c: CtxView, verb: 'up' | 'ctx'): string[] {
   const out: string[] = [];
-  const until = c.lease ? ` — lease until ${new Date(c.lease.expiresAt).toLocaleTimeString()}` : ' — no lease';
+  // A tethered lease lives as long as its agent: a deadline would be a lie.
+  const until = !c.lease
+    ? ' — no lease'
+    : c.lease.holderPid
+      ? ` — held by agent ${c.lease.holderPid}`
+      : ` — lease until ${new Date(c.lease.expiresAt).toLocaleTimeString()}`;
   const d = c.bindDiagnostics;
   const how = verb === 'up' && d
     ? ` (${d.reuse === 'rebound' || !d.reuse ? 'bound' : d.reuse}${d.durationMs !== undefined ? ` in ${formatDuration(d.durationMs)}` : ''}${d.started?.length ? `; started ${d.started.join(', ')}` : ''}${d.restarted?.length ? `; restarted ${d.restarted.join(', ')}` : ''})`
     : '';
   out.push(`${c.stack} ${c.envId} ${c.state}${how}${until}`);
+  // Why everything was stopped and started again (a full rebind), in words.
+  // A new environment's first bind needs no explaining.
+  const why = verb === 'up' && d && (d.reuse === 'rebound' || !d.reuse) && !d.reasons?.includes('new-environment') ? (d.reasons ?? []).map(rebindReason) : [];
+  if (why.length) out.push(`  full rebind: ${why.join('; ')}`);
   const names = Object.keys(c.services ?? c.urls ?? {});
   const width = Math.max(0, ...names.map((n) => n.length));
   for (const n of names) {
@@ -1253,6 +1499,7 @@ function ctxSummary(c: CtxView, verb: 'up' | 'ctx'): string[] {
     out.push(`  ${n.padEnd(width)}  ${state.padEnd(7)}  ${url}${c.previewUrls?.[n] ? `  (preview ${c.previewUrls[n]})` : ''}`.trimEnd());
   }
   for (const [n, f] of Object.entries(c.failures ?? {})) out.push(`  ${n} ${f.detail} — '${f.hint}' shows why; the next 'runly up' retries it`);
+  if (c.lastUpFailed) out.push(`  the last 'runly up' failed${c.lastUpFailed.class ? ` [${c.lastUpFailed.class}]` : ''}: ${c.lastUpFailed.message} — ${c.lastUpFailed.hint}`);
   for (const [n, ds] of Object.entries(c.datastores ?? {})) out.push(`  datastore ${n}: ${ds.url}${ds.preset ? ` (${ds.preset})` : ''}`);
   if (c.logins) out.push(`  login: ${c.logins.user} / ${c.logins.password}`);
   out.push(`  'runly ctx --env' for shell exports, --json for everything`);

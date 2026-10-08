@@ -6,7 +6,7 @@
  */
 import { describe, it, expect, afterAll } from 'vitest';
 import { execFile, execFileSync, spawn } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { disposeStateSync } from './support/leaks.js';
@@ -111,20 +111,6 @@ services:
     expect(existsSync(join(ctx.stateDir, 'envs', envId))).toBe(false);
     expect(readFileSync(join(wt, 'keep.txt'), 'utf8')).toBe('mine');
     expect(existsSync(join(wt, 'runly.yml'))).toBe(true);
-  }, 60_000);
-
-  it('recovery reclaims the source copy an older daemon left in the environment', async () => {
-    const up = await ctx.cli(['up', '--json'], wt);
-    const envId = up.json!.envId as string;
-    await ctx.cli(['release', '--json'], wt);
-    // Fabricate the projection-era leftover, then quiesce so nothing runs.
-    const legacy = join(ctx.stateDir, 'envs', envId, 'tree');
-    mkdirSync(legacy, { recursive: true });
-    writeFileSync(join(legacy, 'server.mjs'), SERVER);
-    await ctx.cli(['daemon', 'stop', '--json'], wt); // recovery on the next verb reaps and cleans
-    const again = await ctx.cli(['up', '--json'], wt);
-    expect(again.exitCode, again.stdout + again.stderr).toBe(0);
-    expect(existsSync(legacy)).toBe(false);
   }, 60_000);
 });
 
