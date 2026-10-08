@@ -93,7 +93,7 @@ services:
     expect(e.notSet).toContain('V19_UNSET');
     expect(e.leftOut).toBeGreaterThan(0);
     expect(r.json.content).not.toContain('secret-value');
-    expect(r.json.content).toContain('RUNLY_SUPERVISOR=');
+    expect(r.json.content).toContain('RUNLY_SUPERVISOR'); // Environment="RUNLY_SUPERVISOR=…" or a plist <key>
     // Plain: what was captured and left out is said before anything is written.
     const plain = await c.cli(['daemon', 'install', '--print'], wt);
     expect(plain.stderr).toMatch(/captured from this shell: .*V19_REF/);
