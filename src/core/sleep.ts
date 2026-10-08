@@ -92,6 +92,8 @@ export function readKernelSleepRecord(): { sleeptime: number | null; waketime: n
   try {
     const out = execFileSync('/usr/sbin/sysctl', ['-n', 'kern.sleeptime', 'kern.waketime'], {
       encoding: 'utf8',
+      // Never the daemon's stderr: that is daemon.log.
+      stdio: ['ignore', 'pipe', 'ignore'],
       timeout: 2_000,
     });
     const [sleepLine, wakeLine] = out.split('\n');

@@ -259,6 +259,18 @@ again. Restores of one template run side by side; a failed restore is logged
 rebakes. `ephemeral: true` datastores (Redis-class) have no presets; a reset runs
 `drop:` as a flush.
 
+A template keyed by an `@rebake-template` rule is **shared by every worktree of
+the same stack name** on the machine: its key is the `create:` command and the
+content of the rule's files, nothing about the worktree, so a new worktree with
+the same seeds restores instead of baking, and parallel first `up`s bake once.
+A worktree whose seeds differ gets its own key; the others are not touched.
+`--pristine` in one worktree bakes a template private to it, which it uses
+until nothing references it any more; the shared one stays for the rest. A
+datastore without such a rule keeps its templates per worktree, and so does one
+with `share_templates: false` (for a seed whose result depends on the worktree
+beyond those files). Templates a runly before 0.20 baked per worktree are
+adopted the first time a worktree needs the same key.
+
 A datastore only tests use, never the application, can be `copies_only: true`:
 environments never get one, so it costs nothing until a `runly db new|with`
 copy bakes its template (once, then reused). No service may template it, and
@@ -310,8 +322,9 @@ the environment.
 
 Each environment records how to drop its databases when it creates them, so a
 deleted worktree's databases are dropped with the command they were made with.
-Templates are kept per datastore and preset (the newest, plus every one in use),
-the rest after an hour. `runly pool doctor` lists what runly left behind
+Templates are kept per datastore and preset (the newest, plus every one an
+environment, copy or existing worktree of the stack last restored from), the
+rest after an hour. `runly pool doctor` lists what runly left behind
 (unreferenced directories and templates, records of deleted worktrees, processes
 and listeners of gone environments, and, with a datastore `list:` command,
 orphaned server databases in runly's naming); `--fix` removes them. It only
@@ -351,8 +364,13 @@ They reach services and readiness probes, not builds, upkeep or `exec`.
 
 `runly preview <service>` publishes one service of your lease; `preview stop`
 ends it. The tunnel lives as long as the **lease**: restarts, idle stops and
-repeated `up`s leave it up, while `release`, the end of the lease, teardown and a
-daemon stop end it. A bind ends it when the manifest sets `preview.forbidden`,
+repeated `up`s leave it up, while `release`, the end of the lease and teardown
+end it. A daemon restart (a crash, `daemon stop`, an update) takes the tunnel
+down and publishes it again once the daemon holds the ports, with the same
+publisher and, where the publisher can pin it, the same address
+(`cloudflare-quick` gets a new name); the service wakes on the first request.
+`ctx` shows `previewRestore` while that runs, or with the error when it failed;
+`preview stop` ends it either way. A bind ends it when the manifest sets `preview.forbidden`,
 the service is taken `down`, or its port moves; `--reset-data` keeps it and says
 in `previewNotice` that the same URL now serves new data.
 

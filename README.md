@@ -80,6 +80,7 @@ run under `sh` in the worktree; write POSIX sh.
 | `datastores.<ds>.presets` | Named seed states. |
 | `datastores.<ds>.default_preset` | The preset a new datastore is created with (else the first preset). A name, or `{ session, run }` read as one value. |
 | `datastores.<ds>.ephemeral` | `true`: no presets or templates; a reset runs `drop:` as a flush (Redis-class). |
+| `datastores.<ds>.share_templates` | `false`: keep this datastore's templates per worktree. Default: a template keyed by an `@rebake-template` rule is baked once and shared by every worktree of the same stack name on this machine; `--pristine` bakes a private one for its worktree. |
 | `datastores.<ds>.copies_only` | `true`: never provisioned for an environment; only the source of `runly db new\|with` copies (template baked on the first copy). No service may template it; `ctx` does not list it. |
 | `datastores.<ds>.list` | Command printing the namespaces on the server, one per line; read only by `runly pool doctor`. |
 | `appliances.<name>` | A shared backing server: `probe` (required), `start` (run once when the probe fails), `stop` (only for `runly appliance stop`), `ready`, `timeout` (60), `resources`. |
@@ -131,8 +132,8 @@ work-error (your code), `2` env-error (the environment), `3` infra-error
 | `runly token [--role <r>] [--raw]` | Run `auth.token` (role default `admin`, also in `RUNLY_ROLE`); `--raw` prints the bare token. Stopped services start first. |
 | `runly release` | End the lease; the environment stays for the next `up`. |
 | `runly destroy` | Tear down everything runly holds for this worktree: services, data, copies, ports, lease. Its build records, templates and the upkeep rules that declare `outputs` stay. |
-| `runly preview <svc> [--ttl <minutes>] [--https-port N]` | Publish one service through the preview publisher. Unauthenticated. |
-| `runly preview stop` | End the preview. |
+| `runly preview <svc> [--ttl <minutes>] [--https-port N]` | Publish one service through the preview publisher. Unauthenticated. Lasts as long as the lease; a daemon restart publishes it again (same address where the publisher can pin one). |
+| `runly preview stop` | End the preview (also one a restart could not publish again). |
 | `runly status` / `runly doctor` | Daemon, environments, budget and recent warnings (`--json` everything) / health and drift report. |
 | `runly appliance ls\|start\|stop [name]` | Probe, start or stop shared backing servers. |
 | `runly pool ls\|recycle [<env-id>] [--force]\|reconcile\|gc` | Environments; recycle one (or all); reap degraded ones; reclaim orphaned processes. |

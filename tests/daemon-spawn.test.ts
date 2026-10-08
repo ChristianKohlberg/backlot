@@ -10,7 +10,7 @@
 import { describe, it, expect, afterAll } from 'vitest';
 import { execFile } from 'node:child_process';
 import { createServer } from 'node:http';
-import { mkdtempSync, rmSync, writeFileSync, readFileSync } from 'node:fs';
+import { mkdtempSync, readdirSync, readlinkSync, realpathSync, rmSync, writeFileSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { startTime } from '../src/core/procscan.js';
@@ -45,6 +45,52 @@ const cli = (args: string[], cwd: string, env: Record<string, string>) =>
   });
 
 describe('daemon.log stays signal on spawn', () => {
+  it('the autospawned daemon runs in its state root, not in the caller\'s directory (0.20)', async () => {
+    if (process.platform !== 'linux') return;
+    const stateDir = realpathSync(mkdtempSync(join(tmpdir(), 'runly-cwd-')));
+    const wt = realpathSync(mkdtempSync(join(tmpdir(), 'runly-cwd-wt-')));
+    dirs.push(stateDir, wt);
+    // A caller outside any git repository, as a pool script or a deleted
+    // worktree would be; the daemon must neither sit in it nor log git noise.
+    writeFileSync(join(wt, 'runly.yml'), 'name: cwdtest\nservices:\n  web: { run: node -e "setInterval(()=>{},1e6)", ready: { log: "", timeout: 5 } }\nupkeep:\n  - { when: "seed/**", run: "true" }\n');
+    const st = await cli(['status', '--json'], wt, { BACKLOT_STATE_DIR: stateDir });
+    expect(st.code).toBe(0);
+    const pid = Number(readFileSync(join(stateDir, 'daemon.pid'), 'utf8'));
+    expect(readlinkSync(`/proc/${pid}/cwd`)).toBe(stateDir);
+    await cli(['plan', '--json'], wt, { BACKLOT_STATE_DIR: stateDir });
+    await cli(['pool', 'doctor', '--json'], wt, { BACKLOT_STATE_DIR: stateDir });
+    expect(readFileSync(join(stateDir, 'daemon.log'), 'utf8')).not.toMatch(/not a git repository/);
+  });
+
+  it('no synchronous child of runly inherits its stderr (daemon.log)', () => {
+    // execFileSync/execSync pass the child's stderr through unless stdio says
+    // otherwise; under the daemon that is daemon.log. (spawnSync and the async
+    // forms pipe by default.)
+    const offenders: string[] = [];
+    const walk = (dir: string) => {
+      for (const e of readdirSync(dir, { withFileTypes: true })) {
+        const full = join(dir, e.name);
+        if (e.isDirectory()) walk(full);
+        else if (e.name.endsWith('.ts')) {
+          const src = readFileSync(full, 'utf8');
+          for (const m of src.matchAll(/\bexec(?:File)?Sync\(/g)) {
+            // The call's own argument list, parentheses balanced.
+            let depth = 0;
+            let end = m.index! + m[0].length - 1;
+            for (; end < src.length; end++) {
+              if (src[end] === '(') depth++;
+              else if (src[end] === ')' && --depth === 0) break;
+            }
+            const call = src.slice(m.index, end + 1);
+            if (!/stdio/.test(call)) offenders.push(`${full}: ${call.slice(0, 80)}`);
+          }
+        }
+      }
+    };
+    walk(join(repo, 'src'));
+    expect(offenders).toEqual([]);
+  });
+
   it('carries no node:sqlite ExperimentalWarning', async () => {
     const stateDir = mkdtempSync(join(tmpdir(), 'runly-warn-'));
     const wt = mkdtempSync(join(tmpdir(), 'runly-warn-wt-'));

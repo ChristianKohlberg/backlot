@@ -31,7 +31,7 @@ function parentOf(pid: number): number | undefined {
   }
   // macOS and other platforms without /proc: ask ps.
   try {
-    const ppid = Number(execFileSync('ps', ['-o', 'ppid=', '-p', String(pid)], { encoding: 'utf8', timeout: 2000 }).trim());
+    const ppid = Number(execFileSync('ps', ['-o', 'ppid=', '-p', String(pid)], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 2000 }).trim());
     return Number.isInteger(ppid) && ppid > 0 ? ppid : undefined;
   } catch {
     return undefined;

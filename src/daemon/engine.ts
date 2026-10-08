@@ -2,9 +2,9 @@
  * The engine: pool + lease + bind + run orchestration, owning all policy
  * (drivers own transport/storage; the manifest owns repo knowledge).
  */
-import { mkdirSync, rmSync, readdirSync, existsSync, readFileSync, statSync } from 'node:fs';
+import { mkdirSync, rmSync, readdirSync, existsSync, readFileSync } from 'node:fs';
 import { isAbsolute, join, relative, sep } from 'node:path';
-import { Journal, JOURNAL_SCHEMA_VERSION, type DbCopyRow, type DropRecipe, type EnvRow, type LeaseRow } from '../core/journal.js';
+import { Journal, JOURNAL_SCHEMA_VERSION, type DbCopyRow, type DropRecipe, type EnvRow, type LeaseRow, type PreviewRestore } from '../core/journal.js';
 import { BUILD, VERSION, compareVersions, versionSkew } from '../core/version.js';
 import { buildOf, canonicalDirectory, envDatastoreNames, outputsOf, upkeepOutputs, loadStack, normalizeLogins, manifestFileOf, type Manifest, type ServiceSpec, type Stack } from '../core/manifest.js';
 import { snapshotOutputs } from '../core/worktree.js';
@@ -14,7 +14,7 @@ import { buildInputsKey, buildIsCurrent, clearBuilds, everBuilt, forgetBuild, re
 import { LogWriter, UPKEEP_LOG, beginBuildLog, buildLogOf, logFileOf, readLog } from '../core/logs.js';
 import { formatDuration, parseDuration } from '../core/units.js';
 import { BudgetRefusal, LoadBudget, costsOf, needOf, total, type Committed, type Need, type NeedItem, type Reservation } from './budget.js';
-import { clearTreeLedger, forgetRulesWithoutOutputs, pickEnvKeys, pickTreeKeys, readTreeLedger, worktreeStateDir, writeTreeLedger } from '../core/tree-ledger.js';
+import { clearTreeLedger, forgetRulesWithoutOutputs, pickEnvKeys, pickTreeKeys, readTreeLedger, recordWorktreeTemplate, worktreeStateDir, writeTreeLedger } from '../core/tree-ledger.js';
 import { defaultPresetFor, presetToRestore, validatePresetRequest } from '../core/presets.js';
 import { ruleKey, runUpkeep, templateBakeKeys, triggerSet, type UpkeepStep } from '../core/upkeep.js';
 import { allocateInBlock, blockConflicts, ephemeralRange, inBlock, internalBlock, publicBlock, tunnelBlock } from '../core/ports.js';
@@ -24,14 +24,14 @@ import { dbCopiesRoot, envsRoot, stateRoot, templatesRoot, worktreesRoot } from 
 import { BrokerError, commandFailure, template, templateEnv, now, sha256, shortId } from '../core/util.js';
 import { callerEnvSpec, requireCallerEnv, selectCallerEnv, serviceCallerEnv, validateCallerEnv } from '../core/caller-env.js';
 import { cmdTimeoutS, runBounded, LONG_CMD_TIMEOUT_S } from '../core/exec.js';
-import { makeDatastore, parseBakedMarker, withBakeLock, type DsHandle } from '../drivers/datastores.js';
+import { hasOtherTemplateOwner, makeDatastore, parseBakedMarker, sharesTemplates, withBakeLock, type DsHandle, type TemplateScope } from '../drivers/datastores.js';
 import { ensureAppliance, stopAppliance, probeTcp } from '../drivers/appliances.js';
-import { DEFAULT_PREVIEW_PUBLISHER, resolvePreviewPublisher } from '../drivers/preview.js';
+import { DEFAULT_PREVIEW_PUBLISHER, resolvePreviewPublisher, type PreviewSettings } from '../drivers/preview.js';
 import { EnvSupervisor, killGroupVerified, killPidVerified, reapPids, mergeServicePids, serviceGroups, type ServiceExit } from './supervisor.js';
 import { EXEC_SERVICE, groupAlive, isAlive, processGroup, procScanSupported, sameProcess, scanByCwd, scanDbCopy, scanTagged, serviceTag, startTime, type TaggedProc } from '../core/procscan.js';
 import { policy } from '../core/policy.js';
 import { kernelSleepGap, readKernelSleepRecord } from '../core/sleep.js';
-import { retentionSweep, templateRefs } from '../core/retention.js';
+import { retentionSweep, sharedFilesFor, templateFiles, templateRefs, templateVerdicts } from '../core/retention.js';
 import { logEvent, recentEvents } from '../core/events.js';
 import { BindTrace, type BindDiagnostics } from '../core/diagnostics.js';
 import type { Hygiene, LeaseKind, ServicePid } from '../core/types.js';
@@ -130,6 +130,11 @@ class ServiceFailure extends BrokerError {}
  * an agent that crashed kept its environment until the TTL expired. A pid plus
  * its start time can be checked cheaply and survives pid reuse.
  */
+/** A datastore's template scope in this stack (decision 0044): its bake key, shared per manifest name. */
+function templateScope(stack: Stack, bakeKeys: Record<string, string>, name: string, privateBake = false): TemplateScope {
+  return { bakeKey: bakeKeys[name], project: stack.manifest.name, ...(privateBake ? { privateBake } : {}) };
+}
+
 function holderIdentity(pid?: number): { holderPid?: number; holderStart?: number } {
   if (!pid || !Number.isInteger(pid) || pid <= 0) return {};
   return { holderPid: pid, holderStart: startTime(pid) };
@@ -213,6 +218,14 @@ export class Engine {
   // Memory-only successful-bind configuration: a hot-reload refresh keeps the
   // services, so it cannot apply startup env/commands or other manifest configuration.
   private appliedManifests = new Map<string, string>();
+  /**
+   * Re-publishing the leases' previews after a restart (decision 0045), per
+   * lease id: in flight, or failed with the reason `ctx` reports. In memory:
+   * it describes this daemon life; the lease row keeps what to re-publish.
+   */
+  private previewRestores = new Map<string, { service: string; url: string; state: 'restoring' | 'failed'; error?: string; at: number }>();
+  /** Settles once every recorded preview was re-published or reported; a restore that outlives a `shutdown` stops what it started. */
+  previewsRestored: Promise<void> = Promise.resolve();
   private inputRevision = 0;
 
   // -------- lifecycle (decision 0035)
@@ -363,7 +376,15 @@ export class Engine {
     // back, stopped the services, and left the public URL serving a dead port
     // until the lease finally lapsed. killGroupVerified is cross-platform and
     // already reports a pid that is gone (or no longer ours) as reaped.
+    //
+    // The tunnel goes, the publication does not (decision 0045): the lease
+    // still wants it, so it is published again below, once the public ports
+    // are held. A row from before 0.20 says what it published only in its
+    // preview columns; that is recorded first.
     for (const lease of this.journal.allLeases()) {
+      if (lease.previewPid && !lease.previewRestore && lease.previewService && lease.previewUrl && lease.previewPort) {
+        this.journal.setLeasePreviewRestore(lease.id, { service: lease.previewService, url: lease.previewUrl, port: lease.previewPort });
+      }
       if (lease.previewPid) await this.stopPreviewForLease(lease);
     }
     logEvent({
@@ -394,6 +415,11 @@ export class Engine {
         logEvent({ level: 'warn', kind: 'proxy', envId: env.id, detail: `could not hold its public ports at startup (the next bind retries): ${String((err as Error).message ?? err)}` });
       }
     }
+    // Previews come back on the ports just held (decision 0045). Not awaited:
+    // a publisher can take up to 45 s, and requests must not queue behind it.
+    // Each one takes its environment's lock, so a `preview` verb meanwhile
+    // waits for it and a stop wins.
+    this.previewsRestored = this.restorePreviews();
     // Database copies outlive the daemon, and so does the reason to drop one:
     // a holder that died while no daemon was looking, a worktree removed
     // meanwhile, a restore cut short by the stop. Not awaited — drops run
@@ -1141,13 +1167,14 @@ export class Engine {
     bakeKeys: Record<string, string>,
     plan: Array<{ name: string; force: boolean; preset?: string }>,
     say: Progress,
+    privateBakes: ReadonlySet<string> = new Set(),
   ): Promise<string[]> {
     const dsHandle: DsHandle = { envId: env.id, cwd: stack.root, dataDir: this.envDirs(env.id).data };
     const restored: string[] = [];
     const one = async (step: (typeof plan)[number]): Promise<void> => {
       const spec = stack.manifest.datastores?.[step.name];
       if (!spec) return;
-      const ds = makeDatastore(step.name, spec, stack.id, bakeKeys[step.name]);
+      const ds = makeDatastore(step.name, spec, stack.id, templateScope(stack, bakeKeys, step.name, privateBakes.has(step.name)));
       await ds.probe();
       const held = env.presets[step.name];
       const exists = Boolean(env.datastoreNs[step.name]);
@@ -1170,6 +1197,9 @@ export class Engine {
         if (ref) templates[step.name] = ref;
         else delete templates[step.name];
         env.templates = templates;
+        // The worktree's current template, which retention keeps while the
+        // worktree exists — with or without an environment (decision 0044).
+        if (ref) recordWorktreeTemplate(stack.id, stack.root, `${step.name}/${preset}`, ref);
       }
       // Merge into the live row so a supervisor update is not overwritten.
       const current = this.journal.getEnv(env.id);
@@ -1365,10 +1395,16 @@ export class Engine {
     // one that is missing is baked by the restore that needs it. Rebaking it
     // on every fresh environment cost a destroyed worktree 90-110 s per `up`.
     // Only `--pristine` (nothing is trusted) drops the current templates.
+    // A SHARED template (decision 0044) serves other worktrees: `--pristine`
+    // drops only this worktree's private one and bakes a new private one.
+    const privateBakes = new Set<string>();
     if (hygiene === 'pristine') {
       for (const dsName of upkeep.rebakeTemplates) {
         const spec = stack.manifest.datastores?.[dsName];
-        if (spec) await makeDatastore(dsName, spec, stack.id, bakeKeys[dsName]).rebake(stack.root);
+        if (!spec) continue;
+        const scope = templateScope(stack, bakeKeys, dsName);
+        if (sharesTemplates(spec, scope)) privateBakes.add(dsName);
+        await makeDatastore(dsName, spec, stack.id, scope).rebake(stack.root);
       }
     }
     // Which datastores hold data from a template other than the current one:
@@ -1377,7 +1413,7 @@ export class Engine {
     const staleTemplate = (name: string): boolean => {
       const spec = stack.manifest.datastores?.[name];
       if (!spec || !upkeep.rebakeTemplates.includes(name)) return false;
-      const ref = makeDatastore(name, spec, stack.id, bakeKeys[name]).templateRef(presetToRestore(name, spec, env.presets[name]));
+      const ref = makeDatastore(name, spec, stack.id, templateScope(stack, bakeKeys, name)).templateRef(presetToRestore(name, spec, env.presets[name]));
       return ref === null || env.templates?.[name] !== ref;
     };
 
@@ -1496,7 +1532,7 @@ export class Engine {
       }
       if (reloads.length > 0) {
         trace.phase('data');
-        await this.prepareDatastores(stack, env, bakeKeys, reloads.map((name) => ({ name, force: true, preset: reloadPresets[name] })), say);
+        await this.prepareDatastores(stack, env, bakeKeys, reloads.map((name) => ({ name, force: true, preset: reloadPresets[name] })), say, privateBakes);
       }
       trace.phase('ready');
       await startSlice(new Set([...toRestart, ...missing]));
@@ -1528,7 +1564,7 @@ export class Engine {
           name,
           force: reloadPresets[name] !== undefined || hygiene !== 'reuse' || staleTemplate(name),
           preset: reloadPresets[name],
-        })), say);
+        })), say, privateBakes);
       } finally {
         phaseMs.data = performance.now() - t0;
       }
@@ -2202,6 +2238,13 @@ export class Engine {
     }
     const previewUrls: Record<string, string> = {};
     if (lease?.previewService && lease.previewUrl) previewUrls[lease.previewService] = lease.previewUrl;
+    // A preview the restart is still re-publishing, or could not (decision 0045).
+    const restoring = lease ? this.previewRestores.get(lease.id) : undefined;
+    const previewRestore = restoring
+      ? { service: restoring.service, url: restoring.url, state: restoring.state, ...(restoring.error ? { error: restoring.error } : {}) }
+      : lease?.previewRestore && !lease.previewPid
+        ? { service: lease.previewRestore.service, url: lease.previewRestore.url, state: 'restoring' as const }
+        : null;
     return {
       stack: stack.manifest.name,
       envId: env.id,
@@ -2222,6 +2265,11 @@ export class Engine {
        */
       proxy: this.proxy.stats(env.id),
       previewUrls,
+      /**
+       * A preview the daemon re-publishes after a restart (decision 0045):
+       * `restoring`, or `failed` with the error; null when there is none.
+       */
+      previewRestore,
       /**
        * Every declared service and where it stands (decision 0034): `running`,
        * `stopped` (wanted, but not running — a quiesce or a daemon restart; the
@@ -2778,6 +2826,7 @@ export class Engine {
     this.journal.deleteLease(lease.id);
     this.leaseInputs.delete(lease.id);
     this.goneSince.delete(`lease:${lease.id}`);
+    this.previewRestores.delete(lease.id);
   }
 
   /**
@@ -2811,6 +2860,83 @@ export class Engine {
       throw new BrokerError('env-error', `service '${service}' has no allocated port on this environment`, 'preview');
     }
     return port;
+  }
+
+  /**
+   * Publish every recorded preview again after a restart (decision 0045): same
+   * publisher, the settings that pin its address, aimed at the same public
+   * port — which the proxy holds again, so the first request wakes the
+   * service as usual. A failure is an event and `ctx.previewRestore`, never
+   * an error of anyone's verb.
+   */
+  private async restorePreviews(): Promise<void> {
+    const pending = this.journal.allLeases().filter((l) => l.previewRestore && !l.previewPid);
+    await Promise.allSettled(pending.map((l) => this.restorePreview(l)));
+  }
+
+  private async restorePreview(lease: LeaseRow): Promise<void> {
+    const r = lease.previewRestore;
+    if (!r) return;
+    this.previewRestores.set(lease.id, { service: r.service, url: r.url, state: 'restoring', at: now() });
+    try {
+      await this.envLocked(lease.envId, async () => {
+        // Re-read inside the lock: a `preview` or `preview stop` that ran
+        // first decides, and a lease that ended takes its preview with it.
+        const held = this.journal.leaseForEnv(lease.envId);
+        if (this.stopping || !held || held.id !== lease.id || !held.previewRestore || held.previewPid) {
+          this.previewRestores.delete(lease.id);
+          return;
+        }
+        const want = held.previewRestore;
+        const env = this.journal.getEnv(held.envId);
+        if (!env || env.state === 'recycling') {
+          this.previewRestores.delete(lease.id);
+          return;
+        }
+        const stack = loadStack(env.stackRoot);
+        this.assertPreviewAllowed(stack);
+        const port = this.previewTarget(env, stack, want.service);
+        if (port !== want.port) {
+          throw new BrokerError('env-error', `service '${want.service}' is on port ${port} now, not ${want.port}, which its preview was published for`, 'preview');
+        }
+        const pub = resolvePreviewPublisher(want.publisher ?? this.previewPublisherName(stack));
+        pub.checkPrerequisite();
+        const settings = (want.settings ?? stack.manifest.preview) as PreviewSettings | undefined;
+        const { url, pid, pinned } = await pub.start({ envId: env.id, service: want.service, localUrl: `http://localhost:${port}`, logDir: this.envDirs(env.id).logs, settings });
+        const fresh = this.journal.leaseForEnv(env.id);
+        if (!fresh || fresh.id !== lease.id || this.stopping) {
+          if (!(await pub.stop(pid))) logEvent({ level: 'error', kind: 'preview', envId: env.id, detail: `the lease ended while its preview was being restored, and the new tunnel (pid ${pid.pid}) outlived its kill — ${url} may still be serving, unauthenticated` });
+          this.previewRestores.delete(lease.id);
+          return;
+        }
+        fresh.previewService = want.service;
+        fresh.previewUrl = url;
+        fresh.previewPid = pid.pid;
+        fresh.previewStart = pid.startTime;
+        fresh.previewPort = port;
+        this.journal.saveLease(fresh);
+        this.journal.setLeasePreviewRestore(fresh.id, { ...want, url, publisher: pub.name, settings: { ...(settings ?? {}), ...(pinned ?? {}) } });
+        this.previewRestores.delete(lease.id);
+        logEvent({
+          level: url === want.url ? 'info' : 'warn',
+          kind: 'preview',
+          envId: env.id,
+          detail: url === want.url
+            ? `restored the preview of '${want.service}' at ${url} after the daemon restart`
+            : `restored the preview of '${want.service}' after the daemon restart at a NEW address ${url} (was ${want.url}) — ${pub.name} cannot keep its address`,
+        });
+      }, undefined, 'a preview restore');
+    } catch (err) {
+      const error = String((err as Error).message ?? err);
+      this.previewRestores.set(lease.id, { service: r.service, url: r.url, state: 'failed', error, at: now() });
+      logEvent({ level: 'error', kind: 'preview', envId: lease.envId, detail: `could not restore the preview of '${r.service}' (${r.url}) after the daemon restart: ${error} — run 'runly preview ${r.service}' to publish it again` });
+    }
+  }
+
+  /** The lease's preview is over on purpose: a restart must not bring it back (decision 0045). */
+  private forgetPreview(leaseId: string): void {
+    this.journal.setLeasePreviewRestore(leaseId, null);
+    this.previewRestores.delete(leaseId);
   }
 
   async previewStart(cwd: string, service: string, holder?: string, ttlMs?: number, httpsPort?: number): Promise<{ service: string; url: string }> {
@@ -2855,7 +2981,8 @@ export class Engine {
         throw new BrokerError('infra-error', this.unreapedPreview(held), 'preview');
       }
       const dirs = this.envDirs(env.id);
-      const { url, pid } = await pub.start({
+      const settings: PreviewSettings | undefined = httpsPort !== undefined ? { ...stack.manifest.preview, https_port: httpsPort } : stack.manifest.preview;
+      const { url, pid, pinned } = await pub.start({
         envId: env.id,
         service,
         // `localhost`, the same origin ctx advertises for the service — never a
@@ -2868,7 +2995,7 @@ export class Engine {
         logDir: dirs.logs,
         // A caller's --https-port outranks the manifest for this publish only;
         // publishers that do not serve on a port ignore it (decision 0031).
-        settings: httpsPort !== undefined ? { ...stack.manifest.preview, https_port: httpsPort } : stack.manifest.preview,
+        settings,
       });
       // Identity, not mere existence: `pub.start` can take up to 45s holding only
       // this env's lock, and a concurrent release + `up` in that window hands the
@@ -2901,6 +3028,10 @@ export class Engine {
       // extend the lease and then fail.
       if (ttlMs !== undefined && ttlMs > 0) freshLease.expiresAt = now() + ttlMs;
       this.journal.saveLease(freshLease);
+      // What a daemon restart publishes again (decision 0045).
+      const restore: PreviewRestore = { service, url, port: localPort, publisher: pub.name, settings: { ...(settings ?? {}), ...(pinned ?? {}) } };
+      this.journal.setLeasePreviewRestore(freshLease.id, restore);
+      this.previewRestores.delete(freshLease.id);
       this.touch(env.id);
       logEvent({ level: 'info', kind: 'preview', envId: env.id, detail: `published '${service}' at ${url}` });
       return { service, url };
@@ -2920,11 +3051,18 @@ export class Engine {
     return this.envLocked(lease.envId, async () => {
       const held = this.journal.leaseForHolder(h, stack.id);
       if (!held || held.id !== lease.id) return { stopped: false };
-      if (!held.previewPid) return { stopped: false };
+      if (!held.previewPid) {
+        // A preview a restart could not bring back is still on record: stopping
+        // it means it stays down.
+        const pending = held.previewRestore;
+        this.forgetPreview(held.id);
+        return pending ? { stopped: true, service: pending.service } : { stopped: false };
+      }
       const service = held.previewService;
       if (!(await this.stopPreviewForLease(held))) {
         throw new BrokerError('infra-error', this.unreapedPreview(held), 'preview');
       }
+      this.forgetPreview(held.id);
       logEvent({ level: 'info', kind: 'preview', envId: held.envId, detail: `stopped preview for '${service ?? 'unknown'}'` });
       return { stopped: true, service };
     }, undefined, 'a preview stop');
@@ -3087,7 +3225,7 @@ export class Engine {
     // cache is written atomically, so this needs no worktree lock — a copy
     // never waits for a bind's builds.
     const bakeKeys = templateBakeKeys(stack.manifest, stack.root, await triggerSet(stack.root, stack.manifest, worktreeStateDir(stack.id)));
-    const ds = makeDatastore(opts.datastore, spec, stack.id, bakeKeys[opts.datastore]);
+    const ds = makeDatastore(opts.datastore, spec, stack.id, templateScope(stack, bakeKeys, opts.datastore));
     const dir = join(dbCopiesRoot(), name);
     const h: DsHandle = { envId: `${stack.id}-db-${short}`, cwd: stack.root, dataDir: dir };
     const dropCmd = ds.dropCommand(h);
@@ -3113,6 +3251,7 @@ export class Engine {
       await ds.ensure(h, preset, true, false);
       row.state = 'ready';
       row.template = ds.templateRef(preset) ?? undefined;
+      if (row.template) recordWorktreeTemplate(stack.id, stack.root, `${opts.datastore}/${preset}`, row.template);
       this.journal.saveDbCopy(row);
       logEvent({ level: 'info', kind: 'db', detail: `created database copy ${name} of '${opts.datastore}' (${preset}) for ${holder}${row.holderPid ? ` (pid ${row.holderPid})` : ''}` });
       return this.dbCopyView(row);
@@ -3537,31 +3676,31 @@ export class Engine {
     for (const stackDir of existsSync(templatesRoot()) ? readdirSync(templatesRoot()) : []) {
       await withBakeLock(stackDir, async () => {
         const dir = join(templatesRoot(), stackDir);
-        let files: string[];
-        try { files = readdirSync(dir); } catch { return; }
-        const alive = refs.stackAlive(stackDir);
-        const seen = new Map<string, number>();
-        const ordered = files.filter((f) => !f.startsWith('.'))
-          .map((f) => ({ f, m: (() => { try { return statSync(join(dir, f)).mtimeMs; } catch { return 0; } })() }))
-          .sort((a, b) => b.m - a.m);
-        for (const { f } of ordered) {
-          const group = f.lastIndexOf('@') > 0 ? f.slice(0, f.lastIndexOf('@')) : '';
-          const rank = seen.get(group) ?? 0;
-          seen.set(group, rank + 1);
+        if (!existsSync(dir)) return;
+        // The same verdicts as retention (decisions 0037, 0044), without the grace.
+        for (const v of templateVerdicts(stackDir, templateFiles(dir), refs, Math.max(1, policy().templatesKeep), 0, sharedFilesFor(stackDir))) {
+          const f = v.f;
           let ns: string | undefined;
           if (f.endsWith('.baked')) {
             try { ns = parseBakedMarker(readFileSync(join(dir, f), 'utf8')).ns; } catch { ns = undefined; }
           }
-          const keep = (alive && rank < Math.max(1, policy().templatesKeep)) || refs.referenced.has(`${stackDir}/${f}`);
-          if (keep) {
+          if (v.keep) {
             if (ns) markerNs.add(ns);
             continue;
           }
-          const finding: (typeof findings)[number] = { kind: 'template', what: join(dir, f), detail: alive ? 'superseded, and no environment or copy was restored from it' : 'its stack can never be bound again (worktree gone, no rows)' };
+          const detail = {
+            superseded: 'superseded, and no environment, copy or live worktree was restored from it',
+            dead: 'its stack can never be bound again (worktree gone, no rows)',
+            private: 'a --pristine template no environment or copy uses any more',
+            duplicate: 'a per-worktree copy of a shared template that nothing references',
+          }[v.why];
+          const finding: (typeof findings)[number] = { kind: 'template', what: join(dir, f), detail };
           if (fix) {
             try {
               const marker = f.endsWith('.baked') ? parseBakedMarker(readFileSync(join(dir, f), 'utf8')) : null;
-              if (marker?.drop) {
+              // Another marker naming the same database (a shared template
+              // adopted from this one): only the marker goes.
+              if (marker?.drop && !hasOtherTemplateOwner(join(dir, f), marker.ns)) {
                 const r = await runBounded(marker.drop, refs.dropCwd?.(stackDir) ?? stateRoot(), cmdTimeoutS());
                 if (r.code !== 0 || r.timedOut) throw new Error(`drop exited ${r.timedOut ? 'by timeout' : r.code}: ${r.output.slice(-200)}`);
               }
@@ -4068,6 +4207,7 @@ export class Engine {
     if (!lease?.previewPid || !lease.previewService) return undefined;
     const url = lease.previewUrl ?? 'the preview tunnel';
     const confirmed = await this.stopPreviewForLease(lease);
+    this.forgetPreview(lease.id);
     const detail = confirmed
       ? `work-error: ${manifestFileOf(stack)} now sets preview.forbidden, and a stack that forbids preview must not stay published — ${url} has been torn down`
       : `work-error: ${manifestFileOf(stack)} now sets preview.forbidden but the tunnel could NOT be confirmed dead — ${url} may still be serving, unauthenticated`;
@@ -4132,6 +4272,7 @@ export class Engine {
 
     if (cause) {
       const confirmed = await this.stopPreviewForLease(lease);
+      this.forgetPreview(lease.id);
       const detail = confirmed
         ? `${cause.klass}: ${cause.why} — ${url} has been torn down; run 'runly preview ${service}' again for a new URL`
         : `${cause.klass}: ${cause.why}, and the tunnel could NOT be confirmed dead — ${url} may still be serving, unauthenticated`;
@@ -4964,6 +5105,7 @@ export class Engine {
       if (lease.previewPid && !sameProcess(lease.previewPid, lease.previewStart)) {
         const service = lease.previewService ?? 'unknown';
         this.journal.clearLeasePreview(lease.id, lease.previewPid);
+        this.forgetPreview(lease.id);
         lease.previewPid = undefined;
         lease.previewStart = undefined;
         lease.previewUrl = undefined;

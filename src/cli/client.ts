@@ -260,6 +260,11 @@ export async function ensureDaemon(cwd = process.cwd()): Promise<DaemonInfo> {
   // every spawn, burying daemon.log's signal. Suppress ONLY that warning class,
   // and only for the daemon we spawn — a direct CLI or daemon run still warns.
   const child = spawn(process.execPath, ['--disable-warning=ExperimentalWarning', daemonEntry], {
+    // The state root, as under the systemd/launchd unit — never the caller's
+    // directory: a worktree the daemon outlives (it may be deleted while the
+    // daemon still sits in it), and the cwd of anything the daemon starts
+    // without one of its own.
+    cwd: stateRoot(),
     detached: true,
     stdio: ['ignore', log, log],
     env: daemonEnv,
