@@ -12,7 +12,6 @@ import { createInterface } from 'node:readline';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { DatabaseSync } from 'node:sqlite';
 import { Journal, type EnvRow } from '../src/core/journal.js';
 import type { ServicePid } from '../src/core/types.js';
 import { Engine } from '../dist/daemon/engine.js';
@@ -352,7 +351,7 @@ console.log(JSON.stringify({tagged:tagged.pid,untagged:untagged.pid}));
     }
   });
 
-  it('preserves an exited nonleader group across journal upgrade, retry and recovery', async () => {
+  it('preserves an exited nonleader group across a journal reopen, retry and recovery', async () => {
     const root = realpathSync(mkdtempSync(join(tmpdir(), 'bl-nonleader-survivors-')));
     const state = join(root, 'state');
     const saved = { ...process.env };
@@ -413,11 +412,8 @@ console.log(JSON.stringify({tagged:tagged.pid,untagged:untagged.pid}));
       expect(Object.values(journal.getEnv(first.envId)!.servicePids)).toEqual([victim]);
       expect(isAlive(victim.pid)).toBe(false);
       expect(isAlive(members.untagged)).toBe(true);
-      const db = new DatabaseSync(join(state, 'journal.db'));
-      db.exec('PRAGMA user_version = 2');
+      // A reopened journal (the pre-0.16 schema upgrade is retired, decision 0042).
       const migrated = new Journal(join(state, 'journal.db'));
-      expect(db.prepare('PRAGMA user_version').get()!.user_version).toBe(4);
-      db.close();
       expect(Object.values(migrated.getEnv(first.envId)!.servicePids)).toEqual([victim]);
       await expect(bind()).rejects.toThrow(/unreaped service processes/);
       await engine.shutdown();
