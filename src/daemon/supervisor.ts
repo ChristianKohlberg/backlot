@@ -7,7 +7,7 @@
 import { spawn, type ChildProcess } from 'node:child_process';
 import { StringDecoder } from 'node:string_decoder';
 import { mkdirSync } from 'node:fs';
-import { BrokerError, now, safeJoin } from '../core/util.js';
+import { BrokerError, environmentHint, now, safeJoin } from '../core/util.js';
 import { runBounded } from '../core/exec.js';
 import { redactStream } from '../core/caller-env.js';
 import { stateRoot } from '../core/paths.js';
@@ -283,7 +283,9 @@ export class EnvSupervisor {
         throw new BrokerError('work-error', `service '${name}' exited 0 immediately — a service must stay in the FOREGROUND (it looks daemonized)`, name, tail(buf));
       }
       if (running.proc.exitCode !== null && running.restarts >= 3) {
-        throw new BrokerError('work-error', `service '${name}' exited during boot (${running.proc.exitCode})`, name, tail(buf));
+        // Still the service's own failure (decision 0039 marks it failed and
+        // keeps the rest running); a missing tool or runtime says so.
+        throw new BrokerError('work-error', `service '${name}' exited during boot (${running.proc.exitCode})${environmentHint(tail(buf)) ?? ''}`, name, tail(buf));
       }
       if (ready.http && url) {
         // Probe every address the advertised host can mean. `localhost` is

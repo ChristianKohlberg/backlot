@@ -6,7 +6,7 @@ import { mkdirSync, rmSync, readdirSync, existsSync, readFileSync, statSync } fr
 import { isAbsolute, join, relative, sep } from 'node:path';
 import { Journal, JOURNAL_SCHEMA_VERSION, type DbCopyRow, type DropRecipe, type EnvRow, type LeaseRow } from '../core/journal.js';
 import { BUILD, VERSION, compareVersions, versionSkew } from '../core/version.js';
-import { buildOf, canonicalDirectory, envDatastoreNames, outputsOf, loadStack, normalizeLogins, manifestFileOf, type Manifest, type ServiceSpec, type Stack } from '../core/manifest.js';
+import { buildOf, canonicalDirectory, envDatastoreNames, outputsOf, upkeepOutputs, loadStack, normalizeLogins, manifestFileOf, type Manifest, type ServiceSpec, type Stack } from '../core/manifest.js';
 import { snapshotOutputs } from '../core/worktree.js';
 import { forgetNamespace, recordedNamespaces } from '../core/namespaces.js';
 import { runlyEnvVars } from '../core/env-vars.js';
@@ -14,14 +14,14 @@ import { buildInputsKey, buildIsCurrent, clearBuilds, everBuilt, forgetBuild, re
 import { LogWriter, UPKEEP_LOG, beginBuildLog, buildLogOf, logFileOf, readLog } from '../core/logs.js';
 import { formatDuration, parseDuration } from '../core/units.js';
 import { BudgetRefusal, LoadBudget, costsOf, needOf, total, type Committed, type Need, type NeedItem, type Reservation } from './budget.js';
-import { clearTreeLedger, pickEnvKeys, pickTreeKeys, readTreeLedger, worktreeStateDir, writeTreeLedger } from '../core/tree-ledger.js';
+import { clearTreeLedger, forgetRulesWithoutOutputs, pickEnvKeys, pickTreeKeys, readTreeLedger, worktreeStateDir, writeTreeLedger } from '../core/tree-ledger.js';
 import { defaultPresetFor, presetToRestore, validatePresetRequest } from '../core/presets.js';
-import { runUpkeep, templateBakeKeys, triggerSet, type UpkeepStep } from '../core/upkeep.js';
+import { ruleKey, runUpkeep, templateBakeKeys, triggerSet, type UpkeepStep } from '../core/upkeep.js';
 import { allocateInBlock, blockConflicts, ephemeralRange, inBlock, internalBlock, publicBlock, tunnelBlock } from '../core/ports.js';
 import { HOLD_MS, PortInUse, ProxyHub } from './proxy.js';
 import { connect as netConnect } from 'node:net';
 import { dbCopiesRoot, envsRoot, stateRoot, templatesRoot, worktreesRoot } from '../core/paths.js';
-import { BrokerError, template, templateEnv, now, sha256, shortId } from '../core/util.js';
+import { BrokerError, commandFailure, template, templateEnv, now, sha256, shortId } from '../core/util.js';
 import { callerEnvSpec, requireCallerEnv, selectCallerEnv, serviceCallerEnv, validateCallerEnv } from '../core/caller-env.js';
 import { cmdTimeoutS, runBounded, runBoundedIO, LONG_CMD_TIMEOUT_S } from '../core/exec.js';
 import { makeDatastore, parseBakedMarker, withBakeLock, type DsHandle } from '../drivers/datastores.js';
@@ -1113,11 +1113,14 @@ export class Engine {
   }
 
   /**
-   * Create, keep or reload each datastore in `plan`, journalling every
-   * completed restore at once so a later failure still reports the earlier
-   * ones truthfully. A datastore not forced and already present is KEPT —
-   * whatever it holds, even a preset the catalog no longer offers (decision
-   * 0034: no preset means keep the data, never a silent reset to the default).
+   * Create, keep or reload each datastore in `plan` — all of them at once
+   * (0.19): each bakes and restores under its own datastore lock, so three
+   * datastores cost the slowest one, not their sum. Every completed restore is
+   * journalled at once, so a failure still reports the others truthfully, and
+   * the call settles only when every datastore has (the first error wins). A
+   * datastore not forced and already present is KEPT — whatever it holds, even
+   * a preset the catalog no longer offers (decision 0034: no preset means keep
+   * the data, never a silent reset to the default).
    */
   private async prepareDatastores(
     stack: Stack,
@@ -1128,9 +1131,9 @@ export class Engine {
   ): Promise<string[]> {
     const dsHandle: DsHandle = { envId: env.id, cwd: stack.root, dataDir: this.envDirs(env.id).data };
     const restored: string[] = [];
-    for (const step of plan) {
+    const one = async (step: (typeof plan)[number]): Promise<void> => {
       const spec = stack.manifest.datastores?.[step.name];
-      if (!spec) continue;
+      if (!spec) return;
       const ds = makeDatastore(step.name, spec, stack.id, bakeKeys[step.name]);
       await ds.probe();
       const held = env.presets[step.name];
@@ -1164,7 +1167,10 @@ export class Engine {
         if (env.templates) current.templates = env.templates;
         this.journal.saveEnv(current);
       }
-    }
+    };
+    const settled = await Promise.allSettled(plan.map(one));
+    const failed = settled.find((r): r is PromiseRejectedResult => r.status === 'rejected');
+    if (failed) throw failed.reason;
     return restored;
   }
 
@@ -1499,6 +1505,10 @@ export class Engine {
         }), waitTree);
       } finally {
         phaseMs.build = performance.now() - t0;
+        // The build share goes back when the BUILDS end, not when the data
+        // phase they overlap does: a short build next to a long bake held its
+        // (large) build reservation for the whole bake.
+        reservation.releaseBuild();
       }
     };
     const phaseMs = { data: 0, build: 0 };
@@ -1506,7 +1516,6 @@ export class Engine {
     // running behind the caller's back, and the data error (if any) wins.
     const [dataDone, buildsDone] = await Promise.allSettled([data(), builds()]);
     trace.overlapped(phaseMs);
-    reservation.releaseBuild();
     if (dataDone.status === 'rejected') throw dataDone.reason;
     if (buildsDone.status === 'rejected') throw buildsDone.reason;
 
@@ -1673,7 +1682,7 @@ export class Engine {
         throw new BrokerError('work-error', `build for service '${name}' timed out after ${buildTimeoutS}s (process group killed; set BACKLOT_CMD_TIMEOUT_S if legitimate)`, name, r.output.slice(-800));
       }
       log?.line(`-- runly: build ${name} exited ${r.code} after ${formatDuration(now() - buildStart)} --`);
-      if (r.code !== 0) throw new BrokerError('work-error', `build failed for service '${name}' ('runly logs ${name} --build' has its output)`, name, r.output.slice(-800));
+      if (r.code !== 0) throw commandFailure(`build failed for service '${name}' ('runly logs ${name} --build' has its output)`, name, r.output);
     } finally {
       clearInterval(beat);
     }
@@ -3308,9 +3317,11 @@ export class Engine {
    * goes now — its environment (services, data, preview, ports, lease) and its
    * database copies. What a worktree pool calls when it takes a worktree back;
    * the sweeper does the same by itself when the worktree is removed or its
-   * agent's tether dies. The worktree's upkeep and build records, and the
-   * baked templates, stay (decision 0039): the next `up` finds its installs
-   * and templates current instead of redoing them.
+   * agent's tether dies. The baked templates and the build records stay
+   * (decision 0039; a build's `outputs:` are checked before it is skipped).
+   * Of the upkeep ledger only the rules that declare `outputs:` stay: the pool
+   * usually resets the worktree next (`git clean -fdx`), which removes what
+   * the other rules produced, and nothing else could tell.
    */
   async destroy(cwd: string) {
     const stack = loadStack(cwd);
@@ -3336,13 +3347,14 @@ export class Engine {
         this.dbBusy.delete(c.name);
       }
     }
-    // The worktree's own records (upkeep ledger, trigger cache, build ledger)
-    // STAY (decision 0039): they describe files in the worktree, which destroy
-    // never touches, so forgetting them only made the next `up` re-run every
-    // upkeep rule and build for nothing. `up --pristine` forgets them; the
-    // sweeper removes them once the worktree itself is gone.
-    logEvent({ level: 'info', kind: 'destroy', detail: `destroyed ${stack.root}: ${envs.length} environment(s), ${copies.length} copy(ies)${failed.length ? `, ${failed.length} copy drop(s) failed (retried by the sweeper)` : ''}` });
-    return { worktree: stack.root, environments: envs, copies, copiesNotDropped: failed };
+    // The trigger cache and the build ledger stay (a skipped build checks its
+    // outputs first). Upkeep rules without `outputs:` are forgotten: nothing
+    // could tell that a reset removed what they produced (rules with outputs
+    // are checked at every bind instead).
+    const withOutputs = new Set((stack.manifest.upkeep ?? []).filter((r) => upkeepOutputs(r).length > 0).map(ruleKey));
+    const upkeepForgotten = await this.treeLocked(stack.id, async () => forgetRulesWithoutOutputs(stack.id, stack.root, (k) => withOutputs.has(k)));
+    logEvent({ level: 'info', kind: 'destroy', detail: `destroyed ${stack.root}: ${envs.length} environment(s), ${copies.length} copy(ies), ${upkeepForgotten} upkeep rule(s) forgotten${failed.length ? `, ${failed.length} copy drop(s) failed (retried by the sweeper)` : ''}` });
+    return { worktree: stack.root, environments: envs, copies, copiesNotDropped: failed, upkeepForgotten };
   }
 
   /**
@@ -3605,10 +3617,12 @@ export class Engine {
       pid: process.pid,
       /**
        * Who restarts this daemon when it crashes (decision 0039): `systemd` or
-       * `launchd` after `runly daemon install`, `autospawn` (the next CLI
-       * command) otherwise.
+       * `launchd` after `runly daemon install` (the unit sets
+       * RUNLY_SUPERVISOR), `autospawn` (the next CLI command) otherwise. Not
+       * INVOCATION_ID: a daemon autospawned from anything under ANY systemd
+       * service inherits that.
        */
-      supervisor: process.env.INVOCATION_ID ? 'systemd' : (process.env.XPC_SERVICE_NAME ?? '').startsWith('dev.runly.daemon') ? 'launchd' : 'autospawn',
+      supervisor: process.env.RUNLY_SUPERVISOR === 'systemd' || process.env.RUNLY_SUPERVISOR === 'launchd' ? process.env.RUNLY_SUPERVISOR : 'autospawn',
       envs, poolMaxTotal: POOL_MAX_TOTAL(), ports,
       /** The server-wide load budget (decision 0036). */
       budget: { ...b, committedMemoryBytes: committed.memoryBytes, committedCpu: committed.cpu, committed: committed.items, waiting: this.budget.queueLength() },

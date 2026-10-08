@@ -43,6 +43,20 @@ export function writeTreeLedger(stackId: string, root: string, fingerprints: Rec
   renameSync(tmp, ledgerPath(stackId));
 }
 
+/**
+ * `runly destroy`: forget the command rules that declare no `outputs:` — the
+ * pool that destroys an environment usually resets the worktree next
+ * (`git clean -fdx`), which removes what they produced, and nothing else could
+ * tell. Rules with `outputs:` stay: their outputs are checked at every bind.
+ */
+export function forgetRulesWithoutOutputs(stackId: string, root: string, keep: (key: string) => boolean): number {
+  const fps = readTreeLedger(stackId);
+  const kept = Object.fromEntries(Object.entries(fps).filter(([k]) => keep(k)));
+  const dropped = Object.keys(fps).length - Object.keys(kept).length;
+  if (dropped > 0) writeTreeLedger(stackId, root, kept);
+  return dropped;
+}
+
 /** `--pristine`: forget what was applied, so every rule runs again. */
 export function clearTreeLedger(stackId: string): void {
   rmSync(ledgerPath(stackId), { force: true });

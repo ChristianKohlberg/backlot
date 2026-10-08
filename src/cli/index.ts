@@ -208,11 +208,13 @@ const verb = rawArgv[0];
 // flag's value is never mis-bound as a positional (and an inner command's own
 // flags survive) — the F1 class of argv bugs. Everything after a lone `--`, and
 // EVERYTHING for `exec`, is treated as a raw passthrough command.
-const VALUE_FLAGS = new Set(['--holder', '--holder-pid', '--ttl', '--role', '--lines', '--ref', '--spec', '--preset', '--https-port', '--since', '--grep', '--until', '--timeout']);
+const VALUE_FLAGS = new Set(['--holder', '--holder-pid', '--ttl', '--role', '--lines', '--ref', '--spec', '--preset', '--https-port', '--since', '--grep', '--until', '--timeout', '--runly-exit']);
 const BOOL_FLAGS = new Set(['--print', '--json', '--env', '--watch', '--reset-data', '--pristine', '--pull', '--detach', '--all', '--force', '--raw', '--data-only', '--progress', '--quiet', '--check', '--rebuild', '--follow', '--build', '--fix']);
 
 const flagVals = new Map<string, string>();
 const presetArgs: string[] = [];
+/** `daemon install --env NAME` (repeatable): a variable to capture into the unit beyond the allowlist. */
+const unitEnvNames: string[] = [];
 const flags = new Set<string>();
 const positional: string[] = [];
 let passthrough: string[] | null = null; // for `exec` / after `--`
@@ -231,6 +233,17 @@ let passthrough: string[] | null = null; // for `exec` / after `--`
     if (a === '--') {
       passthrough = body.slice(i + 1);
       break;
+    }
+    // `--env` is a switch for ctx/up, and takes a NAME for `daemon install`.
+    if (a === '--env' && verb === 'daemon') {
+      const v = body[i + 1];
+      if (v === undefined || v.startsWith('--') || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(v)) {
+        console.error(`runly daemon install: --env needs a variable name, got '${v ?? ''}'`);
+        process.exit(64);
+      }
+      unitEnvNames.push(v);
+      i++;
+      continue;
     }
     if (VALUE_FLAGS.has(a)) {
       const v = body[i + 1];
@@ -576,24 +589,41 @@ async function main(): Promise<void> {
         endProgress();
         if (res.ok && !json) {
           const d = res.data as DbCopy;
-          console.log(`name=${shellValue(d.name)}\nurl=${shellValue(d.url)}\npreset=${shellValue(d.preset)}`);
+          console.log(`name=${shellValue(d.name)}\nurl=${shellValue(d.url)}\ndatabase=${shellValue(d.ns)}\npreset=${shellValue(d.preset)}`);
           return;
         }
         break;
       }
       if (sub === 'with') {
+        // stdout is the command's: everything runly says goes to stderr,
+        // prefixed `runly db with:` (with --json, one JSON line at the end).
+        // runly's own failures exit 1/2/3 like every verb — or --runly-exit N
+        // (125, say, as docker run does), so a caller can tell them from the
+        // command's own codes, which always pass through unchanged.
+        const own = flagValue('--runly-exit');
+        const ownCode = own === undefined ? undefined : Number(own);
+        if (own !== undefined && (!Number.isInteger(ownCode) || ownCode! < 1 || ownCode! > 255)) {
+          console.error(`runly db with: --runly-exit expects an exit code (1-255), got '${own}'`);
+          process.exit(64);
+        }
+        const report = (r: Record<string, unknown>) => { if (json) console.error(JSON.stringify({ runlyDbWith: r })); };
         // The copy is tethered to THIS process: the CLI outlives the command,
         // so if it is killed the daemon's reaper drops the copy.
         const created = await rpc('db-new', { cwd, holder, holderPid: process.pid, datastore: positional[1], preset: dbPreset }, progress);
         endProgress();
         if (!created.ok) {
-          errExit(created.error);
-          return;
+          const e = created.error;
+          const code = ownCode ?? (e.class === 'work-error' ? 1 : e.class === 'infra-error' ? 3 : 2);
+          console.error(`runly db with: [${e.class ?? 'error'}] ${e.message}${e.source ? ` (${e.source})` : ''}`);
+          if (e.logExcerpt) console.error(`--- log excerpt ---\n${e.logExcerpt}`);
+          report({ from: 'runly', exitCode: code, error: e });
+          process.exit(code);
         }
         const copy = created.data as DbCopy;
         const code = await runWithCopy(passthrough!, copy);
-        const dropped = await rpc('db-drop', { name: copy.name });
+        const dropped = await rpc('db-drop', { name: copy.name }).catch((err: Error) => ({ ok: false as const, error: { message: err.message } as RpcError }));
         if (!dropped.ok) console.error(`runly db with: dropping ${copy.name} failed (${dropped.error.message}) — the sweeper retries it`);
+        report({ from: 'command', exitCode: code, copy: copy.name, database: copy.ns, dropped: dropped.ok });
         process.exit(code);
       }
       if (sub === 'ls') {
@@ -994,6 +1024,8 @@ interface DbCopy {
   datastore: string;
   preset: string;
   url: string;
+  /** The database's own name on its server (the file path for sqlite). */
+  ns: string;
   state: string;
   worktree: string;
   holder: string;
@@ -1062,14 +1094,26 @@ function doctorLines(d: PoolDoctorData): string[] {
  * removes it; a running daemon keeps running, unsupervised.
  */
 async function daemonUnitVerb(sub: 'install' | 'uninstall'): Promise<void> {
-  const plan = unitPlan();
+  const plan = unitPlan(undefined, unitEnvNames);
   if (!plan) {
     errExit({ class: 'work-error', message: `runly daemon ${sub}: no supervisor for ${process.platform} (systemd user units on Linux, launchd on macOS)`, source: 'daemon' });
     return;
   }
+  const e = plan.environment;
+  const environment = { captured: e.captured, notSet: e.notSet, excludedInputs: e.excluded, leftOut: e.leftOut };
+  // What the unit carries, and what it does not, said before anything is written.
+  const sayEnvironment = () => {
+    console.error(`runly daemon install: the unit's environment — captured from this shell: ${e.captured.join(', ') || 'nothing'}`);
+    if (e.notSet.length) console.error(`  referenced by the manifest or --env but not set in this shell (not captured): ${e.notSet.join(', ')}`);
+    if (e.excluded.length) console.error(`  env_from inputs, never stored in a unit (each 'up' supplies them): ${e.excluded.join(', ')}`);
+    console.error(`  ${e.leftOut} other variable(s) of this shell were left out; add one with --env NAME`);
+  };
   if (sub === 'install' && flags.has('--print')) {
-    if (json) out({ kind: plan.kind, name: plan.name, path: plan.path, content: plan.content });
-    else process.stdout.write(plan.content);
+    if (json) out({ kind: plan.kind, name: plan.name, path: plan.path, content: plan.content, environment });
+    else {
+      sayEnvironment();
+      process.stdout.write(plan.content);
+    }
     return;
   }
   if (sub === 'uninstall') {
@@ -1082,6 +1126,7 @@ async function daemonUnitVerb(sub: 'install' | 'uninstall'): Promise<void> {
     out({ kind: plan.kind, name: plan.name, path: plan.path, removed: true, steps: r.steps, detail: 'the running daemon (if any) keeps running without a supervisor; the next verb that finds none autospawns one' });
     return;
   }
+  if (sub === 'install' && !json) sayEnvironment();
   const r = installUnit(plan);
   if (r.error) {
     errExit({ class: 'infra-error', message: `runly daemon install: ${r.error}`, source: 'daemon', logExcerpt: r.steps.join('\n') });
@@ -1101,7 +1146,7 @@ async function daemonUnitVerb(sub: 'install' | 'uninstall'): Promise<void> {
     : started
       ? `the daemon now runs under ${plan.kind === 'systemd' ? `${plan.name}.service` : plan.name}`
       : `the unit is installed; the next runly verb starts the daemon through it`;
-  out({ kind: plan.kind, name: plan.name, path: plan.path, installed: true, started, steps: r.steps, next });
+  out({ kind: plan.kind, name: plan.name, path: plan.path, installed: true, started, steps: r.steps, next, environment });
 }
 
 /**
@@ -1110,25 +1155,34 @@ async function daemonUnitVerb(sub: 'install' | 'uninstall'): Promise<void> {
  * SIGINT/SIGTERM/SIGHUP are passed on, so the copy is dropped after the
  * command stops.
  *
- * If THIS process dies without that chance (SIGKILL, OOM), the daemon drops
- * the copy — and must take the command down first, or it goes on working
- * against a dropped database (decision 0039). So the command carries the
- * copy's tag (`BACKLOT_DB_COPY`, inherited by everything it starts: Linux
- * finds them all by it), its pid and start time are recorded on the copy, and
- * without a terminal it runs in its own process group, which the daemon
- * signals as a whole. At a terminal it stays in ours, so job control (Ctrl-C,
- * reading the terminal) behaves as before; there the daemon signals the
- * recorded pid and, on Linux, every tagged process.
+ * The command runs under a watchdog (`watchdog.js`) that holds a pipe from
+ * this process: when the CLI dies without the chance to stop it (SIGKILL,
+ * OOM, a kill of its process group that the command's own group escaped),
+ * the pipe closes and the watchdog takes the command down — it must not go on
+ * working against a copy the daemon is about to drop (decision 0039). The
+ * daemon backs it up: the command carries the copy's tag (`BACKLOT_DB_COPY`,
+ * inherited by everything it starts: Linux finds them all by it), and the
+ * watchdog's pid and start time are recorded on the copy. Without a terminal
+ * it leads its own process group, which is signalled as a whole; at a
+ * terminal it stays in ours, so job control (Ctrl-C, reading the terminal)
+ * behaves as before.
  */
 async function runWithCopy(parts: string[], copy: DbCopy): Promise<number> {
   const { spawn } = await import('node:child_process');
   const { constants } = await import('node:os');
-  const env = { ...process.env, RUNLY_DB_URL: copy.url, RUNLY_DB_NAME: copy.name, ...dbCopyTag(copy.name, stateRoot()) };
+  const { fileURLToPath } = await import('node:url');
+  const { dirname } = await import('node:path');
+  const env = { ...process.env, ...dbVars(copy), ...dbCopyTag(copy.name, stateRoot()) };
   const fromTerminal = process.stdin.isTTY === true || process.stdout.isTTY === true || process.stderr.isTTY === true;
   const ownGroup = !fromTerminal;
-  const child = parts.length === 1
-    ? spawn(parts[0]!, { stdio: 'inherit', env, shell: true, detached: ownGroup })
-    : spawn(parts[0]!, parts.slice(1), { stdio: 'inherit', env, detached: ownGroup });
+  const watchdog = join(dirname(fileURLToPath(import.meta.url)), 'watchdog.js');
+  const child = spawn(process.execPath, [watchdog, parts.length === 1 ? 'shell' : 'argv', ownGroup ? 'group' : 'nogroup', ...parts], {
+    stdio: ['inherit', 'inherit', 'inherit', 'pipe'],
+    env,
+    detached: ownGroup,
+  });
+  // The tie: this end closes when this process dies, however it dies.
+  (child.stdio[3] as unknown as { unref?: () => void } | null)?.unref?.();
   // Listen before anything is awaited: a command that ends while the
   // attach RPC is in flight must not be missed.
   const ended = new Promise<number>((resolve) => {
@@ -1146,8 +1200,8 @@ async function runWithCopy(parts: string[], copy: DbCopy): Promise<number> {
   }
   const forward = (sig: NodeJS.Signals) => () => {
     try {
-      // In its own group, the whole group: `sh -c` forks, and the real
-      // command is its child.
+      // In its own group, the whole group: the watchdog, the shell and the
+      // real command beneath it.
       if (ownGroup && child.pid !== undefined) process.kill(-child.pid, sig);
       else child.kill(sig);
     } catch {
@@ -1169,6 +1223,16 @@ async function runWithCopy(parts: string[], copy: DbCopy): Promise<number> {
   process.off('SIGTERM', onTerm);
   process.off('SIGHUP', onHup);
   return code;
+}
+
+/**
+ * What `db with`'s command reads (and `db new` prints): RUNLY_DB_URL to
+ * connect; RUNLY_DB_DATABASE, the database's own name on its server (the file
+ * for sqlite); RUNLY_DB_COPY, runly's handle for `db drop`. RUNLY_DB_NAME is
+ * the handle too, kept for the scripts that read it.
+ */
+function dbVars(copy: DbCopy): Record<string, string> {
+  return { RUNLY_DB_URL: copy.url, RUNLY_DB_DATABASE: copy.ns, RUNLY_DB_COPY: copy.name, RUNLY_DB_NAME: copy.name };
 }
 
 /** A plain, aligned table; `-` for an empty cell. */

@@ -1,4 +1,4 @@
-import { declaredDefaultPreset, defaultPreset, type DatastoreSpec, type Manifest } from './manifest.js';
+import { declaredDefaultPreset, defaultPreset, envDatastoreNames, type DatastoreSpec, type Manifest } from './manifest.js';
 import { BrokerError } from './util.js';
 
 /** The presets a datastore offers. A manifest without a catalog keeps its historical default choices. */
@@ -60,15 +60,19 @@ export function presetToRestore(name: string, spec: DatastoreSpec, held: string 
   return defaultPresetFor(name, spec);
 }
 
-/** CLI shorthand is only unambiguous for a single datastore. */
+/**
+ * CLI shorthand is only unambiguous for a single datastore — of the ones an
+ * environment has: a `copies_only` datastore (decision 0039) is never reloaded
+ * by `up`/`reset-data`, so it does not make `--preset NAME` ambiguous.
+ */
 export function parsePresetArgs(manifest: Manifest, values: string[]): Record<string, string> | undefined {
   if (values.length === 0) return undefined;
-  const stores = Object.keys(manifest.datastores ?? {});
+  const stores = envDatastoreNames(manifest);
   const choices: Record<string, string> = Object.create(null);
   for (const value of values) {
     const at = value.indexOf('=');
     if (at < 0 && stores.length !== 1) {
-      throw new BrokerError('work-error', '--preset NAME requires exactly one datastore; use --preset DATASTORE=NAME', 'manifest');
+      throw new BrokerError('work-error', `--preset NAME requires exactly one datastore an environment has (here: ${stores.join(', ') || 'none'}); use --preset DATASTORE=NAME`, 'manifest');
     }
     const name = at < 0 ? stores[0]! : value.slice(0, at);
     const preset = at < 0 ? value : value.slice(at + 1);

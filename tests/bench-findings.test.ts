@@ -88,10 +88,15 @@ upkeep:
 }
 
 describe('B1: templates survive a teardown (decision 0039)', () => {
-  it('up after destroy reuses the template whose key is unchanged and re-runs no upkeep rule', async () => {
+  it('up after destroy reuses the template whose key is unchanged, and re-runs only the upkeep rules without outputs', async () => {
     const c = ctx();
     const server = tmp('runly-b1-srv-');
-    const wt = c.worktree(bakingStack(server, { bakeS: 2 }));
+    const files = bakingStack(server, { bakeS: 2 });
+    // 0.19: a rule that declares its outputs stays applied across a destroy
+    // (they are checked at every bind); one without is forgotten.
+    files['runly.yml'] += '  - { when: package.json, run: "echo ran >> kept.log && touch .installed", outputs: .installed }\n';
+    files['.gitignore'] += 'kept.log\n.installed\n';
+    const wt = c.worktree(files);
     const first = await c.cli(['up', '--json'], wt);
     expect(first.code, first.stderr + first.stdout).toBe(0);
     expect(lines(join(server, 'bakes.log'))).toHaveLength(1);
@@ -106,7 +111,8 @@ describe('B1: templates survive a teardown (decision 0039)', () => {
     // The template from the first up is current (same create, same seed.sql):
     // restored, not rebaked; the upkeep rule's trigger did not change.
     expect(lines(join(server, 'bakes.log')), 'the template was rebaked after destroy').toHaveLength(1);
-    expect(lines(join(wt, 'upkeep.log')), 'an upkeep rule re-ran after destroy').toHaveLength(1);
+    expect(lines(join(wt, 'upkeep.log')), 'a rule without outputs is forgotten by destroy').toHaveLength(2);
+    expect(lines(join(wt, 'kept.log')), 'a rule whose outputs exist re-ran after destroy').toHaveLength(1);
     expect(again.json.bindDiagnostics.phasesMs.data).toBeLessThan(1500);
     // The fresh environment's datastore was restored from that template.
     expect(readFileSync(join(server, again.json.datastores.main.ns, 'preset'), 'utf8').trim()).toBe('dev');

@@ -185,12 +185,15 @@ describe('L3 a start during a crash backoff', () => {
     const { EnvSupervisor } = await import('../../src/daemon/supervisor.js');
     const root = mkdtempSync(join(tmpdir(), 'l3-'));
     dirs.push(root);
-    const sup = new EnvSupervisor('l3-e1', root, join(root, 'logs'));
+    // Deterministic (0.19): the second start waits for the supervisor's own
+    // signal that the relaunch is pending (onCrashed fires as it schedules
+    // the backoff), not for a fixed 100 ms after the crash.
+    let crashed!: () => void;
+    const relaunchPending = new Promise<void>((r) => (crashed = r));
+    const sup = new EnvSupervisor('l3-e1', root, join(root, 'logs'), undefined, undefined, undefined, { onCrashed: () => crashed() });
     const run = 'echo x >> launches.txt; if [ -f first ]; then sleep 30; else touch first; exit 1; fi';
     sup.start('svc', { run }, {});
-    // Wait for the crash: its relaunch is now pending (500 ms backoff).
-    for (let i = 0; i < 50 && !readSafe(join(root, 'first')); i++) await new Promise((r) => setTimeout(r, 20));
-    await new Promise((r) => setTimeout(r, 100));
+    await relaunchPending;
     sup.start('svc', { run }, {});
     await new Promise((r) => setTimeout(r, 1500));
     expect(readFileSync(join(root, 'launches.txt'), 'utf8').trim().split('\n')).toHaveLength(2);

@@ -251,6 +251,10 @@ export async function ensureDaemon(cwd = process.cwd()): Promise<DaemonInfo> {
   // A daemon autospawned from inside `runly db with`'s command must not carry
   // that copy's tag: reaping the copy kills what carries it (decision 0039).
   delete daemonEnv.BACKLOT_DB_COPY;
+  // Nor a supervisor's marks: an autospawned daemon is supervised by nobody,
+  // whatever service the CLI that spawned it runs under.
+  delete daemonEnv.RUNLY_SUPERVISOR;
+  delete daemonEnv.INVOCATION_ID;
   const log = openSync(join(stateRoot(), 'daemon.log'), 'a');
   // node:sqlite (the journal) prints "SQLite is an experimental feature" on
   // every spawn, burying daemon.log's signal. Suppress ONLY that warning class,

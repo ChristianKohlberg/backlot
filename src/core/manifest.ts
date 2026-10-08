@@ -138,7 +138,19 @@ export interface UpkeepRule {
   run: string;
   /** Hard process-group deadline in seconds; default 300, global override wins. */
   timeout?: number;
+  /**
+   * Paths (relative to the stack root) the rule's command leaves behind — an
+   * install's `node_modules/.modules.yaml`, a generated client's directory. A
+   * rule whose trigger is unchanged runs again when any of them is missing
+   * (a `git clean -fdx` removed it). A rule without `outputs:` is forgotten by
+   * `runly destroy` instead, so the next `up` after a pool reset runs it.
+   */
+  outputs?: string | string[];
 }
+
+/** A rule's declared `outputs:` as a list (empty when it declares none). */
+export const upkeepOutputs = (rule: { outputs?: string | string[] }): string[] =>
+  rule.outputs === undefined ? [] : Array.isArray(rule.outputs) ? rule.outputs : [rule.outputs];
 
 /**
  * A seeded, dev-grade login the stack advertises to consumers. `role` names the
@@ -342,25 +354,35 @@ export function loadStack(from: string, opts: { validate?: boolean } = {}): Stac
   return { manifest, root, id, file: basename(file) };
 }
 
+/** Every string in `value`, with the manifest path it sits at (`services.web.ready.cmd`). */
+function* stringsIn(value: unknown, path: string): Generator<[string, string]> {
+  if (typeof value === 'string') yield [path, value];
+  else if (Array.isArray(value)) for (const [i, v] of value.entries()) yield* stringsIn(v, `${path}[${i}]`);
+  else if (value && typeof value === 'object') for (const [k, v] of Object.entries(value)) yield* stringsIn(v, path ? `${path}.${k}` : k);
+}
+
 /**
  * A `copies_only` datastore (decision 0039) has no environment namespace, so
- * nothing that runs in an environment can be handed one: a service that
- * templates it is refused at load, naming the alternative.
+ * nothing templated against an environment can name one: any field outside
+ * `datastores:` that templates it — a service's run, build, env or ready:,
+ * `auth.token`, a preview setting — is refused at load, naming the field and
+ * the alternative.
  */
 function checkCopiesOnly(manifest: Manifest, file: string): void {
-  for (const [ds, spec] of Object.entries(manifest.datastores ?? {})) {
-    if (spec.copies_only !== true) continue;
+  const only = Object.entries(manifest.datastores ?? {}).filter(([, spec]) => spec.copies_only === true).map(([ds]) => ds);
+  if (only.length === 0) return;
+  const rest = Object.fromEntries(Object.entries(manifest).filter(([k]) => k !== 'datastores'));
+  for (const ds of only) {
     const escaped = ds.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
     const ref = new RegExp(`\\{\\{\\s*datastores\\.${escaped}\\.`);
-    for (const [name, svc] of Object.entries(manifest.services ?? {})) {
-      const texts = [svc.run, buildOf(svc)?.run ?? '', ...Object.values(svc.env ?? {})];
-      if (texts.some((t) => typeof t === 'string' && ref.test(t))) {
-        throw new BrokerError(
-          'work-error',
-          `service '${name}' templates datastore '${ds}', which is copies_only in ${file} — an environment never has one; take a copy with 'runly db new ${ds}' (or 'runly db with ${ds} -- <cmd>'), or drop copies_only`,
-          'manifest',
-        );
-      }
+    for (const [where, text] of stringsIn(rest, '')) {
+      if (!ref.test(text)) continue;
+      const svc = /^services\.([^.[]+)\./.exec(where)?.[1];
+      throw new BrokerError(
+        'work-error',
+        `${svc !== undefined ? `service '${svc}'` : where} templates datastore '${ds}', which is copies_only in ${file}${svc !== undefined ? ` (at ${where})` : ''} — an environment never has one; take a copy with 'runly db new ${ds}' (or 'runly db with ${ds} -- <cmd>'), or drop copies_only`,
+        'manifest',
+      );
     }
   }
 }

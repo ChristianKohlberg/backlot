@@ -88,10 +88,30 @@ interface Carry {
    */
   replays: number;
   deadline: number;
+  /** It outgrew its own or the global replay cap: never retried again, nothing kept. */
+  capped?: boolean;
 }
 
 /** Client bytes kept for a replay; a request larger than this is not retried. */
 const MAX_REPLAY_BYTES = 1024 * 1024;
+/**
+ * Every connection's carried bytes together, across the daemon (0.19): 1 MB
+ * each times a few hundred held uploads was unbounded memory. Past this, a
+ * connection that would carry more is no longer retryable and keeps nothing.
+ */
+const replayCapBytes = (): number => {
+  const v = Number(process.env.BACKLOT_PROXY_REPLAY_CAP_BYTES);
+  return Number.isFinite(v) && v >= 0 ? v : 64 * 1024 * 1024;
+};
+let carriedTotal = 0;
+/** What every connection carries for a replay right now (tests, `status`). */
+export const replayCarriedBytes = (): number => carriedTotal;
+/** Give back what `carry` holds; idempotent. */
+function dropCarry(carry: Carry): void {
+  carriedTotal = Math.max(0, carriedTotal - carry.bytes);
+  carry.bytes = 0;
+  carry.chunks = [];
+}
 /** Resets tolerated while the target is still `up` (the supervisor has not seen the exit yet). */
 const MAX_UP_RESETS = 5;
 /** Relaunches one connection's delivered bytes may be carried to. */
@@ -220,6 +240,7 @@ class Target {
       client.once('close', () => this.open.delete(client));
     }
     const replay: Carry = carry ?? { chunks: [], bytes: 0, ended: false, resets: 0, replays: 0, deadline: Date.now() + HOLD_MS() };
+    if (!carry) client.once('close', () => dropCarry(replay));
     connectInternal(internalPort, (err, upstream) => {
       if (err || !upstream) {
         this.refused(client, replay);
@@ -230,7 +251,7 @@ class Target {
         return;
       }
       let answered = false;
-      let retryable = replay.bytes <= MAX_REPLAY_BYTES;
+      let retryable = replay.bytes <= MAX_REPLAY_BYTES && !replay.capped;
       let settled = false;
       // Did any client byte reach this process? Before one did, it cannot have
       // acted on the request, so a retry is not a replay.
@@ -247,11 +268,14 @@ class Target {
         this.lastActivityAt = Date.now();
         this.hub.noteActivity(this.envId, this.key);
         if (!answered && retryable) {
-          replay.chunks.push(chunk);
-          replay.bytes += chunk.length;
-          if (replay.bytes > MAX_REPLAY_BYTES) {
+          if (replay.bytes + chunk.length > MAX_REPLAY_BYTES || carriedTotal + chunk.length > replayCapBytes()) {
             retryable = false;
-            replay.chunks = [];
+            replay.capped = true;
+            dropCarry(replay);
+          } else {
+            replay.chunks.push(chunk);
+            replay.bytes += chunk.length;
+            carriedTotal += chunk.length;
           }
         }
         delivered = true;
@@ -284,7 +308,7 @@ class Target {
       };
       upstream.once('data', () => {
         answered = true;
-        replay.chunks = [];
+        dropCarry(replay);
       });
       upstream.on('error', () => {
         if (canRetry()) lost();

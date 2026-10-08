@@ -10,9 +10,10 @@
 import { mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { cmdTimeoutS, runBounded } from './exec.js';
-import { globToRegex, sha256, fileHash, BrokerError } from './util.js';
+import { existsSync } from 'node:fs';
+import { globToRegex, sha256, fileHash, BrokerError, commandFailure, safeJoin } from './util.js';
 import { enumerateSource } from './worktree.js';
-import type { Manifest } from './manifest.js';
+import { upkeepOutputs, type Manifest } from './manifest.js';
 
 export interface UpkeepStep {
   /** 1-based position in the manifest's upkeep list — progress never names the command. */
@@ -177,10 +178,14 @@ export async function runUpkeep(
       continue;
     }
     const hash = triggerHash(root, files, rule.when);
-    if (previous[key] === hash) {
+    // Its trigger is unchanged — but a rule that declares what it leaves
+    // behind is due again when that is gone (a pool's `git clean -fdx`).
+    const missing = rule.run.startsWith('@') ? undefined : upkeepOutputs(rule).find((o) => !existsSync(safeJoin(root, o, 'upkeep outputs')));
+    if (previous[key] === hash && missing === undefined) {
       outcome.steps.push({ index: position, when: rule.when, status: 'fresh', durationMs: 0 });
       continue;
     }
+    if (previous[key] === hash) onProgress?.(`upkeep rule ${position}: its output ${missing} is missing — running it again`);
 
     const started = Date.now();
     if (rule.run.startsWith('@')) {
@@ -219,7 +224,7 @@ export async function runUpkeep(
       if (r.code !== 0) {
         onProgress?.(`${label}: failed (${Math.floor((Date.now() - started) / 1000)}s elapsed)`);
         // Triggered by the binding's own change -> work-error by default (decision 0008).
-        throw new BrokerError('work-error', `upkeep rule failed: ${rule.run}`, rule.when, r.output.slice(-800));
+        throw commandFailure(`upkeep rule failed: ${rule.run}`, rule.when, r.output);
       }
       onProgress?.(`${label}: finished (${Math.floor((Date.now() - started) / 1000)}s elapsed)`);
     }

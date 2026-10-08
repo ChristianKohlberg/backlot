@@ -309,7 +309,7 @@ describe('runly db: copies outside any environment', () => {
     // Human output names exactly what a script needs.
     const human = await ctx.cli(['db', 'new', 'audit'], wt);
     expect(human.code, human.stderr).toBe(0);
-    expect(human.stdout).toMatch(/^name=audit-\w+\nurl=\S+audit\.db\npreset=dev\n$/);
+    expect(human.stdout).toMatch(/^name=audit-\w+\nurl=\S+audit\.db\ndatabase=\S+audit\.db\npreset=dev\n$/);
     // Many in parallel.
     const many = await Promise.all([0, 1, 2, 3].map(() => ctx.cli(['db', 'new', 'audit', '--json'], wt)));
     expect(many.every((r) => r.code === 0)).toBe(true);

@@ -22,6 +22,7 @@ import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { stateRoot } from '../core/paths.js';
+import { loadStack } from '../core/manifest.js';
 
 export type UnitKind = 'systemd' | 'launchd';
 
@@ -55,33 +56,106 @@ export function unitKind(): UnitKind | null {
 const daemonEntry = (): string => join(dirname(fileURLToPath(import.meta.url)), '..', 'daemon', 'index.js');
 
 /**
- * What the daemon runs with. A unit does not inherit a login shell's
- * environment, and services, builds and upkeep run with the daemon's: PATH
- * (node, pnpm, docker, dotnet) and the BACKLOT_* settings are captured at
- * install time. Anything else a service needs belongs in its manifest `env:`.
+ * The installing shell's variables a daemon needs and a unit would not have:
+ * a unit starts from systemd's or launchd's bare environment, while services,
+ * builds, upkeep and datastore commands run with the daemon's. Missing
+ * DOTNET_ROOT made every template bake of a .NET stack fail under the unit.
  */
-function unitEnvironment(root: string): Record<string, string> {
-  const env: Record<string, string> = { BACKLOT_STATE_DIR: root };
-  if (process.env.PATH) env.PATH = process.env.PATH;
-  for (const [k, v] of Object.entries(process.env)) {
-    if (!k.startsWith('BACKLOT_') || v === undefined) continue;
-    if (['BACKLOT_STATE_DIR', 'BACKLOT_HOLDER_PID', 'BACKLOT_DB_COPY', 'BACKLOT_ENV_ID', 'BACKLOT_SERVICE', 'BACKLOT_STATE_ROOT', 'BACKLOT_FAKE_VERSION'].includes(k)) continue;
-    env[k] = v;
+const CAPTURE_EXACT = ['PATH', 'LANG', 'DOTNET_ROOT', 'DOCKER_HOST', 'DOCKER_CONTEXT', 'JAVA_HOME', 'HTTP_PROXY', 'HTTPS_PROXY', 'NO_PROXY', 'http_proxy', 'https_proxy', 'no_proxy'];
+const CAPTURE_PREFIXES = ['DOTNET_', 'LC_', 'NODE_', 'NVM_', 'SSL_CERT_'];
+/** runly's own per-process tags and per-call inputs: never baked into a unit. */
+const NEVER_CAPTURE = ['BACKLOT_STATE_DIR', 'BACKLOT_HOLDER_PID', 'BACKLOT_DB_COPY', 'BACKLOT_ENV_ID', 'BACKLOT_SERVICE', 'BACKLOT_STATE_ROOT', 'BACKLOT_FAKE_VERSION', 'RUNLY_SUPERVISOR', 'INVOCATION_ID'];
+
+export interface CapturedEnv {
+  /** What goes into the unit (BACKLOT_STATE_DIR and RUNLY_SUPERVISOR included). */
+  env: Record<string, string>;
+  /** Names taken from the installing shell, sorted. */
+  captured: string[];
+  /** Names the manifest's commands reference, or `--env` asked for, that this shell does not set. */
+  notSet: string[];
+  /** The manifest's `env_from` inputs: supplied per `up`, never stored in a unit. */
+  excluded: string[];
+  /** How many other variables of this shell were left out. */
+  leftOut: number;
+}
+
+/**
+ * `$NAME` / `${NAME}` the stack's commands read from the daemon's environment
+ * — run, build, upkeep, datastore and appliance commands, auth.token — when
+ * the install runs in a stack. Best effort: nothing when there is no manifest.
+ */
+function manifestReferences(cwd: string): { names: string[]; inputs: string[] } {
+  try {
+    const m = loadStack(cwd, { validate: false }).manifest;
+    const texts: string[] = [];
+    for (const s of Object.values(m.services ?? {})) {
+      texts.push(s.run, typeof s.build === 'string' ? s.build : s.build?.run ?? '', s.ready?.cmd ?? '');
+    }
+    for (const u of m.upkeep ?? []) texts.push(u.run);
+    for (const d of Object.values(m.datastores ?? {})) texts.push(d.create ?? '', d.drop ?? '', d.template_restore ?? '', d.list ?? '');
+    for (const a of Object.values(m.appliances ?? {})) texts.push(a.start ?? '', a.stop ?? '', a.ready ?? '');
+    texts.push(m.auth?.token ?? '');
+    const names = new Set<string>();
+    for (const t of texts) for (const match of t.matchAll(/\$\{?([A-Za-z_][A-Za-z0-9_]*)/g)) names.add(match[1]!);
+    const inputs = Object.values(m.services ?? {}).flatMap((s) => Object.keys(s.env_from ?? {}));
+    return { names: [...names], inputs };
+  } catch {
+    return { names: [], inputs: [] };
   }
-  return env;
+}
+
+/**
+ * What the daemon runs with under the unit: the installing shell's PATH, the
+ * allowlist above, the BACKLOT_* settings, every variable the stack's commands
+ * reference (when installed from a stack) and each `--env NAME` — never an
+ * `env_from` input, which travels with each `up`. RUNLY_SUPERVISOR tells the
+ * daemon who restarts it (`status.supervisor`).
+ */
+export function captureEnvironment(root: string, kind: UnitKind, extra: string[] = [], cwd = process.cwd(), from: NodeJS.ProcessEnv = process.env): CapturedEnv {
+  const refs = manifestReferences(cwd);
+  const inputs = new Set(refs.inputs);
+  const wanted = new Set([...refs.names, ...extra]);
+  const env: Record<string, string> = {};
+  const captured: string[] = [];
+  const notSet: string[] = [];
+  let leftOut = 0;
+  for (const [k, v] of Object.entries(from)) {
+    if (v === undefined) continue;
+    const take = !NEVER_CAPTURE.includes(k) && !inputs.has(k) && (
+      k.startsWith('BACKLOT_') || CAPTURE_EXACT.includes(k) || CAPTURE_PREFIXES.some((p) => k.startsWith(p)) || wanted.has(k));
+    if (take) {
+      env[k] = v;
+      captured.push(k);
+    } else leftOut++;
+  }
+  for (const k of wanted) if (from[k] === undefined && !inputs.has(k) && !NEVER_CAPTURE.includes(k)) notSet.push(k);
+  env.BACKLOT_STATE_DIR = root;
+  env.RUNLY_SUPERVISOR = kind;
+  return { env, captured: captured.sort(), notSet: notSet.sort(), excluded: [...inputs].filter((k) => from[k] !== undefined).sort(), leftOut };
 }
 
 /** systemd quoting for one Environment= assignment. */
 const systemdEnv = (k: string, v: string): string => `Environment="${`${k}=${v}`.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/%/g, '%%')}"`;
-const systemdArg = (a: string): string => (/^[A-Za-z0-9_@%+=:,./-]+$/.test(a) ? a : `"${a.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`).replace(/%/g, '%%');
+const systemdArg = (a: string): string => (/^[A-Za-z0-9_@%+=:,./-]+$/.test(a) ? a : `"${a.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`).replace(/%/g, '%%').replace(/\$/g, '$$$$');
+/**
+ * A path in a setting that takes the rest of the line (WorkingDirectory=,
+ * StandardOutput=append:): never quoted — systemd reads quotes as part of the
+ * path and refuses it as not absolute — only `%` escaped. A state root with
+ * spaces works this way (verified with `systemd-analyze --user verify`).
+ */
+const systemdPath = (p: string): string => p.replace(/%/g, '%%');
 const xml = (s: string): string => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 
-export function unitPlan(root = stateRoot()): UnitPlan | null {
+export function unitPlan(root = stateRoot(), extraEnv: string[] = [], opts: { capture?: boolean } = {}): (UnitPlan & { environment: CapturedEnv }) | null {
   const kind = unitKind();
   if (!kind) return null;
   const name = unitBaseName(root);
   const argv = [process.execPath, '--disable-warning=ExperimentalWarning', daemonEntry()];
-  const env = unitEnvironment(root);
+  // Locating an installed unit needs only its name and path, not the capture.
+  const environment = opts.capture === false
+    ? { env: { BACKLOT_STATE_DIR: root, RUNLY_SUPERVISOR: kind }, captured: [], notSet: [], excluded: [], leftOut: 0 }
+    : captureEnvironment(root, kind, extraEnv);
+  const env = environment.env;
   const log = join(root, 'daemon.log');
   if (kind === 'systemd') {
     const dir = join(process.env.XDG_CONFIG_HOME || join(homedir(), '.config'), 'systemd', 'user');
@@ -95,7 +169,7 @@ export function unitPlan(root = stateRoot()): UnitPlan | null {
       'Type=simple',
       `ExecStart=${argv.map(systemdArg).join(' ')}`,
       ...Object.entries(env).map(([k, v]) => systemdEnv(k, v)),
-      `WorkingDirectory=${systemdArg(root)}`,
+      `WorkingDirectory=${systemdPath(root)}`,
       // A crash (non-zero exit, a fatal signal) restarts it within seconds;
       // `runly daemon stop` and `runly update` exit 0 and are not undone.
       'Restart=on-failure',
@@ -106,14 +180,14 @@ export function unitPlan(root = stateRoot()): UnitPlan | null {
       'KillMode=process',
       // `daemon stop` waits up to 60 s for services to stop; leave room.
       'TimeoutStopSec=90',
-      `StandardOutput=append:${log}`,
-      `StandardError=append:${log}`,
+      `StandardOutput=append:${systemdPath(log)}`,
+      `StandardError=append:${systemdPath(log)}`,
       '',
       '[Install]',
       'WantedBy=default.target',
       '',
     ].join('\n');
-    return { kind, name, path: join(dir, `${name}.service`), content };
+    return { kind, name, path: join(dir, `${name}.service`), content, environment };
   }
   const label = name.replace(/^runly-daemon/, 'dev.runly.daemon');
   const content = `<?xml version="1.0" encoding="UTF-8"?>
@@ -140,12 +214,12 @@ ${Object.entries(env).map(([k, v]) => `    <key>${xml(k)}</key><string>${xml(v)}
 </dict>
 </plist>
 `;
-  return { kind, name: label, path: join(homedir(), 'Library', 'LaunchAgents', `${label}.plist`), content };
+  return { kind, name: label, path: join(homedir(), 'Library', 'LaunchAgents', `${label}.plist`), content, environment };
 }
 
 /** The installed unit for this state root, if any. */
 export function installedUnit(root = stateRoot()): UnitPlan | null {
-  const plan = unitPlan(root);
+  const plan = unitPlan(root, [], { capture: false });
   return plan && existsSync(plan.path) ? plan : null;
 }
 
