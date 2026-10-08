@@ -12,7 +12,7 @@
  * 124, like timeout(1)).
  */
 import { closeSync, openSync, readSync, statSync } from 'node:fs';
-import { interleave, markPrior, readLastLines, readLog, sinceLastStart, type LogLine } from '../core/logs.js';
+import { interleave, markPrior, readLastLines, readLog, sinceLastStart, UPKEEP_LOG, type LogLine } from '../core/logs.js';
 import { parseDuration } from '../core/units.js';
 
 export interface LogsSpec {
@@ -104,22 +104,26 @@ export function backlog(spec: LogsSpec, o: LogsOptions, ends?: Map<string, numbe
  * decision 0038 — whether or not `--until` was given). Returns the exit code.
  */
 export async function showLogs(spec: LogsSpec, o: LogsOptions, write: (s: string) => void = (s) => process.stdout.write(s)): Promise<number> {
+  if (spec.build && !o.follow) return showBuildSections(spec, o, write);
   const start = Date.now();
   // Where the follower starts is taken BEFORE the backlog is read: a line
   // written in between is then the follower's, not lost between the two.
   const cursors = new Map<string, Cursor>(spec.files.map(({ file }) => [file, cursorOf(file)]));
   const lines = backlog(spec, o, new Map([...cursors].map(([f, c]) => [f, c.pos])));
+  // `--grep` that matched nothing exits 1, like grep(1) (0.19), so a script
+  // can branch on it; the (empty) answer is still printed.
+  const noMatch = o.grep !== undefined && lines.length === 0 ? 1 : 0;
   if (!o.follow && o.json) {
     // `lines` keeps its pre-0.16 meaning (the text, newline-joined); `entries` is the structured form.
     const service = spec.files.length === 1 ? spec.files[0]!.service : undefined;
     write(`${JSON.stringify({ envId: spec.envId, ...(service ? { service } : {}), build: spec.build, lines: lines.map((l) => render(l, { ...o, json: false })).join('\n'), entries: lines.map((l) => JSON.parse(render(l, { ...o, json: true })) as unknown) })}\n`);
-    return 0;
+    return noMatch;
   }
   for (const l of lines) {
     write(`${render(l, o)}\n`);
     if (!l.prior && o.until?.test(l.text)) return 0;
   }
-  if (!o.follow) return 0;
+  if (!o.follow) return noMatch;
 
   // Follow: poll each file for what is appended past its cursor. A rotation
   // renames the live file to `.1` (same inode) and starts a new one: the rest
@@ -170,6 +174,49 @@ export async function showLogs(spec: LogsSpec, o: LogsOptions, write: (s: string
     }
     await new Promise((r) => setTimeout(r, 200));
   }
+}
+
+/**
+ * `logs --build` without `-f` (0.19): one section per build log (the upkeep
+ * output first, then each service's last build), each with its own last
+ * `--lines` lines — interleaved by time, one long build pushed every other
+ * section out of the window. Each header says how many lines it shows of
+ * how many, so a cut is never silent. `--grep` that matches nothing in any
+ * section exits 1.
+ */
+function showBuildSections(spec: LogsSpec, o: LogsOptions, write: (s: string) => void): number {
+  const since = o.since === undefined ? undefined : parseSince(o.since)!;
+  const limit = o.lines ?? (o.since !== undefined ? Infinity : 40);
+  const sections = spec.files.map(({ service, file }) => {
+    let lines = readLog(file, service);
+    if (since?.kind === 'up') lines = sinceLastStart(lines);
+    else if (since?.kind === 'age') {
+      const from = Date.now() - since.ms;
+      lines = lines.filter((l) => !Number.isNaN(l.at) && l.at >= from);
+    }
+    const all = select(lines, o);
+    const shown = Number.isFinite(limit) ? all.slice(-limit) : all;
+    return { service, total: all.length, shown };
+  });
+  const matched = sections.reduce((n, s) => n + s.total, 0);
+  const code = o.grep !== undefined && matched === 0 ? 1 : 0;
+  if (o.json) {
+    const entries = sections.flatMap((s) => s.shown.map((l) => JSON.parse(render(l, { ...o, json: true })) as unknown));
+    write(`${JSON.stringify({
+      envId: spec.envId, build: true,
+      sections: sections.map((s) => ({ service: s.service, lines: s.total, shown: s.shown.length, truncated: s.total - s.shown.length })),
+      lines: sections.flatMap((s) => s.shown.map((l) => render(l, { ...o, json: false, prefix: spec.files.length !== 1 }))).join('\n'),
+      entries,
+    })}\n`);
+    return code;
+  }
+  for (const s of sections) {
+    const what = s.service === UPKEEP_LOG ? 'upkeep' : `build ${s.service}`;
+    const cut = s.total - s.shown.length;
+    write(`== ${what}: ${s.total === 0 ? (o.grep ? 'no matching lines' : 'no output recorded') : cut > 0 ? `last ${s.shown.length} of ${s.total} lines (${cut} earlier cut; --lines ${s.total} shows all)` : `${s.total} line${s.total === 1 ? '' : 's'}`} ==\n`);
+    for (const l of s.shown) write(`${l.text}\n`);
+  }
+  return code;
 }
 
 const STAMP = /^(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d+)?Z) (.*)$/;
