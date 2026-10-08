@@ -75,7 +75,7 @@ if (args[0] === 'serve' && args[1] === 'status') {
 }
 if (args[0] === 'serve' && args[1].startsWith('--https=')) {
   const port = args[1].slice('--https='.length);
-  if (process.env.FAKE_TS_DENY) {
+  if (process.env.FAKE_TS_DENY || existsSync(join(dir, 'deny'))) {
     console.error('sending serve config: Access denied: serve config denied');
     process.exit(1);
   }
@@ -335,3 +335,92 @@ async function goneWithin(pid: number, ms: number): Promise<boolean> {
   }
   return !alive(pid);
 }
+
+/**
+ * A daemon restart re-publishes the lease's preview (decision 0045): same
+ * publisher, same tailnet port, aimed at the public port the proxy holds
+ * again — and the service wakes on the first request through it.
+ */
+describe('a daemon restart re-publishes the preview', () => {
+  const daemonPid = (stateDir: string) => Number(readFileSync(join(stateDir, 'daemon.pid'), 'utf8'));
+  const servePid = (stateDir: string) => Number(readFileSync(join(stateDir, 'serve.pid'), 'utf8'));
+  const killDaemon = async (stateDir: string) => {
+    const pid = daemonPid(stateDir);
+    process.kill(pid, 'SIGKILL');
+    expect(await goneWithin(pid, 5000)).toBe(true);
+  };
+  const waitCtx = async (cli: ReturnType<typeof ctx>['cli'], pred: (j: Record<string, unknown>) => boolean, ms = 20_000) => {
+    const deadline = Date.now() + ms;
+    let last: Record<string, unknown> | undefined;
+    while (Date.now() < deadline) {
+      last = (await cli(['ctx', '--json'])).json;
+      if (last && pred(last)) return last;
+      await new Promise((r) => setTimeout(r, 200));
+    }
+    return last;
+  };
+
+  it('after a SIGKILL: same URL, a new serve, and the request wakes the service', async () => {
+    const { cli, stateDir, tsDir } = ctx(TS);
+    expect((await cli(['up', '--json'])).code).toBe(0);
+    // A derived port and a caller's override: both must come back as they were.
+    const prev = await cli(['preview', 'web', '--https-port', '20777', '--json']);
+    expect(prev.code, prev.stderr).toBe(0);
+    const url = String(prev.json?.url);
+    expect(url).toBe('https://box.tail1234.ts.net:20777');
+    const before = servePid(stateDir);
+
+    await killDaemon(stateDir);
+    const after = await waitCtx(cli, (j) => (j.previewUrls as Record<string, string>)?.web === url && servePid(stateDir) !== before);
+    expect(after?.previewUrls, JSON.stringify(after)).toEqual({ web: url });
+    expect(after?.previewRestore).toBeNull();
+    const now = servePid(stateDir);
+    expect(now).not.toBe(before);
+    expect(alive(now)).toBe(true);
+    expect(await goneWithin(before, 5000)).toBe(true);
+    const serves = readFileSync(join(tsDir, 'calls.txt'), 'utf8').split('\n').filter((l) => l.startsWith('serve --https='));
+    expect(serves).toHaveLength(2);
+    expect(serves[1]).toBe(serves[0]);
+    // The serve is aimed at the public port; the service was stopped by the
+    // restart and wakes on the first request.
+    const target = /http:\/\/localhost:(\d+)/.exec(serves[1]!)![1];
+    const res = await fetch(`http://127.0.0.1:${target}/`);
+    expect(await res.text()).toBe('ok');
+    const ev = readFileSync(join(stateDir, 'events.jsonl'), 'utf8');
+    expect(ev).toMatch(/restored the preview of 'web' at https:\/\/box\.tail1234\.ts\.net:20777/);
+  }, 60_000);
+
+  it('after a graceful stop too, and not after preview stop', async () => {
+    const { cli, stateDir } = ctx(`${TS}  https_port: 20611\n`);
+    expect((await cli(['up', '--json'])).code).toBe(0);
+    expect((await cli(['preview', 'web', '--json'])).code).toBe(0);
+    expect((await cli(['daemon', 'stop', '--json'])).code).toBe(0);
+    const back = await waitCtx(cli, (j) => Object.keys((j.previewUrls as object) ?? {}).length > 0);
+    expect(back?.previewUrls).toEqual({ web: 'https://box.tail1234.ts.net:20611' });
+
+    expect((await cli(['preview', 'stop', '--json'])).code).toBe(0);
+    await killDaemon(stateDir);
+    const gone = await waitCtx(cli, () => true);
+    await new Promise((r) => setTimeout(r, 1500));
+    const later = (await cli(['ctx', '--json'])).json;
+    expect(gone?.previewUrls).toEqual({});
+    expect(later?.previewUrls).toEqual({});
+    expect(later?.previewRestore).toBeNull();
+  }, 60_000);
+
+  it('a restore that fails is an event and ctx says so; preview stop forgets it', async () => {
+    const { cli, stateDir, tsDir } = ctx(`${TS}  https_port: 20621\n`);
+    expect((await cli(['up', '--json'])).code).toBe(0);
+    expect((await cli(['preview', 'web', '--json'])).code).toBe(0);
+    writeFileSync(join(tsDir, 'deny'), '');
+    await killDaemon(stateDir);
+    const failed = await waitCtx(cli, (j) => (j.previewRestore as { state?: string } | null)?.state === 'failed');
+    expect(failed?.previewRestore).toMatchObject({ service: 'web', url: 'https://box.tail1234.ts.net:20621', state: 'failed' });
+    expect(String((failed?.previewRestore as { error?: string }).error)).toMatch(/operator/);
+    expect(failed?.previewUrls).toEqual({});
+    expect(readFileSync(join(stateDir, 'events.jsonl'), 'utf8')).toMatch(/could not restore the preview of 'web'/);
+    const stop = await cli(['preview', 'stop', '--json']);
+    expect(stop.json?.stopped).toBe(true);
+    expect((await cli(['ctx', '--json'])).json?.previewRestore).toBeNull();
+  }, 60_000);
+});

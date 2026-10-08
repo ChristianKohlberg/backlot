@@ -38,6 +38,10 @@ export interface PreviewPublisher {
    * throws, it must already have killed it. Nothing downstream can clean up a
    * tunnel whose pid was never returned, and a live one is a public,
    * unauthenticated URL with no record anywhere.
+   *
+   * `pinned` (0.20, decision 0045): settings that make a later start publish
+   * the SAME address — what a daemon restart passes back. A publisher whose
+   * address the settings already determine (or that cannot pin one) omits it.
    */
   start(opts: {
     envId: string;
@@ -49,7 +53,7 @@ export interface PreviewPublisher {
      * hostnames needs the zone; `cloudflare-quick` ignores it entirely.
      */
     settings?: PreviewSettings;
-  }): Promise<{ url: string; pid: ServicePid }>;
+  }): Promise<{ url: string; pid: ServicePid; pinned?: PreviewSettings }>;
   /**
    * Returns true only when the tunnel is CONFIRMED gone. A false verdict must
    * keep the caller's record (reapPids' contract): a forgotten preview pid is a
@@ -632,7 +636,7 @@ class TailscalePublisher implements PreviewPublisher {
     localUrl: string;
     logDir: string;
     settings?: PreviewSettings;
-  }): Promise<{ url: string; pid: ServicePid }> {
+  }): Promise<{ url: string; pid: ServicePid; pinned?: PreviewSettings }> {
     this.checkPrerequisite();
     const bin = tailscaleBin();
     const host = this.self(bin);
@@ -709,7 +713,9 @@ class TailscalePublisher implements PreviewPublisher {
     if (!pid) {
       throw withSurvivor(new BrokerError('env-error', 'tailscale serve started without a pid', 'preview'), await abandon(proc, spawnedStart));
     }
-    return { url, pid: { pid, startTime: spawnedStart } };
+    // A derived port depends on what else is served right now; a restart
+    // must ask for this one, not derive again.
+    return { url, pid: { pid, startTime: spawnedStart }, pinned: { https_port: port } };
   }
 
   /** The foreground session dies with the process, and the tailnet mapping with it. */

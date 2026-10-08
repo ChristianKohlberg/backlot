@@ -143,6 +143,26 @@ export interface LeaseRow {
   previewStart?: number;
   /** Local port the tunnel was published against, so a rebind can spot drift. */
   previewPort?: number;
+  /**
+   * What `runly preview` published, kept until the preview is stopped on
+   * purpose (0.20, decision 0045): a daemon restart reaps the tunnel and
+   * publishes it again from this. Written only by `setLeasePreviewRestore`,
+   * never by `saveLease`, so a stale lease snapshot cannot erase it.
+   */
+  previewRestore?: PreviewRestore;
+}
+
+/** A published preview, as a restart re-publishes it (decision 0045). */
+export interface PreviewRestore {
+  service: string;
+  /** The URL it had; a publisher that pins its address gives the same one again. */
+  url: string;
+  /** The environment's public port it was aimed at. */
+  port: number;
+  /** The publisher, by name; absent for a preview published before 0.20 (the manifest's then). */
+  publisher?: string;
+  /** The settings that reproduce the address (the manifest's `preview` block plus what the publisher pinned). */
+  settings?: Record<string, unknown>;
 }
 
 /**
@@ -253,7 +273,8 @@ export class Journal {
         id TEXT PRIMARY KEY, env_id TEXT NOT NULL, kind TEXT NOT NULL,
         holder TEXT NOT NULL, hygiene TEXT NOT NULL, expires_at INTEGER NOT NULL,
         holder_pid INTEGER, holder_start INTEGER,
-        preview_service TEXT, preview_url TEXT, preview_pid INTEGER, preview_start INTEGER, preview_port INTEGER
+        preview_service TEXT, preview_url TEXT, preview_pid INTEGER, preview_start INTEGER, preview_port INTEGER,
+        preview_restore TEXT
       );
       CREATE TABLE IF NOT EXISTS counters (
         stack TEXT PRIMARY KEY, next_env INTEGER NOT NULL DEFAULT 1
@@ -269,7 +290,7 @@ export class Journal {
     `);
     // A schema-4 journal written by 0.16 or 0.17 lacks the columns added since
     // (additive: no schema bump). Only the duplicate-column case is benign.
-    for (const [table, col] of [['envs', 'activity TEXT'], ['envs', 'drop_recipes TEXT'], ['envs', 'templates TEXT'], ['db_copies', 'template TEXT'], ['db_copies', 'child TEXT']] as const) {
+    for (const [table, col] of [['envs', 'activity TEXT'], ['envs', 'drop_recipes TEXT'], ['envs', 'templates TEXT'], ['db_copies', 'template TEXT'], ['db_copies', 'child TEXT'], ['leases', 'preview_restore TEXT']] as const) {
       try {
         this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${col}`);
       } catch (err) {
@@ -519,6 +540,11 @@ export class Journal {
     this.db.prepare(`UPDATE leases SET ${cols} WHERE id=? AND preview_pid=?`).run(id, stoppedPid);
   }
 
+  /** Record (or, with null, forget) what a restart re-publishes for this lease (decision 0045). */
+  setLeasePreviewRestore(id: string, restore: PreviewRestore | null): void {
+    this.db.prepare('UPDATE leases SET preview_restore = ? WHERE id = ?').run(restore ? JSON.stringify(restore) : null, id);
+  }
+
   private rowToLease(r: Record<string, unknown>): LeaseRow {
     return {
       id: r.id as string,
@@ -534,6 +560,7 @@ export class Journal {
       previewPid: (r.preview_pid as number | null) ?? undefined,
       previewStart: (r.preview_start as number | null) ?? undefined,
       previewPort: (r.preview_port as number | null) ?? undefined,
+      previewRestore: parseJson<PreviewRestore>(r.preview_restore),
     };
   }
 
