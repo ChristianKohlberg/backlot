@@ -1,6 +1,6 @@
 ---
 name: runly-setup
-description: Create or edit a repository's runly.yml or runly.yaml manifest, including services, builds, readiness, seeded data, caller inputs, and previews. Use runly for operating an already configured stack.
+description: Create or edit a repository's runly.yml or runly.yaml manifest, including datastore/container topology, service orchestration, hidden build/cache costs, and initial monitoring and tuning. Use runly for operating an already configured stack.
 ---
 
 # Set up runly
@@ -8,6 +8,18 @@ description: Create or edit a repository's runly.yml or runly.yaml manifest, inc
 Build a manifest around the repository's existing commands. Inspect its package
 scripts, build outputs, dev-server options, seed commands and tests first.
 Preserve existing configuration when editing it.
+
+Setup includes a recommendation and a measured first iteration, not just valid
+YAML. Read [topology](references/topology.md) before choosing datastore, container
+and service boundaries. Read [tuning](references/tuning.md) for the cache audit,
+verification matrix and initial monitoring plan.
+
+Trace scripts, Compose/Docker entrypoints, migration/seed paths and test fixtures.
+Explain the proposed ownership/isolation boundaries and why they fit this repo.
+Find redundant work and missing invalidation inputs before enabling skips.
+Validate correctness first; measure cost before claiming an optimization.
+Initial real-world use needs monitoring to fine-tune resource declarations,
+build/seed caching, readiness and idle/wake behavior.
 
 ## Format and discovery
 
@@ -148,5 +160,9 @@ startup failures. Repeat plain up to verify reuse/restart behavior.
 Exercise preset/reset or copy workflows when part of the setup, on data created
 for that verification. Do not destroy an existing environment just to test config.
 
-Report the manifest path, verified commands/tests, and external prerequisites
-still unverified.
+Report the manifest path, recommended topology, verified commands/tests and
+measured cold/warm behavior. Leave the initial monitoring checklist from the
+tuning reference: what remains provisional, what to observe during the first
+development sessions, and which findings should trigger changes. Record external
+prerequisites and concurrency/isolation cases still unverified. Do not describe
+the setup as optimized merely because it starts successfully.
