@@ -18,6 +18,7 @@
  */
 import {
   copyFileSync,
+  renameSync,
   mkdirSync,
   statSync,
   utimesSync,
@@ -29,6 +30,7 @@ import {
   constants as fsConstants,
 } from 'node:fs';
 import { dirname, join } from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import { connect } from 'node:net';
 import { templatesRoot } from '../core/paths.js';
 import { recordNamespace } from '../core/namespaces.js';
@@ -491,19 +493,46 @@ class SqliteDs implements DsDriver {
           await withDatastoreLock(slot.dir, this.name, true, async () => {
             if (existsSync(tpl)) return;
             recordTemplateRoot(slot.dir, h.cwd);
+            const pending = `${tpl}.${process.pid}.${Math.random().toString(36).slice(2)}.pending`;
             const adopt = this.slots.adoptable(slot);
             if (adopt) {
               try {
-                copyFileSync(adopt.full, tpl, fsConstants.COPYFILE_FICLONE);
-                utimesSync(tpl, new Date(), new Date(adopt.mtime));
+                copyFileSync(adopt.full, pending, fsConstants.COPYFILE_FICLONE);
+                utimesSync(pending, new Date(), new Date(adopt.mtime));
+                renameSync(pending, tpl);
                 logEvent({ level: 'info', kind: 'template', envId: h.envId, detail: `adopted template ${adopt.dir}/${slot.file} of '${this.name}' (${preset}) as the shared one — no bake` });
                 return;
               } catch {
-                rmSync(tpl, { force: true }); // retired meanwhile: bake instead
+                // A failed adoption never publishes a partially copied template.
+              } finally {
+                rmSync(pending, { force: true });
               }
             }
-            await measureMetric('datastore.template_bake_ms', labels, () => this.runCreate(h.cwd, tpl, preset)); // bake once
-            bakedHere = true;
+            // The final path is the success marker. A failed seed (or daemon
+            // crash mid-seed) must never leave a partial database there for
+            // the next bind to trust. Publish only after the command succeeds.
+            try {
+              await measureMetric('datastore.template_bake_ms', labels, async () => {
+                await this.runCreate(h.cwd, pending, preset);
+                // A seed can exit successfully without closing its connection
+                // (process.exit), leaving committed pages only in the WAL.
+                // Recover/checkpoint before publishing a standalone db file.
+                if (['-wal', '-shm', '-journal'].some((suffix) => existsSync(pending + suffix))) {
+                  const db = new DatabaseSync(pending);
+                  try {
+                    const checkpoint = db.prepare('PRAGMA wal_checkpoint(TRUNCATE)').get();
+                    if (checkpoint?.busy !== 0) throw new BrokerError('work-error', `seed for '${this.name}' left SQLite in use — close all seed connections before the create command exits`, 'datastore');
+                  } finally {
+                    db.close();
+                  }
+                }
+                renameSync(pending, tpl);
+              });
+              bakedHere = true;
+            } finally {
+              rmSync(pending, { force: true });
+              dropSidecars(pending);
+            }
           });
         }
         // Restores share the lock: several copies at once, but never while a

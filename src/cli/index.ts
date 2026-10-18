@@ -858,7 +858,7 @@ async function main(): Promise<void> {
           return;
         }
       } else {
-        await monitorStats(async (signal) => {
+        const monitored = await monitorStats(async (signal) => {
           const result = await rpc('stats', { cwd, all: flags.has('--all'), sinceMs }, undefined, 10_000, signal);
           if (!result.ok) {
             const kind = result.error.class === 'work-error' || result.error.class === 'env-error' ? result.error.class : 'infra-error';
@@ -866,6 +866,9 @@ async function main(): Promise<void> {
           }
           return result.data as StatsData;
         }, { json, intervalMs, timeoutMs });
+        // Node's standard stdout can retain an outstanding pipe write after
+        // destroy(). A canceled monitor must not wait forever for that reader.
+        if (monitored.outputInterrupted) process.exit(0);
         return;
       }
       break;

@@ -218,7 +218,7 @@ Decision 0038. The supervisor's `LogWriter` (`src/core/logs.ts`) stamps whole li
 - **A crash loop never destroys an environment.** The supervisor's `onDegraded(service, exit)` → `serviceFailed` records `failedServices` (memory only), stops the service under the env lock, and `ps`/`ctx`/wake/`resumeForVerb` honour it; `startServices` clears it. This applies with or without a lease.
 - **Activity is only verbs that use the env** (`touch()` callers: exec, token, preview; binds and down set `lastUsedAt`). Never add `touch()` to a read-only verb.
 - **`db with`'s command is tagged `BACKLOT_DB_COPY`** and recorded on the copy row (`child`); `dropDbCopy` → `stopCopyUsers` first. `ensureDaemon` strips the tag so a daemon spawned from inside such a command does not inherit it.
-- **The proxy replays until the first byte back** (`Carry` in `proxy.ts`, 1 MB cap, 5 resets while `up`). Anything after the service answered is never retried.
+- **The proxy replays only a single complete, bodyless safe-method HTTP/1 request before the first byte back** (`Carry` in `proxy.ts`, 1 MB cap, 5 resets while `up`). Pipelined requests, upgrades and ambiguous framing are not replayable: a GET followed by a POST must never duplicate the POST after a reset. Anything after the service answered is never retried. Holds and refused-forward retries share the original connection deadline.
 - **`runly daemon install`** (`src/cli/daemon-unit.ts`): one unit per state root; `ensureDaemon` starts it only when it runs THIS build (`unitRunsThisBuild`), else spawns as before. `BACKLOT_SYSTEMCTL`/`BACKLOT_LAUNCHCTL` exist for tests; never let a test touch the real user manager.
 - `tests/bench-findings.test.ts` and `tests/proxy-reset.test.ts` are the regression tests.
 
@@ -382,3 +382,8 @@ not HTTP request latency. Keep names/labels free of commands, URLs and payloads.
 Live budget values are declared costs. Persisted duration histogram estimates and
 daemon-life proxy counters have different reset/coverage semantics; expose both.
 See tests/metrics*.test.ts, proxy-metrics, proxy-metric-context and datastore-metrics.
+
+## SQLite template publication and monitoring audit
+
+- A SQLite template's final path is its success marker. Seed or adopt into a unique pending file, checkpoint any WAL/journal sidecars after seeding, and rename only after successful creation or copying. Failed or killed seeds must never publish a partial template. Retention must exclude pending files and sidecars from current-template ranking, then reclaim them after grace. `tests/datastore-drivers.test.ts` covers failed seeds, SIGKILL and committed WAL data.
+- Monitor output must obey stdout backpressure and remain cancellable while a consumer is not reading. Polling is sequential; timeout/signals also cancel a pending write. `tests/metrics-stress.test.ts` exercises actual unread subprocess pipes. Persisted metric buckets must satisfy histogram/count/range invariants before loading; cap eviction must not scan the whole history per observation.

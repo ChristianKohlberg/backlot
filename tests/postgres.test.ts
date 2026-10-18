@@ -115,6 +115,17 @@ datastores:
     expect(pg(`psql -U postgres -d ${ns} -tAc "select count(*) from items"`).trim()).toBe('3');
   });
 
+  it('reports real native clone timings without exposing the connection password', async () => {
+    const res = await cli(['stats', '--json']);
+    expect(res.exitCode, res.out).toBe(0);
+    const series = res.json!.series as Array<{ name: string; count: number; min?: number; labels: { outcome?: string; datastore?: string } }>;
+    const samples = (name: string) => series.filter((s) => s.name === name && s.labels.datastore === 'main' && s.labels.outcome === 'success');
+    expect(samples('datastore.template_bake_ms').reduce((n, s) => n + s.count, 0)).toBe(1);
+    expect(samples('datastore.restore_ms').reduce((n, s) => n + s.count, 0)).toBe(2);
+    expect(samples('datastore.restore_ms').every((s) => s.min! >= 0)).toBe(true);
+    expect(res.out).not.toContain('postgres:pw@');
+  });
+
   it('ctx --env exports the datastore connection string for the repo\'s own checks', async () => {
     const res = await cli(['ctx', '--env']);
     expect(res.exitCode, `stdout: ${res.stdout ?? ''}

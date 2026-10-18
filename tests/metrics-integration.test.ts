@@ -1,6 +1,6 @@
 import { afterEach, expect, it } from 'vitest';
 import { get } from 'node:http';
-import { writeFileSync, readFileSync, mkdirSync } from 'node:fs';
+import { writeFileSync, readFileSync, mkdirSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { makeCtx, SERVER, waitFor, type Ctx } from './support/context.js';
 
@@ -36,6 +36,10 @@ it('monitor stays read-only; cold traffic correlates wake and first byte; scoped
   expect(nestedStats.code, nestedStats.stderr).toBe(0);
   expect(nestedStats.json.live.environments).toHaveLength(0);
   expect(nestedStats.json.series).toHaveLength(0);
+  writeFileSync(join(nested, 'runly.yml'), 'invalid: [yaml');
+  const invalidNested = await c.cli(['stats', '--json'], nested);
+  expect(invalidNested.code, 'an invalid child manifest must not show its parent statistics').not.toBe(0);
+  writeFileSync(join(nested, 'runly.yml'), manifest('metrics-nested'));
   const before = await c.cli(['stats', '--json'], wt);
   expect(before.code, before.stderr + before.stdout).toBe(0);
   expect(before.json.series.some((s: {name: string}) => s.name === 'bind.total_ms')).toBe(true);
@@ -76,3 +80,21 @@ it('monitor stays read-only; cold traffic correlates wake and first byte; scoped
   expect(all.json.live.environments).toHaveLength(2);
   expect(new Set(all.json.series.map((s: {labels: {stack?: string}}) => s.labels.stack)).size).toBe(2);
 }, 60_000);
+
+it('statistics keep a journaled nested stack scope after its manifest is removed', async () => {
+  c = makeCtx();
+  const parent = c.worktree({ 'runly.yml': manifest('stats-parent'), 'server.mjs': SERVER });
+  const child = join(parent, 'child');
+  mkdirSync(child);
+  writeFileSync(join(child, 'runly.yaml'), manifest('stats-child'));
+  writeFileSync(join(child, 'server.mjs'), SERVER);
+  expect((await c.cli(['up', '--json'], parent)).code).toBe(0);
+  expect((await c.cli(['up', '--json'], child)).code).toBe(0);
+  const before = await c.cli(['stats', '--json'], child);
+  rmSync(join(child, 'runly.yaml'));
+  const after = await c.cli(['stats', '--json'], child);
+  expect(after.code, after.stderr + after.stdout).toBe(0);
+  expect(after.json.scope).toBe(before.json.scope);
+  expect(after.json.live.environments).toHaveLength(1);
+  expect(after.json.series.every((s: {labels: {stack?: string}}) => s.labels.stack === before.json.scope)).toBe(true);
+}, 30_000);

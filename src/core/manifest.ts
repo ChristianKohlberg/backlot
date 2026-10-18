@@ -5,6 +5,7 @@ import { parse } from 'yaml';
 import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
 import { BrokerError, safeJoin } from './util.js';
+import { envName } from './env-vars.js';
 
 export interface ReadySpec {
   http?: string;
@@ -353,11 +354,50 @@ export function loadStack(from: string, opts: { validate?: boolean } = {}): Stac
   // upkeep rule ever makes runly read it: it is never a legitimate source file.
   for (const inc of manifest.sync?.include ?? []) safeJoin(root, inc, 'sync.include');
   checkCopiesOnly(manifest, basename(file));
+  checkDatastoreNamespaces(manifest);
+  checkExportNames(manifest);
   // Identity = absolute root + declared name; filesystem-safe. Hash the WHOLE
   // path: slicing base64url(root) kept only the last ~6 bytes, so sibling
   // worktrees like agent-1/myapp and agent-2/myapp collided into one pool.
   const id = stackIdentity(manifest.name, root);
   return { manifest, root, id, file: basename(file) };
+}
+
+/** Context and exec exports must never silently overwrite another resource. */
+function checkExportNames(manifest: Manifest): void {
+  const groups: Array<[string, string[]]> = [
+    ['services', Object.keys(manifest.services)],
+    ['ports', Object.values(manifest.services).flatMap((service) => service.port ? [service.port] : [])],
+    ['datastores', Object.keys(manifest.datastores ?? {})],
+  ];
+  for (const [group, keys] of groups) {
+    const seen = new Map<string, string>();
+    for (const key of keys) {
+      const normalized = envName(key);
+      const other = seen.get(normalized);
+      if (other !== undefined && other !== key) {
+        throw new BrokerError('work-error', `${group} '${other}' and '${key}' produce the same exported environment variable name '${normalized}' — rename one so its uppercase name is distinct`, 'manifest');
+      }
+      seen.set(normalized, key);
+    }
+  }
+}
+
+/** Command drivers normalize their datastore keys for SQL-safe namespaces.
+ * Refuse ambiguous names before either store can drop or seed the other's data.
+ * Preserve the naming scheme so existing databases remain addressable.
+ */
+function checkDatastoreNamespaces(manifest: Manifest): void {
+  const names = new Map<string, string>();
+  for (const [name, spec] of Object.entries(manifest.datastores ?? {})) {
+    if (spec.driver === 'sqlite' || spec.copies_only) continue;
+    const normalized = name.replace(/[^A-Za-z0-9_]/g, '_');
+    const other = names.get(normalized);
+    if (other !== undefined) {
+      throw new BrokerError('work-error', `datastores '${other}' and '${name}' produce the same server namespace — rename one datastore so its SQL-safe name is distinct`, 'manifest');
+    }
+    names.set(normalized, name);
+  }
 }
 
 /** Every string in `value`, with the manifest path it sits at (`services.web.ready.cmd`). */

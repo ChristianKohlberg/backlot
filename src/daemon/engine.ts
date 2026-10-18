@@ -6,7 +6,7 @@ import { mkdirSync, rmSync, readdirSync, existsSync, readFileSync } from 'node:f
 import { isAbsolute, join, relative, sep } from 'node:path';
 import { Journal, JOURNAL_SCHEMA_VERSION, NO_LEASE_EXPIRY, type DbCopyRow, type DropRecipe, type EnvRow, type LeaseRow, type PreviewRestore } from '../core/journal.js';
 import { BUILD, VERSION, compareVersions, versionSkew } from '../core/version.js';
-import { buildOf, canonicalDirectory, envDatastoreNames, outputsOf, upkeepOutputs, loadStack, normalizeLogins, manifestFileOf, type Manifest, type ServiceSpec, type Stack } from '../core/manifest.js';
+import { buildOf, canonicalDirectory, findStackRoot, envDatastoreNames, outputsOf, upkeepOutputs, loadStack, normalizeLogins, manifestFileOf, type Manifest, type ServiceSpec, type Stack } from '../core/manifest.js';
 import { snapshotOutputs } from '../core/worktree.js';
 import { forgetNamespace, recordedNamespaces } from '../core/namespaces.js';
 import { runlyEnvVars } from '../core/env-vars.js';
@@ -3666,6 +3666,7 @@ export class Engine {
             dead: 'its stack can never be bound again (worktree gone, no rows)',
             private: 'a --pristine template no environment or copy uses any more',
             duplicate: 'a per-worktree copy of a shared template that nothing references',
+            incomplete: 'incomplete SQLite template bake left by an interrupted seed',
           }[v.why];
           const finding: (typeof findings)[number] = { kind: 'template', what: join(dir, f), detail };
           if (fix) {
@@ -3866,10 +3867,18 @@ export class Engine {
         const rel = relative(env.stackRoot, dir);
         return rel === '' || (!rel.startsWith('..' + sep) && rel !== '..' && !isAbsolute(rel));
       }).sort((a, b) => b.stackRoot.length - a.stackRoot.length);
-      try { stack = loadStack(cwd, { validate: false }).id; }
-      catch (err) {
-        if (!candidates[0]) throw err;
-        stack = candidates[0].stack;
+      let manifestRoot: string | undefined;
+      try { manifestRoot = findStackRoot(cwd); } catch { /* a removed manifest still has journal history */ }
+      const known = candidates[0];
+      if (known && (!manifestRoot || known.stackRoot.length > manifestRoot.length)) {
+        stack = known.stack;
+      } else {
+        try { stack = loadStack(cwd, { validate: false }).id; }
+        catch (err) {
+          // A broken nested stack must not silently inherit its parent's history.
+          if (!known || known.stackRoot !== manifestRoot) throw err;
+          stack = known.stack;
+        }
       }
     }
     this.proxy.flushMetrics();

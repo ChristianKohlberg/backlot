@@ -4,8 +4,9 @@
  * Every service port of an environment has two numbers: the PUBLIC port, which
  * this module listens on (127.0.0.1 and ::1) for the environment's whole life,
  * and an INTERNAL port the service is started on, fresh at every start. Bytes
- * are piped between the two without looking at them — no HTTP awareness, so
- * WebSockets, gRPC, a database wire protocol all pass the same way.
+ * are forwarded unchanged, so WebSockets, gRPC and database wire protocols
+ * all pass through. Limited HTTP/1 recognition only controls safe retries
+ * and startup-error responses; this is not an HTTP request parser.
  *
  * What the indirection buys:
  * - the public port survives every restart (an `up` that rebuilt, reset-data,
@@ -67,6 +68,8 @@ export const HOLD_MS = (): number => Number(process.env.BACKLOT_PROXY_HOLD_MS ??
 const MAX_HELD = 512;
 
 interface Waiter {
+  /** Updated when a public listener moves; timers belong to the new target. */
+  owner: Target;
   socket: Socket;
   timer: NodeJS.Timeout;
   /** A connection being retried after its service reset it: what it already sent, to replay. */
@@ -122,25 +125,37 @@ function dropCarry(carry: Carry): void {
 const MAX_UP_RESETS = 5;
 /** Relaunches one connection's delivered bytes may be carried to. */
 const MAX_REPLAYS = 1;
-/** HTTP methods that are safe to repeat (RFC 9110 §9.2.1/§9.2.2) — no side effect a second run could double. */
-const IDEMPOTENT = /^(GET|HEAD|OPTIONS) /;
-
 /**
- * May bytes a process already received be sent to the next one? Only when the
- * connection's first bytes are an HTTP request with a method that is safe to
- * repeat: the dead process may have acted on what it read (charged a card,
- * inserted a row) before it died, and a replay would act a second time. Any
- * other request — POST, PUT, PATCH, DELETE, a database or TLS wire protocol,
- * a first chunk too short to tell — is not replayed once delivered.
+ * Replay only one complete, bodyless HTTP/1 request with a safe method. Looking
+ * at the first method alone is insufficient: a GET may be followed by a
+ * pipelined POST, or carry a body that another parser treats as another request.
+ * Ambiguous framing, upgrades, partial headers and unknown protocols fail closed.
  */
 export function replayable(chunks: readonly Buffer[]): boolean {
-  const head = Buffer.concat(chunks.length > 1 ? chunks.slice(0, 4) : chunks).subarray(0, 8).toString('latin1');
-  return IDEMPOTENT.test(head);
+  const request = Buffer.concat(chunks).toString('latin1');
+  const end = request.indexOf('\r\n\r\n');
+  if (end < 0 || end + 4 !== request.length) return false;
+  const [line, ...headers] = request.slice(0, end).split('\r\n');
+  if (!/^(GET|HEAD|OPTIONS) [^\s]+ HTTP\/1\.[01]$/.test(line!)) return false;
+  let contentLength = false;
+  for (const header of headers) {
+    const match = /^([!#$%&'*+.^_`|~0-9A-Za-z-]+):[ \t]*([^\r\n]*)$/.exec(header);
+    if (!match) return false;
+    const name = match[1]!.toLowerCase();
+    if (name === 'transfer-encoding' || name === 'upgrade') return false;
+    if (name === 'content-length') {
+      if (contentLength || match[2]!.trim() !== '0') return false;
+      contentLength = true;
+    }
+  }
+  return true;
 }
 
 /** One measurement per accepted TCP connection, including all retries. */
 interface ConnectionMeasurement {
   started: number;
+  /** One startup wait budget across holding, forwarding and retries. */
+  deadline: number;
   firstByte: boolean;
   rejected: boolean;
   attempts: number;
@@ -235,7 +250,7 @@ class Target {
     this.accepted++;
     this.metric('proxy.accepted', 1);
     this.startMetricTimer();
-    const measurement: ConnectionMeasurement = { started: performance.now(), firstByte: false, rejected: false, attempts: 0 };
+    const measurement: ConnectionMeasurement = { started: performance.now(), deadline: Date.now() + HOLD_MS(), firstByte: false, rejected: false, attempts: 0 };
     connectionMeasurements.set(client, measurement);
     client.once('close', () => {
       this.finishHold(client);
@@ -261,22 +276,25 @@ class Target {
       this.reject(client, carry, 'capacity');
       return;
     }
+    // A retry waiting for startup is held, no longer an open upstream pipe.
+    this.open.delete(client);
     const measurement = connectionMeasurements.get(client);
     if (measurement && measurement.holdStarted === undefined) measurement.holdStarted = performance.now();
     // A paused socket buffers what the client sends (and TCP backpressure
     // stops it beyond that), so nothing is lost while it waits.
     client.pause();
     const waiter: Waiter = {
+      owner: this,
       socket: client,
       carry,
       timer: setTimeout(() => {
-        this.dropWaiter(waiter);
-        this.lastError = 'Service startup exceeded the proxy wait deadline';
-        this.reject(client, carry, 'timeout');
-      }, carry ? Math.max(0, carry.deadline - Date.now()) : HOLD_MS()),
+        waiter.owner.dropWaiter(waiter);
+        waiter.owner.lastError = 'Service startup exceeded the proxy wait deadline';
+        waiter.owner.reject(client, carry, 'timeout');
+      }, Math.max(0, (carry?.deadline ?? measurement?.deadline ?? Date.now() + HOLD_MS()) - Date.now())),
     };
     waiter.timer.unref();
-    client.once('close', () => this.dropWaiter(waiter));
+    client.once('close', () => waiter.owner.dropWaiter(waiter));
     this.waiters.push(waiter);
   }
 
@@ -349,7 +367,7 @@ class Target {
    * 0035) when that is safe:
    * - nothing of the client's reached the process (refused, or lost before
    *   the proxy wrote a byte upstream): always — it cannot have acted;
-   * - bytes reached it: only for an idempotent HTTP request (`replayable`),
+   * - bytes reached it: only for a complete, bodyless, single safe-method HTTP request (`replayable`),
    *   and only to ONE more process (`MAX_REPLAYS`).
    * Otherwise the client sees the close or reset, as it would without a proxy
    * (decision 0039, corrected in 0.18.1).
@@ -357,12 +375,17 @@ class Target {
   private forward(client: Socket, internalPort: number, carry?: Carry): void {
     this.startMetricTimer(); // Transferred held sockets did not enter this target's onConnection.
     const measurement = connectionMeasurements.get(client);
+    if (Date.now() >= (carry?.deadline ?? measurement?.deadline ?? Infinity)) {
+      this.lastError = 'Service startup exceeded the proxy wait deadline';
+      this.reject(client, carry, 'timeout');
+      return;
+    }
     if (measurement && measurement.attempts++ > 0) this.metric('proxy.retry', 1, carry?.replays ? 'reset' : 'refused', measurement.operationId);
     if (!this.open.has(client)) {
       this.open.add(client);
       client.once('close', () => this.open.delete(client));
     }
-    const replay: Carry = carry ?? { chunks: [], bytes: 0, ended: false, resets: 0, replays: 0, deadline: Date.now() + HOLD_MS() };
+    const replay: Carry = carry ?? { chunks: [], bytes: 0, ended: false, resets: 0, replays: 0, deadline: measurement?.deadline ?? Date.now() + HOLD_MS() };
     if (!carry) client.once('close', () => dropCarry(replay));
     connectInternal(internalPort, (err, upstream) => {
       if (err || !upstream) {
@@ -513,7 +536,7 @@ class Target {
       if (client.destroyed) return;
       if (this.state === 'up' && this.internalPort !== undefined) this.forward(client, this.internalPort, carry);
       else this.refused(client, carry);
-    }, 200).unref();
+    }, Math.min(200, Math.max(0, carry.deadline - Date.now()))).unref();
   }
 
   close(): void {
@@ -709,7 +732,15 @@ export class ProxyHub {
     }
     if (existing) {
       // Move held connections too: they are waiting for the SERVICE, not the port.
-      target.waiters = existing.waiters;
+      // The new IPv4 listener may already have accepted clients while its
+      // IPv6 bind awaited. Keep those waiters as well as the transferred ones.
+      target.waiters.push(...existing.waiters);
+      for (const waiter of existing.waiters) {
+        waiter.owner = target;
+        // A reset connection was previously open, then held for a restart.
+        // Closing the old listener must not destroy the stream we just moved.
+        existing.open.delete(waiter.socket);
+      }
       existing.waiters = [];
       existing.close();
     }

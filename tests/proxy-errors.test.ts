@@ -116,3 +116,144 @@ it('the expiring origin preserves TCP half-close request/response protocols', as
     expect(reply).toBe('reply:request');
   } finally {socket.destroy();gate.close();server.close();}
 });
+
+it('an expiring origin drains a large response after the upstream gracefully closes', async () => {
+  const payload = Buffer.alloc(8 * 1024 * 1024, 97);
+  const server = createServer(socket => {
+    socket.on('error', () => {});
+    socket.resume();
+    socket.on('end', () => socket.end(payload));
+  });
+  await new Promise<void>(resolve => server.listen(0, 'localhost', resolve));
+  const gate = await PreviewGate.open((server.address() as {port:number}).port, Date.now() + 10_000);
+  const socket = connect(Number(new URL(gate.url).port), 'localhost');
+  socket.on('error', () => {});
+  try {
+    let received = 0;
+    socket.on('data', chunk => { received += chunk.length; });
+    const closed = new Promise<void>(resolve => socket.once('close', resolve));
+    await new Promise<void>(resolve => socket.once('connect', resolve));
+    socket.pause();
+    socket.end('request');
+    await sleep(200);
+    socket.resume();
+    await closed;
+    expect(received).toBe(payload.length);
+  } finally { socket.destroy(); gate.close(); server.close(); }
+});
+
+it('renewing a live gate preserves its stream past the old deadline and closes it at the new one', async () => {
+  const server = createServer(socket => { socket.on('error', () => {}); socket.pipe(socket); });
+  await new Promise<void>(resolve => server.listen(0, 'localhost', resolve));
+  const oldDeadline = Date.now() + 1000;
+  const gate = await PreviewGate.open((server.address() as {port:number}).port, oldDeadline);
+  const socket = connect(Number(new URL(gate.url).port), 'localhost');
+  socket.on('error', () => {});
+  try {
+    let response = '';
+    socket.on('data', data => response += data.toString());
+    const closed = new Promise<void>(resolve => socket.once('close', resolve));
+    await new Promise<void>(resolve => socket.once('connect', resolve));
+    const newDeadline = Date.now() + 2000;
+    expect(gate.renew(newDeadline)).toBe(true);
+    await sleep(Math.max(0, oldDeadline - Date.now()) + 100);
+    expect(socket.destroyed).toBe(false);
+    socket.write('still the same connection');
+    await closed;
+    expect(response).toBe('still the same connection');
+    expect(Date.now()).toBeGreaterThanOrEqual(newDeadline);
+    expect(gate.renew(Date.now() + 5000)).toBe(false);
+  } finally { socket.destroy(); gate.close(); server.close(); }
+});
+
+it('wall-clock expiry also blocks server-initiated stream bytes before its timer runs', async () => {
+  const { vi } = await import('vitest');
+  let send: (() => void) | undefined;
+  const server = createServer(socket => {
+    socket.on('error', () => {});
+    send = () => socket.write('must not reach public client');
+  });
+  await new Promise<void>(resolve => server.listen(0, 'localhost', resolve));
+  const deadline = Date.now() + 60_000;
+  const gate = await PreviewGate.open((server.address() as {port:number}).port, deadline);
+  const socket = connect(Number(new URL(gate.url).port), 'localhost');
+  socket.on('error', () => {});
+  let clock: ReturnType<typeof vi.spyOn> | undefined;
+  try {
+    let response = '';
+    socket.on('data', data => response += data.toString());
+    const closed = new Promise<void>(resolve => socket.once('close', resolve));
+    for (let i = 0; !send && i < 100; i++) await sleep(10);
+    expect(send).toBeDefined();
+    clock = vi.spyOn(Date, 'now').mockReturnValue(deadline + 1);
+    send!();
+    await closed;
+    expect(response).toBe('');
+  } finally { clock?.mockRestore(); socket.destroy(); gate.close(); server.close(); }
+});
+
+it('keeps one startup deadline across a held connection and refused forwards', async () => {
+  const { hub, port } = await fixture();
+  const prior = process.env.BACKLOT_PROXY_HOLD_MS;
+  process.env.BACKLOT_PROXY_HOLD_MS = '1000';
+  const server = createServer(socket => socket.once('data', () => socket.end('HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok')));
+  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+  const unavailable = (await allocateInBlock({lo: 28000, hi: 28999}, new Set()))!;
+  try {
+    hub.starting('e', 'web');
+    const response = request(port, ['GET / HTTP/1.1\r\nHost: localhost\r\n\r\n']);
+    await sleep(700);
+    hub.up('e', 'web', unavailable, 'web');
+    await sleep(500);
+    hub.up('e', 'web', (server.address() as {port:number}).port, 'web');
+    expect(await response).toContain('503 Service Unavailable');
+  } finally {
+    hub.closeAll(); server.close();
+    if (prior === undefined) delete process.env.BACKLOT_PROXY_HOLD_MS; else process.env.BACKLOT_PROXY_HOLD_MS = prior;
+  }
+});
+
+it('removes timed-out held connections from the replacement listener after a port move', async () => {
+  const { hub, port } = await fixture();
+  const prior = process.env.BACKLOT_PROXY_HOLD_MS;
+  process.env.BACKLOT_PROXY_HOLD_MS = '200';
+  try {
+    hub.starting('e', 'web');
+    const response = request(port, ['GET / HTTP/1.1\r\nHost: localhost\r\n\r\n']);
+    for (let i = 0; hub.stats('e').web?.held !== 1 && i < 50; i++) await sleep(10);
+    expect(hub.stats('e').web?.held).toBe(1);
+    expect(hub.stats('e').web?.open).toBe(0);
+    const moved = (await allocateInBlock({lo: 29000, hi: 29999}, new Set([port])))!;
+    await hub.listen('e', 'web', moved);
+    expect(await response).toContain('503 Service Unavailable');
+    expect(hub.stats('e').web?.held).toBe(0);
+  } finally {
+    hub.closeAll();
+    if (prior === undefined) delete process.env.BACKLOT_PROXY_HOLD_MS; else process.env.BACKLOT_PROXY_HOLD_MS = prior;
+  }
+});
+
+it('moves a held retry without destroying the previously forwarded client stream', async () => {
+  const { hub, port } = await fixture();
+  const dying = createServer(socket => {
+    socket.on('error', () => {});
+    socket.once('data', () => { hub.starting('e', 'web'); socket.resetAndDestroy(); });
+  });
+  const recovered = createServer(socket => {
+    socket.on('error', () => {});
+    socket.once('data', () => socket.end('HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok'));
+  });
+  await Promise.all([dying, recovered].map(server => new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve))));
+  try {
+    hub.up('e', 'web', (dying.address() as {port:number}).port, 'web');
+    const response = request(port, ['GET / HTTP/1.1\r\nHost: localhost\r\n\r\n']);
+    for (let i = 0; hub.stats('e').web?.held !== 1 && i < 100; i++) await sleep(10);
+    expect(hub.stats('e').web?.held).toBe(1);
+    expect(hub.stats('e').web?.open).toBe(0);
+    const moved = (await allocateInBlock({lo: 29000, hi: 29999}, new Set([port])))!;
+    await hub.listen('e', 'web', moved);
+    hub.up('e', 'web', (recovered.address() as {port:number}).port, 'web');
+    expect(await response).toContain('200 OK');
+    expect(hub.stats('e').web?.held).toBe(0);
+  } finally { hub.closeAll(); dying.close(); recovered.close(); }
+});

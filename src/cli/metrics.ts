@@ -1,3 +1,4 @@
+import type { Writable } from 'node:stream';
 import type { Engine } from '../daemon/engine.js';
 import { formatDuration, formatSize } from '../core/units.js';
 
@@ -35,15 +36,36 @@ export function statsLines(report: StatsData): string[] {
   return lines;
 }
 
-/** Sequential snapshots, one request at a time. Ctrl-C releases the timer/listeners. */
+/** Sequential snapshots with output backpressure. Ctrl-C releases timers/listeners.
+ * Standard stdout cannot reliably cancel an outstanding pipe write; the CLI must
+ * exit explicitly when outputInterrupted is true, after this function cleans up.
+ */
 export async function monitorStats(
   fetch: (signal: AbortSignal) => Promise<StatsData>,
-  options: { json: boolean; intervalMs: number; timeoutMs?: number },
-): Promise<void> {
+  options: { json: boolean; intervalMs: number; timeoutMs?: number; output?: Writable & { isTTY?: boolean } },
+): Promise<{ outputInterrupted: boolean }> {
+  const output = options.output ?? process.stdout;
+  let outputError: Error | undefined;
   let stopped = false;
+  let waitingForOutput = false;
+  let outputInterrupted = false;
   const controller = new AbortController();
   let wake: (() => void) | undefined;
-  const stop = () => { stopped = true; controller.abort(); wake?.(); };
+  const stop = () => {
+    stopped = true;
+    controller.abort();
+    // A pending pipe write otherwise keeps the CLI process alive after its
+    // timeout/SIGINT, even though the monitoring loop has already returned.
+    if (waitingForOutput) { outputInterrupted = true; output.destroy(); }
+    wake?.();
+  };
+  const onOutputError = (error: NodeJS.ErrnoException) => {
+    // A consumer such as `head` closing its pipe is a normal end of monitoring.
+    if (error.code !== 'EPIPE') outputError = error;
+    stop();
+  };
+  output.on('error', onOutputError);
+  output.on('close', stop);
   process.on('SIGINT', stop);
   process.on('SIGTERM', stop);
   const timeout = options.timeoutMs === undefined ? undefined : setTimeout(stop, options.timeoutMs);
@@ -53,10 +75,17 @@ export async function monitorStats(
       try { report = await fetch(controller.signal); }
       catch (err) { if (stopped) break; throw err; }
       if (stopped) break;
-      if (options.json) console.log(JSON.stringify(report));
-      else {
-        if (process.stdout.isTTY) process.stdout.write('\x1b[2J\x1b[H');
-        console.log(statsLines(report).join('\n'));
+      const text = options.json ? JSON.stringify(report) + '\n'
+        : (output.isTTY ? '\x1b[2J\x1b[H' : '') + statsLines(report).join('\n') + '\n';
+      if (!output.write(text) && !stopped) {
+        waitingForOutput = true;
+        // Polling must not outrun a slow pipe. Retain at most one snapshot and
+        // let cancellation interrupt the wait even when the reader never drains.
+        await new Promise<void>((resolve) => {
+          const done = () => { waitingForOutput = false; output.off('drain', done); wake = undefined; resolve(); };
+          output.once('drain', done);
+          wake = done;
+        });
       }
       if (stopped) break;
       await new Promise<void>((resolve) => {
@@ -64,8 +93,12 @@ export async function monitorStats(
         wake = () => { clearTimeout(timer); wake = undefined; resolve(); };
       });
     }
+    if (outputError) throw outputError;
+    return { outputInterrupted };
   } finally {
     clearTimeout(timeout);
+    output.off('error', onOutputError);
+    output.off('close', stop);
     process.off('SIGINT', stop);
     process.off('SIGTERM', stop);
   }

@@ -50,6 +50,7 @@ interface Store {
   dirty: boolean;
   timer?: NodeJS.Timeout;
   prunedAt?: number;
+  observedAt?: number;
 }
 export interface MetricSeries {
   name: string;
@@ -95,7 +96,9 @@ function keyOf(b: Pick<Bucket, 'name' | 'labels'>, at?: number): string {
   return JSON.stringify([at, b.name, b.labels]);
 }
 function prune(s: Store, now: number): void {
-  if (s.prunedAt !== undefined && now - s.prunedAt < MINUTE && now >= s.prunedAt) return;
+  const rolledBack = s.observedAt !== undefined && now < s.observedAt;
+  s.observedAt = now;
+  if (!rolledBack && s.prunedAt !== undefined && now - s.prunedAt < MINUTE && now >= s.prunedAt) return;
   s.prunedAt = now;
   const minute = Math.floor(now / MINUTE) * MINUTE;
   for (const [key, b] of s.buckets) {
@@ -125,8 +128,27 @@ function store(): Store {
     if (statSync(path).size > MAX_FILE_BYTES) throw new Error('metrics size');
     const parsed = JSON.parse(readFileSync(path, 'utf8'));
     if (parsed.version !== 1 || !Array.isArray(parsed.buckets) || parsed.buckets.length > MAX_BUCKETS) throw new Error('metrics format');
-    for (const b of parsed.buckets) {
-      if (typeof b.name !== 'string' || !b.labels || !Number.isFinite(b.at) || !Number.isFinite(b.total) || !Number.isFinite(b.min) || !Number.isFinite(b.max) || !Number.isSafeInteger(b.count) || b.count < 1 || !Array.isArray(b.histogram) || b.histogram.length !== BOUNDS.length + 1 || b.histogram.some((n: unknown) => !Number.isSafeInteger(n) || (n as number) < 0)) throw new Error('metrics bucket');
+    // New observations append chronologically (rollback prunes the future).
+    // Restore that invariant even if a persisted document was reordered, so
+    // cap eviction is O(1) on the daemon's traffic path.
+    for (const b of parsed.buckets.sort((a: Bucket, b: Bucket) => a.at - b.at)) {
+      if (typeof b.name !== 'string' || !/^[a-z][a-z0-9_.-]{0,99}$/.test(b.name) ||
+        !b.labels || typeof b.labels !== 'object' || Array.isArray(b.labels) ||
+        !Number.isSafeInteger(b.at) || b.at % MINUTE !== 0 ||
+        !Number.isFinite(b.total) || b.total < 0 || !Number.isFinite(b.min) || b.min < 0 ||
+        !Number.isFinite(b.max) || b.max < b.min || !Number.isSafeInteger(b.count) || b.count < 1 ||
+        !Array.isArray(b.histogram) || b.histogram.length !== BOUNDS.length + 1 ||
+        b.histogram.some((n: unknown) => !Number.isSafeInteger(n) || (n as number) < 0) ||
+        b.histogram.reduce((sum: number, n: number) => sum + n, 0) !== b.count) throw new Error('metrics bucket');
+      // Tolerate accumulated floating-point rounding, but reject totals or
+      // occupied histogram bins incompatible with the recorded extrema.
+      const mean = b.total / b.count;
+      const tolerance = Math.max(1, mean, b.max) * 1e-10;
+      const bin = (value: number) => { const i = BOUNDS.findIndex((bound) => value <= bound); return i < 0 ? BOUNDS.length : i; };
+      const first = bin(b.min); const last = bin(b.max);
+      if (mean < b.min - tolerance || mean > b.max + tolerance ||
+        b.histogram.some((n: number, i: number) => n > 0 && (i < first || i > last)) ||
+        b.histogram[first] === 0 || b.histogram[last] === 0) throw new Error('metrics bucket range');
       b.labels = cleanLabels(b.labels);
       s.buckets.set(keyOf(b, b.at), b);
     }
@@ -195,8 +217,7 @@ export function recordMetric(name: string, value: number, labels: MetricLabels =
     if (!b) {
       if (s.buckets.size >= MAX_BUCKETS) {
         // Remove oldest bucket rather than refusing measurements of new worktrees.
-        let oldest: string | undefined; let oldestAt = Infinity;
-        for (const [k, bucket] of s.buckets) if (bucket.at < oldestAt) { oldestAt = bucket.at; oldest = k; }
+        const oldest = s.buckets.keys().next().value;
         if (oldest !== undefined) { s.collection.droppedObservations += s.buckets.get(oldest)!.count; s.buckets.delete(oldest); }
         s.collection.historyTruncated = true;
       }

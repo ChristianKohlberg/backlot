@@ -171,3 +171,47 @@ describe('manifest filenames', () => {
     }
   });
 });
+
+
+describe('command datastore namespace validation', () => {
+  it('rejects names that normalize to the same server namespace before provisioning', async () => {
+    const { mkdtempSync, writeFileSync, rmSync } = await import('node:fs');
+    const { tmpdir } = await import('node:os');
+    const { loadStack } = await import('../src/core/manifest.js');
+    const dir = mkdtempSync(join(tmpdir(), 'runly-ds-names-'));
+    try {
+      const manifest = { name: 'collision', services: { web: { run: 'true' } }, datastores: {
+        'app-a': { driver: 'postgres', create: 'true', url: 'postgres://localhost/{{ns}}' },
+        app_a: { driver: 'postgres', create: 'true', url: 'postgres://localhost/{{ns}}' },
+      } };
+      writeFileSync(join(dir, 'runly.yaml'), JSON.stringify(manifest));
+      expect(() => loadStack(dir)).toThrow(/app-a.*app_a.*same.*namespace/);
+      // SQLite filenames differ, but the exported environment variables still collide.
+      for (const spec of Object.values(manifest.datastores)) spec.driver = 'sqlite';
+      writeFileSync(join(dir, 'runly.yaml'), JSON.stringify(manifest));
+      expect(() => loadStack(dir)).toThrow(/same exported environment variable/);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('exported resource names', () => {
+  it.each(['services', 'ports', 'datastores'])('rejects case-fold collisions in %s', async (group) => {
+    const { mkdtempSync, writeFileSync, rmSync } = await import('node:fs');
+    const { tmpdir } = await import('node:os');
+    const { loadStack } = await import('../src/core/manifest.js');
+    const dir = mkdtempSync(join(tmpdir(), 'runly-export-names-'));
+    try {
+      const manifest = group === 'services'
+        ? { name: 'collision', services: { web: { run: 'true' }, WEB: { run: 'true' } } }
+        : group === 'ports'
+          ? { name: 'collision', services: { one: { run: 'true', port: 'web' }, two: { run: 'true', port: 'WEB' } } }
+          : { name: 'collision', services: { web: { run: 'true' } }, datastores: { web: { driver: 'sqlite', create: 'true' }, WEB: { driver: 'sqlite', create: 'true' } } };
+      writeFileSync(join(dir, 'runly.yaml'), JSON.stringify(manifest));
+      // Ports are lowercase-only in the schema; the semantic guard also
+      // protects callers that deliberately load without schema validation.
+      expect(() => loadStack(dir, { validate: group !== 'ports' })).toThrow(/web.*WEB.*same exported environment variable/);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+});

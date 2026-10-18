@@ -71,7 +71,7 @@ const templateGroup = (file: string): string => {
 
 export type TemplateVerdict =
   | { f: string; keep: true; why: 'current' | 'referenced' | 'grace' }
-  | { f: string; keep: false; why: 'superseded' | 'dead' | 'private' | 'duplicate' };
+  | { f: string; keep: false; why: 'superseded' | 'dead' | 'private' | 'duplicate' | 'incomplete' };
 
 /**
  * What retention (and `pool doctor`, without the grace) does with each
@@ -100,6 +100,12 @@ export function templateVerdicts(
   const seen = new Map<string, number>();
   const out: TemplateVerdict[] = [];
   for (const { f, mtime } of [...files].sort((a, b) => b.mtime - a.mtime)) {
+    // Crash-left SQLite bakes and their sidecars are never usable templates
+    // and must not consume a 'current' slot ahead of a completed bake.
+    if (/\.db\.\d+\.[a-z0-9]+\.pending(?:-wal|-shm|-journal)?$/.test(f)) {
+      out.push(Date.now() - mtime < graceMs ? { f, keep: true, why: 'grace' } : { f, keep: false, why: 'incomplete' });
+      continue;
+    }
     const priv = isPrivateTemplateFile(f);
     const duplicate = !priv && !isSharedTemplateDir(dir) && sharedFiles.has(f);
     let current = false;

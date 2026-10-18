@@ -14,7 +14,7 @@ import { join } from 'node:path';
 import { Journal } from '../src/core/journal.js';
 import { scanTagged } from '../src/core/procscan.js';
 import { ProxyHub } from '../src/daemon/proxy.js';
-import { allocateInBlock, DEFAULT_INTERNAL_BLOCK, DEFAULT_PUBLIC_BLOCK, DEFAULT_TUNNEL_BLOCK, ephemeralRange } from '../src/core/ports.js';
+import { probeFree, allocateInBlock, DEFAULT_INTERNAL_BLOCK, DEFAULT_PUBLIC_BLOCK, DEFAULT_TUNNEL_BLOCK, ephemeralRange } from '../src/core/ports.js';
 import { disposeStateSync } from './support/leaks.js';
 
 const repo = join(import.meta.dirname, '..');
@@ -350,23 +350,35 @@ describe('the proxy in front of a real environment', () => {
   it('never hands the same public port to two stacks, and re-binds them after a daemon restart', async () => {
     // A machine-wide cap above three, so the third stack fails on ports, not capacity
     // (a small CI runner's heuristic cap is 2).
-    const d = track(daemonCtx({ BACKLOT_PORT_RANGE: '27100-27103', BACKLOT_POOL_MAX_TOTAL: '8' }));
+    // Keep this deliberately full block outside the default public range:
+    // unrelated daemons/soaks may legitimately claim any port in that range.
+    let lo = 0;
+    for (let attempt = 0; attempt < 100; attempt++) {
+      const candidate = 10000 + Math.floor(Math.random() * 9997);
+      if ((await Promise.all([0, 1, 2, 3].map(offset => probeFree(candidate + offset)))).every(Boolean)) {
+        lo = candidate;
+        break;
+      }
+    }
+    expect(lo, 'a free four-port test block below the default public range').toBeGreaterThan(0);
+    const hi = lo + 3;
+    const d = track(daemonCtx({ BACKLOT_PORT_RANGE: `${lo}-${hi}`, BACKLOT_POOL_MAX_TOTAL: '8' }));
     const a = trackDir(makeWorktree('alloc-a', { web: 'server.mjs', api: 'server.mjs' }));
     const b = trackDir(makeWorktree('alloc-b', { web: 'server.mjs', api: 'server.mjs' }));
     const [ua, ub] = await Promise.all([d.cli(['up', '--json'], a), d.cli(['up', '--json'], b)]);
-    expect(ua.exitCode, ua.stderr).toBe(0);
-    expect(ub.exitCode, ub.stderr).toBe(0);
+    expect(ua.exitCode, ua.stdout + ua.stderr).toBe(0);
+    expect(ub.exitCode, ub.stdout + ub.stderr).toBe(0);
     const all = [...Object.values(portsOf(ua)), ...Object.values(portsOf(ub))];
     expect(new Set(all).size).toBe(4);
     for (const p of all) {
-      expect(p).toBeGreaterThanOrEqual(27100);
-      expect(p).toBeLessThanOrEqual(27103);
+      expect(p).toBeGreaterThanOrEqual(lo);
+      expect(p).toBeLessThanOrEqual(hi);
     }
     // The block is full now: a third stack is refused, naming the block.
     const c = trackDir(makeWorktree('alloc-c'));
     const uc = await d.cli(['up', '--json'], c);
     expect(uc.exitCode).not.toBe(0);
-    expect(uc.stdout + uc.stderr).toMatch(/no free public port left in 27100-27103/);
+    expect(uc.stdout + uc.stderr).toContain(`no free public port left in ${lo}-${hi}`);
 
     // Daemon restart: every recorded public port is held again before any bind.
     expect((await d.cli(['daemon', 'stop'], a)).exitCode).toBe(0);
