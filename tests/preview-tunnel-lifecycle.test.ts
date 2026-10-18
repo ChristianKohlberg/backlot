@@ -54,12 +54,12 @@ describe('preview tunnels (teardown and lifecycle)', () => {
     await cli(['up', '--json']);
     await cli(['preview', 'web', '--json']);
     const pid = tunnelPid(stateDir);
-    writeFileSync(join(wt, 'stack.yaml'), readFileSync(join(wt, 'stack.yaml'), 'utf8') + 'preview:\n  forbidden: true\n');
+    writeFileSync(join(wt, 'runly.yml'), readFileSync(join(wt, 'runly.yml'), 'utf8') + 'preview:\n  forbidden: true\n');
     writeFileSync(join(wt, 'note.txt'), 'edited\n');
     const synced = await cli(['up', '--json']);
     expect(synced.code).toBe(0);
     expect(synced.json?.previewUrls).toEqual({});
-    expect(String(synced.json?.previewNotice)).toMatch(/work-error: stack.yaml now sets preview.forbidden/);
+    expect(String(synced.json?.previewNotice)).toMatch(/work-error: runly.yml now sets preview.forbidden/);
     expect(await goneWithin(pid, 10_000)).toBe(true);
   });
 
@@ -71,8 +71,8 @@ describe('preview tunnels (teardown and lifecycle)', () => {
     await cli(['preview', 'web', '--json']);
     const pid = tunnelPid(stateDir);
     writeFileSync(
-      join(wt, 'stack.yaml'),
-      readFileSync(join(wt, 'stack.yaml'), 'utf8').replace('port: web, env: { PORT: "{{ports.web}}" }', 'port: frontend, env: { PORT: "{{ports.frontend}}" }'),
+      join(wt, 'runly.yml'),
+      readFileSync(join(wt, 'runly.yml'), 'utf8').replace('port: web, env: { PORT: "{{ports.web}}" }', 'port: frontend, env: { PORT: "{{ports.frontend}}" }'),
     );
     const synced = await cli(['up', '--json']);
     expect(synced.code).toBe(0);
@@ -87,7 +87,7 @@ describe('preview tunnels (teardown and lifecycle)', () => {
     const before = await cli(['up', '--json']);
     await cli(['preview', 'web', '--json']);
     const pid = tunnelPid(stateDir);
-    writeFileSync(join(wt, 'stack.yaml'), readFileSync(join(wt, 'stack.yaml'), 'utf8')
+    writeFileSync(join(wt, 'runly.yml'), readFileSync(join(wt, 'runly.yml'), 'utf8')
       .replace('env: { PORT:', 'env: { VALUE: changed, PORT:'));
     const synced = await cli(['up', '--json']);
     expect(synced.code).toBe(0);
@@ -127,8 +127,8 @@ describe('preview tunnels (teardown and lifecycle)', () => {
     const pid = tunnelPid(stateDir);
     writeFileSync(join(wt, 'boom.mjs'), `process.exit(1);\n`);
     writeFileSync(
-      join(wt, 'stack.yaml'),
-      readFileSync(join(wt, 'stack.yaml'), 'utf8').replace('api: { run: node srv.mjs', 'api: { run: node boom.mjs'),
+      join(wt, 'runly.yml'),
+      readFileSync(join(wt, 'runly.yml'), 'utf8').replace('api: { run: node srv.mjs', 'api: { run: node boom.mjs'),
     );
     const narrowed = await cli(['up', 'api', '--json']);
     expect(narrowed.code).not.toBe(0);
@@ -188,7 +188,7 @@ describe('preview tunnels (teardown and lifecycle)', () => {
 
 function presetPreview(hotReload = false) {
   const f = ctx({}, '', hotReload);
-  const manifestPath = join(f.wt, 'stack.yaml');
+  const manifestPath = join(f.wt, 'runly.yml');
   const manifest = parse(readFileSync(manifestPath, 'utf8'));
   manifest.datastores = { main: {
     driver: 'sqlite', presets: ['dev', 'alternate'], default_preset: { session: 'dev' },

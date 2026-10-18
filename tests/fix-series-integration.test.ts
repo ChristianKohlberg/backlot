@@ -23,7 +23,7 @@ function fixture() {
     datastores: { main: { driver: 'sqlite', create: 'node seed.mjs "{{ns}}" "{{preset}}"', template: true, presets: ['dev', 'alternate'] } },
     preview: { forbidden: false },
   };
-  const save = () => writeFileSync(join(tree, 'stack.yaml'), JSON.stringify(manifest)); save();
+  const save = () => writeFileSync(join(tree, 'runly.yml'), JSON.stringify(manifest)); save();
   writeFileSync(join(tree, 'server.mjs'), "import{createServer}from'node:http';createServer((q,s)=>s.end('ok')).listen(Number(process.env.PORT),'127.0.0.1');\n");
   writeFileSync(join(tree, 'seed.mjs'), "import{DatabaseSync}from'node:sqlite';const d=new DatabaseSync(process.argv[2]);d.exec('CREATE TABLE marker(value TEXT)');d.prepare('INSERT INTO marker VALUES (?)').run(process.argv[3]);d.close();\n");
   const child = join(root, 'child.mjs'); const launcher = join(root, 'launcher.mjs'); const bin = join(root, 'cloudflared');

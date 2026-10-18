@@ -49,7 +49,7 @@ function makeWt(name: string, extra = ''): string {
   const dir = mkdtempSync(join(tmpdir(), `runly-cfx-${name}-`));
   writeFileSync(join(dir, 'server.mjs'), SERVE);
   writeFileSync(
-    join(dir, 'stack.yaml'),
+    join(dir, 'runly.yml'),
     `name: ${name}
 services:
   web: { run: node server.mjs, port: web, env: { PORT: "{{ports.web}}" }, ready: { http: /, timeout: 20 } }

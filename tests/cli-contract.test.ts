@@ -58,7 +58,7 @@ describe('a wedged daemon must not hang the caller forever', () => {
     const stateDir = mkdtempSync(join(tmpdir(), 'runly-wedge-'));
     const wt = mkdtempSync(join(tmpdir(), 'runly-wedge-wt-'));
     dirs.push(stateDir, wt);
-    writeFileSync(join(wt, 'stack.yaml'), `name: wedge\nservices: {}\n`);
+    writeFileSync(join(wt, 'runly.yml'), `name: wedge\nservices: {}\n`);
 
     // A daemon that is ALIVE (answers ping, so the CLI does not just replace it)
     // but wedged on real work. This is the case req.setTimeout alone did nothing
@@ -113,7 +113,7 @@ describe('an over-limit socket path is refused as infra, not silently truncated'
     const stateDir = join(base, 'x'.repeat(120));
     const wt = mkdtempSync(join(tmpdir(), 'runly-sun-cli-wt-'));
     dirs.push(base, stateDir, wt);
-    writeFileSync(join(wt, 'stack.yaml'), `name: sun\nservices: {}\n`);
+    writeFileSync(join(wt, 'runly.yml'), `name: sun\nservices: {}\n`);
 
     const { code, stdout } = await new Promise<{ code: number; stdout: string }>((resolve) => {
       execFile(
@@ -137,7 +137,7 @@ describe('exec preserves argument boundaries', () => {
     const stateDir = mkdtempSync(join(tmpdir(), 'runly-exec-'));
     const wt = mkdtempSync(join(tmpdir(), 'runly-exec-wt-'));
     dirs.push(stateDir, wt);
-    writeFileSync(join(wt, 'stack.yaml'), `name: ex\nservices:\n  idle: { run: "echo ready; sleep 300", ready: { log: "ready", timeout: 20 } }\n`);
+    writeFileSync(join(wt, 'runly.yml'), `name: ex\nservices:\n  idle: { run: "echo ready; sleep 300", ready: { log: "ready", timeout: 20 } }\n`);
     execFileSync('git', ['init', '-q'], { cwd: wt });
     const env = { ...process.env, BACKLOT_STATE_DIR: stateDir, BACKLOT_SWEEP_MS: '500' };
     const cli = (args: string[]) =>
@@ -158,7 +158,7 @@ describe('exec preserves argument boundaries', () => {
     const stateDir = mkdtempSync(join(tmpdir(), 'runly-exec2-'));
     const wt = mkdtempSync(join(tmpdir(), 'runly-exec2-wt-'));
     dirs.push(stateDir, wt);
-    writeFileSync(join(wt, 'stack.yaml'), `name: ex2\nservices:\n  idle: { run: "echo ready; sleep 300", ready: { log: "ready", timeout: 20 } }\n`);
+    writeFileSync(join(wt, 'runly.yml'), `name: ex2\nservices:\n  idle: { run: "echo ready; sleep 300", ready: { log: "ready", timeout: 20 } }\n`);
     execFileSync('git', ['init', '-q'], { cwd: wt });
     const env = { ...process.env, BACKLOT_STATE_DIR: stateDir, BACKLOT_SWEEP_MS: '500' };
     const cli = (args: string[]) =>
@@ -178,7 +178,7 @@ describe('bounded flags are validated, not silently coerced', () => {
     const stateDir = mkdtempSync(join(tmpdir(), 'runly-lines-'));
     const wt = mkdtempSync(join(tmpdir(), 'runly-lines-wt-'));
     dirs.push(stateDir, wt);
-    writeFileSync(join(wt, 'stack.yaml'), `name: ln\nservices: {}\n`);
+    writeFileSync(join(wt, 'runly.yml'), `name: ln\nservices: {}\n`);
     execFileSync('git', ['init', '-q'], { cwd: wt });
     const code = await new Promise<number>((resolve) => {
       execFile(

@@ -61,7 +61,7 @@ describe('a service that daemonizes is refused, fast and with the blame on the r
     // The classic accident: the run command backgrounds the real process and
     // returns 0 at once. The declared ready gate would wait 30s if polled.
     writeFileSync(
-      join(wt, 'stack.yaml'),
+      join(wt, 'runly.yml'),
       `name: dmz\nservices:\n  bg: { run: "sleep 300 &", ready: { log: "never-logged", timeout: 30 } }\n`,
     );
     execFileSync('git', ['init', '-q'], { cwd: wt });

@@ -7,7 +7,7 @@
  * through the real CLI, all mechanics repo-declared commands.
  *
  * This is the "mssql template_restore needs a real consumer" backlog item:
- * the command pair below is exactly what Revamp's stack.yaml would declare to
+ * the command pair below is exactly what Revamp's runly.yml would declare to
  * stop re-seeding (~30-50 s) on every bind.
  *
  * The image is amd64-only; on Apple Silicon it runs under Rosetta emulation,
@@ -88,7 +88,7 @@ describe.skipIf(!hasMssql)('mssql datastore (docker-gated)', () => {
     }
     if (!up) throw new Error(`${IMAGE} in ${CONTAINER} never answered sqlcmd`);
     writeFileSync(
-      join(wt, 'stack.yaml'),
+      join(wt, 'runly.yml'),
       `name: hello-mssql
 services:
   app:

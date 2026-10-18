@@ -42,7 +42,7 @@ function ctx(opts: { total: number; idleTtlMs?: number; sweepMs?: number; stubbo
     const wt = mkdtempSync(join(tmpdir(), `runly-mcap-${name}-`));
     dirs.push(wt);
     writeFileSync(
-      join(wt, 'stack.yaml'),
+      join(wt, 'runly.yml'),
       // The cheapest manifest the schema allows (it requires at least one
       // service): a shell that announces readiness and idles. No port, no build,
       // no datastore — none of which capacity accounting counts.

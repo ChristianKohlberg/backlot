@@ -130,10 +130,10 @@ services:
 });
 
 describe('messages name the manifest actually loaded', () => {
-  it('a repo whose manifest is backlot.yml is told about backlot.yml, not runly.yml', async () => {
+  it('a repo whose manifest is runly.yaml is told about runly.yaml, not runly.yml', async () => {
     const c = ctx();
     const wt = c.worktree({
-      'backlot.yml': `name: mfname
+      'runly.yaml': `name: mfname
 services:
   web:
     run: node server.mjs
@@ -145,10 +145,10 @@ services:
     });
     const db = await c.cli(['db', 'new', 'nosuch'], wt);
     expect(db.code).not.toBe(0);
-    expect(db.stdout + db.stderr).toMatch(/no datastore 'nosuch' in backlot\.yml/);
+    expect(db.stdout + db.stderr).toMatch(/no datastore 'nosuch' in runly\.yaml/);
     const svc = await c.cli(['up', 'nope'], wt);
     expect(svc.code).not.toBe(0);
-    expect(svc.stdout + svc.stderr).toMatch(/no service 'nope' in backlot\.yml/);
+    expect(svc.stdout + svc.stderr).toMatch(/no service 'nope' in runly\.yaml/);
     await c.cli(['destroy', '--json'], wt);
   }, 60_000);
 });

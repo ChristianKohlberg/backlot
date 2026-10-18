@@ -46,7 +46,7 @@ it('public origin closes at its deadline even while a build holds the environmen
   const args = JSON.parse(readFileSync(join(stateDir, 'tunnel.pid.args'), 'utf8')) as string[];
   const origin = args[args.indexOf('--url') + 1]!;
   expect((await fetch(origin)).status).toBe(200);
-  const manifest = join(wt, 'stack.yaml');
+  const manifest = join(wt, 'runly.yml');
   writeFileSync(manifest, readFileSync(manifest, 'utf8').replace('web: { run:', 'web: { build: "sleep 5", run:'));
   const building = cli(['up', '--json']);
   await sleep(Math.max(0, Number(preview.json?.expiresAt) - Date.now()) + 150);
@@ -117,7 +117,7 @@ it('failed up leaves the existing preview deadline unchanged', async () => {
   const { cli, wt } = ctx();
   await cli(['up', '--json']);
   const published = await cli(['preview', 'web', '--json']);
-  const manifest = join(wt, 'stack.yaml');
+  const manifest = join(wt, 'runly.yml');
   writeFileSync(manifest, readFileSync(manifest, 'utf8').replace('web: { run:', 'web: { build: "exit 1", run:'));
   const failed = await cli(['up', '--json']);
   expect(failed.code).not.toBe(0);
@@ -131,7 +131,7 @@ it.each(['stop', 'forbidden'])('expired preview stays private after %s, includin
   const published = await cli(['preview', 'web', '--ttl', '0.025', '--json']);
   await sleep(Math.max(0, Number(published.json?.expiresAt) - Date.now()) + 500);
   expect((await cli(['ctx', '--json'])).json?.previewRestore).toMatchObject({state: 'expired'});
-  const manifest = join(wt, 'stack.yaml');
+  const manifest = join(wt, 'runly.yml');
   const source = readFileSync(manifest, 'utf8');
   if (action === 'stop') expect((await cli(['preview', 'stop', '--json'])).code).toBe(0);
   else writeFileSync(manifest, source + '\npreview: { forbidden: true }\n');
@@ -147,7 +147,7 @@ it('failed up does not reopen expired access, and a publisher failure is reporte
   await cli(['up', '--json']);
   const published = await cli(['preview', 'web', '--ttl', '0.04', '--json']);
   await sleep(Math.max(0, Number(published.json?.expiresAt) - Date.now()) + 400);
-  const manifest = join(wt, 'stack.yaml');
+  const manifest = join(wt, 'runly.yml');
   const source = readFileSync(manifest, 'utf8');
   writeFileSync(manifest, source.replace('web: { run:', 'web: { build: "exit 1", run:'));
   expect((await cli(['up', '--json'])).code).not.toBe(0);

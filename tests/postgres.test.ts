@@ -57,7 +57,7 @@ describe.skipIf(!hasDocker)('postgres datastore (docker-gated)', () => {
       }
     }
     writeFileSync(
-      join(wt, 'stack.yaml'),
+      join(wt, 'runly.yml'),
       `name: hello-pg
 services:
   app:

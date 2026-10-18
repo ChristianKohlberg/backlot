@@ -95,7 +95,7 @@ export function ctx(extraEnv: Record<string, string> = {}, stackExtra = '', hotR
     `import{createServer}from'node:http';console.log('ready');createServer((q,s)=>s.end('ok')).listen(Number(process.env.PORT), '127.0.0.1');\n`,
   );
   writeFileSync(
-    join(wt, 'stack.yaml'),
+    join(wt, 'runly.yml'),
     `name: previewtest\nservices:\n  web: { run: node srv.mjs, port: web, env: { PORT: "{{ports.web}}" }, ready: { log: ready, timeout: 20 }${hotReload ? ', hot_reload: true' : ''} }\n  api: { run: node srv.mjs, port: api, env: { PORT: "{{ports.api}}" }, ready: { log: ready, timeout: 20 }${hotReload ? ', hot_reload: true' : ''} }\n${stackExtra}`,
   );
   execFileSync('git', ['init', '-q'], { cwd: wt });

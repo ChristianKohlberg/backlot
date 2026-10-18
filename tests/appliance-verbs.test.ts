@@ -78,7 +78,7 @@ function makeStack(port: number) {
       `createServer(() => {}).listen(${port}, '127.0.0.1', () => writeFileSync(process.argv[2], String(process.pid)));\n`,
   );
   writeFileSync(
-    join(wt, 'stack.yaml'),
+    join(wt, 'runly.yml'),
     [
       'name: applv',
       'services:',

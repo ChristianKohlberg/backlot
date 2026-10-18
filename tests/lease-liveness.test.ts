@@ -32,7 +32,7 @@ function ctx(extraEnv: Record<string, string> = {}) {
   dirs.push(stateDir, wt);
   writeFileSync(join(wt, 'srv.mjs'), `import{createServer}from'node:http';console.log('ready');createServer((q,s)=>s.end('ok')).listen(Number(process.env.PORT), '127.0.0.1');\n`);
   writeFileSync(
-    join(wt, 'stack.yaml'),
+    join(wt, 'runly.yml'),
     `name: lease\nservices:\n  web: { run: node srv.mjs, port: web, env: { PORT: "{{ports.web}}" }, ready: { log: ready, timeout: 20 } }\n`,
   );
   execFileSync('git', ['init', '-q'], { cwd: wt });
@@ -217,7 +217,7 @@ describe('a quiesce is never published as a teardown (decision 0021)', () => {
     // stretches the stop window to observable length.
     const c = ctx({ BACKLOT_SERVICE_IDLE_MS: '1000', BACKLOT_LEASE_TTL_MS: '600000' });
     writeFileSync(
-      join(c.wt, 'stack.yaml'),
+      join(c.wt, 'runly.yml'),
       `name: lease\nservices:\n  web: { run: "trap '' TERM; echo ready; sleep 300", ready: { log: ready, timeout: 20 } }\n`,
     );
     expect((await c.cli(['up', '--json'])).code).toBe(0);

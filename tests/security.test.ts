@@ -52,7 +52,7 @@ ${extra}`;
 function makeWt(stackYaml: string): string {
   const dir = mkdtempSync(join(tmpdir(), 'runly-sec-wt-'));
   writeFileSync(join(dir, 'server.mjs'), SERVE);
-  writeFileSync(join(dir, 'stack.yaml'), stackYaml);
+  writeFileSync(join(dir, 'runly.yml'), stackYaml);
   execFileSync('git', ['init', '-q'], { cwd: dir });
   return dir;
 }

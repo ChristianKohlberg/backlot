@@ -491,7 +491,7 @@ describe('logs for a silent service (BACKLOG P3, 2026-07-03)', () => {
   // .log file ever exists for it.
   const dir = mkdtempSync(join(tmpdir(), 'runly-wt-silent-'));
   writeFileSync(
-    join(dir, 'stack.yaml'),
+    join(dir, 'runly.yml'),
     `name: silent\nservices:\n  quiet:\n    run: sleep 300\n    ready: { cmd: "true", timeout: 20 }\n`,
   );
   execFileSync('git', ['init', '-q'], { cwd: dir });

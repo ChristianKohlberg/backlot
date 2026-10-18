@@ -128,7 +128,7 @@ describe('stack identity (loadStack)', () => {
       const manifest = 'name: myapp\nservices:\n  web:\n    run: node s.mjs\n    port: web\n';
       for (const agent of ['agent-1', 'agent-2']) {
         mkdirSync(join(base, agent, 'myapp'), { recursive: true });
-        writeFileSync(join(base, agent, 'myapp', 'stack.yaml'), manifest);
+        writeFileSync(join(base, agent, 'myapp', 'runly.yml'), manifest);
       }
       const a = loadStack(join(base, 'agent-1', 'myapp'));
       const b = loadStack(join(base, 'agent-2', 'myapp'));
@@ -141,34 +141,31 @@ describe('stack identity (loadStack)', () => {
   });
 });
 
-describe('manifest filename (runly.yml, backlot.yml, stack.yaml accepted)', () => {
-  it('loads runly.yml as the canonical manifest, preferring it over stack.yaml', async () => {
+describe('manifest filenames', () => {
+  it('accepts both Runly extensions, prefers yml, searches upward and rejects retired names', async () => {
     const { mkdtempSync, mkdirSync, writeFileSync, rmSync } = await import('node:fs');
     const { tmpdir } = await import('node:os');
     const { loadStack } = await import('../src/core/manifest.js');
     const base = mkdtempSync(join(tmpdir(), 'runly-manifest-'));
     try {
-      const svc = 'services:\n  web:\n    run: node s.mjs\n    port: web\n';
-      // runly.yml alone: the canonical name must work.
-      mkdirSync(join(base, 'canonical'));
-      writeFileSync(join(base, 'canonical', 'runly.yml'), `name: canonical\n${svc}`);
-      expect(loadStack(join(base, 'canonical')).manifest.name).toBe('canonical');
-      // Both present: runly.yml wins (the rename, not a coin toss).
-      mkdirSync(join(base, 'both'));
-      writeFileSync(join(base, 'both', 'runly.yml'), `name: new-name\n${svc}`);
-      writeFileSync(join(base, 'both', 'stack.yaml'), `name: old-name\n${svc}`);
-      writeFileSync(join(base, 'both', 'backlot.yml'), `name: backlot-name\n${svc}`);
-      expect(loadStack(join(base, 'both')).manifest.name).toBe('new-name');
-      // Existing Backlot repos remain valid and beat the older stack.yaml name.
-      mkdirSync(join(base, 'backlot'));
-      writeFileSync(join(base, 'backlot', 'backlot.yml'), `name: backlot-name\n${svc}`);
-      expect(loadStack(join(base, 'backlot')).manifest.name).toBe('backlot-name');
-      writeFileSync(join(base, 'backlot', 'stack.yaml'), `name: oldest-name\n${svc}`);
-      expect(loadStack(join(base, 'backlot')).manifest.name).toBe('backlot-name');
-      // stack.yaml alone: pre-rename repos keep working across the upgrade.
-      mkdirSync(join(base, 'legacy'));
-      writeFileSync(join(base, 'legacy', 'stack.yaml'), `name: legacy\n${svc}`);
-      expect(loadStack(join(base, 'legacy')).manifest.name).toBe('legacy');
+      for (const name of ['runly.yml', 'runly.yaml', 'backlot.yml', 'stack.yaml']) {
+        const dir = join(base, 'case-' + name);
+        mkdirSync(join(dir, 'child'), { recursive: true });
+        writeFileSync(join(dir, name), 'name: filename-test\nservices: {web: {run: "true"}}\n');
+        if (name.startsWith('runly.')) {
+          expect(loadStack(join(dir, 'child')).file).toBe(name);
+        } else {
+          expect(() => loadStack(dir)).toThrow(/no runly.yml or runly.yaml/);
+        }
+      }
+      const both = join(base, 'both');
+      mkdirSync(both);
+      writeFileSync(join(both, 'runly.yaml'), 'name: yaml-choice\nservices: {web: {run: "true"}}\n');
+      writeFileSync(join(both, 'runly.yml'), 'name: yml-choice\nservices: {web: {run: "true"}}\n');
+      expect(loadStack(both).manifest.name).toBe('yml-choice');
+      // An invalid preferred file must not silently fall back to another config.
+      writeFileSync(join(both, 'runly.yml'), 'name: [invalid]\nservices: {web: {run: "true"}}\n');
+      expect(() => loadStack(both)).toThrow();
     } finally {
       rmSync(base, { recursive: true, force: true });
     }

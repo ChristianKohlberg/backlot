@@ -46,7 +46,7 @@ function ctx(extraEnv: Record<string, string> = {}) {
     `import{createServer}from'node:http';console.log('ready');createServer((q,s)=>s.end('ok')).listen(Number(process.env.PORT), '127.0.0.1');\n`,
   );
   writeFileSync(
-    join(wt, 'stack.yaml'),
+    join(wt, 'runly.yml'),
     `name: agentlease\nservices:\n  web: { run: node srv.mjs, port: web, env: { PORT: "{{ports.web}}" }, ready: { log: ready, timeout: 20 } }\n`,
   );
   execFileSync('git', ['init', '-q'], { cwd: wt });
@@ -137,7 +137,7 @@ describe('pool recycle honours the environment it was given (#40)', () => {
     // (decision 0032).
     const wt2 = mkdtempSync(join(tmpdir(), 'runly-agentlease-wt2-'));
     cleanups.push(() => rmSync(wt2, { recursive: true, force: true }));
-    for (const f of ['srv.mjs', 'stack.yaml']) writeFileSync(join(wt2, f), readFileSync(join(wt, f)));
+    for (const f of ['srv.mjs', 'runly.yml']) writeFileSync(join(wt2, f), readFileSync(join(wt, f)));
     execFileSync('git', ['init', '-q'], { cwd: wt2 });
     const a = await cli(['up', '--json']);
     expect(a.code).toBe(0);
@@ -279,7 +279,7 @@ describe('token --raw prints what an Authorization header wants (#41, #39)', () 
   it('prints the bare token, and ctx advertises the supported path', async () => {
     const { cli, wt } = ctx();
     writeFileSync(
-      join(wt, 'stack.yaml'),
+      join(wt, 'runly.yml'),
       `name: agentlease\nservices:\n  web: { run: node srv.mjs, port: web, env: { PORT: "{{ports.web}}" }, ready: { log: ready, timeout: 20 } }\n` +
         `auth:\n  token: "printf tk_{{role}}"\n`,
     );

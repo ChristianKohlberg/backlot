@@ -275,7 +275,7 @@ export interface Stack {
   root: string;
   /** Stable identity: pools are keyed by this. */
   id: string;
-  /** The manifest's file name as found (runly.yml, backlot.yml or stack.yaml), for messages. */
+  /** The manifest's file name as found (runly.yml or runly.yaml), for messages. */
   file?: string;
 }
 
@@ -305,10 +305,8 @@ function validate(data: unknown): void {
 }
 
 /** Walk upward from cwd to the nearest manifest. */
-/** runly.yml is canonical; backlot.yml and stack.yaml stay accepted so
- * existing consumers survive the upgrade. When several exist, runly.yml wins —
- * a rename, not a coin toss. */
-export const MANIFEST_NAMES = ['runly.yml', 'backlot.yml', 'stack.yaml'] as const;
+/** Both Runly extensions are accepted; .yml wins when both exist. */
+export const MANIFEST_NAMES = ['runly.yml', 'runly.yaml'] as const;
 
 function manifestIn(dir: string): string | null {
   for (const name of MANIFEST_NAMES) {
@@ -334,7 +332,7 @@ export function findStackRoot(from: string): string {
     if (manifestIn(dir)) return dir;
     const parent = dirname(dir);
     if (parent === dir) {
-      throw new BrokerError('work-error', `no runly.yml (or backlot.yml / stack.yaml) found from ${from} upward`, 'manifest');
+      throw new BrokerError('work-error', `no runly.yml or runly.yaml found from ${from} upward`, 'manifest');
     }
     dir = parent;
   }
@@ -348,7 +346,7 @@ export function findStackRoot(from: string): string {
 export function loadStack(from: string, opts: { validate?: boolean } = {}): Stack {
   const root = findStackRoot(from);
   const file = manifestIn(root);
-  if (!file) throw new BrokerError('work-error', `no runly.yml (or backlot.yml / stack.yaml) in ${root}`, 'manifest');
+  if (!file) throw new BrokerError('work-error', `no runly.yml or runly.yaml in ${root}`, 'manifest');
   const manifest = parse(readFileSync(file, 'utf8')) as Manifest;
   if (opts.validate !== false) validate(manifest);
   // A path that escapes the worktree is refused at load, whether or not an

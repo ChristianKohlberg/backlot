@@ -67,7 +67,7 @@ createServer((q, s) => s.end('clean')).listen(Number(process.env.PORT), '127.0.0
     writeFileSync(join(wt, 'dep.txt'), 'v1\n');
     writeFileSync(join(wt, '.gitignore'), 'cache/\n');
     writeFileSync(
-      join(wt, 'stack.yaml'),
+      join(wt, 'runly.yml'),
       `name: escalate
 services:
   web:
@@ -124,7 +124,7 @@ setTimeout(() => process.exit(1), 250); // dies AFTER readiness — the partial-
 `,
     );
     writeFileSync(
-      join(wt, 'stack.yaml'),
+      join(wt, 'runly.yml'),
       `name: flappy
 services:
   web: { run: node server.mjs, port: web, env: { PORT: "{{ports.web}}" }, ready: { http: /, timeout: 20 } }
@@ -167,7 +167,7 @@ createServer((q, s) => s.end('ok')).listen(Number(process.env.PORT), '127.0.0.1'
 `,
     );
     writeFileSync(
-      join(wt, 'stack.yaml'),
+      join(wt, 'runly.yml'),
       `name: idle
 services:
   web: { run: node server.mjs, port: web, env: { PORT: "{{ports.web}}" }, ready: { http: /, timeout: 20 } }
@@ -228,7 +228,7 @@ describe('the upkeep ledger belongs to the worktree, not to an environment (deci
     writeFileSync(join(wt, 'dep.txt'), 'v1\n');
     writeFileSync(join(wt, '.gitignore'), 'node_modules/\nupkeep.log\n');
     writeFileSync(
-      join(wt, 'stack.yaml'),
+      join(wt, 'runly.yml'),
       `name: ledger
 services:
   idle: { run: "echo ready; sleep 300", ready: { log: "ready", timeout: 20 } }
@@ -270,7 +270,7 @@ describe('identity changes do not authorize data deletion', () => {
     // because the only orphan test was "stackRoot missing".
     writeFileSync(join(wt, 'server.mjs'), `import{createServer}from'node:http';console.log('up');createServer((q,s)=>s.end('ok')).listen(Number(process.env.PORT), '127.0.0.1');\n`);
     writeFileSync(
-      join(wt, 'stack.yaml'),
+      join(wt, 'runly.yml'),
       `name: strand\nservices:\n  web: { run: node server.mjs, port: web, env: { PORT: "{{ports.web}}" }, ready: { http: /, timeout: 20 } }\n`,
     );
     execFileSync('git', ['init', '-q'], { cwd: wt });

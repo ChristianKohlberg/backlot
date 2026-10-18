@@ -48,7 +48,7 @@ function ctx(extraEnv: Record<string, string> = {}) {
   const wt = mkdtempSync(join(tmpdir(), 'runly-atom-wt-'));
   dirs.push(stateDir, wt);
   writeFileSync(
-    join(wt, 'stack.yaml'),
+    join(wt, 'runly.yml'),
     `name: atom\nservices:\n  web: { run: "echo ready; sleep 300", ready: { log: ready, timeout: 20 } }\n`,
   );
   execFileSync('git', ['init', '-q'], { cwd: wt });

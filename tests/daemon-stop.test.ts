@@ -41,7 +41,7 @@ it('waits for slow service shutdown before completing and the next command reach
     writeFileSync(join(f.root, 'server.mjs'), `import {createServer} from 'node:http';
 process.on('SIGTERM',()=>setTimeout(()=>process.exit(0),800));
 createServer((q,s)=>s.end('ready')).listen(Number(process.env.PORT),'127.0.0.1');\n`);
-    writeFileSync(join(f.root, 'stack.yaml'), `name: stop-completion
+    writeFileSync(join(f.root, 'runly.yml'), `name: stop-completion
 services:
   web:
     run: node server.mjs

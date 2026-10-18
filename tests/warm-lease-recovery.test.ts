@@ -58,7 +58,7 @@ describe('a surviving lease on a restarted daemon', () => {
     const wt = mkdtempSync(join(tmpdir(), 'runly-warm-wt-'));
     dirs.push(stateDir, wt);
     writeFileSync(
-      join(wt, 'stack.yaml'),
+      join(wt, 'runly.yml'),
       `name: warm\nservices:\n  web: { run: "echo ready; sleep 300", ready: { log: ready, timeout: 20 } }\n`,
     );
     execFileSync('git', ['init', '-q'], { cwd: wt });

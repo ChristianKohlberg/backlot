@@ -25,7 +25,7 @@ const secret = process.env.TEST_CALLER_KEY;
 if (secret) { process.stdout.write(secret.slice(0, 3)); setTimeout(() => console.log(secret.slice(3)), 30); }
 createServer((q,s) => s.end(JSON.stringify({value:secret ?? null,pid:process.pid,extra:process.env.TEST_UNDECLARED ?? null}))).listen(Number(process.env.PORT),'127.0.0.1',()=>console.log('ready'));
 `);
-  writeFileSync(join(tree, 'backlot.yml'), `name: inputs
+  writeFileSync(join(tree, 'runly.yaml'), `name: inputs
 services:
   web:
     run: node server.mjs
@@ -150,12 +150,12 @@ describe('caller environment inputs', () => {
     expect((await f.cli(['status'])).code).toBe(0);
     const first = await f.cli(['up'], { TEST_CALLER_KEY: 'optional-secret' });
     expect(first.code).toBe(0);
-    const manifest = readFileSync(join(f.tree, 'backlot.yml'), 'utf8');
-    writeFileSync(join(f.tree, 'backlot.yml'), manifest.replace('    env_from: { TEST_CALLER_KEY: optional }\n', ''));
+    const manifest = readFileSync(join(f.tree, 'runly.yaml'), 'utf8');
+    writeFileSync(join(f.tree, 'runly.yaml'), manifest.replace('    env_from: { TEST_CALLER_KEY: optional }\n', ''));
     const removed = await f.cli(['reset-data']);
     expect(removed.code, removed.stderr + removed.stdout).toBe(0);
     expect((await f.response(removed.json)).value).toBeNull();
-    writeFileSync(join(f.tree, 'backlot.yml'), manifest);
+    writeFileSync(join(f.tree, 'runly.yaml'), manifest);
     const restored = await f.cli(['reset-data']);
     expect((await f.response(restored.json)).value).toBeNull();
     expect((await f.cli(['up'], { TEST_CALLER_KEY: 'optional-secret' })).code).toBe(0);
@@ -166,7 +166,7 @@ describe('caller environment inputs', () => {
 
   it('keeps a templated manifest default for an omitted optional input and masks the daemon without one', async () => {
     const f = fixture();
-    writeFileSync(join(f.tree, 'backlot.yml'), readFileSync(join(f.tree, 'backlot.yml'), 'utf8')
+    writeFileSync(join(f.tree, 'runly.yaml'), readFileSync(join(f.tree, 'runly.yaml'), 'utf8')
       .replace("env: { PORT: '{{ports.web}}' }", "env: { PORT: '{{ports.web}}', TEST_CALLER_KEY: 'default-{{public_ports.web}}' }"));
     // Boot the daemon with a same-named value: the manifest default must win over it.
     expect((await f.cli(['status'], { TEST_CALLER_KEY: 'stale-daemon-value' }, f.root)).code).toBe(0);
@@ -183,7 +183,7 @@ describe('caller environment inputs', () => {
     const returned = await f.cli(['up']);
     expect((await f.response(returned.json)).value).toBe(`default-${port}`);
     // Drop the default again: omission now masks the daemon's own value.
-    writeFileSync(join(f.tree, 'backlot.yml'), readFileSync(join(f.tree, 'backlot.yml'), 'utf8')
+    writeFileSync(join(f.tree, 'runly.yaml'), readFileSync(join(f.tree, 'runly.yaml'), 'utf8')
       .replace(", TEST_CALLER_KEY: 'default-{{public_ports.web}}'", ''));
     const masked = await f.cli(['up']);
     expect(masked.code, masked.stderr + masked.stdout).toBe(0);
@@ -192,7 +192,7 @@ describe('caller environment inputs', () => {
 
   it('binds a preserved slice whose service left the manifest instead of refusing before the claim', async () => {
     const f = fixture();
-    const manifest = readFileSync(join(f.tree, 'backlot.yml'), 'utf8').replace('    hot_reload: true\n', '') + [
+    const manifest = readFileSync(join(f.tree, 'runly.yaml'), 'utf8').replace('    hot_reload: true\n', '') + [
       '  worker:',
       '    run: node server.mjs',
       '    port: worker',
@@ -200,11 +200,11 @@ describe('caller environment inputs', () => {
       '    ready: { http: /, timeout: 10 }',
       '',
     ].join('\n');
-    writeFileSync(join(f.tree, 'backlot.yml'), manifest);
+    writeFileSync(join(f.tree, 'runly.yaml'), manifest);
     const slice = await f.cli(['up', 'worker']);
     expect(slice.code, slice.stderr + slice.stdout).toBe(0);
     expect(Object.keys(slice.json.urls)).toEqual(['worker']);
-    writeFileSync(join(f.tree, 'backlot.yml'), manifest.replace(/  worker:\n(    .*\n)+/, ''));
+    writeFileSync(join(f.tree, 'runly.yaml'), manifest.replace(/  worker:\n(    .*\n)+/, ''));
     // reset-data keeps the lease's slice, so it is the verb that meets the stale one.
     const synced = await f.cli(['reset-data']);
     expect(synced.code, synced.stderr + synced.stdout).toBe(0);
@@ -247,8 +247,8 @@ describe('caller environment inputs', () => {
       '    ready: { http: /, timeout: 10 }',
       '',
     ].join('\n');
-    const manifest = readFileSync(join(f.tree, 'backlot.yml'), 'utf8') + plainService;
-    writeFileSync(join(f.tree, 'backlot.yml'), manifest);
+    const manifest = readFileSync(join(f.tree, 'runly.yaml'), 'utf8') + plainService;
+    writeFileSync(join(f.tree, 'runly.yaml'), manifest);
     writeFileSync(join(f.tree, 'assert-clean.mjs'), "if(process.env.TEST_CALLER_KEY !== undefined) process.exit(12);console.log('clean');\n");
     // No status/prewarm: this command must create the actual shared daemon.
     const cold = await f.cli(['up'], { TEST_CALLER_KEY: 'first-caller-secret' });
@@ -264,7 +264,7 @@ describe('caller environment inputs', () => {
 
   it('refuses broker control names in env_from before autospawn', async () => {
     const f = fixture();
-    writeFileSync(join(f.tree, 'backlot.yml'), readFileSync(join(f.tree, 'backlot.yml'), 'utf8')
+    writeFileSync(join(f.tree, 'runly.yaml'), readFileSync(join(f.tree, 'runly.yaml'), 'utf8')
       .replace('TEST_CALLER_KEY: optional', 'BACKLOT_STATE_DIR: required'));
     const result = await f.cli(['up']);
     expect(result.code).toBe(1);
