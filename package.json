@@ -1,5 +1,5 @@
 {
-  "name": "runly",
+  "name": "@theford/runly",
   "version": "0.20.0",
   "description": "The repo-aware environment broker: puts a working, seeded, provable instance of your web application in front of coding agents and humans — warm pools, leases, bind-by-sync. Brokers environments; never provides them.",
   "keywords": [
@@ -21,6 +21,9 @@
   "bin": {
     "runly": "dist/cli/index.js",
     "backlot": "dist/cli/index.js"
+  },
+  "publishConfig": {
+    "access": "public"
   },
   "files": [
     "dist",

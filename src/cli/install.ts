@@ -35,19 +35,23 @@ export function installKind(): InstallInfo {
     // pnpm materialises packages under a `.pnpm` store and links them, so the
     // real path names it even when the link does not.
     if (parts.some((p) => p === '.pnpm')) {
-      return { kind: 'pnpm', root, upgradeHint: 'pnpm add -g runly@latest' };
+      return { kind: 'pnpm', root, upgradeHint: 'pnpm add -g @theford/runly@latest' };
     }
     // A global npm root is a node_modules with no package.json ABOVE it; a
     // project-local install always has the consuming project's manifest there.
-    const projectManifest = join(root, '..', '..', 'package.json');
+    // Scoped packages add an @scope directory beneath node_modules.
+    const packageParent = dirname(root);
+    const modulesRoot = packageParent.split(sep).at(-1)?.startsWith('@')
+      ? dirname(packageParent) : packageParent;
+    const projectManifest = join(modulesRoot, '..', 'package.json');
     if (existsSync(projectManifest)) {
       return {
         kind: 'node_modules',
         root,
-        upgradeHint: 'npm install runly@latest (this is a project-local install; update the dependency)',
+        upgradeHint: 'npm install @theford/runly@latest (this is a project-local install; update the dependency)',
       };
     }
-    return { kind: 'npm-global', root, upgradeHint: 'npm install -g runly@latest' };
+    return { kind: 'npm-global', root, upgradeHint: 'npm install -g @theford/runly@latest' };
   }
   // A checkout: dist/ is built from src/ in place, so the upgrade is a pull and
   // a rebuild. Never suggest npm here — it would install a second copy over the
