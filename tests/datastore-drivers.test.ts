@@ -4,7 +4,7 @@
  * whether a function was called.
  */
 import { describe, it, expect, afterAll } from 'vitest';
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync, existsSync, readFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync, utimesSync, existsSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
@@ -384,8 +384,18 @@ process.exit(0);
     mkdirSync(dir);
     const complete = 'app-dev@1234.db';
     const pending = 'app-dev@1234.db.42.abcd.pending';
+    // Model abandoned artifacts with explicit past mtimes. APFS timestamps
+    // can be fractionally ahead of Date.now(), legitimately keeping a freshly
+    // written file in grace even when graceMs is zero. Pending files remain
+    // newer than the completed template to exercise retention ranking.
+    const now = Date.now();
     writeFileSync(join(dir, complete), 'complete');
-    for (const suffix of ['', '-wal', '-shm', '-journal']) writeFileSync(join(dir, pending + suffix), 'incomplete');
+    utimesSync(join(dir, complete), new Date(now - 20_000), new Date(now - 20_000));
+    for (const suffix of ['', '-wal', '-shm', '-journal']) {
+      const file = join(dir, pending + suffix);
+      writeFileSync(file, 'incomplete');
+      utimesSync(file, new Date(now - 10_000), new Date(now - 10_000));
+    }
     expect(await pruneTemplates({ templatesKeep: 1, templateGraceMs: 0 }, root)).toBe(4);
     expect(readFileSync(join(dir, complete), 'utf8')).toBe('complete');
   });
