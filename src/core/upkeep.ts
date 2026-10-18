@@ -13,7 +13,8 @@ import { cmdTimeoutS, runBounded } from './exec.js';
 import { existsSync } from 'node:fs';
 import { globToRegex, sha256, fileHash, BrokerError, commandFailure, safeJoin } from './util.js';
 import { enumerateSource, enumerateSourceStats } from './worktree.js';
-import { upkeepOutputs, type Manifest } from './manifest.js';
+import { recordMetric } from './metrics.js';
+import { stackIdentity, upkeepOutputs, type Manifest } from './manifest.js';
 
 export interface UpkeepStep {
   /** 1-based position in the manifest's upkeep list — progress never names the command. */
@@ -175,7 +176,9 @@ export async function runUpkeep(
   for (const [index, rule] of (manifest.upkeep ?? []).entries()) {
     const key = ruleKey(rule);
     const position = index + 1;
+    const metricLabels = { stack: stackIdentity(manifest.name, root), reason: 'rule-' + position };
     if (rule.run.startsWith('@') && !builtins) {
+      recordMetric('upkeep.skipped', 1, { ...metricLabels, outcome: 'builtin-deferred' });
       outcome.steps.push({ index: position, when: rule.when, status: 'skipped', durationMs: 0, reason: 'acts on an environment\'s data; the next bind applies it' });
       continue;
     }
@@ -184,12 +187,14 @@ export async function runUpkeep(
     // behind is due again when that is gone (a pool's `git clean -fdx`).
     const missing = rule.run.startsWith('@') ? undefined : upkeepOutputs(rule).find((o) => !existsSync(safeJoin(root, o, 'upkeep outputs')));
     if (previous[key] === hash && missing === undefined) {
+      recordMetric('upkeep.skipped', 1, { ...metricLabels, outcome: 'unchanged' });
       outcome.steps.push({ index: position, when: rule.when, status: 'fresh', durationMs: 0 });
       continue;
     }
     if (previous[key] === hash) onProgress?.(`upkeep rule ${position}: its output ${missing} is missing — running it again`);
 
     const started = Date.now();
+    const metricStarted = performance.now();
     if (rule.run.startsWith('@')) {
       const [builtin, ...args] = rule.run.slice(1).split(/\s+/);
       if (builtin === 'rebake-template') {
@@ -215,7 +220,13 @@ export async function runUpkeep(
       let r;
       try {
         opts.onOutput?.begin(`${label} (when: ${rule.when})`);
-        r = await runBounded(rule.run, root, timeoutS, undefined, opts.onOutput);
+        try {
+          r = await runBounded(rule.run, root, timeoutS, undefined, opts.onOutput);
+          recordMetric('upkeep.run_ms', performance.now() - metricStarted, { ...metricLabels, outcome: r.timedOut || r.code !== 0 ? 'error' : 'success' });
+        } catch (err) {
+          recordMetric('upkeep.run_ms', performance.now() - metricStarted, { ...metricLabels, outcome: 'error' });
+          throw err;
+        }
       } finally {
         if (heartbeat) clearInterval(heartbeat);
       }

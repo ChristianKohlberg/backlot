@@ -371,3 +371,14 @@ generic 503 with Retry-After on failure/timeout. Binary/TLS/established streams 
 receive injected HTTP. Never expose raw exceptions/logs publicly. Local proxy stats
 carry `lastError` and `readyAt`; using `runly ps`, `ctx --json`, logs and daemon events
 provides diagnostics. Regression tests: preview-deadline, proxy-errors, proxy-reset.
+
+## Local measurements (decision 0049)
+
+stats/monitor never touch activity, admit work or wake services. Metrics store is
+bounded, local, best-effort and batched; flush after closing proxies at shutdown.
+Proxy callbacks must clear inherited bind metric context. Cold-wake operation IDs
+link the triggering connection to startup only; first-byte is connection-level,
+not HTTP request latency. Keep names/labels free of commands, URLs and payloads.
+Live budget values are declared costs. Persisted duration histogram estimates and
+daemon-life proxy counters have different reset/coverage semantics; expose both.
+See tests/metrics*.test.ts, proxy-metrics, proxy-metric-context and datastore-metrics.

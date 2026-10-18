@@ -23,6 +23,8 @@
  */
 import { createServer, connect, type Server, type Socket } from 'node:net';
 import { logEvent } from '../core/events.js';
+import { randomUUID } from 'node:crypto';
+import { recordMetric } from '../core/metrics.js';
 
 export type TargetState = 'down' | 'starting' | 'up';
 
@@ -57,7 +59,7 @@ export interface ProxyStats {
  * (closed). Returning false closes it at once, which is what a client saw
  * before the proxy existed: nothing listening.
  */
-export type WakeHook = (envId: string, key: string) => boolean;
+export type WakeHook = (envId: string, key: string, operationId?: string) => boolean;
 
 /** How long a connection may wait for its service to become ready. */
 export const HOLD_MS = (): number => Number(process.env.BACKLOT_PROXY_HOLD_MS ?? 90_000);
@@ -136,6 +138,17 @@ export function replayable(chunks: readonly Buffer[]): boolean {
   return IDEMPOTENT.test(head);
 }
 
+/** One measurement per accepted TCP connection, including all retries. */
+interface ConnectionMeasurement {
+  started: number;
+  firstByte: boolean;
+  rejected: boolean;
+  attempts: number;
+  operationId?: string;
+  holdStarted?: number;
+}
+const connectionMeasurements = new WeakMap<Socket, ConnectionMeasurement>();
+
 class Target {
   servers: Server[] = [];
   state: TargetState = 'down';
@@ -149,13 +162,42 @@ class Target {
   accepted = 0;
   readonly open = new Set<Socket>();
   waiters: Waiter[] = [];
+  private pendingClientBytes = 0;
+  private pendingServerBytes = 0;
+  private metricTimer?: NodeJS.Timeout;
+
+  private metric(name: string, value: number, reason?: string, operationId?: string): void {
+    recordMetric(name, value, {
+      stack: this.metricStack, envId: this.envId,
+      service: this.service ?? this.key,
+      // A listener inherits the async context of the bind that created it.
+      // Traffic hours later is not part of that operation (or datastore).
+      datastore: undefined, outcome: undefined, operationId, reason,
+    });
+  }
+
+  /** Chunk handlers only increment numbers. Disk aggregation runs at most every 5s. */
+  flushMetrics(): void {
+    if (this.pendingClientBytes) this.metric('proxy.client_bytes', this.pendingClientBytes);
+    if (this.pendingServerBytes) this.metric('proxy.server_bytes', this.pendingServerBytes);
+    this.pendingClientBytes = this.pendingServerBytes = 0;
+  }
+
+  private finishHold(client: Socket): void {
+    const m = connectionMeasurements.get(client);
+    if (m?.holdStarted === undefined) return;
+    this.metric('proxy.hold_ms', performance.now() - m.holdStarted, undefined, m.operationId);
+    m.holdStarted = undefined;
+  }
+
+  private metricStack?: string;
 
   constructor(
     readonly envId: string,
     readonly key: string,
     readonly port: number,
     private readonly hub: ProxyHub,
-  ) {}
+  ) { this.metricStack = hub.metricScope(envId); }
 
   stats(): ProxyStats {
     return {
@@ -174,15 +216,40 @@ class Target {
     };
   }
 
+  private startMetricTimer(): void {
+    if (!this.metricTimer) {
+      this.metricTimer = setInterval(() => this.flushMetrics(), 5000);
+      this.metricTimer.unref();
+    }
+  }
+
+  private requestWake(client: Socket): boolean {
+    const m = connectionMeasurements.get(client);
+    const operationId = m?.operationId ?? randomUUID();
+    const requested = this.hub.wake(this.envId, this.key, operationId);
+    if (requested && m) m.operationId = operationId;
+    return requested;
+  }
+
   onConnection(client: Socket): void {
     this.accepted++;
+    this.metric('proxy.accepted', 1);
+    this.startMetricTimer();
+    const measurement: ConnectionMeasurement = { started: performance.now(), firstByte: false, rejected: false, attempts: 0 };
+    connectionMeasurements.set(client, measurement);
+    client.once('close', () => {
+      this.finishHold(client);
+      this.metric('proxy.closed', 1, measurement.rejected ? 'rejected' : measurement.firstByte ? 'responded' : 'no_response', measurement.operationId);
+      this.flushMetrics();
+      connectionMeasurements.delete(client);
+    });
     // Never let a peer reset crash the daemon.
     client.on('error', () => client.destroy());
     if (this.state === 'up' && this.internalPort !== undefined) {
       this.forward(client, this.internalPort);
       return;
     }
-    if (this.state === 'down' && !this.hub.wake(this.envId, this.key)) {
+    if (this.state === 'down' && !this.requestWake(client)) {
       this.reject(client);
       return;
     }
@@ -191,9 +258,11 @@ class Target {
 
   private hold(client: Socket, carry?: Carry): void {
     if (this.waiters.length >= MAX_HELD) {
-      this.reject(client);
+      this.reject(client, carry, 'capacity');
       return;
     }
+    const measurement = connectionMeasurements.get(client);
+    if (measurement && measurement.holdStarted === undefined) measurement.holdStarted = performance.now();
     // A paused socket buffers what the client sends (and TCP backpressure
     // stops it beyond that), so nothing is lost while it waits.
     client.pause();
@@ -203,7 +272,7 @@ class Target {
       timer: setTimeout(() => {
         this.dropWaiter(waiter);
         this.lastError = 'Service startup exceeded the proxy wait deadline';
-        this.reject(client, carry);
+        this.reject(client, carry, 'timeout');
       }, carry ? Math.max(0, carry.deadline - Date.now()) : HOLD_MS()),
     };
     waiter.timer.unref();
@@ -213,8 +282,14 @@ class Target {
 
   /** Only a recognizable HTTP/1 request gets HTTP. Never inject into an
    * established stream or a binary/TLS protocol. Bound fragmented/absent input. */
-  private reject(client: Socket, carry?: Carry): void {
+  private reject(client: Socket, carry?: Carry, reason = 'unavailable'): void {
     if (client.destroyed) return;
+    this.finishHold(client);
+    const measurement = connectionMeasurements.get(client);
+    if (measurement && !measurement.rejected) {
+      measurement.rejected = true;
+      this.metric('proxy.rejected', 1, reason, measurement.operationId);
+    }
     let head = carry ? Buffer.concat(carry.chunks).subarray(0, 1024) : Buffer.alloc(0);
     let done = false;
     const finish = (http: boolean) => {
@@ -244,6 +319,7 @@ class Target {
   }
 
   private dropWaiter(waiter: Waiter): void {
+    this.finishHold(waiter.socket);
     clearTimeout(waiter.timer);
     const i = this.waiters.indexOf(waiter);
     if (i >= 0) this.waiters.splice(i, 1);
@@ -254,6 +330,7 @@ class Target {
     const waiters = this.waiters;
     this.waiters = [];
     for (const w of waiters) {
+      this.finishHold(w.socket);
       clearTimeout(w.timer);
       if (w.socket.destroyed) continue;
       if (this.state === 'up' && this.internalPort !== undefined) this.forward(w.socket, this.internalPort, w.carry);
@@ -278,6 +355,9 @@ class Target {
    * (decision 0039, corrected in 0.18.1).
    */
   private forward(client: Socket, internalPort: number, carry?: Carry): void {
+    this.startMetricTimer(); // Transferred held sockets did not enter this target's onConnection.
+    const measurement = connectionMeasurements.get(client);
+    if (measurement && measurement.attempts++ > 0) this.metric('proxy.retry', 1, carry?.replays ? 'reset' : 'refused', measurement.operationId);
     if (!this.open.has(client)) {
       this.open.add(client);
       client.once('close', () => this.open.delete(client));
@@ -308,6 +388,7 @@ class Target {
       const onData = (chunk: Buffer) => {
         // Count before forwarding.
         this.clientBytes += chunk.length;
+        this.pendingClientBytes += chunk.length;
         this.lastActivityAt = Date.now();
         this.hub.noteActivity(this.envId, this.key);
         if (!answered && retryable) {
@@ -328,6 +409,12 @@ class Target {
       // Count bytes, not open sockets: an idle keep-alive must still sleep.
       const onResponse = (chunk: Buffer) => {
         this.serverBytes += chunk.length;
+        this.pendingServerBytes += chunk.length;
+        const measurement = connectionMeasurements.get(client);
+        if (measurement && !measurement.firstByte) {
+          measurement.firstByte = true;
+          this.metric('proxy.first_byte_ms', performance.now() - measurement.started, undefined, measurement.operationId);
+        }
         this.lastActivityAt = Date.now();
         this.hub.noteActivity(this.envId, this.key);
       };
@@ -404,7 +491,7 @@ class Target {
     if (client.destroyed) return;
     if (Date.now() >= carry.deadline) {
       this.lastError = 'Service startup exceeded the proxy wait deadline';
-      this.reject(client, carry);
+      this.reject(client, carry, 'timeout');
       return;
     }
     if (this.state === 'starting') {
@@ -412,7 +499,7 @@ class Target {
       return;
     }
     if (this.state === 'down') {
-      if (this.hub.wake(this.envId, this.key)) this.hold(client, carry);
+      if (this.requestWake(client)) this.hold(client, carry);
       else this.reject(client, carry);
       return;
     }
@@ -430,6 +517,9 @@ class Target {
   }
 
   close(): void {
+    if (this.metricTimer) clearInterval(this.metricTimer);
+    this.metricTimer = undefined;
+    this.flushMetrics();
     for (const s of this.servers) s.close();
     this.servers = [];
     this.state = 'down';
@@ -489,6 +579,13 @@ function listenOn(server: Server, port: number, host: string): Promise<boolean> 
 
 export class ProxyHub {
   private targets = new Map<string, Target>();
+  private metricScopes = new Map<string, string>();
+
+  setMetricScope(envId: string, stack: string): void { this.metricScopes.set(envId, stack); }
+  metricScope(envId: string): string | undefined { return this.metricScopes.get(envId); }
+
+  /** Flush byte deltas before a stats snapshot without touching activity. */
+  flushMetrics(): void { for (const target of this.targets.values()) target.flushMetrics(); }
   /**
    * Internal ports handed to a start that is not `up` yet, by env/key. A port
    * is probed free when it is allocated, and the service binds it seconds
@@ -513,9 +610,9 @@ export class ProxyHub {
     this.activityHook = hook;
   }
 
-  wake(envId: string, key: string): boolean {
+  wake(envId: string, key: string, operationId?: string): boolean {
     try {
-      return this.wakeHook?.(envId, key) ?? false;
+      return this.wakeHook?.(envId, key, operationId) ?? false;
     } catch {
       return false;
     }
@@ -696,6 +793,7 @@ export class ProxyHub {
 
   /** Release every listener of an environment (teardown). */
   closeEnv(envId: string): void {
+    this.metricScopes.delete(envId);
     for (const [id, t] of this.targets) {
       if (t.envId === envId) {
         t.close();
@@ -709,6 +807,7 @@ export class ProxyHub {
     for (const t of this.targets.values()) t.close();
     this.targets.clear();
     this.reservedInternal.clear();
+    this.metricScopes.clear();
   }
 
   /** Stats by port key for one environment. */

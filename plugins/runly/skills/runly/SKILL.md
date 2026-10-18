@@ -10,7 +10,7 @@ from `runly.yml` or `runly.yaml` at the repo root. A per-machine daemon supervis
 services and holds a stable public port per service. You get URLs, logins and
 connection strings; you run your own tests against them.
 
-Every verb takes `--json` (stdout is one JSON object). Exit codes: `0` ok,
+Every verb takes `--json` (one object; monitor emits one per snapshot). Exit codes: `0` ok,
 `1` work-error (your code: fix it), `2` env-error (the environment: run `up`
 again), `3` infra-error (something external, or version skew: act on the
 message), `64` usage. Branch on the class, not just the code.
@@ -150,6 +150,16 @@ tether. This does not control the application environment.
   deadline; a restart restores it only if unexpired. End publication and disable
   reopening with `runly preview stop`. Check `previewExpiresAt` and
   `previewRestore` in `ctx --json`, and any `previewNotice` from `up`.
+
+## Measure before tuning
+
+Use runly stats --since 30m --json for this worktree's bounded history, or --all
+for the daemon. runly monitor --interval 2s --timeout 60 --json captures a bounded
+NDJSON observation window. Monitoring never keeps services active. Compare build
+skips/restarts, datastore bake/restore time, budget wait and wake duration before
+changing settings. Check sample counts and collection truncation/storage errors.
+Proxy first-byte timing is per TCP connection, not per HTTP request or WebSocket
+message. Budget figures are declared costs, not measured resource use.
 
 ## Inputs, recovery and installation
 

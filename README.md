@@ -105,7 +105,7 @@ and ignored.
 
 ## Command reference
 
-Every verb takes `--json` (stdout is one JSON object). Exit codes: `0` ok, `1`
+Every verb takes `--json` (one JSON object; `monitor` emits one per snapshot). Exit codes: `0` ok, `1`
 work-error (your code), `2` env-error (the environment), `3` infra-error
 (something external), `64` usage.
 
@@ -134,6 +134,8 @@ work-error (your code), `2` env-error (the environment), `3` infra-error
 | `runly destroy` | Tear down everything runly holds for this worktree: services, data, copies, ports, lease. Its build records, templates and the upkeep rules that declare `outputs` stay. |
 | `runly preview <svc> [--ttl <minutes>] [--https-port N]` | Publish one service through the preview publisher. Unauthenticated. Always expires: 30 minutes by default. `--ttl` changes public access only. Successful `up` renews active previews or reopens automatically expired ones for that TTL. Explicit `preview stop` keeps it private; restart alone never reopens expired access. |
 | `runly preview stop` | End the preview (also one a restart could not publish again). |
+| `runly stats [--all] [--since 30m]` | Local timings and counters, scoped to this worktree by default. Up to 24h bounded history; JSON includes correlated observations and coverage metadata. |
+| `runly monitor [--all] [--since 30m] [--interval 2s] [--timeout 60]` | Live statistics without waking services. Ctrl-C stops; JSON is NDJSON, one object per snapshot. |
 | `runly status` / `runly doctor` | Daemon, environments, budget and recent warnings (`--json` everything) / health and drift report. |
 | `runly appliance ls\|start\|stop [name]` | Probe, start or stop shared backing servers. |
 | `runly pool ls\|recycle [<env-id>] [--force]\|reconcile\|gc` | Environments; recycle one (or all); reap degraded ones; reclaim orphaned processes. |

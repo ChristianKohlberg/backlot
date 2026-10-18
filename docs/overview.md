@@ -443,3 +443,55 @@ Not a build system or build cache (it runs your commands; your build tools decid
 what is current). Not a test or checks runner (your tests read `ctx --env`). Not
 a dev or watch mode (run `up` after a change; a dev server that reloads itself
 just keeps running). Not CI, not an agent, and not a compute provider.
+
+## Measure and tune a setup
+
+Use recorded statistics during the first development sessions:
+
+~~~sh
+runly stats --since 30m
+runly stats --all --since 2h --json
+runly monitor --interval 2s
+runly monitor --since 30m --timeout 60 --json
+~~~
+
+Stats defaults to this worktree and the last 30 minutes; --all includes all
+worktrees on the daemon. Monitor refreshes sequentially until Ctrl-C or its
+timeout (seconds). Its JSON output is one object per line, suitable for capture.
+Neither command counts as environment activity or wakes services. Like other
+CLI reads, they can autostart a stopped daemon.
+
+Compare unchanged up, a source edit, a seed edit and idle/wake cycles.
+Measurements include bind/build phases, skipped builds/upkeep, budget waits,
+service readiness and idle stops, datastore bake/create/restore/drop, template
+reuse/retries, and proxy traffic, holds, retries and first upstream bytes.
+JSON recentOperations links a cold wake's triggering connection to its startup
+stages. It contains the latest 200 correlated observations, not a complete trace.
+
+A high datastore.restore_ms points to copying cost; repeated template_bake_ms
+suggests seed invalidation or cache reuse needs investigation. Slow
+wake.total_ms with high budget.wait_ms means load admission is a contributor.
+build.skipped, build.run_ms and service.restarts help distinguish avoided work
+from a fast build that still restarts services. These measurements describe what
+happened; they do not prove a cache's input set is correct.
+
+**First-byte timing is connection-level.** proxy.first_byte_ms starts at TCP
+accept and ends when the first upstream bytes reach the proxy. It includes
+startup delay for a cold connection, but cannot separate individual HTTP
+keep-alive requests or WebSocket messages, and does not prove client receipt.
+proxy.hold_ms measures explicit startup holds, excluding retry backoff.
+Quantiles apply to those observations, not all application requests.
+
+History uses minute buckets for up to 24 hours, bounded by entry and byte caps;
+heavy use can shorten it. Window starts round down to a minute. p50/p95 are
+histogram estimates; sample counts accompany them. Check collection for
+retainedSince, truncation, dropped observations and storage errors before drawing
+conclusions. retainedSince does not promise continuous coverage. Historical
+aggregates survive daemon restarts; live proxy totals do not. Machine budget
+figures are declared costs, not actual CPU/memory samples—use ps and bounded
+OS/container measurements for those. Data/build phases may overlap.
+
+Recording is local and stores no request contents, URLs, commands or credentials.
+Batched persistence can lose recent measurements on a crash. Monitoring has
+bounded overhead; it is not a replacement for application request tracing or
+an external latency benchmark.

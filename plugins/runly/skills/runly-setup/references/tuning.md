@@ -65,10 +65,17 @@ usage, explicitly label tuning provisional and hand back the measurements needed
 
 Capture a small baseline table: scenario, elapsed time, phase costs, services
 started/restarted, template baked/reused, resource peaks/queueing, and outcome.
-Use available bindDiagnostics from up --json, logs --build, ps --all, plan --json,
+Use stats --since 30m --json and bounded monitor --interval 2s --timeout 60
+--json captures, plus bindDiagnostics from up --json, logs --build, ps --all, plan --json,
 status events, and bounded OS/container measurements as appropriate.
 Read-only snapshots are fine; avoid a noisy continuous ps polling loop.
 Redact credentials and connection strings from saved observations.
+Check collection.retainedSince, truncation, storage errors and sample counts.
+Stats history uses minute buckets and approximate histogram quantiles; monitor
+JSON is NDJSON. Proxy first-byte observations are per TCP connection, not per
+application request. Shared budget figures are declared costs, not resource
+measurements. Use recentOperations to relate the triggering cold connection to
+its wake; it is bounded and does not trace every waiting connection.
 
 Exercise the relevant scenarios, using disposable test data/worktrees where
 needed; do not reset a user's database to manufacture a cold start:

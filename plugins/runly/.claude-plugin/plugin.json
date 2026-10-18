@@ -1,6 +1,6 @@
 {
   "name": "runly",
-  "version": "0.15.0",
+  "version": "0.16.0",
   "description": "Two stack-agnostic skills: runly for operating the CLI, and runly-setup for creating and validating manifests. CLI-only, no MCP server.",
   "author": {
     "name": "ChristianKohlberg"

@@ -110,6 +110,8 @@ async function dispatch(verb: string, args: Record<string, unknown>, emit: (phas
       return engine.applianceStart(cwd, args.name ? String(args.name) : undefined);
     case 'appliance-stop':
       return engine.applianceStop(cwd, String(args.name));
+    case 'stats':
+      return engine.stats(cwd, Boolean(args.all), args.sinceMs === undefined ? undefined : Number(args.sinceMs));
     case 'status':
       return engine.status();
     case 'doctor':

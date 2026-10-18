@@ -53,10 +53,11 @@ export function rpc(
   args: Record<string, unknown>,
   onProgress?: (phase: string) => void,
   deadlineMs?: number,
+  signal?: AbortSignal,
 ): Promise<RpcResponse> {
   return new Promise((resolve, reject) => {
     const req = request(
-      { socketPath: socketPath(), path: '/rpc', method: 'POST', headers: { 'content-type': 'application/json' } },
+      { signal, socketPath: socketPath(), path: '/rpc', method: 'POST', headers: { 'content-type': 'application/json' } },
       (res) => {
         let buf = '';
         let result: RpcResponse | undefined;

@@ -16,6 +16,7 @@ import { loadStack, manifestDeprecations } from '../core/manifest.js';
 import { parsePresetArgs } from '../core/presets.js';
 import { BrokerError } from '../core/util.js';
 import { parseSince, showLogs, type LogsSpec } from './logs.js';
+import { monitorStats, statsLines, type StatsData } from './metrics.js';
 import { autoTether } from './tether.js';
 import { formatDuration, formatSize, parseDuration } from '../core/units.js';
 import { exportLines, shellValue } from '../core/env-vars.js';
@@ -156,6 +157,12 @@ Usage:
                           that went)
   runly preview stop      stop the preview tunnel on your lease (also one a
                           restart could not publish again)
+  runly stats [--all] [--since 30m]
+                          bounded local measurements (up to 24h), no service wake.
+                          --json includes histogram estimates and recent operations.
+  runly monitor [--all] [--since 30m] [--interval 2s] [--timeout <seconds>]
+                          live statistics; Ctrl-C stops. --json emits one JSON
+                          object per line per snapshot (NDJSON).
   runly status            daemon, environments, the load budget and recent
                           warnings (--json: everything)
   runly appliance ls|start|stop [name]
@@ -230,7 +237,7 @@ const verb = rawArgv[0];
 // flag's value is never mis-bound as a positional (and an inner command's own
 // flags survive) — the F1 class of argv bugs. Everything after a lone `--`, and
 // EVERYTHING for `exec`, is treated as a raw passthrough command.
-const VALUE_FLAGS = new Set(['--holder', '--holder-pid', '--ttl', '--role', '--lines', '--ref', '--spec', '--preset', '--https-port', '--since', '--grep', '--until', '--timeout', '--runly-exit']);
+const VALUE_FLAGS = new Set(['--holder', '--holder-pid', '--ttl', '--role', '--lines', '--ref', '--spec', '--preset', '--https-port', '--since', '--grep', '--until', '--timeout', '--runly-exit', '--interval']);
 const BOOL_FLAGS = new Set(['--print', '--json', '--env', '--watch', '--reset-data', '--pristine', '--pull', '--detach', '--all', '--force', '--raw', '--data-only', '--progress', '--quiet', '--check', '--rebuild', '--follow', '--build', '--fix']);
 
 const flagVals = new Map<string, string>();
@@ -400,7 +407,7 @@ async function main(): Promise<void> {
     }
   }
 
-  const known = ['up', 'down', 'ctx', 'ps', 'plan', 'db', 'warm', 'exec', 'logs', 'token', 'reset-data', 'release', 'destroy', 'preview', 'status', 'doctor', 'appliance', 'pool', 'daemon', 'update'];
+  const known = ['up', 'down', 'ctx', 'ps', 'plan', 'db', 'warm', 'exec', 'logs', 'token', 'reset-data', 'release', 'destroy', 'preview', 'stats', 'monitor', 'status', 'doctor', 'appliance', 'pool', 'daemon', 'update'];
   if (!known.includes(verb)) {
     console.error(`runly: unknown verb '${verb}'\n\n${USAGE}`);
     process.exit(64);
@@ -418,6 +425,20 @@ async function main(): Promise<void> {
       console.error(`runly ${verb}: --env and --json are alternatives — pick one`);
       process.exit(64);
     }
+  }
+
+  let metricsOptions: { sinceMs: number; intervalMs: number; timeoutMs?: number };
+  if (verb === 'stats' || verb === 'monitor') {
+    const sinceMs = parseDuration(flagValue('--since') ?? '30m');
+    const intervalMs = parseDuration(flagValue('--interval') ?? '2s');
+    const timeoutMs = flagValue('--timeout') === undefined ? undefined : parseDuration(flagValue('--timeout'));
+    if (!Number.isFinite(sinceMs) || !sinceMs || sinceMs > 86_400_000 ||
+        !Number.isFinite(intervalMs) || intervalMs === undefined || intervalMs < 250 || intervalMs > 60_000 ||
+        (flagValue('--timeout') !== undefined && (!Number.isFinite(timeoutMs) || !timeoutMs || timeoutMs > 2_147_483_647))) {
+      console.error('runly: stats/monitor expects --since >0..24h, --interval 250ms..60s, and a positive bounded --timeout');
+      process.exit(64);
+    }
+    metricsOptions = { sinceMs, intervalMs, timeoutMs };
   }
 
   // Collect before autospawn: a malformed binding manifest must not start a
@@ -824,6 +845,28 @@ async function main(): Promise<void> {
           ...(ttlMs !== undefined ? { ttlMs } : {}),
           ...(httpsPort !== undefined ? { httpsPort } : {}),
         });
+      }
+      break;
+    }
+    case 'stats':
+    case 'monitor': {
+      const { sinceMs, intervalMs, timeoutMs } = metricsOptions!;
+      if (verb === 'stats') {
+        res = await rpc('stats', { cwd, all: flags.has('--all'), sinceMs });
+        if (res.ok && !json) {
+          console.log(statsLines(res.data as StatsData).join('\n'));
+          return;
+        }
+      } else {
+        await monitorStats(async (signal) => {
+          const result = await rpc('stats', { cwd, all: flags.has('--all'), sinceMs }, undefined, 10_000, signal);
+          if (!result.ok) {
+            const kind = result.error.class === 'work-error' || result.error.class === 'env-error' ? result.error.class : 'infra-error';
+            throw new BrokerError(kind, result.error.message, result.error.source);
+          }
+          return result.data as StatsData;
+        }, { json, intervalMs, timeoutMs });
+        return;
       }
       break;
     }

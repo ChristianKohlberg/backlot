@@ -35,6 +35,7 @@ import { confirmedMissing } from '../core/existence.js';
 import { kernelSleepGap, readKernelSleepRecord } from '../core/sleep.js';
 import { retentionSweep, sharedFilesFor, templateFiles, templateRefs, templateVerdicts } from '../core/retention.js';
 import { logEvent, recentEvents } from '../core/events.js';
+import { flushMetrics, measureMetric, metricsSnapshot, recordMetric, withMetricContext } from '../core/metrics.js';
 import { BindTrace, type BindDiagnostics } from '../core/diagnostics.js';
 import type { Hygiene, LeaseKind, ServicePid } from '../core/types.js';
 
@@ -167,10 +168,11 @@ function describeExit(exit: ServiceExit): string {
 }
 
 export class Engine {
+  private readonly metricsDaemonStartedAt = Date.now();
   constructor(private readonly reapServiceGroup: typeof killGroupVerified = killGroupVerified) {
     // Start on demand (decision 0035): a connection to a stopped, wanted
     // service's public port starts it; the proxy holds the connection meanwhile.
-    this.proxy.setWakeHook((envId, key) => this.requestWake(envId, key));
+    this.proxy.setWakeHook((envId, key, operationId) => this.requestWake(envId, key, operationId));
     // Client bytes are activity (decision 0035) — a clock per port, persisted throttled.
     this.proxy.setActivityHook((envId, key) => this.noteActivity(envId, key));
   }
@@ -636,6 +638,7 @@ export class Engine {
    * one line per moved port, empty when nothing moved.
    */
   private async ensureProxies(env: EnvRow): Promise<string[]> {
+    this.proxy.setMetricScope(env.id, env.stack);
     const moved: string[] = [];
     const block = publicBlock();
     for (const [key, port] of Object.entries(env.ports)) {
@@ -1063,7 +1066,7 @@ export class Engine {
       const recipe = env.dropRecipes?.[name];
       try {
         say(`dropping datastore '${name}' from this environment (copies_only)`);
-        if (recipe) await this.runDropRecipe(recipe, recipe.cwd && existsSync(recipe.cwd) ? recipe.cwd : stack.root);
+        if (recipe) await measureMetric('datastore.drop_ms', { stack: stack.id, envId: env.id, datastore: name, reason: 'removed' }, () => this.runDropRecipe(recipe, recipe.cwd && existsSync(recipe.cwd) ? recipe.cwd : stack.root));
         else await makeDatastore(name, spec, stack.id).drop({ envId: env.id, cwd: stack.root, dataDir: this.envDirs(env.id).data });
       } catch (err) {
         logEvent({ level: 'warn', kind: 'datastore', envId: env.id, detail: `datastore '${name}' is copies_only now, but dropping its environment namespace failed (teardown retries): ${String((err as Error).message ?? err)}` });
@@ -1164,31 +1167,40 @@ export class Engine {
   }
 
   private async bindAndStart(stack: Stack, envSnapshot: EnvRow, hygiene: Hygiene, onProgress?: Progress, requestedServices?: string[], freshClaim = false, callerEnv?: unknown, requestedPresets?: unknown, rebuild = false, signal?: AbortSignal): Promise<{ env: EnvRow; previewNotice?: string; bindDiagnostics: BindDiagnostics }> {
-    const say = onProgress ?? (() => undefined);
-    // The load budget (decision 0036): state what this bind builds and starts
-    // BEFORE doing any of it, and wait in the server-wide queue while it does
-    // not fit. The reservation's build share goes back after the build phase.
-    const live = this.journal.getEnv(envSnapshot.id) ?? envSnapshot;
-    const running = new Set(Object.keys(this.supervisor(live).pids()));
-    const base = freshClaim ? running : new Set([...this.desiredServices(stack, live), ...running]);
-    const added = requestedServices === undefined ? new Set<string>() : this.resolveServiceClosure(stack, requestedServices);
-    const active = new Set([...base, ...added].filter((n) => n in stack.manifest.services));
-    const decided: BuildDecisions = new Map();
-    const need = await this.needFor(stack, live, new Set([...active].filter((n) => !running.has(n))), this.bindScope(active, running, requestedServices, added), { rebuild: rebuild || hygiene === 'pristine', mode: 'bind' }, decided);
-    const reservation = await this.budget.admit(need, `up ${stack.manifest.name} (${live.id})`, {
-      onWait: (position, etaMs, why) => say(`waiting for the load budget: position ${position}, about ${formatDuration(etaMs)} — ${why}`),
-      source: 'budget',
-      signal,
-    });
-    try {
-      return await this.bindAndStartInner(stack, envSnapshot, hygiene, onProgress, requestedServices, freshClaim, callerEnv, requestedPresets, rebuild, reservation, decided);
-    } finally {
-      reservation.release();
-      // A public port marked `starting` whose service never became ready (a
-      // failed build, a boot timeout) must not keep holding connections until
-      // they time out: they are closed, as a client found it before the proxy.
-      this.proxy.settle(envSnapshot.id);
-    }
+    return withMetricContext({ stack: stack.id, envId: envSnapshot.id, operationId: shortId() }, () => measureMetric('bind.total_ms', {}, async () => {
+      const say = onProgress ?? (() => undefined);
+      // The load budget (decision 0036): state what this bind builds and starts
+      // BEFORE doing any of it, and wait in the server-wide queue while it does
+      // not fit. The reservation's build share goes back after the build phase.
+      const live = this.journal.getEnv(envSnapshot.id) ?? envSnapshot;
+      const running = new Set(Object.keys(this.supervisor(live).pids()));
+      const base = freshClaim ? running : new Set([...this.desiredServices(stack, live), ...running]);
+      const added = requestedServices === undefined ? new Set<string>() : this.resolveServiceClosure(stack, requestedServices);
+      const active = new Set([...base, ...added].filter((n) => n in stack.manifest.services));
+      const decided: BuildDecisions = new Map();
+      const need = await this.needFor(stack, live, new Set([...active].filter((n) => !running.has(n))), this.bindScope(active, running, requestedServices, added), { rebuild: rebuild || hygiene === 'pristine', mode: 'bind' }, decided);
+      const reservation = await measureMetric('budget.wait_ms', {}, () => this.budget.admit(need, `up ${stack.manifest.name} (${live.id})`, {
+        onWait: (position, etaMs, why) => say(`waiting for the load budget: position ${position}, about ${formatDuration(etaMs)} — ${why}`),
+        source: 'budget',
+        signal,
+      }));
+      try {
+        const result = await this.bindAndStartInner(stack, envSnapshot, hygiene, onProgress, requestedServices, freshClaim, callerEnv, requestedPresets, rebuild, reservation, decided);
+        for (const [phase, ms] of Object.entries(result.bindDiagnostics.phasesMs)) {
+          if (phase === 'queue') continue; // acquisition timing is recorded by up, outside bind
+          recordMetric('bind.' + phase + '_ms', ms, { outcome: 'success' });
+        }
+        for (const service of result.bindDiagnostics.restarted) recordMetric('service.restarts', 1, { service });
+        recordMetric('bind.reuse', 1, { reason: result.bindDiagnostics.reuse });
+        return result;
+      } finally {
+        reservation.release();
+        // A public port marked `starting` whose service never became ready (a
+        // failed build, a boot timeout) must not keep holding connections until
+        // they time out: they are closed, as a client found it before the proxy.
+        this.proxy.settle(envSnapshot.id);
+      }
+    }));
   }
 
   private async bindAndStartInner(stack: Stack, envSnapshot: EnvRow, hygiene: Hygiene, onProgress: Progress | undefined, requestedServices: string[] | undefined, freshClaim: boolean, callerEnv: unknown, requestedPresets: unknown, rebuild: boolean, reservation: Reservation, decided: BuildDecisions = new Map()): Promise<{ env: EnvRow; previewNotice?: string; bindDiagnostics: BindDiagnostics }> {
@@ -1741,6 +1753,7 @@ export class Engine {
     const cmd = ctx ? template(b.run, ctx) : b.run;
     const decision = await this.buildDecision(stack, name, spec, cmd, opts);
     if (!decision.run) {
+      recordMetric('build.skipped', 1, { stack: stack.id, envId: env?.id, service: name, reason: opts.mode });
       say(`build ${name}: skipped (${decision.reason})`);
       return { ran: false, durationMs: 0 };
     }
@@ -1748,7 +1761,7 @@ export class Engine {
     // Dropped before it runs: a build that fails half-way vouches for nothing.
     forgetBuild(stack.id, stack.root, name);
     try {
-      await this.runServiceBuild(name, cmd, stack.root, say, env ? this.envDirs(env.id).logs : undefined);
+      await measureMetric('build.run_ms', { stack: stack.id, envId: env?.id, service: name, reason: opts.mode }, () => this.runServiceBuild(name, cmd, stack.root, say, env ? this.envDirs(env.id).logs : undefined));
     } finally {
       // It may have written another build's inputs: later decisions are made afresh.
       opts.decided?.clear();
@@ -1965,9 +1978,14 @@ export class Engine {
         const beat = setInterval(() => say(`waiting for '${name}' … ${Math.round((now() - readyStart) / 1000)}s`), 3000);
         beat.unref();
         try {
-          await sup.waitReady(name, spec, url, serviceEnv);
+          await measureMetric('service.ready_ms', { stack: stack.id, envId: env.id, service: name }, () => sup.waitReady(name, spec, url, serviceEnv));
           clearInterval(beat);
           if (spec.port && internal !== undefined) this.proxy.up(env.id, spec.port, internal, name);
+          const idleAt = this.idleStoppedAt.get(`${env.id}\0${name}`);
+          if (idleAt !== undefined) {
+            recordMetric('service.idle_until_ready_ms', Math.max(0, now() - idleAt), { stack: stack.id, envId: env.id, service: name });
+            this.idleStoppedAt.delete(`${env.id}\0${name}`);
+          }
           say(`'${name}' ready`);
         } catch (err) {
           clearInterval(beat);
@@ -2068,6 +2086,7 @@ export class Engine {
         env.id,
         async () => {
           queueMs = performance.now() - queueStarted;
+          recordMetric('up.acquire_ms', queueMs, { stack: stack.id, envId: env.id });
           if (opts.signal?.aborted) throw new CallerGone('env-error', `the caller disconnected before its bind of ${env.id} started`, 'pool');
           const result = await this.bindAndStart(stack, env, hygiene, opts.onProgress, services, fresh, suppliedInputs, opts.presets, Boolean(opts.rebuild), opts.signal);
           const notice = await this.previewAfterUp(env.id);
@@ -3281,6 +3300,7 @@ export class Engine {
     } catch (err) {
       logEvent({ level: 'warn', kind: 'db', detail: `stopping the command of ${live.name} failed: ${String((err as Error).message ?? err)}` });
     }
+    const dropStarted = performance.now();
     let ok = true;
     let output: string | undefined;
     if (live.dropCmd) {
@@ -3298,6 +3318,7 @@ export class Engine {
         output = `refused to delete ${live.dropPath}: it is not a copy directory under ${dbCopiesRoot()}`;
       }
     }
+    recordMetric('datastore.drop_ms', performance.now() - dropStarted, { stack: live.stack, datastore: live.datastore, reason: 'copy', outcome: ok ? 'success' : 'error' });
     if (ok) {
       this.journal.deleteDbCopy(live.name);
       this.goneSince.delete(`copy:${live.name}`);
@@ -3834,6 +3855,36 @@ export class Engine {
     };
   }
 
+  stats(cwd: string, all = false, sinceMs = 30 * 60_000) {
+    if (!Number.isFinite(sinceMs) || sinceMs <= 0 || sinceMs > 86_400_000) {
+      throw new BrokerError('work-error', 'stats --since must be greater than zero and at most 24h', 'stats');
+    }
+    let stack: string | undefined;
+    if (!all) {
+      const dir = canonicalDirectory(cwd);
+      const candidates = this.journal.allEnvs().filter((env) => {
+        const rel = relative(env.stackRoot, dir);
+        return rel === '' || (!rel.startsWith('..' + sep) && rel !== '..' && !isAbsolute(rel));
+      }).sort((a, b) => b.stackRoot.length - a.stackRoot.length);
+      try { stack = loadStack(cwd, { validate: false }).id; }
+      catch (err) {
+        if (!candidates[0]) throw err;
+        stack = candidates[0].stack;
+      }
+    }
+    this.proxy.flushMetrics();
+    const environments = this.journal.allEnvs().filter((env) => stack === undefined || env.stack === stack).map((env) => ({
+      id: env.id, stack: env.stack, state: env.state, proxy: this.proxy.stats(env.id),
+    }));
+    const committed = this.budget.committed();
+    return {
+      ...metricsSnapshot({ sinceMs, stack }),
+      scope: all ? 'all' : stack,
+      live: { daemonStartedAt: this.metricsDaemonStartedAt, proxyCounters: 'since-listener-created; reset-on-daemon-restart', environments, budget: { scope: 'machine', waiting: this.budget.queueLength(),
+        committedMemoryBytes: committed.memoryBytes, committedCpu: committed.cpu } },
+    };
+  }
+
   /** Who a restart would make rebind: every live lease, named. */
   leaseHolders(): Array<{ envId: string; holder: string; kind: string }> {
     return this.journal.allLeases().map((l) => ({ envId: l.envId, holder: l.holder, kind: l.kind }));
@@ -4343,7 +4394,7 @@ export class Engine {
       const recipe = recipes[name];
       try {
         if (recipe) {
-          await this.runDropRecipe(recipe, cwdFor(recipe.cwd));
+          await measureMetric('datastore.drop_ms', { stack: env.stack, envId: env.id, datastore: name, reason: 'teardown' }, () => this.runDropRecipe(recipe, cwdFor(recipe.cwd)));
           continue;
         }
         const spec = stack?.manifest.datastores?.[name];
@@ -4620,6 +4671,7 @@ export class Engine {
         return;
       }
       for (const n of names) {
+        recordMetric('service.idle_stops', 1, { stack: env.stack, envId: env.id, service: n });
         this.idleStopped.add(`${env.id}\0${n}`);
         this.idleStoppedAt.set(`${env.id}\0${n}`, now());
       }
@@ -4655,7 +4707,7 @@ export class Engine {
    * stays down); the proxy holds the connection meanwhile. Synchronous and
    * cheap: the start runs in the background.
    */
-  private requestWake(envId: string, key: string): boolean {
+  private requestWake(envId: string, key: string, operationId?: string): boolean {
     try {
       if (this.stopping) return false;
       const env = this.journal.getEnv(envId);
@@ -4672,7 +4724,7 @@ export class Engine {
       if (this.blockedByFailure(stack, envId, name)) return false;
       const id = `${envId}\0${name}`;
       if (!this.waking.has(id)) {
-        const p = this.wakeService(env.id, name)
+        const p = this.wakeService(env.id, name, operationId)
           .catch((err) => logEvent({ level: 'warn', kind: 'wake', envId, detail: `starting '${name}' on demand failed: ${String((err as Error).message ?? err)}` }))
           .finally(() => this.waking.delete(id));
         this.waking.set(id, p);
@@ -4690,53 +4742,62 @@ export class Engine {
    * how long the proxy holds a connection), no rebuild unless needed (a
    * `when:` build whose inputs changed, or one that never succeeded here).
    */
-  private async wakeService(envId: string, name: string): Promise<void> {
-    const started = now();
-    let closure = new Set<string>([name]);
-    let keyOf: (n: string) => string | undefined = () => undefined;
-    try {
-      await this.envLocked(envId, async () => {
-        const env = this.journal.getEnv(envId);
-        const lease = this.journal.leaseForEnv(envId);
-        if (this.stopping || !env || env.state === 'recycling' || env.state === 'degraded' || (env.failStreak ?? 0) > 0) throw new BrokerError('env-error', `environment ${envId} cannot be woken (failed bind, or being torn down)`, 'wake');
-        const stack = loadStack(env.stackRoot);
-        if (stack.id !== env.stack) throw new BrokerError('env-error', 'worktree identity changed; run runly up', 'wake');
-        keyOf = (n) => stack.manifest.services[n]?.port;
-        const sup = this.supervisor(env);
-        const running = new Set(Object.keys(sup.pids()));
-        if (running.has(name)) {
-          // Started by an `up` while this waited: forward to it.
-          const key = keyOf(name);
-          const internal = key ? this.proxy.internalPortOf(envId, key) : undefined;
-          if (key && internal !== undefined) this.proxy.up(envId, key, internal, name);
-          return;
+  private async wakeService(envId: string, name: string, operationId?: string): Promise<void> {
+    return withMetricContext({ stack: this.journal.getEnv(envId)?.stack, envId, service: name, operationId: operationId ?? shortId() }, async () => {
+      const started = now();
+      const metricStarted = performance.now();
+      let outcome = 'success';
+      let closure = new Set<string>([name]);
+      let keyOf: (n: string) => string | undefined = () => undefined;
+      try {
+        await this.envLocked(envId, async () => {
+          const env = this.journal.getEnv(envId);
+          const lease = this.journal.leaseForEnv(envId);
+          if (this.stopping || !env || env.state === 'recycling' || env.state === 'degraded' || (env.failStreak ?? 0) > 0) throw new BrokerError('env-error', `environment ${envId} cannot be woken (failed bind, or being torn down)`, 'wake');
+          const stack = loadStack(env.stackRoot);
+          if (stack.id !== env.stack) throw new BrokerError('env-error', 'worktree identity changed; run runly up', 'wake');
+          keyOf = (n) => stack.manifest.services[n]?.port;
+          const sup = this.supervisor(env);
+          const running = new Set(Object.keys(sup.pids()));
+          if (running.has(name)) {
+            outcome = 'already-running';
+            // Started by an `up` while this waited: forward to it.
+            const key = keyOf(name);
+            const internal = key ? this.proxy.internalPortOf(envId, key) : undefined;
+            if (key && internal !== undefined) this.proxy.up(envId, key, internal, name);
+            return;
+          }
+          const wanted = this.desiredServices(stack, env);
+          closure = new Set([...this.resolveServiceClosure(stack, [name])].filter((n) => wanted.has(n) && !running.has(n)));
+          if (closure.size === 0) {
+            outcome = 'cancelled';
+            // A `down` queued ahead of this wake took the service out of the
+            // wanted set: nothing is to start. Close what the proxy holds now
+            // and leave the environment's state alone — marking it `hot` with
+            // nothing running held the client until the hold timeout.
+            const key = keyOf(name);
+            if (key && this.proxy.state(envId, key) !== 'up') this.proxy.down(envId, key);
+            return;
+          }
+          await this.startStoppedLocked(stack, env, lease, closure, {
+            label: `wake ${name} (${envId})`,
+            source: 'wake',
+            waitMs: Math.max(1000, HOLD_MS() - (now() - started) - 5_000),
+          });
+          logEvent({ level: 'info', kind: 'wake', envId, detail: `started ${[...closure].map((n) => `'${n}'`).join(', ')} on a connection to its public port (${formatDuration(now() - started)})` });
+        }, undefined, 'a start on demand');
+      } catch (err) {
+        outcome = 'error';
+        // Whatever the proxy holds for these services is closed now, not at the hold timeout.
+        for (const n of closure) {
+          const key = keyOf(n);
+          if (key && this.proxy.state(envId, key) !== 'up') this.proxy.down(envId, key, `Could not restore ${n}; inspect runly logs ${n} and daemon events`);
         }
-        const wanted = this.desiredServices(stack, env);
-        closure = new Set([...this.resolveServiceClosure(stack, [name])].filter((n) => wanted.has(n) && !running.has(n)));
-        if (closure.size === 0) {
-          // A `down` queued ahead of this wake took the service out of the
-          // wanted set: nothing is to start. Close what the proxy holds now
-          // and leave the environment's state alone — marking it `hot` with
-          // nothing running held the client until the hold timeout.
-          const key = keyOf(name);
-          if (key && this.proxy.state(envId, key) !== 'up') this.proxy.down(envId, key);
-          return;
-        }
-        await this.startStoppedLocked(stack, env, lease, closure, {
-          label: `wake ${name} (${envId})`,
-          source: 'wake',
-          waitMs: Math.max(1000, HOLD_MS() - (now() - started) - 5_000),
-        });
-        logEvent({ level: 'info', kind: 'wake', envId, detail: `started ${[...closure].map((n) => `'${n}'`).join(', ')} on a connection to its public port (${formatDuration(now() - started)})` });
-      }, undefined, 'a start on demand');
-    } catch (err) {
-      // Whatever the proxy holds for these services is closed now, not at the hold timeout.
-      for (const n of closure) {
-        const key = keyOf(n);
-        if (key && this.proxy.state(envId, key) !== 'up') this.proxy.down(envId, key, `Could not restore ${n}; inspect runly logs ${n} and daemon events`);
+        throw err;
+      } finally {
+        recordMetric('wake.total_ms', performance.now() - metricStarted, { outcome });
       }
-      throw err;
-    }
+    });
   }
 
   /**
@@ -4758,7 +4819,7 @@ export class Engine {
     // Resuming what ran a moment ago adds nothing the box did not just carry:
     // the CPU gate is skipped for it (the memory gates still apply).
     const recent = [...closure].every((n) => now() - (this.idleStoppedAt.get(`${env.id}\0${n}`) ?? -Infinity) < RECENT_RUN_MS);
-    const reservation = await this.budget.admit(need, opts.label, { waitMs: opts.waitMs, source: opts.source, skipLoadGate: recent });
+    const reservation = await measureMetric('budget.wait_ms', { stack: stack.id, envId: env.id, reason: 'resume' }, () => this.budget.admit(need, opts.label, { waitMs: opts.waitMs, source: opts.source, skipLoadGate: recent }));
     try {
       const say: Progress = opts.say ?? (() => undefined);
       await this.ensureAppliances(stack, say, reservation);
@@ -4916,6 +4977,7 @@ export class Engine {
     this.sweeping = true;
     try {
       await this.sweepOnce();
+      flushMetrics();
     } finally {
       this.sweeping = false;
     }
@@ -5094,6 +5156,7 @@ export class Engine {
     this.previewGates.clear();
     this.proxy.setWakeHook(undefined);
     this.proxy.closeAll();
+    flushMetrics();
     // Activity clocks survive a restart (decision 0035): whatever the throttle held back is written now.
     this.flushActivity(true);
     // Leases survive a daemon stop; their tunnels do not. Nothing supervises a
@@ -5127,5 +5190,6 @@ export class Engine {
     // The listeners go with the process anyway; closing them explicitly lets
     // a successor daemon bind them the moment this one has stopped.
     this.proxy.closeAll();
+    flushMetrics();
   }
 }
