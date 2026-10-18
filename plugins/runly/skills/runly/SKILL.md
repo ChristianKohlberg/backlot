@@ -1,12 +1,12 @@
 ---
 name: runly
-description: Use runly to put a running, seeded, authenticated instance of the web app in front of you before inspecting behaviour, proving a change with the repo's own tests, or reproducing a bug. Use when the repo has a runly.yml at its root and the `runly` CLI is installed. Covers up/down, ctx --env for your tests, database copies (db with), ps, plan, logs, idle and wake, worktree lifetime, and destroy.
+description: Use the runly CLI to start an existing stack, run tests, inspect logs, manage data and previews, or troubleshoot its environment. For creating or changing the manifest, use runly-setup.
 ---
 
 # runly
 
 runly runs the repo's app **in your worktree**, one environment per worktree,
-from the `runly.yml` at the repo root. A per-machine daemon supervises the
+from `runly.yml` or `runly.yaml` at the repo root. A per-machine daemon supervises the
 services and holds a stable public port per service. You get URLs, logins and
 connection strings; you run your own tests against them.
 
@@ -27,7 +27,11 @@ runly down web           # stop one service (no name = all); lease, data and por
 
 **After an edit, run `runly up` again.** It runs the due upkeep and the builds
 and restarts only the services whose build output changed; a dev server without
-a `build:` keeps running and reloads itself. `--rebuild` forces every build.
+a `build:` keeps running and reloads itself. With named services, other running
+services are not built or restarted. Plain builds run each time; `build: {run, when}`
+can skip unchanged inputs only while its outputs remain intact. `--rebuild`
+bypasses that skip. Without declared outputs a built service always restarts;
+dependents do not restart merely because a dependency did.
 
 **Run your tests against it.** `ctx --env` (or `up --env`) prints
 `export KEY=value` lines:
@@ -48,7 +52,8 @@ name), drops it afterwards and exits with the command's code; runly's own
 failures say `runly db with:` on stderr (`--runly-exit 125` gives them a code of
 their own). Copies need no lease and run in parallel; don't
 start your own database container. `runly db new main` keeps one until
-`runly db drop <name>`. A datastore marked `copies_only` exists only this way:
+`runly db drop <name>`, worktree removal, or its configured holder's death.
+A datastore marked `copies_only` exists only this way:
 environments never get one and `ctx` does not list it.
 
 **See what runs.** `runly ps` (this worktree; `--all` for the box): each service's
@@ -141,9 +146,33 @@ tether. This does not control the application environment.
 - `runly update --force`: on a shared box it interrupts someone else's bind. If
   a verb fails with infra-error naming two versions, run `runly update`.
 - Preview without being asked: `runly preview <svc>` publishes an
-  unauthenticated URL. It lasts as long as the lease, across daemon restarts
-  (`ctx --json` `previewRestore` reports a re-publish that failed). End it with
-  `runly preview stop`.
+  unauthenticated URL (Tailscale is tailnet-only). Public access has its own
+  deadline; a restart restores it only if unexpired. End publication and disable
+  reopening with `runly preview stop`. Check `previewExpiresAt` and
+  `previewRestore` in `ctx --json`, and any `previewNotice` from `up`.
+
+## Inputs, recovery and installation
+
+Supply a service's `env_from` variables in the shell running `up`; required
+ones must be present. Explicit `up` refreshes them, while `reset-data` preserves
+them. Values are memory-only and lost on release or daemon restart; run `up`
+with them again. Do not put secrets in the manifest or install them into the
+daemon unit.
+
+After a daemon restart, traffic, `exec` or `token` resumes wanted services
+without redoing builds; `up` reapplies the worktree. Read-only `ctx` and `ps`
+do not resume services. The proxy holds a request while starting; a startup
+failure before an HTTP response returns 503 with Retry-After. Inspect `runly ps`,
+`runly ctx --json`, `runly logs <svc>` and `runly logs --build`; local proxy
+diagnostics include `lastError` and `readyAt`. Established streams can disconnect;
+do not assume mutating requests are safe to retry.
+
+Install or upgrade with `npm i -g @theford/runly`, then `runly update` to load
+the installed build into the daemon. `update` does not download packages.
+For a checkout follow its install hint instead. Optional `runly daemon install`
+supervises the daemon with systemd/launchd. Its environment is captured at install
+time: reinstall after changing PATH or required daemon variables; use
+`--env NAME` for an additional variable. Caller `env_from` inputs stay excluded.
 
 ## Other verbs
 

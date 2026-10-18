@@ -1,7 +1,7 @@
 {
   "name": "@theford/runly",
   "version": "0.21.0",
-  "description": "The repo-aware environment broker: puts a working, seeded, provable instance of your web application in front of coding agents and humans — warm pools, leases, bind-by-sync. Brokers environments; never provides them.",
+  "description": "Worktree-owned app environments for coding agents and humans: seeded data, activity-based idle and wake, stable proxy ports, and expiring public previews.",
   "keywords": [
     "environment",
     "broker",

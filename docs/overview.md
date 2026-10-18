@@ -376,10 +376,13 @@ They reach services and readiness probes, not builds, upkeep or `exec`.
 ## Previews
 
 `runly preview <service>` publishes one service of your lease; `preview stop`
-ends it. The tunnel lives as long as the **lease**: restarts, idle stops and
-repeated `up`s leave it up, while `release`, the end of the lease and teardown
-end it. A daemon restart (a crash, `daemon stop`, an update) takes the tunnel
-down and publishes it again once the daemon holds the ports, with the same
+ends it and clears reopening intent. Public access expires after 30 minutes
+(or `preview --ttl <minutes>`), including open streams. Idle stops and service
+restarts preserve the tunnel within its deadline. Successful `up` renews it,
+or republishes an automatically expired preview for its saved duration;
+`release` and teardown end publication. A daemon restart (a crash,
+`daemon stop`, an update) restores only unexpired access once the daemon holds
+the ports, without extending its deadline, with the same
 publisher and, where the publisher can pin it, the same address
 (`cloudflare-quick` gets a new name); the service wakes on the first request.
 `ctx` shows `previewRestore` while that runs, or with the error when it failed;

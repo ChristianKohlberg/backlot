@@ -111,7 +111,8 @@ export interface VersionSkew {
  * This exists because `ensureDaemon` spawns the daemon from the CLI's own
  * `dist/`, which means an upgrade replaces both files but does NOT replace the
  * RUNNING daemon — it keeps serving old code for as long as it lives, and the
- * socket carries no version. An old daemon does not reject arguments it has
+ * socket path alone identifies no version; ping provides it. An old daemon
+ * does not reject arguments it has
  * never heard of, it ignores them: a 0.8.0 daemon asked for `up --data-only`
  * boots the whole application instead, and the caller is told nothing. That is
  * the same failure shape as issue #41 — a wrong result that reads as a bug in

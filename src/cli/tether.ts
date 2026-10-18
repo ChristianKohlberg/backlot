@@ -1,5 +1,5 @@
 /**
- * The automatic tether (decision 0035). A lease or copy tied to a holder
+ * The automatic db-new tether. A standalone copy tied to a holder
  * process is torn down once that process has been gone for the grace period
  * (BACKLOT_TETHER_GRACE_MS, default 60 s). The CLI exits per invocation, so
  * the holder must be the long-lived caller; when none is given, the agent
@@ -10,7 +10,8 @@
  *     ancestor of this CLI — a stale value inherited into an unrelated
  *     process tree (a daemon, a nohup'd job) is never trusted.
  *
- * BACKLOT_TETHER=off opts out (the environment then lives by its TTL).
+ * BACKLOT_TETHER=off opts out of automatic copy tethering.
+ * Application environments never use this tether.
  * --holder-pid / BACKLOT_HOLDER_PID always win.
  */
 import { execFileSync } from 'node:child_process';

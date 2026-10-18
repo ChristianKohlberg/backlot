@@ -49,8 +49,8 @@ Usage:
                           other worktrees of this stack name (an
                           @rebake-template key) is left to them, and this
                           worktree gets a private one.
-                          A service idle for 10 minutes (no runly verb on the
-                          environment, no bytes through its port; idle: per
+                          A service idle for 5 minutes (no activity-bearing verb,
+                          no bytes through any environment port; idle: per
                           service) is stopped, its port kept; the next
                           connection starts it again and is held until it is up.
                           Builds run in depends_on waves (parallel within a
@@ -150,8 +150,8 @@ Usage:
                           Public access expires after 30 minutes (override with --ttl).
                           A successful up renews or reopens an expired preview for
                           that TTL; preview stop disables reopening.
-                          A daemon restart preserves the deadline and publishes
-                          it again (same address where the publisher
+                          A daemon restart preserves the deadline and restores
+                          only unexpired access (same address where the publisher
                           can keep one; ctx --json: previewRestore says how
                           that went)
   runly preview stop      stop the preview tunnel on your lease (also one a
@@ -188,10 +188,10 @@ Usage:
   runly update [--check] [--force]
                           make the RUNNING daemon be the INSTALLED build. An
                           upgrade replaces the files on disk but not the daemon
-                          already in memory, and the socket carries no version —
-                          so a new CLI would keep being served by the old code.
-                          This restarts it. Leases SURVIVE; services stop and
-                          each holder's next verb rebinds. --check reports the
+                          already in memory. Version skew refuses normal verbs
+                          until update restarts it. Leases SURVIVE; services
+                          resume on traffic, exec or token; up reapplies builds.
+                          --check reports the
                           versions and who would rebind, and changes nothing.
                           runly never installs itself: it prints the command
                           for your install and leaves it to you.
@@ -511,10 +511,8 @@ async function main(): Promise<void> {
   }
   const cwd = process.cwd();
   const holder = flagValue('--holder');
-  // The CLI exits per invocation, so ITS pid is useless as a liveness signal.
-  // This must be the long-lived caller — the agent process, or a supervising
-  // shell. Given one, the daemon releases the lease the moment it dies instead
-  // of holding the environment for the rest of the TTL.
+  // A holder pid is metadata for up. Only db new uses it for liveness;
+  // that copy needs a caller that outlives this short-lived CLI invocation.
   const holderPidSource = flagValue('--holder-pid') !== undefined ? '--holder-pid' : 'BACKLOT_HOLDER_PID';
   const holderPidRaw = flagValue('--holder-pid') ?? process.env.BACKLOT_HOLDER_PID;
   let holderPid: number | undefined;

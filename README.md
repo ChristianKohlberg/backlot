@@ -15,11 +15,12 @@ runly update          # after every upgrade: restarts the running daemon onto th
 ```
 
 The daemon starts on first use (a unix socket in `~/.local/state/backlot`;
-`BACKLOT_STATE_DIR` moves it). The `backlot` command and `backlot.yml` are
-accepted aliases, and every setting is a `BACKLOT_*` environment variable
+`BACKLOT_STATE_DIR` moves it). Both `runly.yml` and `runly.yaml` are accepted
+(`runly.yml` wins if both exist); `backlot` remains a command alias, and every setting is a `BACKLOT_*` environment variable
 ([list](docs/architecture.md#configuration)).
 
-For Claude Code, install the bundled skill:
+For Claude Code, install the bundled skills: **runly** for using the CLI and
+**runly-setup** for creating or editing the manifest:
 
 ```
 /plugin marketplace add ChristianKohlberg/backlot
@@ -51,7 +52,7 @@ ends is in [the guide](docs/overview.md#an-environments-life).
 
 ## Manifest reference
 
-`runly.yml` at the repo root ([JSON Schema](schema/runly.schema.json)). Commands
+`runly.yml` or `runly.yaml` at the repo root ([JSON Schema](schema/runly.schema.json)). Commands
 run under `sh` in the worktree; write POSIX sh.
 
 | Field | Meaning |

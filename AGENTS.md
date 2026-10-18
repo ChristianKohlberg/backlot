@@ -124,7 +124,7 @@ lifetime rule is deliberately different ([decision 0027](docs/decisions/0027-lea
 A rebind, a restarting `up` or an idle quiesce restarts or stops services while the lease
 continues, and the tunnel **survives all of them**; ports are stable for an
 environment's lifetime, so it is aimed at the same place when the services return.
-It is reaped only when the lease ends (`release`, the
+It is reaped on its public-access deadline (decision 0047), when the lease ends (`release`, the
 sweeper's torn-row prune), at `teardownClaimed` (before `deleteEnv` drops the row
 that names it), at `shutdown()`, and in `recover()`.
 
@@ -317,12 +317,13 @@ The repo doubles as its own Claude Code plugin marketplace (docs/config only —
 does not touch the CLI build). Layout:
 - `.claude-plugin/marketplace.json` — marketplace manifest at repo root.
 - `plugins/runly/.claude-plugin/plugin.json` — the plugin manifest; **bump its
-  `version` when the skill changes** (independent of `package.json`'s CLI version).
+  `version` when either skill changes** (independent of `package.json`'s CLI version).
 - `plugins/runly/skills/runly/SKILL.md` — the **upstream canonical** runly
-  skill. Keep it short, task-oriented and generic; never hardcode a consuming
-  repo's services or presets. It must not contradict `README.md`.
+  CLI usage skill. `plugins/runly/skills/runly-setup/SKILL.md` owns manifest setup.
+  Keep both task-oriented and generic; never hardcode a consuming repo's
+  services or presets. Neither should contradict `README.md`.
 
-runly is CLI-only: the plugin ships **only the skill — no `.mcp.json`.** Install
+runly is CLI-only: the plugin ships **only the two skills — no `.mcp.json`.** Install
 is `/plugin marketplace add ChristianKohlberg/backlot && /plugin install runly`.
 
 ## Docs

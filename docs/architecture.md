@@ -526,8 +526,8 @@ that names the wrong subsystem.
 
 `runly update` restarts the daemon; the autospawn then brings up the installed
 build. **Leases survive**: services stop, environments go `warm`, and each holder's
-next verb rebinds — the same transition the idle quiesce already performs (decision
-0021), which is why a live lease is reported rather than refused. What *is* refused
+traffic, exec or token resumes wanted services; up reapplies upkeep and builds.
+A live lease is therefore reported rather than refused. What *is* refused
 is an in-flight operation (`busy` — the caller is waiting on it over this
 socket) and a downgrade (an older CLI restarting a newer daemon, the direction that
 can strand journal state); `--force` overrides either. runly never installs
@@ -604,10 +604,13 @@ service through a preview **publisher** adapter (default: a Cloudflare quick tun
 `cloudflared`, an env-error when absent) and reports the URL in `ctx.previewUrls`;
 `runly preview stop` ends it. It is opt-in per invocation and **scoped to the lease,
 not to the service incarnation** — a restarting `up`, a rebind or an idle quiesce leaves the
-tunnel up, while `release`, TTL lapse and teardown reap it. `shutdown` and crash
+tunnel up within the public-access deadline, while `release`, preview expiry
+and teardown reap it. Successful up renews an active deadline or reopens saved
+automatically expired publication; explicit preview stop clears that intent. `shutdown` and crash
 recovery reap the tunnel but not the publication: the lease row keeps what was
 published (`preview_restore`: service, URL, public port, publisher, the settings that
-pin its address), and `recover()` publishes it again once the proxy holds the ports
+pin its address, expiresAt and ttlMs), and `recover()` publishes it again only
+if unexpired, once the proxy holds the ports
 (decision 0045); a failure is an event and `ctx.previewRestore`. Exceptions and `previewNotice` reporting are defined by
 [preview reconciliation](decisions/0027-lease-scoped-public-preview.md).
 The URL is **public and unauthenticated** — see the
