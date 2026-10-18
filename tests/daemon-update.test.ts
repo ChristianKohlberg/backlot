@@ -257,7 +257,7 @@ describe('runly update', () => {
     const { cli, stateDir } = ctx({ service: true });
     // Lease created by a 0.7.0-claiming CLI against a 0.7.0-claiming daemon, so
     // the bind itself is not blocked by the skew gate.
-    const up = await cli(['up', '--ttl', '10', '--json'], { fakeVersion: '0.7.0' });
+    const up = await cli(['up', '--json'], { fakeVersion: '0.7.0' });
     expect(up.code).toBe(0);
     const envId = String((up.json as { envId?: string }).envId ?? '');
     expect(envId).not.toBe('');

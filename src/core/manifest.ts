@@ -61,10 +61,10 @@ export interface ServiceSpec {
   run: string;
   build?: BuildSpec;
   /**
-   * How long this service may sit with no client bytes through its public
-   * port and no runly verb on its environment before it is stopped (decision
+   * How long this service may sit with no proxy bytes in either direction anywhere in its
+   * environment and no using runly verb before it is stopped (decision
    * 0035). A duration (`90s`, `10m`, `2h`), seconds as a number, or `never`.
-   * Default: BACKLOT_SERVICE_IDLE_MS (10 minutes).
+   * Default: BACKLOT_SERVICE_IDLE_MS (5 minutes).
    */
   idle?: string | number;
   resources?: ResourceSpec;

@@ -5,10 +5,10 @@ Teaches [Claude Code](https://claude.com/claude-code) to drive
 `runly.yml`. It bundles one thing: the **`runly` skill**, a short, stack-agnostic
 guide to starting the app in your worktree (`up`/`down`), running your own tests
 against it (`ctx --env`), database copies (`db with`), `ps`, `plan`, `logs`, idle
-and wake, the session tether and `destroy`.
+and wake, expiring public previews and `destroy`.
 
 runly is CLI-only, so the plugin ships only the skill: no MCP server and no
-`.mcp.json`. It needs the `runly` CLI on your `PATH` (`npm i -g runly`) and a
+`.mcp.json`. It needs the `runly` CLI on your `PATH` (`npm i -g @theford/runly`) and a
 `runly.yml` at the repo root.
 
 ## Install

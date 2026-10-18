@@ -209,7 +209,7 @@ services:
       { 'src.txt': 'v1', '.gitignore': 'order.log\n' },
     );
     try {
-      const up = spawn(process.execPath, [CLI, 'up', '--ttl', '5', '--json'], { cwd: wt, env: ctx.env, stdio: 'ignore' });
+      const up = spawn(process.execPath, [CLI, 'up', '--json'], { cwd: wt, env: ctx.env, stdio: 'ignore' });
       const done = new Promise((r) => up.once('exit', r));
       const order = () => (existsSync(join(wt, 'order.log')) ? readFileSync(join(wt, 'order.log'), 'utf8').trim().split('\n') : []);
       for (let i = 0; i < 100 && !order().includes('build-start'); i++) await new Promise((r) => setTimeout(r, 100));
@@ -239,7 +239,7 @@ services:
       { 'server.mjs': SERVER },
     );
     try {
-      const up = await ctx.cli(['up', '--ttl', '30', '--json'], wt);
+      const up = await ctx.cli(['up', '--json'], wt);
       expect(up.exitCode, up.stdout + up.stderr).toBe(0);
       const started = Date.now();
       const other = await ctx.cli(['up', '--holder', 'someone-else', '--json'], wt);

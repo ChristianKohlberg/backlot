@@ -58,7 +58,7 @@ afterAll(async () => {
 
 describe('request-local bind diagnostics', () => {
   it('explains a cold bind, a reuse and a rebind — the build runs on every one of them', async () => {
-    const cold = await context(['up', '--ttl', '5']);
+    const cold = await context(['up']);
     const d = cold.bindDiagnostics!;
     checkTimings(d);
     expect(d.reuse).toBe('rebound');

@@ -261,7 +261,7 @@ console.log(JSON.stringify({tagged:tagged.pid,untagged:untagged.pid}));
     }
   });
 
-  it('retains failed eviction ownership and releases it after confirmed cwd cleanup', async () => {
+  it('retains failed explicit recycle ownership and releases it after confirmed cwd cleanup', async () => {
     const root = realpathSync(mkdtempSync(join(tmpdir(), 'bl-eviction-survivors-')));
     const state = join(root, 'state');
     const saved = { ...process.env };
@@ -312,6 +312,7 @@ console.log(JSON.stringify({tagged:tagged.pid,untagged:untagged.pid}));
       if (!procScanSupported()) released.servicePids.cwd = cwdOnly;
       journal.saveEnv(released);
       await expect(engine.up({ cwd: other, holder: 'b' })).rejects.toThrow(/cap/);
+      await expect(engine.poolRecycle({ envId: first.envId, force: true })).rejects.toThrow(/unreaped/);
       const retained = journal.getEnv(first.envId)!;
       expect(retained.state).toBe('warm');
       expect(Object.values(retained.servicePids).map((r) => r.pid).sort()).toEqual([tagged.pid, cwdOnly.pid].sort());
@@ -333,6 +334,7 @@ console.log(JSON.stringify({tagged:tagged.pid,untagged:untagged.pid}));
       } else {
         for (const rec of blocked.values()) await killGroupVerified(rec.pid, rec.startTime);
       }
+      expect((await engine.poolRecycle({ envId: first.envId, force: true })).recycled).toEqual([first.envId]);
       const admitted = await engine.up({ cwd: other, holder: 'b' });
       expect(journal.getEnv(first.envId)).toBeUndefined();
       expect(existsSync(original.root)).toBe(false);
@@ -500,7 +502,7 @@ console.log(JSON.stringify({tagged:tagged.pid,untagged:untagged.pid}));
         else expect(kill).toHaveBeenCalledWith(record.pid, record.startTime, undefined, undefined, expect.any(Function));
       }
       expect(Object.values(original.servicePids).filter((r) => !blocked.has(r.pid)).every((r) => !groupAlive(r.pid))).toBe(true);
-      await expect(fetch(first.urls.web.replace('localhost', '127.0.0.1'), { signal: AbortSignal.timeout(2000) })).rejects.toThrow();
+      expect((await fetch(first.urls.web.replace('localhost', '127.0.0.1'), { signal: AbortSignal.timeout(2000) })).status).toBe(503);
       await expect(engine.up({ cwd: other, holder: 'b' })).rejects.toMatchObject({ message: expect.stringMatching(/cap/) });
       blocked.delete(children[0]!.record.pid);
       await refuse();

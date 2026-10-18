@@ -315,7 +315,7 @@
               "minimum": 0
             }
           ],
-          "description": "How long this service may go without client bytes through its public port and without a runly verb on its environment before it is stopped; the next connection to its port starts it again (leased environments only). A duration (90s, 10m, 2h), seconds as a number, or `never`/`off`. Default BACKLOT_SERVICE_IDLE_MS (10 minutes)."
+          "description": "How long this service may go without proxy bytes in either direction anywhere in its environment and without a using runly verb before it is stopped; the next connection to its port starts it again (with or without a lease). A duration (90s, 10m, 2h), seconds as a number, or `never`/`off`. Default BACKLOT_SERVICE_IDLE_MS (5 minutes)."
         },
         "resources": {
           "$ref": "#/$defs/resources"

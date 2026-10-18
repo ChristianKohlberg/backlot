@@ -24,7 +24,7 @@ const USAGE = `runly — puts a working instance of a web application in front o
 
 Usage:
   runly up [service...] [--preset [DATASTORE=]NAME]... [--reset-data|--pristine]
-           [--rebuild] [--ttl <minutes>] [--holder-pid <pid>] [--env]
+           [--rebuild] [--holder-pid <pid>] [--env]
                           lease THIS worktree's one environment and start the
                           named services plus their depends_on closure (none
                           named = every service). ADDITIVE: never stops a
@@ -147,8 +147,11 @@ Usage:
                           With preview.publisher: tailscale it is served on this
                           machine's tailnet name instead (tailnet only);
                           --https-port pins that port for this publish.
-                          It lasts as long as the lease: a daemon restart
-                          publishes it again (same address where the publisher
+                          Public access expires after 30 minutes (override with --ttl).
+                          A successful up renews or reopens an expired preview for
+                          that TTL; preview stop disables reopening.
+                          A daemon restart preserves the deadline and publishes
+                          it again (same address where the publisher
                           can keep one; ctx --json: previewRestore says how
                           that went)
   runly preview stop      stop the preview tunnel on your lease (also one a
@@ -196,26 +199,13 @@ Usage:
 
 Holding an environment:
 
-  Under Claude Code, up and db new tether to the session automatically
-  (CLAUDE_PID, when it is a live ancestor of the CLI): the environment lives
-  while the session does and is torn down a minute after it ends.
-  BACKLOT_TETHER=off opts out.
-
-  --ttl <minutes>          the lease length (default 30) — the form for other
-                           agents and scripts. up renews it. Only for an
-                           untethered lease: it skips the automatic tether, and
-                           is refused next to --holder-pid.
-  --holder-pid <pid>       For an interactive shell, or any caller that OUTLIVES the
-  (BACKLOT_HOLDER_PID)     command. Ties the environment to that process: a minute
-                           after it exits, the environment is torn down (services,
-                           data, ports, lease); while it lives, the lease does not
-                           expire.
-
-'BACKLOT_HOLDER_PID=$$ runly up' works at a shell prompt and CANNOT work from an
-agent harness: each command runs in a fresh shell, so '$$' names a process that has
-already exited. Such a lease would be reclaimable the instant it was created — the
-environment would be torn down while you were still using it — so runly refuses
-the bind instead. Use --ttl.
+  Environments belong to the worktree, not to the agent process. Services idle
+  after five quiet minutes and wake on traffic, including after release.
+  preview --ttl <minutes>  Public access deadline (default 30 minutes).
+                           Never changes the environment lifetime.
+  --holder-pid <pid>       Optional owner metadata for up; death does not destroy
+  (BACKLOT_HOLDER_PID)     the environment. For db new, it still scopes the copy
+                           to that process; db with owns its command's copy.
 
 up and reset-data accept --preset NAME (one datastore), or repeatable
 --preset DATASTORE=NAME; a named datastore is reloaded from its template, every
@@ -346,7 +336,8 @@ function parseTtlMinutes(v: string): number | undefined {
   if (!m) return undefined;
   const mins = Number(m[1]);
   if (!Number.isFinite(mins) || mins <= 0) return undefined;
-  return mins * 60_000;
+  const ms = mins * 60_000;
+  return Number.isFinite(ms) && Number.isSafeInteger(Math.ceil(Date.now() + ms)) ? ms : undefined;
 }
 
 function hygiene(): string | undefined {
@@ -412,6 +403,10 @@ async function main(): Promise<void> {
   const known = ['up', 'down', 'ctx', 'ps', 'plan', 'db', 'warm', 'exec', 'logs', 'token', 'reset-data', 'release', 'destroy', 'preview', 'status', 'doctor', 'appliance', 'pool', 'daemon', 'update'];
   if (!known.includes(verb)) {
     console.error(`runly: unknown verb '${verb}'\n\n${USAGE}`);
+    process.exit(64);
+  }
+  if (flagValue('--ttl') !== undefined && (verb !== 'preview' || positional[0] === 'stop')) {
+    console.error('runly: --ttl is only for public previews; environments idle after five minutes and live with their worktree. Use release to end a lease.');
     process.exit(64);
   }
   if (flags.has('--env')) {
@@ -529,51 +524,27 @@ async function main(): Promise<void> {
       console.error(`runly: ${holderPidSource} expects a process id, got '${holderPidRaw}'`);
       process.exit(64);
     }
-    // A holder that is ALREADY dead is worse than no holder at all: the daemon
-    // releases such a lease on its very next sweep, so the environment goes
-    // back in the pool while the caller is still using it — and the next bind
-    // hands that caller's database to somebody else, silently. The pattern
-    // that produces this is `BACKLOT_HOLDER_PID=$$ runly up` from an agent
-    // harness, which runs every command in a fresh shell: `$$` is a shell that
-    // has already exited. Refuse, and name the form that works.
-    if (!isAlive(holderPid)) {
+    // Standalone database copies still use process ownership.
+    if (verb === 'db' && !isAlive(holderPid)) {
       console.error(
-        `runly: ${holderPidSource} ${holderPid} is not a live process — the lease would be reclaimable the moment it is created.\n` +
+        `runly: ${holderPidSource} ${holderPid} is not a live process — the database copy would be reclaimable the moment it is created.\n` +
           `  If this came from '$$': each agent command runs in a fresh shell, so that shell is already gone.\n` +
-          `  Under Claude Code, drop ${holderPidSource}: runly tethers the lease to the agent by itself (CLAUDE_PID, when it is a live ancestor).\n` +
-          `  Elsewhere use 'runly ${verb} --ttl <minutes>'; ${holderPidSource} is for interactive shells that outlive the command.`,
+          `  Under Claude Code, drop ${holderPidSource}: runly tethers the copy to the agent by itself (CLAUDE_PID, when it is a live ancestor).\n` +
+          `  Use 'runly db with' for a command-scoped copy, or name a process that outlives the copy.`,
       );
       process.exit(64);
     }
   }
-  // No explicit holder process: tether to the agent this CLI runs under, when
-  // it can be found (decision 0035) — Claude Code's CLAUDE_PID, if it is a
-  // live ancestor. BACKLOT_TETHER=off opts out.
-  // `--ttl` asks for a lease that ends at a deadline: it is the untethered
-  // form, so it opts out of the automatic tether, and next to an explicit
-  // holder process (which keeps the lease alive while it lives) it means
-  // nothing and is refused.
-  if (flagValue('--ttl') !== undefined && holderPid !== undefined && (verb === 'up' || verb === 'db')) {
-    console.error(`runly: --ttl sets the length of an untethered lease; a lease held by ${holderPidSource} ${holderPid} lives as long as that process — drop one of them`);
-    process.exit(64);
-  }
-  if (holderPid === undefined && flagValue('--ttl') === undefined && (verb === 'up' || (verb === 'db' && positional[0] === 'new'))) holderPid = autoTether();
+  // Standalone copies retain their explicit process lifetime. Environments
+  // are worktree-owned: never infer their lifetime from the invoking agent.
+  if (holderPid === undefined && verb === 'db' && positional[0] === 'new') holderPid = autoTether();
 
   let res: RpcResponse | undefined;
   switch (verb) {
     case 'up': {
-      const ttl = flagValue('--ttl');
-      let ttlMs: number | undefined;
-      if (ttl !== undefined) {
-        ttlMs = parseTtlMinutes(ttl);
-        if (ttlMs === undefined) {
-          console.error(`runly: --ttl expects minutes (a positive number), got '${ttl}'`);
-          process.exit(64);
-        }
-      }
       res = await rpc(
         'up',
-        { cwd, holder, holderPid, hygiene: hygiene(), ttlMs, services: positional, callerEnv, presets, rebuild: flags.has('--rebuild') },
+        { cwd, holder, holderPid, hygiene: hygiene(), services: positional, callerEnv, presets, rebuild: flags.has('--rebuild') },
         progress,
       );
       endProgress();
@@ -743,7 +714,7 @@ async function main(): Promise<void> {
       // its real exit code, and no lock on the environment while it runs.
       res = await rpc('exec-env', { cwd, holder });
       if (!res.ok) break;
-      const d = res.data as { envId: string; root: string; vars: Record<string, string> };
+      const d = res.data as { envId: string; root: string; vars: Record<string, string>; heartbeatMs?: number };
       const r = await runExec(parts, cmd, d, json);
       if (r.timedOutS !== undefined) {
         errExit({ class: 'work-error', message: `exec timed out after ${r.timedOutS}s (its process group was killed; BACKLOT_CMD_TIMEOUT_S sets the deadline)`, source: 'exec', logExcerpt: r.stderr?.slice(-800) });
@@ -1206,10 +1177,10 @@ async function daemonUnitVerb(sub: 'install' | 'uninstall'): Promise<void> {
  * caller's stdio, nothing buffered or cut. `--json`: stdout and stderr are
  * collected whole for the JSON answer. The exit code is the command's (128+n
  * for a signal). No deadline unless BACKLOT_CMD_TIMEOUT_S is set; while the
- * command runs, the environment is touched every minute (it is in use).
+ * command runs, the environment is touched at most every minute, faster for short idle settings.
  */
 async function runExec(
-  parts: string[], cmd: string, d: { envId: string; root: string; vars: Record<string, string> }, json: boolean,
+  parts: string[], cmd: string, d: { envId: string; root: string; vars: Record<string, string>; heartbeatMs?: number }, json: boolean,
 ): Promise<{ code: number; stdout?: string; stderr?: string; timedOutS?: number }> {
   const { spawn } = await import('node:child_process');
   const { constants } = await import('node:os');
@@ -1240,7 +1211,7 @@ async function runExec(
   process.on('SIGINT', onInt);
   process.on('SIGTERM', onTerm);
   process.on('SIGHUP', onHup);
-  const heartbeat = setInterval(() => void rpc('exec-touch', { envId: d.envId }).catch(() => null), 60_000);
+  const heartbeat = setInterval(() => void rpc('exec-touch', { envId: d.envId }).catch(() => null), d.heartbeatMs ?? 60_000);
   heartbeat.unref();
   const raw = process.env.BACKLOT_CMD_TIMEOUT_S;
   const deadlineS = raw !== undefined && raw !== '' && Number(raw) > 0 ? Number(raw) : undefined;
@@ -1374,7 +1345,7 @@ function dbLines(copies: DbCopy[]): string[] {
 interface StatusData {
   pid: number;
   supervisor: string;
-  envs: Array<{ id: string; state: string; worktree: string; summary: string; idleMs: number; lease: { holder: string; expiresAt: number; holderPid?: number } | null }>;
+  envs: Array<{ id: string; state: string; worktree: string; summary: string; idleMs: number; lease: { holder: string; expiresAt: number | null; holderPid?: number } | null }>;
   poolMaxTotal: number;
   ports: { conflicts: string[] };
   budget: { enabled: boolean; memoryBytes: number; cpu: number; committedMemoryBytes: number; committedCpu: number; waiting: number };
@@ -1451,7 +1422,7 @@ interface CtxView {
   stack: string;
   envId: string;
   state: string;
-  lease: { id: string; expiresAt: number; holderPid?: number | null } | null;
+  lease: { id: string; expiresAt: number | null; holderPid?: number | null } | null;
   urls?: Record<string, string>;
   ports?: Record<string, number>;
   services?: Record<string, 'running' | 'failed' | 'stopped' | 'down'>;
@@ -1485,11 +1456,11 @@ function rebindReason(code: string): string {
  */
 function ctxSummary(c: CtxView, verb: 'up' | 'ctx'): string[] {
   const out: string[] = [];
-  // A tethered lease lives as long as its agent: a deadline would be a lie.
+  // No expiry is a distinct lifecycle, not a distant calendar date.
   const until = !c.lease
     ? ' — no lease'
-    : c.lease.holderPid
-      ? ` — held by agent ${c.lease.holderPid}`
+    : c.lease.expiresAt === null
+      ? ' — worktree lease (no expiry)'
       : ` — lease until ${new Date(c.lease.expiresAt).toLocaleTimeString()}`;
   const d = c.bindDiagnostics;
   const how = verb === 'up' && d

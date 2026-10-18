@@ -6,12 +6,11 @@ import { readFileSync } from 'node:fs';
 import { cpus, totalmem } from 'node:os';
 import { join } from 'node:path';
 import { stateRoot } from './paths.js';
-import { parseDuration, parseSize } from './units.js';
+import { parseSize } from './units.js';
 
 export interface Policy {
   /** Machine-wide ceiling across ALL stacks (the memory heuristic is per host). */
   poolMaxTotal: number;
-  sessionTtlMs: number;
   idleTtlMs: number;
   waitMs: number;
   /** Retention knobs (task: disk sweep). */
@@ -24,12 +23,7 @@ export interface Policy {
   serviceIdleMs: number;
   /** A dead tether is believed only after this long (decision 0035). */
   tetherGraceMs: number;
-  /**
-   * An environment nobody leases is torn down (services, data, ports) after
-   * this long without activity (0.19, BACKLOT_UNLEASED_TTL, default 24h,
-   * `off` never). Templates and the worktree's records stay, so the next
-   * `up` there restores rather than bakes and skips fresh upkeep.
-   */
+  /** Retired compatibility field: always Infinity; idle never destroys data. */
   unleasedTtlMs: number;
   /** The server-wide load budget (decision 0036). */
   budget: Budget;
@@ -72,7 +66,6 @@ interface ConfigFile {
   templateGraceMs?: number;
   budget?: Partial<Budget> & { memory?: string | number; reserve?: string | number };
   poolMaxTotal?: number;
-  sessionTtlMs?: number;
   idleTtlMs?: number;
   waitMs?: number;
   logCapBytes?: number;
@@ -122,15 +115,6 @@ const num = (envVar: string, fileVal: number | undefined, fallback: number): num
   return fallback;
 };
 
-/** A duration knob: env var or config value as `24h`/`90m`/seconds, or `off` (Infinity). */
-const duration = (envVar: string, fileVal: string | number | undefined, fallback: number): number => {
-  const e = process.env[envVar];
-  const fromEnv = e !== undefined && e !== '' ? parseDuration(e) : undefined;
-  if (fromEnv !== undefined) return fromEnv;
-  const fromFile = fileVal !== undefined ? parseDuration(fileVal) : undefined;
-  return fromFile ?? fallback;
-};
-
 /** A size knob: env var or config value as bytes or `2G`. */
 const size = (envVar: string, fileVal: string | number | undefined, fallback: number): number => {
   const e = process.env[envVar];
@@ -176,7 +160,6 @@ export function policy(): Policy {
     // without an application is a `runly db` copy, which is not an
     // environment and answers to no pool cap. BACKLOT_POOL_MAX_DATA_ONLY and
     // `poolMaxDataOnly` are ignored.
-    sessionTtlMs: num('BACKLOT_LEASE_TTL_MS', f.sessionTtlMs, 30 * 60_000),
     idleTtlMs,
     waitMs: num('BACKLOT_WAIT_MS', f.waitMs, 60_000),
     // One rotation per file (decision 0038): a service keeps up to twice this.
@@ -185,9 +168,9 @@ export function policy(): Policy {
     // newest template of each, plus every one an environment or copy uses.
     templatesKeep: num('BACKLOT_TEMPLATES_KEEP', f.templatesKeep, 1),
     templateGraceMs: num('BACKLOT_TEMPLATE_GRACE_MS', f.templateGraceMs, 60 * 60_000),
-    serviceIdleMs: num('BACKLOT_SERVICE_IDLE_MS', f.serviceIdleMs, 10 * 60_000),
+    serviceIdleMs: num('BACKLOT_SERVICE_IDLE_MS', f.serviceIdleMs, 5 * 60_000),
     tetherGraceMs: num('BACKLOT_TETHER_GRACE_MS', f.tetherGraceMs, 60_000),
-    unleasedTtlMs: duration('BACKLOT_UNLEASED_TTL', f.unleasedTtl, 24 * 3_600_000),
+    unleasedTtlMs: Infinity, // retired: idle environments retain their data,
     budget: budgetPolicy(f),
   };
 }

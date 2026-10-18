@@ -179,8 +179,8 @@ const stats = {
   downUps: 0,
   dbCopies: 0,
   dbWithRuns: 0,
-  queuedAcquires: 0,
-  leaseExpiries: 0,
+  holderHandoffs: 0,
+  leaseReleases: 0,
   quiesceRebinds: 0,
   idleWakes: 0,
   budgetQueued: 0,
@@ -664,27 +664,27 @@ async function statusEnvs() {
   return s.body?.envs ?? [];
 }
 
-/** (d) Capacity churn on stack B: queueing, expiries, quiesce — the sweeper's beat. */
+/** (d) Capacity churn on stack B: holder handoffs, release, quiesce — the sweeper's beat. */
 async function phaseCapacity() {
   log(`phase capacity (cycle ${cycle})`);
-  // A short-TTL holder holds stack B's one environment (decision 0032); a
-  // second holder queues on its expiry.
-  const h1 = await cli(['up', '--holder', 'soak-h1', '--ttl', '0.07'], { cwd: stackB }); // ~4s
+  // Explicit release hands the worktree's single environment to another holder.
+  const h1 = await cli(['up', '--holder', 'soak-h1'], { cwd: stackB });
   must(h1.body?.state === 'hot', 'capacity', 'stack B holder failed to bind', h1.stdout.slice(0, 200));
   const t0 = Date.now();
+  await cli(['release', '--holder', 'soak-h1'], { cwd: stackB });
   const h3 = await cli(['up', '--holder', 'soak-h3'], { cwd: stackB, timeoutMs: 90_000 });
-  if (must(h3.body?.state === 'hot', 'capacity', 'queued holder never acquired the worktree\'s environment (waited past the expiry window)', h3.stdout.slice(0, 300))) {
-    stats.queuedAcquires++;
-    log(`  queued acquire served after ${Date.now() - t0}ms`);
+  if (must(h3.body?.state === 'hot', 'capacity', 'next holder never acquired the released worktree\'s environment', h3.stdout.slice(0, 300))) {
+    stats.holderHandoffs++;
+    log(`  holder handoff completed after ${Date.now() - t0}ms`);
   }
   await cli(['release', '--holder', 'soak-h3'], { cwd: stackB });
 
-  // The sweeper must drop the expired leases on its own.
+  // The explicit release must leave no holder behind.
   const cleared = await until(20_000, 1000, async () => {
     const envs = await statusEnvs();
     return envs.filter((e) => e.stack.startsWith('soak-b') && e.lease).length === 0;
   });
-  if (must(cleared, 'capacity', 'expired stack-B leases were never swept')) stats.leaseExpiries += 1;
+  if (must(cleared, 'capacity', 'stack-B release did not clear its holder')) stats.leaseReleases += 1;
 
   // Idle stop → wake by request (decision 0035): stack B's web declares
   // `idle: 8s`. Left alone it is stopped while lease, data and port stay; a
@@ -825,7 +825,7 @@ async function chaosStaleRoot() {
   const dir = join(stacksDir, `c-${++cSeq}`);
   writeStackMin(dir, 'soak-c');
   gitInit(dir);
-  const up = await cli(['up', '--ttl', '0.1'], { cwd: dir }); // ~6s lease
+  const up = await cli(['up'], { cwd: dir });
   if (!must(up.body?.state === 'hot', 'chaos', 'stale-root probe stack failed to bind', up.stdout.slice(0, 300))) {
     rmSync(dir, { recursive: true, force: true });
     return;
@@ -833,7 +833,7 @@ async function chaosStaleRoot() {
   const envId = up.body.envId;
   log(`chaos: deleting worktree ${dir} mid-lease (env ${envId})`);
   rmSync(dir, { recursive: true, force: true });
-  // Lease lapses in seconds; the sweeper must then see the missing stack root
+  // The sweeper must see the missing stack root
   // and reap the env — row AND directory — with no help from anyone.
   const reaped = await until(40_000, 1000, async () => {
     const gone = !(await statusEnvs()).some((e) => e.id === envId);
@@ -1055,8 +1055,8 @@ function printStats() {
   lines.push(`  down+up round trips    ${stats.downUps}`);
   lines.push(`  db copies (new+drop)   ${stats.dbCopies}`);
   lines.push(`  db with runs           ${stats.dbWithRuns}`);
-  lines.push(`  queued acquires        ${stats.queuedAcquires}`);
-  lines.push(`  lease expiries swept   ${stats.leaseExpiries}`);
+  lines.push(`  holder handoffs        ${stats.holderHandoffs}`);
+  lines.push(`  explicit releases      ${stats.leaseReleases}`);
   lines.push(`  idle stop -> wake      ${stats.idleWakes}`);
   lines.push(`  budget queue waits     ${stats.budgetQueued}`);
   lines.push(`  logs --until (0/124)   ${stats.logsUntil}`);
@@ -1126,11 +1126,13 @@ async function main() {
       await maybeChaos();
       if (timeLeft() < 30_000) break;
       await phaseRestart(); // leaves the session lease up, deliberately
-      await maybeChaos();
       if (timeLeft() < 30_000) break;
       await phaseEnvExport(); // reads that session's environment
       if (timeLeft() < 45_000) break;
       await phaseDownAndDb(); // additive up / down + db copies on that lease
+      // These three phases share a lease. Chaos recovery may release it, so
+      // inject faults only after all of its consumers have finished.
+      await maybeChaos();
       if (timeLeft() < 45_000) break;
       await phaseCapacity();
       if (timeLeft() > 60_000) await phaseBudget();

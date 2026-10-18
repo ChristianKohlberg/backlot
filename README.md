@@ -1,6 +1,6 @@
 # runly
 
-[![npm](https://img.shields.io/npm/v/runly)](https://www.npmjs.com/package/runly) [![ci](https://github.com/ChristianKohlberg/backlot/actions/workflows/ci.yml/badge.svg)](https://github.com/ChristianKohlberg/backlot/actions/workflows/ci.yml) [![release](https://img.shields.io/github/v/release/ChristianKohlberg/backlot)](https://github.com/ChristianKohlberg/backlot/releases)
+[![npm](https://img.shields.io/npm/v/@theford/runly)](https://www.npmjs.com/package/@theford/runly) [![ci](https://github.com/ChristianKohlberg/backlot/actions/workflows/ci.yml/badge.svg)](https://github.com/ChristianKohlberg/backlot/actions/workflows/ci.yml) [![release](https://img.shields.io/github/v/release/ChristianKohlberg/backlot)](https://github.com/ChristianKohlberg/backlot/releases)
 
 runly puts a running, seeded, authenticated instance of your web application in
 front of a coding agent or a human. It runs your repo's own commands in the
@@ -10,7 +10,7 @@ worktree you call it from, one environment per worktree, described by one
 ## Install
 
 ```bash
-npm i -g runly        # requires Node ≥ 22.13 and git
+npm i -g @theford/runly        # requires Node ≥ 22.13 and git
 runly update          # after every upgrade: restarts the running daemon onto the installed build
 ```
 
@@ -46,7 +46,7 @@ runly destroy                # tear down everything this worktree holds
 
 After an edit, run `runly up` again: it runs the due upkeep and the builds and
 restarts only the services whose build output changed. Idle services stop after
-10 minutes and start again on the next request. How an environment lives and
+5 minutes and start again on the next request. How an environment lives and
 ends is in [the guide](docs/overview.md#an-environments-life).
 
 ## Manifest reference
@@ -67,7 +67,7 @@ run under `sh` in the worktree; write POSIX sh.
 | `services.<svc>.ready` | Readiness: `http` (path answering 200), `log` (regex), or `cmd` (exit 0); `timeout` seconds (120). |
 | `services.<svc>.fatal_logs` | Regex that fails the start at once when it appears in the log. |
 | `services.<svc>.depends_on` | Services that must be ready first. |
-| `services.<svc>.idle` | Idle time before the service is stopped (`90s`, `30m`, `2h`, seconds, or `never`). Default 10 minutes. |
+| `services.<svc>.idle` | Idle time before the service is stopped (`90s`, `30m`, `2h`, seconds, or `never`). Default 5 minutes. |
 | `services.<svc>.resources` | Cost for the load budget: `{ memory, cpu, build: { memory, cpu } }`. Default 512M / 0.5 cpu running, 1G / 1 cpu building. |
 | `datastores.<ds>.driver` | `sqlite`, `postgres`, `mssql`, `mysql` or `redis`. Required. |
 | `datastores.<ds>.create` | Creates and seeds a namespace; `{{ns}}`, `{{preset}}`. |
@@ -114,9 +114,8 @@ work-error (your code), `2` env-error (the environment), `3` infra-error
 | `  --preset [ds=]NAME` | Reload that datastore from its template (repeatable); the services that use it restart. Without it, data is kept. |
 | `  --reset-data` / `--pristine` | Restore every datastore / that, plus re-run every upkeep rule and build (never deletes worktree files). |
 | `  --rebuild` | Run every build, ignoring `when:`. |
-| `  --ttl <minutes>` | Lease length (default 30), for an untethered lease: it skips the automatic tether, and is refused next to `--holder-pid`. |
 | `  --env` | Print the `ctx --env` export lines instead of the summary. |
-| `  --holder-pid <pid>` | Tie the environment to a process that outlives the command; torn down a minute after it exits. The summary then says `held by agent <pid>` instead of a deadline. |
+| `  --holder-pid <pid>` | Optional process metadata; process death never destroys the environment. |
 | `runly down [svc...]` | Stop these services (none = all); lease, data and ports stay. |
 | `runly ctx [--env]` | A short summary (service URLs and states, datastores, login, a failed last `up`); `--json` the full context; `--env` prints `export RUNLY_*=…` lines for `eval`. |
 | `runly ps [--all]` | Services (state, ports, pid, idle, memory) and database copies of this worktree, or of the whole box (with a worktree column). A service that crash-looped, or failed its boot during an `up`, shows `failed` with its last exit; an `up` that failed (a build, upkeep, data) is named with its error. The next `up` retries both. |
@@ -132,7 +131,7 @@ work-error (your code), `2` env-error (the environment), `3` infra-error
 | `runly token [--role <r>] [--raw]` | Run `auth.token` (role default `admin`, also in `RUNLY_ROLE`); `--raw` prints the bare token. Stopped services start first. |
 | `runly release` | End the lease; the environment stays for the next `up`. |
 | `runly destroy` | Tear down everything runly holds for this worktree: services, data, copies, ports, lease. Its build records, templates and the upkeep rules that declare `outputs` stay. |
-| `runly preview <svc> [--ttl <minutes>] [--https-port N]` | Publish one service through the preview publisher. Unauthenticated. Lasts as long as the lease; a daemon restart publishes it again (same address where the publisher can pin one). |
+| `runly preview <svc> [--ttl <minutes>] [--https-port N]` | Publish one service through the preview publisher. Unauthenticated. Always expires: 30 minutes by default. `--ttl` changes public access only. Successful `up` renews active previews or reopens automatically expired ones for that TTL. Explicit `preview stop` keeps it private; restart alone never reopens expired access. |
 | `runly preview stop` | End the preview (also one a restart could not publish again). |
 | `runly status` / `runly doctor` | Daemon, environments, budget and recent warnings (`--json` everything) / health and drift report. |
 | `runly appliance ls\|start\|stop [name]` | Probe, start or stop shared backing servers. |

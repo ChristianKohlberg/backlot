@@ -59,7 +59,7 @@ Kubernetes, Windows, secrets management, and dashboards are not.
 | **Environment** | The one environment of a worktree, on a substrate: running services, allocated ports, a datastore namespace, its logs — running **in the caller's worktree**, whose caches it shares ([decision 0032](decisions/0032-environments-run-in-the-callers-worktree.md)). Durable; belongs to the worktree, never to a person or task. Its lease says which services it wants up — `up` adds, `down` takes away — and every datastore exists for its whole life ([decision 0034](decisions/0034-additive-up-database-copies-and-ps.md)). |
 | **Database copy** | A fresh copy of one datastore, restored from the environments' template, outside any environment: no lease, no ports, no services (`runly db new|with`, decision 0034). Journalled with its holder and its drop command; reaped like an environment when the holder or the worktree is gone. |
 | **Binding** | A source state (the caller's worktree, as it is) plus a data state (preset, at a hygiene level) attached to the worktree's one environment. Since decision 0032 it is not a frozen snapshot: the services read the live worktree, and runly records no identity of it. |
-| **Lease** | Temporary ownership of an environment, with a TTL or a holder process ([its life](overview.md#an-environments-life)). TTL expiry leaves the environment **warm** for the worktree's next `up`; a dead holder process tears it down. |
+| **Lease** | Worktree ownership until explicit release or destruction ([its life](overview.md#an-environments-life)). No TTL or process liveness governs it. |
 
 There is no Run noun: runly executes no checks and gives no verdicts (decision
 0032). A repo runs its own tests against `runly ctx --env`.
@@ -112,13 +112,11 @@ start runly 0.18 on it once first, which migrates it (decision 0042).
 
 ### The safety invariant
 
-**An environment's private state never holds the only copy of anything, and runly
-never deletes the worktree.** The consumer's worktree remains the sole source of truth
-and is where the environment runs; the environment's own directory (data, logs) is
-disposable; templates are rebuildable by definition. Every reclaim decision — lease
-expiry, recycle, teardown, even losing the machine — deletes only that private
-directory, and teardown checks that it lies under the state root and does not contain
-the worktree before it does (decision 0032).
+**runly never deletes the worktree.** Environment data may contain work that has
+not been saved elsewhere. Idle stop retains it. Destruction requires confirmed
+worktree removal or an explicit destructive command. Teardown removes only the
+private environment directory and recorded datastore resources; it verifies the
+directory lies under the state root and does not contain the worktree before removal.
 
 ## 4. Convergence, not checkpointing
 
@@ -186,31 +184,46 @@ service has idle-stopped) → recycled (`pristine` rebuild). Rebind from hot ≈
 from warm ≈ start + ready-wait; pristine ≈ full provision (bounded by templates and
 shared caches, below).
 
-**Lifecycle** ([decision 0035](decisions/0035-services-idle-on-their-own-clock-and-wake-on-demand.md)).
-Each running service has its own idle clock: the last runly verb that USES its
-environment (`up`, `reset-data`, `exec`, `token`, `preview`, `down` — reading with
-`ctx`, `ps`, `plan`, `logs` or `status` is not activity, decision 0039), the last
-client byte through its own public port, its own start. `ps` shows IDLE and STOPS
-IN from that one clock. Past
-`BACKLOT_SERVICE_IDLE_MS` (10 min; `idle:` per service) the sweeper stops it under the
-environment lock; lease, data, ports and the other services stay, and `ps` says
-`idle`. A connection to its public port wakes it (the proxy's wake hook → `wakeService`:
-closure, appliances, datastores kept, load budget, build only if needed) and is held
-until it is ready; services reach each other through public ports, so wakes chain. A
-crash restart marks the port `starting` (supervisor hooks `onCrashed` / `onRelaunched` /
-`onGaveUp`), and a refused forward — or one dropped before the first byte back, under
-the replay rule above — is retried and held, so the self-restart gap holds connections
-too. A service that crash-loops past its restart budget in a LEASED environment — or,
-during a bind, fails its boot on its own account (exit, `fatal_logs`, daemonized) — is
-stopped and reported `failed` (`ps`, `ctx.failures`, a `service-failed` event: last exit, `runly logs
-<svc>`); the environment, its data, its other services and its logs stay, nothing
-wakes it, and the next `up` starts it again (decision 0039). Only an unleased
-environment is marked `degraded` and recycled for it. Activity clocks are persisted (`envs.activity`, throttled to 5 s, and
-at sweep and shutdown). A lease or copy tethered to a holder process is torn down
-completely once the holder has been dead for `BACKLOT_TETHER_GRACE_MS` (60 s); a live
-holder renews its lease's TTL. Under Claude Code the CLI tethers to `CLAUDE_PID` when it
-is a live ancestor. A worktree that is gone (or holds another stack) takes its
-environment with it, leased or not; `runly destroy` does it on request.
+**Lifecycle** ([decision 0046](decisions/0046-worktree-owned-activity-lifecycle.md)).
+
+Environments belong to worktrees, independently of agent processes. After **5 minutes**
+without activity, managed services stop; data, configuration and public ports stay.
+Activity means bytes in either direction through any environment proxy port, or a
+verb that uses the environment (`up`, `exec`, `token`, `preview`, `reset-data`, `down`).
+Read-only commands and internal readiness probes do not count. The clock is shared
+across the environment, with per-service `idle:` overrides.
+
+New connections wake wanted services and their dependencies even after `release`,
+subject to the load budget. Explicitly downed or failed services require `up`.
+WebSocket messages, protocol heartbeats and server-sent events count as traffic;
+a silent open connection does not. Consequently an idle stop closes silent sockets:
+clients must reconnect. Run silent background work with `runly exec` (heartbeats
+while its child runs), or set `idle: never`. Shared appliances remain running.
+
+Agent death, disconnection, idle age and pool pressure never delete an environment.
+A confirmed missing worktree does; inaccessible paths and filesystem errors are not
+proof of deletion. Renaming a worktree removes its old path and therefore also
+triggers cleanup. Explicit `destroy` and `pool recycle` remain destructive.
+Environment leases never expire; `--ttl` is rejected outside `preview`. Public
+previews always expire (30 minutes by default, `preview --ttl <minutes>` to change
+it). Expiry closes public access, including open streams, but retains the lease
+and environment. A successful `up` renews an active preview for its configured TTL. Failed `up`
+calls and daemon restarts do not extend it. A successful `up` also reopens a
+previously enabled preview after automatic expiry, using its saved TTL. Explicit
+`preview stop`, `release`, or a forbidden-preview configuration clears that intent. `--holder-pid` on `up` is diagnostic metadata only; there is no
+agent-specific automatic tether. Required caller inputs lost on release or daemon
+restart must be supplied by a fresh `up` before services using them can wake.
+
+A full machine-wide environment cap refuses creation and names `BACKLOT_POOL_MAX_TOTAL`;
+raise the cap or explicitly destroy an unwanted environment. Load admission still
+bounds running services and builds. Failed starts retain data; retrying never
+implicitly runs `--pristine`.
+
+Standalone database copies retain their separate lifecycle: `db with` owns a copy
+for its command; `db new` can use an explicit process holder or the Claude ancestor
+tether. This does not control the application environment.
+
+Activity is journaled every five seconds, at sweeps and shutdown, then restored after restart.
 
 **Load budget** ([decision 0036](decisions/0036-a-server-wide-load-budget.md)).
 `src/daemon/budget.ts`: every bind and wake computes its need (run resources of what
@@ -231,28 +244,10 @@ everything else goes after a grace (a `<name>@shared` dir counts as alive while 
 worktree of that name does — decision 0044); `runly pool doctor [--fix]` lists and
 removes orphans that are provably runly's own.
 
-**One environment per worktree, a machine-wide cap, and eviction.** A stack (one
-worktree) has exactly one environment (decision 0032). `poolMaxTotal` is machine-wide,
-derived from this host's cores. It gates environment **creation** only — rebinding an
-existing environment is never capacity-checked — so it bounds how many environments are
-*held*; the load budget bounds what runs.
-
-That made a cold environment permanently expensive: idle reclamation quiesces *heat*,
-not the environment, so the row survived and the machine-wide budget stayed full
-forever. A host with as many worktrees as the heuristic allows locked out every new
-stack indefinitely while nothing was running (#46). So when the machine-wide cap is
-what binds, runly **evicts the least-recently-used cold environment** — unleased, not
-busy, idle past `idleTtlMs` — and takes its slot. Never a leased or busy one, and never
-one released recently enough to still be doing the warm pool's job; the victim pays one
-cold provision on its next bind, and the eviction is logged as `pool-evict`. "Cold" here
-means idle past the TTL whether or not the sweeper has quiesced it yet: the sweep only
-looks every `BACKLOT_SWEEP_MS`, so a just-abandoned environment is `hot` while already
-condemned, and requiring `warm` refused the caller for that whole window. Excluding cold rows from the count instead (the obvious alternative)
-would have left nothing to stop N of them being rebound hot at once.
-
-Waiting can never clear a machine-wide block — the count is of rows, and releasing a
-lease leaves the row behind — so if nothing is evictable the refusal is immediate, and
-names the cap that actually bound plus `BACKLOT_POOL_MAX_TOTAL` (#47).
+**One environment per worktree, a machine-wide cap.** The cap gates creation;
+existing environments can be reused. Cold rows still count. Creation refuses at
+capacity without eviction; releasing a lease does not free a row. Explicit cleanup
+or raising `BACKLOT_POOL_MAX_TOTAL` frees capacity. The load budget bounds what runs.
 
 A database without the application is a `runly db` copy
 ([decision 0034](decisions/0034-additive-up-database-copies-and-ps.md)), which is not an
@@ -261,7 +256,7 @@ environment and answers to no pool cap. Every environment counts against `poolMa
 ### Journal upgrade barrier
 
 The journal stamps its schema in `PRAGMA user_version`, and a daemon refuses a
-journal stamped newer than it understands. The current schema is 4.
+journal stamped newer than it understands. The current schema is 5 (decision 0046): older daemons must not apply destructive lifetime policies to retained environments.
 
 Journal schema 3 retains every observed unresolved process group in
 `servicePids.*.pgid` and additional `pgids`, including groups a process leaves.
@@ -428,15 +423,9 @@ first bind; no presets or templates).
 | `reset-data` | restore every datastore from its template, each with the preset it holds (or the one named), keep all build caches | agent verify loops (`up --reset-data` before the tests) |
 | `pristine` | fresh private state and data; every upkeep rule and every build re-run in the worktree (nothing there is deleted) | merge-grade proofs; auto-escalation |
 
-Two consecutive bind failures on the same warm environment auto-escalate the next bind
-to `pristine` (a per-env `failStreak` in the journal, cleared by any successful bind) —
-the standard defense against stale-cache heisenbugs. Never for an environment the
-caller already leases (0.18.1): pristine reloads its data, which is the holder's work.
-One failed service (decision 0039) does not count as a bind failure. A service that flaps past its
-restart budget marks an UNLEASED environment `degraded`: skipped by acquisition, recycled
-by the sweeper. In a leased environment it is stopped and reported `failed` instead
-(decision 0039). **Warm is a cache, not a home**: the pool stays honest only while
-discarding any environment is cheap.
+Failed binds retain their data and require a new `up` to retry. No automatic pristine
+reset occurs. A service past its crash budget is stopped and reported failed, with
+or without a lease; the environment survives.
 
 `reset-data` is also exposed mid-lease as a verb: replay your repro against pristine
 data after twenty minutes of debugging mutation.
@@ -472,26 +461,10 @@ Every failure is classified — the field an agent branches on mechanically:
   there; on Linux it detects wall-clock outrunning the monotonic clock (which halts
   through suspend). One sleep is pardoned exactly once, and every pardon is logged
   as a `pardon` event naming the gap and the detector.
-- **A lease can name its holder's process** (`--holder-pid`, `BACKLOT_HOLDER_PID`, or
-  Claude Code's `CLAUDE_PID` automatically, when it is a live ancestor of the CLI). The
-  default holder is a worktree PATH, and nothing about a path can die. A named process is
-  checked against its start time; while it lives the lease does not expire, and once it
-  has been dead for `BACKLOT_TETHER_GRACE_MS` (60 s) the environment is torn down
-  (decision 0035). **This makes it a form for callers that outlive the command, and
-  `--ttl` the form for other agents.** A bind naming an ALREADY-dead pid is refused
-  outright (exit 64): the environment would be reclaimed while its caller was still using
-  it. The pattern that produces this is `BACKLOT_HOLDER_PID=$$ runly up` from an agent
-  harness, where every command gets a fresh shell, so `$$` is already gone.
-- **A lease does not exempt a service from its idle clock** (decision 0035). Each service
-  stops after `BACKLOT_SERVICE_IDLE_MS` without a runly verb that uses its environment or a
-  client byte on its port; the lease, data and ports survive, and the next connection or
-  `up` starts it again. A live agent is not activity, and neither is an agent polling
-  `ctx`, `ps`, `plan`, `logs` or `status` (decision 0039).
-- **Leases need no heartbeat** because losing a lease is designed to be worthless: an
-  explicit `up` refreshes the TTL (`reset-data` and read-only verbs deliberately do not,
-  so an idle agent that only polls `ctx` does not hold an environment forever); expiry
-  leaves the environment warm; the source of truth never left the worktree. A tethered
-  lease is renewed by its live holder process instead.
+- **Leases are worktree-owned and never expire.** TTL belongs only to public previews. A holder PID is diagnostic metadata, never liveness.
+- **Activity controls idle stop**, independently of leases. Traffic in either
+  direction anywhere in the environment, using verbs, and exec heartbeats count.
+  Read-only polling and mere process/socket existence do not.
 - **Remote is the mirror image**: the world keeps running (and billing) while the lid
   is shut. Therefore remote environments always carry **provider-side TTLs** as the
   backstop, and a long remote operation must be submit-and-poll, never a held SSH
@@ -516,7 +489,7 @@ The CLI **is** the API: every verb takes `--json`; stdout is data, stderr is hum
 
 ```
 runly up [service...] [--preset [ds=]p]... [--reset-data|--pristine] [--rebuild]
-         [--ttl <minutes>] [--holder-pid <pid>] [--env]   # lease; ADD services; upkeep + builds, restart what changed; --env: export lines
+         [--holder-pid <pid>] [--env]   # lease; ADD services; upkeep + builds, restart what changed; --env: export lines
 runly plan [service...] [--rebuild]            # what up would build/start, its cost, starts now | would wait for X
 runly destroy                                  # tear down everything this worktree holds, now
 runly down [service...]                        # stop just these (none = all); lease, data, ports stay
@@ -596,7 +569,7 @@ single-quoted only when a shell needs it), each as an `export` line, so
 `eval "$(runly ctx --env)" && pnpm e2e` hands them to the test command. `up --env` prints
 the same lines after the bind, and `exec` sets the same variables. Without `--json` or
 `--env`, `up` and `ctx` print a short summary (services, URLs, datastores, login; a
-tethered lease as `held by agent <pid>`, else its deadline; after `up`, what started or
+lease as `worktree lease (no expiry)`; after `up`, what started or
 restarted and the reasons for a full rebind; a failed last `up` from `lastUpFailed`).
 `status` and `destroy` print a summary too; `--json` is unchanged.
 
@@ -655,11 +628,11 @@ reads is ignored.
 | Env var | config.json key | Default |
 | --- | --- | --- |
 | `BACKLOT_STATE_DIR` | — | `$XDG_STATE_HOME/backlot` (the per-machine root; 0700) |
-| `BACKLOT_SERVICE_IDLE_MS` | `serviceIdleMs` | 10 min — a running service with no verb on its environment and no client byte on its port is stopped (decision 0035); `idle:` per service overrides |
-| `BACKLOT_TETHER_GRACE_MS` | `tetherGraceMs` | 60 s — how long a holder process must stay dead before its environment or copy is torn down |
-| `BACKLOT_TETHER` | — | `off` disables the automatic Claude Code tether (`CLAUDE_PID`) |
+| `BACKLOT_SERVICE_IDLE_MS` | `serviceIdleMs` | 5 min — environment-wide proxy traffic and using verbs; service `idle:` overrides |
+| `BACKLOT_TETHER_GRACE_MS` | `tetherGraceMs` | 60 s — database-copy holder death grace only |
+| `BACKLOT_TETHER` | — | `off` disables automatic Claude ancestry detection for `db new` only |
 | `BACKLOT_PROXY_HOLD_MS` | — | 90 s — how long a connection is held while its service starts or wakes |
-| `BACKLOT_POOL_MAX_TOTAL` | `poolMaxTotal` | With the load budget on: `2 x cores`, clamped **[4,64]** — a cap on environments HELD, machine-wide. With `BACKLOT_BUDGET=off`: `min(cores/2, memGB/4)`, clamped **[2,8]**. When this is what binds, a cold unleased env is evicted rather than the caller refused |
+| `BACKLOT_POOL_MAX_TOTAL` | `poolMaxTotal` | With budget on: 2 x cores, clamped [4,64]; otherwise [2,8]. Bounds retained environments; never automatically evicts |
 | `BACKLOT_BUDGET` | `budget.enabled` | on — `off` admits everything (decision 0036) |
 | `BACKLOT_BUDGET_MEMORY` | `budget.memory` | 70 % of RAM — declared memory runly may commit at once |
 | `BACKLOT_BUDGET_CPU` | `budget.cpu` | 1.5 x cores |
@@ -669,9 +642,9 @@ reads is ignored.
 | `BACKLOT_BUDGET_WAIT_MS` | `budget.waitMs` | 10 min — longest wait in the budget queue |
 | `BACKLOT_BUDGET_MAX_QUEUE` | `budget.maxQueue` | 64 waiters |
 | `BACKLOT_TEMPLATE_GRACE_MS` | `templateGraceMs` | 1 h — an unreferenced, superseded template is kept this long after it was baked |
-| `BACKLOT_LEASE_TTL_MS` | `sessionTtlMs` | 30 min — the lease TTL when `up` gives no `--ttl` |
-| `BACKLOT_IDLE_TTL_MS` | `idleTtlMs` | 30 min — an unleased environment's services stop after this at the latest, and an unleased environment idle this long may be evicted for a new one |
-| `BACKLOT_UNLEASED_TTL` | `unleasedTtl` | 24 h (`24h`, `90m`, seconds, or `off`) — an unleased environment nobody used this long is torn down by the sweep: services, data, ports; templates and the worktree's records stay (decision 0041) |
+| `BACKLOT_LEASE_TTL_MS` | — | Retired and ignored; leases never expire |
+| `BACKLOT_IDLE_TTL_MS` | `idleTtlMs` | Legacy heat-reporting threshold only; does not stop or delete environments |
+| `BACKLOT_UNLEASED_TTL` | `unleasedTtl` | Retired and ignored; inactivity never destroys environments |
 | `BACKLOT_WAIT_MS` | `waitMs` | 60 s — how long a bind waits for an environment held by another holder, or for a slot at the machine-wide cap |
 | `BACKLOT_HOLDER_PID` | — | the holder process for `up` and `db new` (as `--holder-pid`) |
 | `BACKLOT_PORT_RANGE` | — | `20000-29999` — public ports |

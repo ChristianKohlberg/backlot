@@ -4,7 +4,7 @@
  */
 import { mkdirSync, rmSync, readdirSync, existsSync, readFileSync } from 'node:fs';
 import { isAbsolute, join, relative, sep } from 'node:path';
-import { Journal, JOURNAL_SCHEMA_VERSION, type DbCopyRow, type DropRecipe, type EnvRow, type LeaseRow, type PreviewRestore } from '../core/journal.js';
+import { Journal, JOURNAL_SCHEMA_VERSION, NO_LEASE_EXPIRY, type DbCopyRow, type DropRecipe, type EnvRow, type LeaseRow, type PreviewRestore } from '../core/journal.js';
 import { BUILD, VERSION, compareVersions, versionSkew } from '../core/version.js';
 import { buildOf, canonicalDirectory, envDatastoreNames, outputsOf, upkeepOutputs, loadStack, normalizeLogins, manifestFileOf, type Manifest, type ServiceSpec, type Stack } from '../core/manifest.js';
 import { snapshotOutputs } from '../core/worktree.js';
@@ -30,6 +30,8 @@ import { DEFAULT_PREVIEW_PUBLISHER, resolvePreviewPublisher, type PreviewSetting
 import { EnvSupervisor, killGroupVerified, killPidVerified, reapPids, mergeServicePids, serviceGroups, type ServiceExit } from './supervisor.js';
 import { EXEC_SERVICE, groupAlive, isAlive, processGroup, procScanSupported, sameProcess, scanByCwd, scanDbCopy, scanTagged, serviceTag, startTime, type TaggedProc } from '../core/procscan.js';
 import { policy } from '../core/policy.js';
+import { PreviewGate } from './preview-gate.js';
+import { confirmedMissing } from '../core/existence.js';
 import { kernelSleepGap, readKernelSleepRecord } from '../core/sleep.js';
 import { retentionSweep, sharedFilesFor, templateFiles, templateRefs, templateVerdicts } from '../core/retention.js';
 import { logEvent, recentEvents } from '../core/events.js';
@@ -43,8 +45,6 @@ const serviceOf = (stack: Stack, name: string): ServiceSpec => {
   if (!spec) throw new BrokerError('work-error', `no service '${name}' in ${manifestFileOf(stack)}`, 'manifest');
   return spec;
 };
-const LEASE_TTL = () => policy().sessionTtlMs;
-const IDLE_TTL = () => policy().idleTtlMs;
 /** A wake within this long of the service's idle stop skips the budget's CPU gate (decision 0036). */
 const RECENT_RUN_MS = 60 * 60_000;
 const WAIT_MS = () => policy().waitMs;
@@ -223,6 +223,63 @@ export class Engine {
    * lease id: in flight, or failed with the reason `ctx` reports. In memory:
    * it describes this daemon life; the lease row keeps what to re-publish.
    */
+  private previewTimers = new Map<string, NodeJS.Timeout>();
+  private previewGates = new Map<string, PreviewGate>();
+
+  private armPreview(leaseId: string, expiresAt: number): void {
+    clearTimeout(this.previewTimers.get(leaseId));
+    const timer = setTimeout(() => {
+      this.previewTimers.delete(leaseId);
+      if (now() < expiresAt) { this.armPreview(leaseId, expiresAt); return; }
+      void this.expirePreview(leaseId).catch(err => logEvent({ level: 'error', kind: 'preview', detail: `preview expiry failed: ${String(err)}` }));
+    }, Math.min(Math.max(0, expiresAt - now()), 2_147_483_647));
+    timer.unref();
+    this.previewTimers.set(leaseId, timer);
+  }
+
+  /** Called synchronously after a successful up, while the env lock is held. */
+  private renewPreview(envId: string): void {
+    const lease = this.journal.leaseForEnv(envId);
+    const preview = lease?.previewRestore;
+    if (!lease || !preview || !lease.previewPid || !sameProcess(lease.previewPid, lease.previewStart)) return;
+    const gate = this.previewGates.get(lease.id);
+    if (!gate || gate.pid !== lease.previewPid || (preview.expiresAt ?? 0) <= now()) return;
+    const ttlMs = preview.ttlMs ?? 30 * 60_000;
+    if (!Number.isFinite(ttlMs) || ttlMs <= 0) return;
+    const expiresAt = now() + ttlMs;
+    if (!gate.renew(expiresAt)) return;
+    this.journal.setLeasePreviewRestore(lease.id, { ...preview, ttlMs, expiresAt });
+    this.armPreview(lease.id, expiresAt);
+    logEvent({ level: 'info', kind: 'preview', envId, detail: `successful up renewed public preview until ${new Date(expiresAt).toISOString()}` });
+  }
+
+  private async expirePreview(leaseId: string): Promise<void> {
+    const lease = this.journal.allLeases().find(l => l.id === leaseId);
+    const deadline = lease?.previewRestore?.expiresAt;
+    if (!lease || (Number.isFinite(deadline) && (deadline ?? 0) > now())) return;
+    clearTimeout(this.previewTimers.get(leaseId));
+    this.previewTimers.delete(leaseId);
+    this.previewRestores.delete(leaseId);
+    // Expiry closes access but preserves explicit publication intent. Legacy
+    // records without a deadline were never safely bounded: forget those.
+    if (!Number.isFinite(deadline)) this.forgetPreview(leaseId);
+    if (!lease.previewPid) return;
+    await this.stopPreviewForLease(lease);
+    logEvent({ level: 'info', kind: 'preview', envId: lease.envId, detail: 'public preview expired; successful up can reopen it with a fresh TTL' });
+  }
+
+  /** Under the env lock, after a successful bind; never publish a private lease. */
+  private async previewAfterUp(envId: string): Promise<string | undefined> {
+    this.renewPreview(envId);
+    const lease = this.journal.leaseForEnv(envId);
+    if (!lease?.previewRestore) return;
+    const gate = this.previewGates.get(lease.id);
+    if (lease.previewPid && sameProcess(lease.previewPid, lease.previewStart) && gate?.pid === lease.previewPid && gate.expiresAt > now()) return;
+    await this.restorePreview(lease, true, true);
+    const result = this.previewRestores.get(lease.id);
+    if (result?.state === 'failed') return `services are ready, but public preview could not be reopened: ${result.error}`;
+  }
+
   private previewRestores = new Map<string, { service: string; url: string; state: 'restoring' | 'failed'; error?: string; at: number }>();
   /** Settles once every recorded preview was re-published or reported; a restore that outlives a `shutdown` stops what it started. */
   previewsRestored: Promise<void> = Promise.resolve();
@@ -337,6 +394,8 @@ export class Engine {
 
   /** Recovery (decision 0009): reap recorded PIDs from a previous daemon life; hot -> warm. */
   async recover(): Promise<void> {
+    // Retire legacy environment deadlines on upgrade; preview expiry is independent.
+    for (const lease of this.journal.allLeases()) if (lease.expiresAt !== NO_LEASE_EXPIRY) this.journal.saveLease({ ...lease, expiresAt: NO_LEASE_EXPIRY });
     let envs = 0;
     let stranded = 0;
     for (const env of this.journal.allEnvs()) {
@@ -624,7 +683,7 @@ export class Engine {
   }
 
   /** One atomic claim attempt — MUST run under the pool lock. */
-  private async tryClaim(stack: Stack, holder: string, kind: LeaseKind, hygiene: Hygiene, ttlMs: number, holderPid?: number, onlyMine = false): Promise<ClaimOutcome> {
+  private async tryClaim(stack: Stack, holder: string, kind: LeaseKind, hygiene: Hygiene, holderPid?: number, onlyMine = false): Promise<ClaimOutcome> {
     // A holder keeps its env: rebinding your own lease is the normal loop —
     // unless that env is being torn down or has flapped, in which case drop the
     // stale lease and fall through to a fresh claim.
@@ -636,11 +695,9 @@ export class Engine {
     if (mine && !(onlyMine && mine.expiresAt <= now())) {
       const env = this.journal.getEnv(mine.envId);
       if (env && env.state !== 'recycling' && env.state !== 'degraded') {
-        // The tether is the LATEST caller's: an `up` that names no holder
-        // process (a human, BACKLOT_TETHER=off) clears the previous one. Kept,
-        // an agent's tether outlived the hand-over, and the agent's exit then
-        // tore down the environment — data and all — under the next user.
-        this.journal.saveLease({ ...mine, hygiene, expiresAt: now() + ttlMs, holderPid: undefined, holderStart: undefined, ...holderIdentity(holderPid) });
+        // Diagnostic identity follows the latest caller: an `up` with no holder
+        // process clears previous diagnostic process metadata.
+        this.journal.saveLease({ ...mine, hygiene, expiresAt: NO_LEASE_EXPIRY, holderPid: undefined, holderStart: undefined, ...holderIdentity(holderPid) });
         // A continuing lease keeps the services it wants: bindAndStart adds
         // the request to env.activeServices (decision 0034).
         return { env, fresh: false };
@@ -668,7 +725,7 @@ export class Engine {
     if (!env && envs.length === 0 && this.capacityBinding() === null) env = await this.createEnv(stack);
     if (env) {
       this.journal.saveLease({
-        id: `l-${shortId()}`, envId: env.id, kind, holder, hygiene, expiresAt: now() + ttlMs,
+        id: `l-${shortId()}`, envId: env.id, kind, holder, hygiene, expiresAt: NO_LEASE_EXPIRY,
         ...holderIdentity(holderPid),
       });
       // fresh: true — a NEW owner. It must not inherit a previous holder's
@@ -693,106 +750,6 @@ export class Engine {
   }
 
   /**
-   * Cold, unleased environments that can be given up to free a MACHINE-WIDE
-   * slot, least-recently-used first.
-   *
-   * Why eviction rather than just not counting them (#46's own suggestion): the
-   * caps gate environment CREATION only — rebinding an existing environment is
-   * never capacity-checked — so the row count is what bounds worst-case
-   * concurrent load. Excluding cold rows from the count would leave nothing to
-   * stop N of them being rebound hot at once. Giving the slot back for real
-   * keeps the ceiling meaningful, and costs the least-recently-used environment
-   * one cold provision the next time it is bound.
-   *
-   * Unleased + not busy + idle past IDLE_TTL qualifies. A recently released
-   * environment is the warm pool doing its job, so it is never taken — if
-   * nothing is that idle the caller gets a refusal naming the cap that actually
-   * bound, which is still strictly better than the lockout.
-   *
-   * Deliberately NOT restricted to `warm`. Idle past IDLE_TTL is precisely what
-   * the sweeper quiesces, but it only looks every BACKLOT_SWEEP_MS (15s by
-   * default) — so an environment released and abandoned a moment ago is still
-   * `hot` while already being condemned. Requiring `warm` meant that for a whole
-   * sweep interval the caller was refused with "waiting will not help", when the
-   * next sweep would in fact have made this environment evictable. Taking a
-   * condemned `hot` environment is the same trade one step further, and
-   * recycleOne stops its services through the ordinary teardown.
-   */
-  private evictionCandidates(): EnvRow[] {
-    const floor = IDLE_TTL();
-    return this.journal
-      .allEnvs()
-      .filter(
-        (e) =>
-          // 'provisioning' is mid-creation, 'recycling' is already going, and
-          // 'degraded' is the sweeper's own to reap.
-          (e.state === 'warm' || e.state === 'hot') &&
-          !this.busy.has(e.id) &&
-          !this.journal.leaseForEnv(e.id) &&
-          now() - e.lastUsedAt > floor,
-      )
-      .sort((a, b) => a.lastUsedAt - b.lastUsedAt);
-  }
-
-  /**
-   * Free a machine-wide slot by giving up the least-recently-used cold
-   * environment. Returns the id evicted, or null if nothing qualified.
-   *
-   * MUST NOT hold the pool lock: recycleOne claims under it (the chain is not
-   * re-entrant), and the teardown that follows deletes a tree, which the pool
-   * lock must never wait on. claimForTeardown re-reads and refuses anything
-   * leased or busy, so a candidate chosen here and leased in the gap is declined
-   * rather than taken — never take an environment somebody else is holding (#40).
-   */
-  private async evictForMachineCapacity(stack: Stack): Promise<string | null> {
-    const bound = await this.poolLocked(() => this.capacityBinding());
-    if (bound !== 'machine') return null;
-    const before = `${this.journal.allEnvs().length}/${POOL_MAX_TOTAL()}`;
-    for (const cand of this.evictionCandidates()) {
-      const human = (ms: number) => (ms >= 60_000 ? `${Math.round(ms / 60_000)}m` : `${Math.max(1, Math.round(ms / 1000))}s`);
-      const idleFor = human(now() - cand.lastUsedAt);
-      const wasState = cand.state;
-      if (await this.recycleOne(cand.id, false) !== 'recycled') continue;
-      logEvent({
-        level: 'info',
-        kind: 'pool-evict',
-        envId: cand.id,
-        detail:
-          `evicted to free a machine-wide pool slot for stack '${stack.id}' — ` +
-          `unleased and idle ${idleFor} (${wasState}, past the ${human(IDLE_TTL())} idle TTL), ` +
-          `least recently used of ${this.evictionCandidates().length + 1} candidate(s); the pool held ${before}. ` +
-          `Its next bind provisions cold.`,
-      });
-      return cand.id;
-    }
-    return null;
-  }
-
-  /**
-   * Is some environment about to become claimable on its own?
-   *
-   * `busy` is the one that matters here and was missed: the idle quiesce runs
-   * under the environment lock, which marks it busy, and decision 0021 keeps its
-   * mid-quiesce state as plain `hot` on purpose. So the sweeper reclaiming heat
-   * from the only candidate made it briefly unevictable — and the machine-wide
-   * refusal, which tells the caller that waiting cannot help, fired on a
-   * condition that clears in milliseconds. It reproduced on the macOS runner,
-   * where teardown is slower (services get SIGTERM, then a verified SIGKILL).
-   *
-   * The other three are transient for the reasons the per-stack branch already
-   * gives: the sweeper reaps them and frees capacity.
-   */
-  private transientlyUnclaimable(rows: EnvRow[]): boolean {
-    return rows.some(
-      (e) =>
-        this.busy.has(e.id) ||
-        e.state === 'degraded' ||
-        e.state === 'recycling' ||
-        e.state === 'provisioning',
-    );
-  }
-
-  /**
    * Why this environment could not be given up, per environment.
    *
    * It used to say "too recent to evict" for every unleased row, which is the
@@ -805,9 +762,7 @@ export class Engine {
     if (lease) return `leased by '${lease.holder}' (${lease.kind})`;
     if (this.busy.has(e.id)) return `${e.state}, an operation is in flight on it`;
     if (e.state !== 'warm' && e.state !== 'hot') return `state ${e.state}`;
-    const idleMs = now() - e.lastUsedAt;
-    const human = (ms: number) => (ms >= 60_000 ? `${Math.round(ms / 60_000)}m` : `${Math.max(1, Math.round(ms / 1000))}s`);
-    return `${e.state}, idle ${human(idleMs)} — inside the ${human(IDLE_TTL())} idle TTL, so too recent to evict`;
+    return `${e.state}, data retained for its worktree — use 'runly destroy' or 'runly pool recycle ${e.id}' to free this slot`;
   }
 
   /**
@@ -822,9 +777,9 @@ export class Engine {
     if (this.capacityBinding() === null) return null; // room to grow
     // The MACHINE-WIDE cap is what bound, and waiting cannot clear it: the
     // count is of env ROWS, and releasing a lease leaves the row behind. Only
-    // an eviction, an orphan reap or a degraded reap ever lowers it (#47).
+    // explicit cleanup or worktree removal lowers it.
     const all = this.journal.allEnvs();
-    if (this.transientlyUnclaimable(all) || this.evictionCandidates().length > 0) return null;
+    if (all.some(e => e.state === 'recycling' || confirmedMissing(e.stackRoot))) return null;
     return { scope: 'machine', detail: all.map((e) => `${e.id} (${this.notEvictableBecause(e)})`).join('; ') };
   }
 
@@ -849,7 +804,7 @@ export class Engine {
       const lease = this.journal.leaseForEnv(env.id);
       if (!lease) return this.busy.has(env.id) ? null : undefined;
       if (lease.expiresAt <= deadline) return null;
-      holders.push(`${env.id} held by '${lease.holder}' (${lease.kind}, ${Math.round((lease.expiresAt - now()) / 60_000)}m left)`);
+      holders.push(`${env.id} held by '${lease.holder}' (${lease.kind}, ${lease.expiresAt === NO_LEASE_EXPIRY ? 'no expiry' : `${Math.round((lease.expiresAt - now()) / 60_000)}m left`})`);
     }
     return holders.join('; ');
   }
@@ -886,7 +841,7 @@ export class Engine {
   }
 
   /** Queue at capacity WITHOUT holding the pool lock while sleeping. */
-  private async acquireEnv(stack: Stack, holder: string, kind: LeaseKind, hygiene: Hygiene, ttlMs: number, holderPid?: number, signal?: AbortSignal): Promise<{ env: EnvRow; fresh: boolean }> {
+  private async acquireEnv(stack: Stack, holder: string, kind: LeaseKind, hygiene: Hygiene, holderPid?: number, signal?: AbortSignal): Promise<{ env: EnvRow; fresh: boolean }> {
     const start = now();
     // A holder that already holds this stack's LIVE lease consumes no
     // capacity — rebinding only re-saves it (renewing the deadline for an
@@ -899,7 +854,7 @@ export class Engine {
     // nothing and joins the queue like everyone else.
     const live = this.journal.leaseForHolder(holder, stack.id);
     if (live && live.expiresAt > now()) {
-      const claimed = await this.poolLocked(() => this.tryClaim(stack, holder, kind, hygiene, ttlMs, holderPid, true));
+      const claimed = await this.poolLocked(() => this.tryClaim(stack, holder, kind, hygiene, holderPid, true));
       if (claimed !== null) return claimed;
     }
     // FIFO ticket. Without ordering, every waiter polled independently and a
@@ -910,7 +865,7 @@ export class Engine {
     queue.push(ticket);
     this.waiting.set(stack.id, queue);
     try {
-      return await this.acquireQueued(stack, holder, kind, hygiene, ttlMs, start, ticket, holderPid, signal);
+      return await this.acquireQueued(stack, holder, kind, hygiene, start, ticket, holderPid, signal);
     } finally {
       const rest = (this.waiting.get(stack.id) ?? []).filter((t) => t !== ticket);
       if (rest.length > 0) this.waiting.set(stack.id, rest);
@@ -923,7 +878,6 @@ export class Engine {
     holder: string,
     kind: LeaseKind,
     hygiene: Hygiene,
-    ttlMs: number,
     start: number,
     ticket: number,
     holderPid?: number,
@@ -935,19 +889,10 @@ export class Engine {
       // Only the head of THIS STACK's queue may claim; everyone else waits.
       const queue = this.waiting.get(stack.id);
       const myTurn = !queue || queue.length === 0 || queue[0] === ticket;
-      const claimed = myTurn ? await this.poolLocked(() => this.tryClaim(stack, holder, kind, hygiene, ttlMs, holderPid, false)) : null;
+      const claimed = myTurn ? await this.poolLocked(() => this.tryClaim(stack, holder, kind, hygiene, holderPid, false)) : null;
       if (claimed) return claimed;
-      // A machine-wide block never clears by waiting — the count is of env rows,
-      // and a release leaves the row behind — so a host holding as many cold
-      // worktrees as the heuristic allows locked out every new stack
-      // indefinitely, while nothing was running (#46). Give up the
-      // least-recently-used cold environment instead and claim its slot.
-      if (myTurn && (await this.evictForMachineCapacity(stack))) continue;
-      // This worktree's one environment is dead (a service flapped past its
-      // budget). It used to sit beside a freshly created second one until the
-      // sweeper reaped it; with one environment per worktree, waiting for the
-      // sweep would stall every bind here for a sweep interval. Reap it now.
-      if (myTurn && (await this.reapDegradedOwn(stack))) continue;
+      // Legacy degraded rows become retryable without deleting data.
+      if (myTurn && (await this.retryDegradedOwn(stack))) continue;
       // Refuse to burn the full wait on something that provably cannot resolve.
       const blocked = await this.poolLocked(() => this.structuralCapacityBlock(stack, now() + WAIT_MS()));
       if (blocked) {
@@ -998,19 +943,8 @@ export class Engine {
         (service, exit) => {
           const fresh = this.journal.getEnv(env.id);
           if (!fresh || fresh.state === 'recycling') return;
-          // A LEASED environment is someone's work (decision 0039): the
-          // service that crash-loops is stopped and reported as failed, and
-          // the environment, its data, its other services and its logs stay.
-          // The next `up` retries it.
-          if (this.journal.leaseForEnv(env.id)) {
-            this.serviceFailed(env.id, service, exit);
-            return;
-          }
-          // Nobody holds it: the environment is degraded — skipped by acquire,
-          // recycled by the sweeper (decision 0007).
-          fresh.state = 'degraded';
-          this.journal.saveEnv(fresh);
-          logEvent({ level: 'warn', kind: 'degraded', envId: env.id, detail: `'${service}' ${describeExit(exit)} — the environment is unleased and will be recycled` });
+          // A failed service never owns the lifetime of its worktree's data.
+          this.serviceFailed(env.id, service, exit);
         },
         () => {
           // A pid changed (start/restart/exit): keep the journal truthful so
@@ -2103,32 +2037,15 @@ export class Engine {
   async up(opts: UpOptions) {
     const requestStarted = performance.now();
     const services = opts.services ?? [];
+    if (opts.ttlMs !== undefined) throw new BrokerError('work-error', '--ttl is only for public previews; environment leases do not expire', 'lease');
     const stack = loadStack(opts.cwd);
     const holder = this.callerHolder(opts.cwd, opts.holder, stack);
     const forbiddenNotice = await this.enforceHolderPreviewForbidden(stack, holder, opts.onProgress);
     // Removed by decision 0034; the CLI answers it with exit 64 before the daemon.
     if (opts.dataOnly) throw new BrokerError('work-error', DATA_ONLY_REMOVED, 'manifest');
     this.refuseCopiesOnlyPresets(stack, validatePresetRequest(stack.manifest, opts.presets, stack.file));
-    // Resolve a requested slice BEFORE acquiring an env: an unknown name is a
-    // user typo, not a bind failure, so it must not reach bindAndStart's catch
-    // (which bumps failStreak — two typos would escalate the next real bind to a
-    // pristine data wipe) or churn a pooled env. bindAndStart resolves it again
-    // authoritatively; this is just the early, side-effect-free guard.
+    // Reject invalid service names and caller inputs before claiming the environment.
     if (services.length > 0) this.resolveServiceClosure(stack, services);
-    // A lease pinned to a dead pid is released by the very next sweep, so it
-    // would hand this caller's environment — and its seeded database — to
-    // whoever binds next while the caller is still using it. The CLI refuses
-    // this as a usage error; this guard covers every other client of the RPC.
-    if (opts.holderPid !== undefined && !isAlive(opts.holderPid)) {
-      throw new BrokerError(
-        'work-error',
-        `holder pid ${opts.holderPid} is not a live process — the lease would be reclaimable the moment it is created. ` +
-          `Under Claude Code, leave the holder pid out: the CLI tethers the lease to the agent itself (CLAUDE_PID); elsewhere use a TTL (--ttl <minutes>)`,
-        'lease',
-      );
-    }
-    // Validate before claiming: missing input is caller configuration, not an
-    // environment failure deserving hygiene escalation or a stranded lease.
     const suppliedInputs = opts.callerEnv === undefined ? undefined : validateCallerEnv(stack.manifest, opts.callerEnv);
     const existingLease = this.journal.leaseForHolder(holder, stack.id);
     const existingEnv = existingLease ? this.journal.getEnv(existingLease.envId) : undefined;
@@ -2140,24 +2057,22 @@ export class Engine {
     ]);
     requireCallerEnv(stack.manifest, selectedInputs, suppliedInputs ?? (existingLease ? this.leaseInputs.get(existingLease.id)?.values : undefined) ?? {});
     const kind = opts.kind ?? 'session';
-    let hygiene = opts.hygiene ?? 'reuse';
+    const hygiene = opts.hygiene ?? 'reuse';
     opts.onProgress?.(`acquiring this worktree's environment (machine ${this.journal.allEnvs().length}/${POOL_MAX_TOTAL()})`);
     const queueStarted = performance.now();
     let queueMs = 0;
-    const { env, fresh } = await this.acquireEnv(stack, holder, kind, hygiene, opts.ttlMs ?? LEASE_TTL(), opts.holderPid, opts.signal);
-    // Auto-escalation (decision 0007): two consecutive bind failures on this
-    // warm environment -> the next bind is pristine, whatever was asked. Never
-    // for an environment this caller already held (0.18.1): a leased
-    // environment is someone's work, and pristine wipes its data (decision
-    // 0039). They can ask for `--pristine` themselves.
-    if (hygiene !== 'pristine' && env.failStreak >= 2 && !existingLease) hygiene = 'pristine';
+    const { env, fresh } = await this.acquireEnv(stack, holder, kind, hygiene, opts.holderPid, opts.signal);
+    // Retried binds preserve worktree data; pristine is always explicit.
     try {
       const { env: bound, previewNotice, bindDiagnostics } = await this.envLocked(
         env.id,
-        () => {
+        async () => {
           queueMs = performance.now() - queueStarted;
           if (opts.signal?.aborted) throw new CallerGone('env-error', `the caller disconnected before its bind of ${env.id} started`, 'pool');
-          return this.bindAndStart(stack, env, hygiene, opts.onProgress, services, fresh, suppliedInputs, opts.presets, Boolean(opts.rebuild), opts.signal);
+          const result = await this.bindAndStart(stack, env, hygiene, opts.onProgress, services, fresh, suppliedInputs, opts.presets, Boolean(opts.rebuild), opts.signal);
+          const notice = await this.previewAfterUp(env.id);
+          if (notice) result.previewNotice = [result.previewNotice, notice].filter(Boolean).join('; ');
+          return result;
         },
         (s) => opts.onProgress?.(`waiting for another operation on this environment … ${s}s`),
         'a bind',
@@ -2243,18 +2158,14 @@ export class Engine {
     const previewRestore = restoring
       ? { service: restoring.service, url: restoring.url, state: restoring.state, ...(restoring.error ? { error: restoring.error } : {}) }
       : lease?.previewRestore && !lease.previewPid
-        ? { service: lease.previewRestore.service, url: lease.previewRestore.url, state: 'restoring' as const }
+        ? { service: lease.previewRestore.service, url: lease.previewRestore.url, state: (lease.previewRestore.expiresAt ?? 0) <= now() ? 'expired' as const : 'restoring' as const }
         : null;
     return {
       stack: stack.manifest.name,
       envId: env.id,
       state: env.state,
-      /**
-       * `holderPid`: the process the lease is tethered to (decision 0035) —
-       * while it lives the lease does not expire, so `expiresAt` is only the
-       * renewal horizon. null for a lease that ends at `expiresAt`.
-       */
-      lease: lease ? { id: lease.id, kind: lease.kind, hygiene: lease.hygiene, expiresAt: lease.expiresAt, holderPid: lease.holderPid ?? null } : null,
+      /** holderPid is diagnostic metadata; null expiresAt means no deadline. */
+      lease: lease ? { id: lease.id, kind: lease.kind, hygiene: lease.hygiene, expiresAt: lease.expiresAt === NO_LEASE_EXPIRY ? null : lease.expiresAt, holderPid: lease.holderPid ?? null } : null,
       urls,
       /** The environment's PUBLIC ports by manifest key (`runly ctx --env` → RUNLY_PORT_<KEY>). */
       ports: { ...env.ports },
@@ -2265,6 +2176,7 @@ export class Engine {
        */
       proxy: this.proxy.stats(env.id),
       previewUrls,
+      previewExpiresAt: lease?.previewRestore?.expiresAt ?? null,
       /**
        * A preview the daemon re-publishes after a restart (decision 0045):
        * `restoring`, or `failed` with the error; null when there is none.
@@ -2568,7 +2480,8 @@ export class Engine {
       this.touch(env.id);
     }, undefined, 'an exec');
     // Tagged, so a process listing can tell an exec from a stranger; never reaped (procscan.scanTagged).
-    return { envId: env.id, root: stack.root, vars: { ...vars, ...serviceTag(env.id, EXEC_SERVICE, stateRoot()) } };
+    const heartbeatMs = Math.max(50, Math.min(60_000, ...Object.values(stack.manifest.services).map(s => serviceIdleMs(s) / 3)));
+    return { envId: env.id, root: stack.root, heartbeatMs, vars: { ...vars, ...serviceTag(env.id, EXEC_SERVICE, stateRoot()) } };
   }
 
   /** A running `runly exec` is activity (decision 0039): the CLI calls this while the command runs. */
@@ -2751,6 +2664,8 @@ export class Engine {
    * public, unauthenticated URL nobody can ever name again.
    */
   private async stopPreviewForLease(lease: LeaseRow): Promise<boolean> {
+    const gate = this.previewGates.get(lease.id);
+    if (gate && gate.pid === lease.previewPid) { gate.close(); this.previewGates.delete(lease.id); }
     if (!lease.previewPid) return true;
     let pub = resolvePreviewPublisher(DEFAULT_PREVIEW_PUBLISHER);
     const env = this.journal.getEnv(lease.envId);
@@ -2823,6 +2738,8 @@ export class Engine {
     if (last?.id === lease.id && last.previewPid) {
       logEvent({ level: 'error', kind: 'preview', envId: lease.envId, detail: this.unreapedPreview(last) });
     }
+    clearTimeout(this.previewTimers.get(lease.id));
+    this.previewTimers.delete(lease.id);
     this.journal.deleteLease(lease.id);
     this.leaseInputs.delete(lease.id);
     this.goneSince.delete(`lease:${lease.id}`);
@@ -2874,20 +2791,33 @@ export class Engine {
     await Promise.allSettled(pending.map((l) => this.restorePreview(l)));
   }
 
-  private async restorePreview(lease: LeaseRow): Promise<void> {
+  private async restorePreview(lease: LeaseRow, reopen = false, alreadyLocked = false): Promise<void> {
+    const reason = reopen ? 'after successful up' : 'after the daemon restart';
     const r = lease.previewRestore;
     if (!r) return;
+    if (!Number.isFinite(r.expiresAt) || (!reopen && (r.expiresAt ?? 0) <= now())) { await this.expirePreview(lease.id); return; }
+    if (!reopen) this.armPreview(lease.id, (r.expiresAt ?? 0));
     this.previewRestores.set(lease.id, { service: r.service, url: r.url, state: 'restoring', at: now() });
     try {
-      await this.envLocked(lease.envId, async () => {
+      const restore = async () => {
         // Re-read inside the lock: a `preview` or `preview stop` that ran
         // first decides, and a lease that ended takes its preview with it.
         const held = this.journal.leaseForEnv(lease.envId);
-        if (this.stopping || !held || held.id !== lease.id || !held.previewRestore || held.previewPid) {
+        if (this.stopping || !held || held.id !== lease.id || !held.previewRestore || (!reopen && held.previewPid)) {
           this.previewRestores.delete(lease.id);
           return;
         }
-        const want = held.previewRestore;
+        let want = held.previewRestore;
+        if (reopen) {
+          if (!(await this.stopPreviewForLease(held))) throw new BrokerError('infra-error', this.unreapedPreview(held), 'preview');
+          const fresh = this.journal.leaseForEnv(lease.envId);
+          if (!fresh || fresh.id !== held.id || !fresh.previewRestore) return;
+          const ttlMs = fresh.previewRestore.ttlMs ?? 30 * 60_000;
+          if (!Number.isFinite(ttlMs) || ttlMs <= 0 || !Number.isSafeInteger(Math.ceil(now() + ttlMs))) throw new BrokerError('work-error', 'invalid stored preview TTL; publish the preview again', 'preview');
+          want = { ...fresh.previewRestore, ttlMs, expiresAt: now() + ttlMs };
+          this.journal.setLeasePreviewRestore(held.id, want);
+          this.armPreview(held.id, want.expiresAt ?? 0);
+        }
         const env = this.journal.getEnv(held.envId);
         if (!env || env.state === 'recycling') {
           this.previewRestores.delete(lease.id);
@@ -2902,9 +2832,16 @@ export class Engine {
         const pub = resolvePreviewPublisher(want.publisher ?? this.previewPublisherName(stack));
         pub.checkPrerequisite();
         const settings = (want.settings ?? stack.manifest.preview) as PreviewSettings | undefined;
-        const { url, pid, pinned } = await pub.start({ envId: env.id, service: want.service, localUrl: `http://localhost:${port}`, logDir: this.envDirs(env.id).logs, settings });
+        const gate = await PreviewGate.open(port, (want.expiresAt ?? 0));
+        this.previewGates.set(held.id, gate);
+        let published;
+        try { published = await pub.start({ envId: env.id, service: want.service, localUrl: gate.url, logDir: this.envDirs(env.id).logs, settings }); }
+        catch (err) { gate.close(); throw err; }
+        const { url, pid, pinned } = published;
+        gate.pid = pid.pid;
         const fresh = this.journal.leaseForEnv(env.id);
-        if (!fresh || fresh.id !== lease.id || this.stopping) {
+        if (!fresh || fresh.id !== lease.id || this.stopping || (want.expiresAt ?? 0) <= now() || !fresh.previewRestore) {
+          gate.close();
           if (!(await pub.stop(pid))) logEvent({ level: 'error', kind: 'preview', envId: env.id, detail: `the lease ended while its preview was being restored, and the new tunnel (pid ${pid.pid}) outlived its kill — ${url} may still be serving, unauthenticated` });
           this.previewRestores.delete(lease.id);
           return;
@@ -2922,24 +2859,34 @@ export class Engine {
           kind: 'preview',
           envId: env.id,
           detail: url === want.url
-            ? `restored the preview of '${want.service}' at ${url} after the daemon restart`
-            : `restored the preview of '${want.service}' after the daemon restart at a NEW address ${url} (was ${want.url}) — ${pub.name} cannot keep its address`,
+            ? `restored the preview of '${want.service}' at ${url} ${reason}`
+            : `restored the preview of '${want.service}' ${reason} at a NEW address ${url} (was ${want.url}) — ${pub.name} cannot keep its address`,
         });
-      }, undefined, 'a preview restore');
+      };
+      if (alreadyLocked) await restore();
+      else await this.envLocked(lease.envId, restore, undefined, 'a preview restore');
     } catch (err) {
+      if ((!reopen && (r.expiresAt ?? 0) <= now()) || !this.journal.leaseForEnv(lease.envId)?.previewRestore) {
+        this.previewRestores.delete(lease.id);
+        return;
+      }
       const error = String((err as Error).message ?? err);
       this.previewRestores.set(lease.id, { service: r.service, url: r.url, state: 'failed', error, at: now() });
-      logEvent({ level: 'error', kind: 'preview', envId: lease.envId, detail: `could not restore the preview of '${r.service}' (${r.url}) after the daemon restart: ${error} — run 'runly preview ${r.service}' to publish it again` });
+      logEvent({ level: 'error', kind: 'preview', envId: lease.envId, detail: `could not restore the preview of '${r.service}' (${r.url}) ${reason}: ${error} — run 'runly preview ${r.service}' to publish it again` });
     }
   }
 
   /** The lease's preview is over on purpose: a restart must not bring it back (decision 0045). */
   private forgetPreview(leaseId: string): void {
+    clearTimeout(this.previewTimers.get(leaseId));
+    this.previewTimers.delete(leaseId);
     this.journal.setLeasePreviewRestore(leaseId, null);
     this.previewRestores.delete(leaseId);
   }
 
-  async previewStart(cwd: string, service: string, holder?: string, ttlMs?: number, httpsPort?: number): Promise<{ service: string; url: string }> {
+  async previewStart(cwd: string, service: string, holder?: string, ttlMs?: number, httpsPort?: number): Promise<{ service: string; url: string; expiresAt: number }> {
+    const duration = ttlMs ?? 30 * 60_000;
+    if (!Number.isFinite(duration) || duration <= 0 || !Number.isSafeInteger(Math.ceil(now() + duration))) throw new BrokerError('work-error', 'preview --ttl must be a finite positive duration', 'preview');
     const stack = loadStack(cwd);
     this.assertPreviewAllowed(stack);
     const h = this.callerHolder(cwd, holder, stack);
@@ -2982,7 +2929,11 @@ export class Engine {
       }
       const dirs = this.envDirs(env.id);
       const settings: PreviewSettings | undefined = httpsPort !== undefined ? { ...stack.manifest.preview, https_port: httpsPort } : stack.manifest.preview;
-      const { url, pid, pinned } = await pub.start({
+      const expiresAt = now() + duration;
+      const gate = await PreviewGate.open(localPort, expiresAt);
+      this.previewGates.set(held.id, gate);
+      let published;
+      try { published = await pub.start({
         envId: env.id,
         service,
         // `localhost`, the same origin ctx advertises for the service — never a
@@ -2991,19 +2942,23 @@ export class Engine {
         // ONLY, and a tunnel aimed at 127.0.0.1 then answers 502 for a service
         // that is perfectly up. Both cloudflared and tailscale resolve
         // `localhost` to whichever loopback is listening.
-        localUrl: `http://localhost:${localPort}`,
+        localUrl: gate.url,
         logDir: dirs.logs,
         // A caller's --https-port outranks the manifest for this publish only;
         // publishers that do not serve on a port ignore it (decision 0031).
         settings,
       });
+      } catch (err) { gate.close(); throw err; }
+      const { url, pid, pinned } = published;
+      gate.pid = pid.pid;
       // Identity, not mere existence: `pub.start` can take up to 45s holding only
       // this env's lock, and a concurrent release + `up` in that window hands the
       // holder a DIFFERENT lease on a DIFFERENT environment. Writing the tunnel
       // onto that row would advertise env A's port as env B's preview and leave
       // env A to return to the pool publishing the next holder's services.
       const freshLease = this.journal.leaseForHolder(h, stack.id);
-      if (!freshLease || freshLease.id !== lease.id) {
+      if (!freshLease || freshLease.id !== lease.id || expiresAt <= now()) {
+        gate.close();
         if (!(await pub.stop(pid))) {
           logEvent({
             level: 'error',
@@ -3014,7 +2969,7 @@ export class Engine {
         }
         throw new BrokerError(
           'env-error',
-          `the lease this preview was published for ${freshLease ? 'was replaced' : 'lapsed'} while cloudflared was starting — retry after binding again`,
+          expiresAt <= now() ? 'the public preview deadline elapsed while publishing — retry with a longer preview --ttl' : `the lease this preview was published for ${freshLease ? 'was replaced' : 'ended'} while publishing — retry after running up`,
           'lease',
         );
       }
@@ -3023,18 +2978,15 @@ export class Engine {
       freshLease.previewPid = pid.pid;
       freshLease.previewStart = pid.startTime;
       freshLease.previewPort = localPort;
-      // The lease clock only ever moves on a SUCCESSFUL publish, like every
-      // other verb that takes --ttl: `preview nosuchservice --ttl 60` used to
-      // extend the lease and then fail.
-      if (ttlMs !== undefined && ttlMs > 0) freshLease.expiresAt = now() + ttlMs;
       this.journal.saveLease(freshLease);
       // What a daemon restart publishes again (decision 0045).
-      const restore: PreviewRestore = { service, url, port: localPort, publisher: pub.name, settings: { ...(settings ?? {}), ...(pinned ?? {}) } };
+      const restore: PreviewRestore = { expiresAt, ttlMs: duration, service, url, port: localPort, publisher: pub.name, settings: { ...(settings ?? {}), ...(pinned ?? {}) } };
       this.journal.setLeasePreviewRestore(freshLease.id, restore);
+      this.armPreview(freshLease.id, expiresAt);
       this.previewRestores.delete(freshLease.id);
       this.touch(env.id);
       logEvent({ level: 'info', kind: 'preview', envId: env.id, detail: `published '${service}' at ${url}` });
-      return { service, url };
+      return { service, url, expiresAt };
     }, undefined, 'a preview publish');
   }
 
@@ -3483,7 +3435,7 @@ export class Engine {
         // environment and the last client byte on its port — with the same
         // limit (the unleased cap included).
         const limit = this.serviceIdleLimit(env, spec);
-        const clock = this.serviceClock(env, name, spec);
+        const clock = this.serviceClock(env);
         const lastSeen = st?.lastActivityAt ?? (key ? env.activity?.[key] : undefined);
         services.push({
           env: env.id,
@@ -3828,7 +3780,7 @@ export class Engine {
         proxy: this.proxy.stats(e.id),
         /** Where its services run: the caller's worktree (decision 0032). */
         worktree: e.stackRoot,
-        lease,
+        lease: lease ? { ...lease, expiresAt: lease.expiresAt === NO_LEASE_EXPIRY ? null : lease.expiresAt } : null,
         /** null = every service (the default set); otherwise the services the lease wants up — [] after `runly down` (decision 0034). */
         activeServices: e.activeServices ?? null,
         idleMs: now() - e.lastUsedAt,
@@ -4204,7 +4156,7 @@ export class Engine {
   private async enforcePreviewForbidden(env: EnvRow, stack: Stack, say: Progress): Promise<string | undefined> {
     if (!stack.manifest.preview?.forbidden) return undefined;
     const lease = this.journal.leaseForEnv(env.id);
-    if (!lease?.previewPid || !lease.previewService) return undefined;
+    if (!lease || (!lease.previewPid && !lease.previewRestore)) return undefined;
     const url = lease.previewUrl ?? 'the preview tunnel';
     const confirmed = await this.stopPreviewForLease(lease);
     this.forgetPreview(lease.id);
@@ -4256,8 +4208,9 @@ export class Engine {
     opts: { hygiene: Hygiene; portsReallocated: boolean },
   ): Promise<string | undefined> {
     const lease = this.journal.leaseForEnv(env.id);
-    if (!lease?.previewPid || !lease.previewService) return undefined;
-    const service = lease.previewService;
+    if (!lease || (!lease.previewPid && !lease.previewRestore)) return undefined;
+    const service = lease.previewService ?? lease.previewRestore?.service;
+    if (!service) return undefined;
     const url = lease.previewUrl ?? 'the preview tunnel';
     const portKey = stack.manifest.services[service]?.port;
     const port = portKey ? env.ports[portKey] : undefined;
@@ -4266,7 +4219,7 @@ export class Engine {
       ? { klass: 'work-error', why: `${manifestFileOf(stack)} now sets preview.forbidden, and a stack that forbids preview must not stay published` }
       : !active.has(service)
         ? { klass: 'env-error', why: `service '${service}' is not in this bind's running set${active.size ? ` (${[...active].map((n) => `'${n}'`).join(', ')})` : ' (this lease runs no services)'}, so its preview would publish a port with nothing behind it for the rest of the lease` }
-        : opts.portsReallocated && port !== lease.previewPort
+        : opts.portsReallocated && port !== (lease.previewPort ?? lease.previewRestore?.port)
           ? { klass: 'env-error', why: `service '${service}' moved from port ${lease.previewPort} to ${port ?? 'no port at all'}, so its preview tunnel is aimed at a stale port` }
           : null;
 
@@ -4553,14 +4506,16 @@ export class Engine {
     return { recycled, skipped };
   }
 
-  /** This worktree's degraded, idle environment(s), reaped so a claim can recreate one. */
-  private async reapDegradedOwn(stack: Stack): Promise<boolean> {
-    let reaped = false;
+  /** Make a legacy degraded row retryable without destroying its data. */
+  private async retryDegradedOwn(stack: Stack): Promise<boolean> {
+    let changed = false;
     for (const env of this.journal.envsForStack(stack.id)) {
       if (env.state !== 'degraded' || this.busy.has(env.id)) continue;
-      if (await this.recycleOne(env.id, true) === 'recycled') reaped = true;
+      env.state = 'warm';
+      this.journal.saveEnv(env);
+      changed = true;
     }
-    return reaped;
+    return changed;
   }
 
   /**
@@ -4599,7 +4554,7 @@ export class Engine {
 
   // ---------------------------------------------------------------- lifecycle (decision 0035)
 
-  /** The proxy saw a client byte: the clock moves in memory, and reaches the journal throttled. */
+  /** The proxy saw a byte in either direction: the clock moves in memory, and reaches the journal throttled. */
   private noteActivity(envId: string, key: string): void {
     const at = now();
     const dirty = this.activityDirty.get(envId) ?? {};
@@ -4630,30 +4585,15 @@ export class Engine {
     return at;
   }
 
-  /**
-   * One running service's idle clock: the environment's last runly verb, the
-   * last client byte through the service's own public port (any port's, for
-   * a service with none), and its own start.
-   */
-  private serviceClock(env: EnvRow, service: string, spec: ServiceSpec | undefined): number {
-    let at = Math.max(env.lastUsedAt, this.startedAt.get(`${env.id}\0${service}`) ?? 0);
-    const clocks: Record<string, number | null> = { ...(env.activity ?? {}) };
-    for (const [k, v] of Object.entries(this.proxy.activity(env.id))) if (v !== null && v > (clocks[k] ?? 0)) clocks[k] = v;
-    for (const [k, v] of Object.entries(clocks)) {
-      if (v === null) continue;
-      if (spec?.port ? k === spec.port : true) at = Math.max(at, v);
-    }
+  /** Activity anywhere in the environment keeps its supporting services awake. */
+  private serviceClock(env: EnvRow): number {
+    let at = this.envActivityAt(env);
+    for (const name of Object.keys(env.servicePids)) at = Math.max(at, this.startedAt.get(`${env.id}\0${name}`) ?? 0);
     return at;
   }
 
-  /**
-   * How long a running service of `env` may sit idle: its `idle:` (or the
-   * default), capped for an UNLEASED environment — nobody can wake that one by
-   * traffic — at BACKLOT_IDLE_TTL_MS (the pre-0.16 quiesce). `ps` shows the same.
-   */
-  private serviceIdleLimit(env: EnvRow, spec: ServiceSpec | undefined): number {
-    const unleasedCap = this.journal.leaseForEnv(env.id) ? Infinity : policy().idleTtlMs;
-    return Math.min(serviceIdleMs(spec), unleasedCap);
+  private serviceIdleLimit(_env: EnvRow, spec: ServiceSpec | undefined): number {
+    return serviceIdleMs(spec);
   }
 
   /** Stop the running services of `env` whose idle clock ran out. */
@@ -4662,13 +4602,10 @@ export class Engine {
     const sup = this.supervisors.get(env.id);
     if (!sup) return;
     const manifest = this.envManifests.get(env.id);
-    // Nobody can wake an UNLEASED environment by traffic, so its services stop
-    // after BACKLOT_IDLE_TTL_MS at the latest, whatever `idle:` says (the
-    // pre-0.16 quiesce of an unleased environment).
     const due = (row: EnvRow) => Object.keys(sup.pids()).filter((name) => {
       const spec = manifest?.services[name];
       const limit = this.serviceIdleLimit(row, spec);
-      return Number.isFinite(limit) && now() - this.serviceClock(row, name, spec) > limit;
+      return Number.isFinite(limit) && now() - this.serviceClock(row) > limit;
     });
     if (due(env).length === 0) return;
     await this.envLocked(env.id, async () => {
@@ -4726,8 +4663,6 @@ export class Engine {
       // A bind that failed is redone by `up`, not by traffic: its survivors
       // may still hold the service's resources, and its data may be half-made.
       if ((env.failStreak ?? 0) > 0) return false;
-      const lease = this.journal.leaseForEnv(envId);
-      if (!lease || lease.expiresAt <= now()) return false;
       const stack = loadStack(env.stackRoot);
       if (stack.id !== env.stack) return false;
       const name = Object.entries(stack.manifest.services).find(([, spec]) => spec.port === key)?.[0];
@@ -4763,8 +4698,9 @@ export class Engine {
       await this.envLocked(envId, async () => {
         const env = this.journal.getEnv(envId);
         const lease = this.journal.leaseForEnv(envId);
-        if (this.stopping || !env || !lease || env.state === 'recycling' || env.state === 'degraded') throw new BrokerError('env-error', `environment ${envId} cannot be woken (no live lease, or being torn down)`, 'wake');
+        if (this.stopping || !env || env.state === 'recycling' || env.state === 'degraded' || (env.failStreak ?? 0) > 0) throw new BrokerError('env-error', `environment ${envId} cannot be woken (failed bind, or being torn down)`, 'wake');
         const stack = loadStack(env.stackRoot);
+        if (stack.id !== env.stack) throw new BrokerError('env-error', 'worktree identity changed; run runly up', 'wake');
         keyOf = (n) => stack.manifest.services[n]?.port;
         const sup = this.supervisor(env);
         const running = new Set(Object.keys(sup.pids()));
@@ -4797,7 +4733,7 @@ export class Engine {
       // Whatever the proxy holds for these services is closed now, not at the hold timeout.
       for (const n of closure) {
         const key = keyOf(n);
-        if (key && this.proxy.state(envId, key) !== 'up') this.proxy.down(envId, key);
+        if (key && this.proxy.state(envId, key) !== 'up') this.proxy.down(envId, key, `Could not restore ${n}; inspect runly logs ${n} and daemon events`);
       }
       throw err;
     }
@@ -4810,12 +4746,12 @@ export class Engine {
    * template keys is computed only for one that is missing.
    */
   private async startStoppedLocked(
-    stack: Stack, env: EnvRow, lease: LeaseRow, closure: Set<string>,
+    stack: Stack, env: EnvRow, lease: LeaseRow | undefined, closure: Set<string>,
     opts: { label: string; source: string; waitMs?: number; say?: Progress },
   ): Promise<void> {
     const sup = this.supervisor(env);
     const running = new Set(Object.keys(sup.pids()));
-    const values = this.leaseInputs.get(lease.id)?.values ?? selectCallerEnv(stack.manifest, {});
+    const values = (lease ? this.leaseInputs.get(lease.id)?.values : undefined) ?? selectCallerEnv(stack.manifest, {});
     requireCallerEnv(stack.manifest, closure, values);
     const decided: BuildDecisions = new Map();
     const need = await this.needFor(stack, env, closure, closure, { rebuild: false, mode: 'wake' }, decided);
@@ -4930,7 +4866,7 @@ export class Engine {
     const key = `${envId}\0${service}`;
     this.failedServices.set(key, { ...exit, at: now() });
     const portKey = this.envManifests.get(envId)?.services[service]?.port;
-    if (portKey) this.proxy.down(envId, portKey);
+    if (portKey) this.proxy.down(envId, portKey, `Service ${service} failed; inspect runly logs ${service}`);
     logEvent({
       level: 'warn',
       kind: 'service-failed',
@@ -5094,6 +5030,7 @@ export class Engine {
         });
         continue;
       }
+      if (lease.previewRestore && (!Number.isFinite(lease.previewRestore.expiresAt) || (lease.previewRestore.expiresAt ?? 0) <= now())) { await this.expirePreview(lease.id); continue; }
       // Never expire a lease whose env has an operation in flight (a long bind
       // under a tiny TTL must not lose its env mid-bind).
       if (this.busy.has(lease.envId)) continue;
@@ -5118,99 +5055,27 @@ export class Engine {
           detail: `the preview tunnel for '${service}' exited on its own — its URL is no longer published; run 'runly preview ${service}' again for a new one`,
         });
       }
-      if (lease.holderPid !== undefined) {
-        // The tether (decision 0035). The agent gone — believed only after the
-        // grace, so a pid read racing an exec is not a death — means the
-        // environment goes, all of it: services, data, tunnel, ports, lease.
-        if (this.tetherGone(`lease:${lease.id}`, lease.holderPid, lease.holderStart)) {
-          const outcome = await this.recycleOne(lease.envId, true);
-          logEvent({
-            level: outcome === 'recycled' ? 'info' : 'warn',
-            kind: 'lease',
-            envId: lease.envId,
-            detail: outcome === 'recycled'
-              ? `its tether (holder process ${lease.holderPid}) has been gone for ${formatDuration(policy().tetherGraceMs)} or more — the environment was torn down: services, data, preview, ports and lease`
-              : `its tether (holder process ${lease.holderPid}) is gone, but the teardown did not complete (${outcome}) — retried by the next sweep`,
-          });
-          if (outcome === 'recycled') this.goneSince.delete(`lease:${lease.id}`);
-          continue;
-        }
-        // While the agent lives, its lease lives (decision 0035): the TTL
-        // only bounds a lease nobody tethered.
-        if (sameProcess(lease.holderPid, lease.holderStart) && lease.expiresAt < now() + LEASE_TTL() / 2) {
-          this.journal.saveLease({ ...lease, expiresAt: now() + LEASE_TTL() });
-          continue;
-        }
-      }
-      if (lease.expiresAt < now()) {
-        await this.endLease(lease);
-      }
+
     }
     // Database copies (decision 0034) go when their holder or worktree does —
-    // the same signals the leases above answer to, with no TTL.
+    // independent of environment lifetime, with no TTL.
     await this.reapDbCopies();
     for (const env of this.journal.allEnvs()) {
       if (this.busy.has(env.id)) continue;
-      // An environment whose WORKTREE is gone — deleted or moved, or (after an
-      // identity-scheme change or a manifest rename) its root no longer
-      // resolves to the recorded stack id — is torn down, leased or not
-      // (decision 0035: a worktree removed takes everything with it). A
-      // manifest that merely fails to PARSE is not proof (someone may be
-      // mid-edit), so only a positive id mismatch or a missing root reaps.
-      let orphanReason: string | null = null;
-      if (!existsSync(env.stackRoot)) {
-        orphanReason = `its worktree ${env.stackRoot} is gone`;
-      } else {
-        try {
-          const current = loadStack(env.stackRoot);
-          if (current.id !== env.stack) orphanReason = `its worktree ${env.stackRoot} now resolves to '${current.id}', not '${env.stack}'`;
-        } catch {
-          /* unreadable manifest — ambiguous, leave the env alone */
-        }
-      }
+      // Only confirmed filesystem absence authorizes automatic environment teardown.
+      const orphanReason = confirmedMissing(env.stackRoot) ? `its worktree ${env.stackRoot} is gone` : null;
       if (orphanReason) {
         logEvent({ level: 'info', kind: 'retention', envId: env.id, detail: `${orphanReason} — the environment is torn down (services, data, preview, ports, lease)` });
         const outcome = await this.recycleOne(env.id, true);
         // A deleted worktree's own records (upkeep ledger, trigger cache, build
         // ledger) go with it once nothing names its stack (decision 0037).
-        if (outcome === 'recycled' && !existsSync(env.stackRoot) && this.journal.envsForStack(env.stack).length === 0 &&
+        if (outcome === 'recycled' && confirmedMissing(env.stackRoot) && this.journal.envsForStack(env.stack).length === 0 &&
           !this.journal.allDbCopies().some((c) => c.stack === env.stack)) {
           rmSync(join(worktreesRoot(), env.stack), { recursive: true, force: true });
         }
         continue;
       }
-      if (env.state === 'degraded') {
-        // Only an UNLEASED environment is recycled for a crash loop (decision
-        // 0039): a leased one keeps its data, services and logs, and its
-        // holder's next `up` retries. (A leased environment is not marked
-        // degraded any more; one an older daemon marked is left to its holder.)
-        if (this.journal.leaseForEnv(env.id)) continue;
-        await this.recycleOne(env.id, false);
-        continue;
-      }
-      // Unleased and idle past BACKLOT_UNLEASED_TTL (0.19, default 24h): the
-      // environment goes — services, data, ports — so a worktree nobody came
-      // back to stops holding a database. Its templates and the worktree's
-      // records (upkeep ledger, build ledger) stay: the next `up` there
-      // restores from a template and skips fresh upkeep.
-      const unleasedTtl = policy().unleasedTtlMs;
-      if (Number.isFinite(unleasedTtl) && !this.journal.leaseForEnv(env.id) && now() - this.envActivityAt(env) > unleasedTtl) {
-        const outcome = await this.recycleOne(env.id, false);
-        logEvent({
-          level: outcome === 'recycled' ? 'info' : 'warn',
-          kind: 'retention',
-          envId: env.id,
-          detail: outcome === 'recycled'
-            ? `unleased and unused for ${formatDuration(now() - this.envActivityAt(env))} (BACKLOT_UNLEASED_TTL ${formatDuration(unleasedTtl)}) — torn down; templates and worktree records kept`
-            : `unleased past BACKLOT_UNLEASED_TTL, but the teardown did not complete (${outcome}) — retried by the next sweep`,
-        });
-        if (outcome === 'recycled') continue;
-      }
-      // Idle (decision 0035): each running service on its own clock — the
-      // last client byte through its public port, the last runly verb on the
-      // environment, its own start. Readiness probes bypass the proxy and
-      // never count. The lease, the data and the ports stay; the next
-      // connection starts it again.
+      // Idle and failed environments retain their data while the worktree exists.
       await this.stopIdleServices(env);
     }
     await this.drainSurplusEnvs();
@@ -5223,6 +5088,10 @@ export class Engine {
     // below, so a connection in that window woke a service the stopping
     // daemon then had to chase.
     this.stopping = true;
+    for (const timer of this.previewTimers.values()) clearTimeout(timer);
+    this.previewTimers.clear();
+    for (const gate of this.previewGates.values()) gate.close();
+    this.previewGates.clear();
     this.proxy.setWakeHook(undefined);
     this.proxy.closeAll();
     // Activity clocks survive a restart (decision 0035): whatever the throttle held back is written now.

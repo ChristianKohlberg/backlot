@@ -63,7 +63,7 @@ const pidsOf = (c: Ctx) => {
 };
 
 describe('idle stop (decision 0035)', () => {
-  it('stops each service on its own clock, keeps its port, and health probes do not keep it alive', async () => {
+  it('uses an environment-wide clock, keeps ports, and health probes do not keep it alive', async () => {
     const c = ctx({ BACKLOT_SERVICE_IDLE_MS: '2000' });
     const wt = c.worktree({ 'runly.yml': STACK, 'server.mjs': SERVER });
     const up = await c.cli(['up', '--json'], wt);
@@ -78,7 +78,7 @@ describe('idle stop (decision 0035)', () => {
       await c.cli(['status', '--json'], wt);
       await sleep(400);
     }
-    expect(pidsOf(c), 'api was used by nobody and should be idle-stopped').toEqual(['web']);
+    expect(pidsOf(c).sort(), 'web traffic keeps its supporting api awake').toEqual(['api', 'web']);
 
     const stopped = await waitFor(() => pidsOf(c).length === 0, 15_000);
     expect(stopped).toBe(true);
@@ -138,7 +138,7 @@ describe('start on demand (decision 0035)', () => {
     const wt = c.worktree({ 'runly.yml': STACK, 'server.mjs': SERVER });
     const up = await c.cli(['up', '--json'], wt);
     expect((await c.cli(['down', 'api', '--json'], wt)).code).toBe(0);
-    await expect(fetch(up.json.urls.api, { signal: AbortSignal.timeout(5000) })).rejects.toThrow();
+    expect((await fetch(up.json.urls.api, { signal: AbortSignal.timeout(5000) })).status).toBe(503);
     expect(pidsOf(c)).toEqual(['web']);
   }, 60_000);
 
@@ -184,7 +184,7 @@ describe('activity survives a daemon restart (decision 0035)', () => {
 });
 
 describe('teardown when the agent or its worktree is gone (decision 0035)', () => {
-  it('a dead tether tears everything down — also when it died while the daemon was down', async () => {
+  it('a dead agent does not destroy its environment across a daemon restart', async () => {
     const c = ctx({ BACKLOT_TETHER_GRACE_MS: '0' });
     const wt = c.worktree({ 'runly.yml': STACK, 'server.mjs': SERVER });
     const agent = spawn('sh', ['-c', 'sleep 600'], { detached: true, stdio: 'ignore' });
@@ -195,11 +195,12 @@ describe('teardown when the agent or its worktree is gone (decision 0035)', () =
     await c.stopDaemon(wt);
     process.kill(-agent.pid!, 'SIGKILL');
 
-    // Any verb respawns the daemon; recovery plus one sweep must finish the job.
     await c.cli(['status', '--json'], wt);
-    expect(await waitFor(() => c.journal().allEnvs().length === 0 && c.journal().allLeases().length === 0, 20_000)).toBe(true);
-    expect(existsSync(join(c.stateDir, 'envs', envId))).toBe(false);
-    await expect(fetch(up.json.urls.web, { signal: AbortSignal.timeout(3000) })).rejects.toThrow();
+    await sleep(1500); // several sweeps, with the legacy death grace set to zero
+    expect(c.journal().allEnvs()).toHaveLength(1);
+    expect(c.journal().allLeases()).toHaveLength(1);
+    expect(existsSync(join(c.stateDir, 'envs', envId))).toBe(true);
+    expect((await get(up.json.urls.web)).status).toBe(200);
   }, 60_000);
 
   it('a removed worktree tears its leased environment down, across a daemon restart', async () => {

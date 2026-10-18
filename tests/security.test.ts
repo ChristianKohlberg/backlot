@@ -100,7 +100,7 @@ describe('argv parser (F1/F4)', () => {
   it('rejects an unknown flag and a bad --ttl instead of silently misbehaving', async () => {
     expect((await ctx.cli(['up', '--bogus'], wt)).exitCode).toBe(64);
     expect((await ctx.cli(['up', '--ttl', '4h'], wt)).exitCode).toBe(64); // hours not supported; must not silently default
-    expect((await ctx.cli(['up', '--ttl', '15'], wt)).exitCode).toBe(0); // minutes ok
+    expect((await ctx.cli(['up', '--ttl', '15'], wt)).exitCode).toBe(64); // minutes ok
   });
 });
 

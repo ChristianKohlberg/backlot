@@ -31,7 +31,11 @@ import type { EnvState, Hygiene, LeaseKind, ServicePid } from './types.js';
  * test lane's database. Disk is truth (decision 0009), so the truth has to say
  * what wrote it.
  */
-export const JOURNAL_SCHEMA_VERSION = 4;
+// Schema 5: worktree-owned environments must not be opened by a daemon that
+// destroys them on holder death, idle expiry or automatic capacity eviction.
+export const JOURNAL_SCHEMA_VERSION = 5;
+/** SQLite-safe sentinel for an explicitly non-expiring lease. Exposed as null in ctx. */
+export const NO_LEASE_EXPIRY = Number.MAX_SAFE_INTEGER;
 
 /**
  * service_pids was once `{"web": 1234}` and is now
@@ -81,7 +85,7 @@ export interface EnvRow {
   createdAt: number;
   lastUsedAt: number;
   servicePids: Record<string, ServicePid>;
-  /** Consecutive bind failures — >= 2 auto-escalates the next bind to pristine (decision 0007). */
+  /** Consecutive bind failures; retry requires up and never implicitly resets data. */
   failStreak: number;
   /**
    * The services this environment's lease WANTS up (decision 0034): `up`
@@ -93,7 +97,7 @@ export interface EnvRow {
    */
   activeServices?: string[];
   /**
-   * When each public port last carried a client byte (decision 0035), by port
+   * When each public port last carried a byte in either direction (decision 0035), by port
    * key. Persisted (throttled) so a daemon restart does not reset every idle
    * clock to "active"; the proxy's in-memory counters start from it.
    */
@@ -126,14 +130,7 @@ export interface LeaseRow {
   holder: string;
   hygiene: Hygiene;
   expiresAt: number;
-  /**
-   * The holder's process, when the caller supplied one.
-   *
-   * `holder` is a NAME (a worktree path by default) and nothing about a name
-   * can die — so an agent that crashed held its environment until the TTL
-   * expired, exempt from idle reclamation the whole time. A pid pinned by its
-   * start time can be checked, so a dead holder's lease is released in seconds.
-   */
+  /** Optional diagnostic process identity. Never controls environment lifetime. */
   holderPid?: number;
   holderStart?: number;
   /** Active lease-scoped public preview tunnel, when `runly preview` is running. */
@@ -154,6 +151,10 @@ export interface LeaseRow {
 
 /** A published preview, as a restart re-publishes it (decision 0045). */
 export interface PreviewRestore {
+  /** Absolute public-access deadline. Missing legacy deadlines are revoked on recovery. */
+  expiresAt?: number;
+  /** Duration reused when a successful up renews active public access. */
+  ttlMs?: number;
   service: string;
   /** The URL it had; a publisher that pins its address gives the same one again. */
   url: string;
@@ -598,7 +599,7 @@ export class Journal {
     // Atomic: a kill between these left leases pardoned but idle clocks not,
     // so a machine that slept woke to premature quiesces.
     this.withTx(() => {
-      this.db.prepare('UPDATE leases SET expires_at = expires_at + ?').run(ms);
+      this.db.prepare('UPDATE leases SET expires_at = MIN(expires_at + ?, ?) WHERE expires_at < ?').run(ms, NO_LEASE_EXPIRY, NO_LEASE_EXPIRY);
       this.db.prepare('UPDATE envs SET last_used_at = last_used_at + ?').run(ms);
     });
   }

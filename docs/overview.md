@@ -96,29 +96,42 @@ environment is not locked while the command runs, so an `up` next to a long
 
 ## An environment's life
 
-| Event | What happens |
-| --- | --- |
-| `up` | Creates the worktree's environment if there is none, takes or renews the lease (`--ttl`, default 30 min) and starts services. |
-| A service sees no runly verb that uses its environment and no client byte on its port for 10 min (`idle:` per service, `BACKLOT_SERVICE_IDLE_MS`) | That service is stopped (`ps` says `idle`). Its port, data and the lease stay. The verbs that count are `up`, `reset-data`, `exec`, `token`, `preview` and `down`; reading (`ctx`, `ps`, `plan`, `logs`, `status`) does not. |
-| A connection reaches an idle service's port | The service starts again (its dependencies too, through their own ports) and the connection is held until it is ready (`BACKLOT_PROXY_HOLD_MS`, 90 s). Only a leased environment wakes; a service stopped with `down` stays down. |
-| The holder process dies (`--holder-pid`, `BACKLOT_HOLDER_PID`, or the Claude Code session) | After a one-minute grace (`BACKLOT_TETHER_GRACE_MS`) everything goes: services, data, the copies that process held, preview, ports, lease. While the holder lives, the lease does not expire. |
-| The lease's TTL runs out (no holder process) | The lease ends; the environment stays for the worktree's next `up`. Its services stop after their idle time and are not woken by traffic. |
-| `release` | The same as a TTL end, now. |
-| The worktree is deleted | Everything goes, leased or not, also across a daemon restart. |
-| `destroy` | Everything goes now, the worktree's database copies included. For worktree pools that take a worktree back. The worktree's build records, its templates and the upkeep rules that declare `outputs:` stay, so the next `up` does not redo bakes or installs whose output is still there; a rule without `outputs:` runs again (a pool's `git clean` may have removed what it made). |
-| No lease, and nothing used the environment for 24 h (`BACKLOT_UNLEASED_TTL`, `off` to keep it) | The environment goes: services, data, ports. Templates and the worktree's records stay, so the next `up` there restores rather than bakes. |
-| The box needs a slot (`BACKLOT_POOL_MAX_TOTAL`) | The least recently used unleased environment idle for 30 min (`BACKLOT_IDLE_TTL_MS`) is recycled. |
-| A service crashes past its restart budget (4 exits in quick succession) | Leased: that service is stopped and shown `failed` in `ps` and `ctx` with its last exit (`runly logs <svc>` says why); the environment, its data, its other services and its logs stay, and the next `up` starts it again. Unleased: the environment is marked `degraded` and recycled. |
+Environments belong to worktrees, independently of agent processes. After **5 minutes**
+without activity, managed services stop; data, configuration and public ports stay.
+Activity means bytes in either direction through any environment proxy port, or a
+verb that uses the environment (`up`, `exec`, `token`, `preview`, `reset-data`, `down`).
+Read-only commands and internal readiness probes do not count. The clock is shared
+across the environment, with per-service `idle:` overrides.
 
-**Claude Code.** Claude Code exports `CLAUDE_PID`, the session process that every
-Bash tool call runs under. When it is a live ancestor of the CLI, `up` and
-`db new` use it as the holder automatically, so the environment lives exactly as
-long as the session and goes a minute after it ends. `BACKLOT_TETHER=off` opts
-out (the lease then lives by its TTL). An explicit `--holder-pid` wins.
+New connections wake wanted services and their dependencies even after `release`,
+subject to the load budget. Explicitly downed or failed services require `up`.
+WebSocket messages, protocol heartbeats and server-sent events count as traffic;
+a silent open connection does not. Consequently an idle stop closes silent sockets:
+clients must reconnect. Run silent background work with `runly exec` (heartbeats
+while its child runs), or set `idle: never`. Shared appliances remain running.
 
-**Other shells.** `--holder-pid` only helps a process that outlives the command.
-`BACKLOT_HOLDER_PID=$$ runly up` from an agent harness names a shell that has
-already exited, so runly refuses it (exit 64); use `--ttl` there.
+Agent death, disconnection, idle age and pool pressure never delete an environment.
+A confirmed missing worktree does; inaccessible paths and filesystem errors are not
+proof of deletion. Renaming a worktree removes its old path and therefore also
+triggers cleanup. Explicit `destroy` and `pool recycle` remain destructive.
+Environment leases never expire; `--ttl` is rejected outside `preview`. Public
+previews always expire (30 minutes by default, `preview --ttl <minutes>` to change
+it). Expiry closes public access, including open streams, but retains the lease
+and environment. A successful `up` renews an active preview for its configured TTL. Failed `up`
+calls and daemon restarts do not extend it. A successful `up` also reopens a
+previously enabled preview after automatic expiry, using its saved TTL. Explicit
+`preview stop`, `release`, or a forbidden-preview configuration clears that intent. `--holder-pid` on `up` is diagnostic metadata only; there is no
+agent-specific automatic tether. Required caller inputs lost on release or daemon
+restart must be supplied by a fresh `up` before services using them can wake.
+
+A full machine-wide environment cap refuses creation and names `BACKLOT_POOL_MAX_TOTAL`;
+raise the cap or explicitly destroy an unwanted environment. Load admission still
+bounds running services and builds. Failed starts retain data; retrying never
+implicitly runs `--pristine`.
+
+Standalone database copies retain their separate lifecycle: `db with` owns a copy
+for its command; `db new` can use an explicit process holder or the Claude ancestor
+tether. This does not control the application environment.
 
 A daemon restart (`runly update`) keeps leases, data and ports; services stop and
 the next `up`, `exec` or `token` — or a connection to their port — starts them.
@@ -166,7 +179,7 @@ daemon listens on it and forwards TCP to the service, which is started on a fres
   port it must listen on; everywhere else (other services, builds, `exec`, `ctx`)
   ports and `{{services.<svc>.url}}` are public, and `{{public_ports.<key>}}` is
   public everywhere;
-- client bytes are counted per port (`proxy` in `ctx --json` and `status
+- bytes in both directions are counted per port (`proxy` in `ctx --json` and `status
   --json`); runly's readiness probes bypass the proxy and do not count;
 - it is plain TCP, so WebSockets pass through;
 - a connection the service accepts and drops before answering (it crashed, or

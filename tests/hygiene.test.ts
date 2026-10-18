@@ -8,7 +8,7 @@ import { execFile, execFileSync } from 'node:child_process';
 import { existsSync, mkdtempSync, rmSync, writeFileSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { Journal } from '../src/core/journal.js';
+import { Journal, NO_LEASE_EXPIRY } from '../src/core/journal.js';
 import { disposeStateSync } from './support/leaks.js';
 
 const repo = join(import.meta.dirname, '..');
@@ -92,6 +92,7 @@ caches: [cache]
     // failed the env is no longer hot and every `up` restarts.
     expect((await ctx.cli(['up', '--reset-data', '--json'], wt)).exitCode).toBe(1); // strike 1 (work-error)
     expect((await ctx.cli(['up', '--json'], wt)).exitCode).toBe(1); // strike 2
+    await ctx.cli(['release', '--json'], wt); // retries after release must preserve data too
 
     // 0.18.1: a leased environment is never escalated to pristine on its own
     // (pristine reloads its data, which is the holder's work) — and one failed
@@ -106,7 +107,7 @@ caches: [cache]
   }, 60_000);
 });
 
-describe('degraded marking + auto-reap for a flapping service', () => {
+describe('crash loops preserve worktree data', () => {
   const ctx = makeContext();
   const wt = mkdtempSync(join(tmpdir(), 'runly-flap-'));
   afterAll(() => {
@@ -114,7 +115,7 @@ describe('degraded marking + auto-reap for a flapping service', () => {
     rmSync(wt, { recursive: true, force: true });
   });
 
-  it('a service dying after ready flaps out; leased, it is marked failed and the env stays — released, the env is reaped', async () => {
+  it('a service dying after ready is failed and its environment survives release', async () => {
     writeFileSync(
       join(wt, 'server.mjs'),
       `import { createServer } from 'node:http';
@@ -145,18 +146,13 @@ services:
     // the environment, so it is degraded and reaped, as before.
     expect((await ctx.cli(['up', '--json'], wt)).exitCode).toBe(0);
     expect((await ctx.cli(['release', '--json'], wt)).exitCode).toBe(0);
-    let envs: Awaited<ReturnType<typeof envsOf>> = [];
-    for (let i = 0; i < 60; i++) {
-      envs = await envsOf(ctx, wt);
-      if (envs.length === 0) break; // reaped
-      await new Promise((r) => setTimeout(r, 500));
-    }
-    expect(envs.length).toBe(0);
+    await new Promise(r => setTimeout(r, 6000));
+    expect((await envsOf(ctx, wt)).length).toBe(1);
   }, 90_000);
 });
 
 describe('idle quiesce (hot -> warm) and rebind', () => {
-  const ctx = makeContext({ BACKLOT_IDLE_TTL_MS: '800', BACKLOT_LEASE_TTL_MS: '600' });
+  const ctx = makeContext({ BACKLOT_SERVICE_IDLE_MS: '800', BACKLOT_LEASE_TTL_MS: '600' });
   const wt = mkdtempSync(join(tmpdir(), 'runly-idle-'));
   afterAll(() => {
     ctx.cleanup();
@@ -191,7 +187,7 @@ services:
       await new Promise((r) => setTimeout(r, 300));
     }
     expect(state).toBe('warm');
-    await expect(fetch(url, { signal: AbortSignal.timeout(800) })).rejects.toThrow(); // services genuinely stopped
+    expect((await fetch(url, { signal: AbortSignal.timeout(10_000) })).status).toBe(200); // unleased traffic wakes it
 
     const again = await ctx.cli(['up', '--json'], wt); // warm -> hot rebind, same port
     expect((again.json!.urls as Record<string, string>).web).toBe(url);
@@ -213,6 +209,9 @@ describe('sleep pardon (journal level)', () => {
     j.pardon(3_600_000); // the laptop slept an hour
     expect(j.leaseForEnv('e1')!.expiresAt).toBe(base + 10_000 + 3_600_000);
     expect(j.getEnv('e1')!.lastUsedAt).toBe(base + 3_600_000);
+    j.saveLease({ id: 'l2', envId: 'e2', kind: 'session', holder: 'other', hygiene: 'reuse', expiresAt: NO_LEASE_EXPIRY });
+    j.pardon(3_600_000);
+    expect(j.leaseForEnv('e2')!.expiresAt).toBe(NO_LEASE_EXPIRY);
     rmSync(dir, { recursive: true, force: true });
   });
 });
@@ -256,7 +255,7 @@ upkeep:
   }, 60_000);
 });
 
-describe('environments stranded by a stack-identity change are reaped', () => {
+describe('identity changes do not authorize data deletion', () => {
   const ctx = makeContext({ BACKLOT_SWEEP_MS: '400' });
   const wt = mkdtempSync(join(tmpdir(), 'runly-strand-'));
   afterAll(() => {
@@ -264,7 +263,7 @@ describe('environments stranded by a stack-identity change are reaped', () => {
     rmSync(wt, { recursive: true, force: true });
   });
 
-  it('an unleased env whose recorded stack id no longer matches its root is recycled', async () => {
+  it('an existing worktree retains its environment even if stack identity differs', async () => {
     // The sha256 id migration left every pre-upgrade env under an id no
     // loadStack() will ever produce again: invisible to its stack's pool but
     // still counted against POOL_MAX_TOTAL and still holding ports — forever,
@@ -285,15 +284,9 @@ describe('environments stranded by a stack-identity change are reaped', () => {
     j.saveEnv({ ...real, id: 'strand-OLDID00-e1', stack: 'strand-OLDID00', ports: { web: 1 }, servicePids: {} });
     expect(j.allEnvs().length).toBe(2);
 
-    // The sweeper must reap the stranger and keep the legitimate env.
-    const deadline = Date.now() + 15_000;
-    let ids: string[] = [];
-    for (;;) {
-      ids = new Journal(join(ctx.stateDir, 'journal.db')).allEnvs().map((e) => e.id);
-      if (!ids.includes('strand-OLDID00-e1') || Date.now() > deadline) break;
-      await new Promise((r) => setTimeout(r, 400));
-    }
-    expect(ids, `journal still holds: ${ids.join(', ')}`).not.toContain('strand-OLDID00-e1');
+    await new Promise(r => setTimeout(r, 1500));
+    const ids = j.allEnvs().map(e => e.id);
+    expect(ids).toContain('strand-OLDID00-e1');
     expect(ids).toContain(real.id);
   }, 30_000);
 });

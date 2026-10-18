@@ -250,14 +250,16 @@ describe('Q7 plain summaries, and exec after a daemon restart', () => {
   }, 90_000);
 });
 
-describe('BACKLOT_UNLEASED_TTL tears down an unleased environment nobody uses', () => {
-  it('goes after the TTL; the worktree records stay', async () => {
-    const c = ctx({ BACKLOT_UNLEASED_TTL: '2s', BACKLOT_SWEEP_MS: '300' });
+describe('legacy BACKLOT_UNLEASED_TTL cannot destroy worktree data', () => {
+  it('idles after release and retains data beyond the old TTL', async () => {
+    const c = ctx({ BACKLOT_UNLEASED_TTL: '2s', BACKLOT_SWEEP_MS: '300', BACKLOT_SERVICE_IDLE_MS: '1000' });
     const wt = c.worktree({ 'runly.yml': `${WEB}upkeep:\n  - { when: server.mjs, run: "echo ran >> upkeep.log" }\n`, 'server.mjs': SERVER, '.gitignore': 'upkeep.log\n' });
     const up = await c.cli(['up', '--json'], wt);
     expect(up.code, up.stderr + up.stdout).toBe(0);
     expect((await c.cli(['release', '--json'], wt)).code).toBe(0);
-    expect(await waitFor(() => c.journal().allEnvs().length === 0, 20_000), 'the unleased environment stayed').toBe(true);
+    expect(await waitFor(() => c.journal().allEnvs()[0]?.state === 'warm', 20_000)).toBe(true);
+    await sleep(2500);
+    expect(c.journal().allEnvs()[0]?.id).toBe(up.json.envId);
     const stack = up.json.envId.replace(/-e\d+$/, '');
     expect(existsSync(join(c.stateDir, 'worktrees', stack))).toBe(true);
     // The next up skips the upkeep rule: its ledger survived.
@@ -356,19 +358,19 @@ describe('C6 + C7 db with: RUNLY_DB_DATABASE, and runly failures told apart from
   }, 60_000);
 });
 
-describe('C8 a tethered lease shows its agent; --ttl is for untethered leases', () => {
-  it('prints "held by agent <pid>" and refuses --ttl next to --holder-pid', async () => {
+describe('C8 owner metadata is independent of explicit lease deadlines', () => {
+  it('prints a worktree lease and accepts a deadline with owner metadata', async () => {
     const c = ctx();
     const wt = c.worktree({ 'runly.yml': WEB, 'server.mjs': SERVER });
     const agent = spawn('sleep', ['300'], { stdio: 'ignore' });
     kids.push(agent.pid!);
     const up = await c.cli(['up', '--holder-pid', String(agent.pid)], wt);
     expect(up.code, up.stderr).toBe(0);
-    expect(up.stdout).toMatch(new RegExp(`held by agent ${agent.pid}`));
+    expect(up.stdout).toContain("worktree lease (no expiry)");
     expect(up.stdout).not.toMatch(/lease until/);
     const both = await c.cli(['up', '--holder-pid', String(agent.pid), '--ttl', '10'], wt);
     expect(both.code).toBe(64);
-    expect(both.stderr).toMatch(/--ttl sets the length of an untethered lease/);
+    expect(both.stderr).toMatch(/only for public previews/);
   }, 60_000);
 });
 

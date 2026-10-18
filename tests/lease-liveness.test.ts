@@ -63,10 +63,10 @@ async function waitFor(pred: () => boolean, timeoutMs = 20_000): Promise<boolean
   return pred();
 }
 
-describe('a lease tied to a dead process is torn down after the grace (decision 0035)', () => {
-  it('does not hold the environment for the rest of its TTL', async () => {
+describe('owner process metadata does not control environment lifetime', () => {
+  it('retains data and idles services after its agent crashes', async () => {
     // Grace 0 stands in for the 1-minute default.
-    const { cli, journal } = ctx({ BACKLOT_TETHER_GRACE_MS: '0' });
+    const { cli, journal } = ctx({ BACKLOT_TETHER_GRACE_MS: '0', BACKLOT_SERVICE_IDLE_MS: '1000' });
     // A stand-in for the agent: a real process that will die. Its pid is what
     // the lease is pinned to.
     const agent = spawn('sh', ['-c', 'sleep 600'], { detached: true, stdio: 'ignore' });
@@ -83,13 +83,12 @@ describe('a lease tied to a dead process is torn down after the grace (decision 
 
     process.kill(-agent.pid!, 'SIGKILL'); // the agent crashes
 
-    const released = await waitFor(() => journal().allLeases().length === 0 && journal().allEnvs().length === 0);
-    // Since 0.16 the agent being gone means EVERYTHING goes: not just the
-    // lease, the environment with its services, data and ports.
-    expect(released, 'the lease or the environment outlived its holder').toBe(true);
+    expect(await waitFor(() => journal().allEnvs()[0]?.state === 'warm')).toBe(true);
+    expect(journal().allLeases()).toHaveLength(1);
+    expect(journal().allEnvs()).toHaveLength(1);
   }, 120_000);
 
-  it('waits out the grace before tearing down — a dead pid seen once is not believed', async () => {
+  it('does not destroy an environment even after the old death grace', async () => {
     const { cli, journal } = ctx({ BACKLOT_TETHER_GRACE_MS: '4000' });
     const agent = spawn('sh', ['-c', 'sleep 600'], { detached: true, stdio: 'ignore' });
     agent.unref();
@@ -98,8 +97,8 @@ describe('a lease tied to a dead process is torn down after the grace (decision 
     const killedAt = Date.now();
     await settle(2000);
     expect(journal().allEnvs().length, 'torn down inside the grace').toBe(1);
-    const gone = await waitFor(() => journal().allEnvs().length === 0, 20_000);
-    expect(gone).toBe(true);
+    await settle(2500);
+    expect(journal().allEnvs()).toHaveLength(1);
     expect(Date.now() - killedAt).toBeGreaterThanOrEqual(4000);
   }, 120_000);
 

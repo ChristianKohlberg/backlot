@@ -33,7 +33,7 @@ it('applies changed startup env and run commands without poisoning later reuse, 
   f.write('a.mjs', server('a')); f.write('b.mjs', server('b')); f.write('message.txt', 'one');
   const manifest = (value: string, file = 'a.mjs') => f.write('backlot.yml', `name: startup-config\nservices:\n  web:\n    run: node ${file}\n    port: web\n    env: { PORT: "{{ports.web}}", VALUE: "${value}" }\n    ready: { http: /, timeout: 10 }\n`);
   manifest('before');
-  const first = f.cli(['up', '--ttl', '480m']);
+  const first = f.cli(['up']);
   const body = async () => (await fetch(first.urls.web, { headers: { connection: 'close' }, signal: AbortSignal.timeout(5000) })).json();
   const initial = await body();
   f.write('message.txt', 'two');

@@ -57,6 +57,7 @@ export function makeFakeCloudflared(dir: string): string {
     `import { writeFileSync } from 'node:fs';
 const u = process.env.FAKE_PREVIEW_URL || '${FAKE_URL}';
 writeFileSync(process.env.FAKE_PREVIEW_PIDFILE, String(process.pid));
+writeFileSync(process.env.FAKE_PREVIEW_PIDFILE + ".args", JSON.stringify(process.argv.slice(2)));
 setTimeout(() => {}, 3600_000);
 const emit = () => console.error('INF |  ' + u);
 emit();
@@ -76,6 +77,7 @@ export function makeMuteCloudflared(dir: string): string {
     script,
     `import { writeFileSync } from 'node:fs';
 writeFileSync(process.env.FAKE_PREVIEW_PIDFILE, String(process.pid));
+writeFileSync(process.env.FAKE_PREVIEW_PIDFILE + ".args", JSON.stringify(process.argv.slice(2)));
 setTimeout(() => {}, 3600_000);
 `,
   );

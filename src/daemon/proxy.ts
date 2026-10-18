@@ -12,7 +12,7 @@
  *   a quiesce and the next bind), so a URL handed out once stays good;
  * - a connection that arrives while its service is (re)starting is HELD,
  *   bounded, and forwarded once the service is ready, instead of being refused;
- * - client→server bytes and the time of the last of them are counted per
+ * - bytes in both directions and the time of the last of them are counted per
  *   environment and port — the activity signal idle detection reads (step 6 of
  *   the lifecycle work). runly's own readiness probes go to the internal port,
  *   so they never count.
@@ -32,11 +32,15 @@ export interface ProxyStats {
   /** The service currently behind it, when known. */
   service?: string;
   state: TargetState;
+  lastError?: string;
+  readyAt?: number;
   /** Where the service listens right now (diagnostics only — never hand it out). */
   internalPort?: number;
   /** Client→server bytes since the daemon started proxying this port. */
   clientBytes: number;
-  /** Epoch ms of the last client→server byte; null when none arrived yet. */
+  /** Server→client bytes since the daemon started proxying this port. */
+  serverBytes: number;
+  /** Epoch ms of the last byte in either direction; null before traffic. */
   lastActivityAt: number | null;
   /** Connections currently piped. */
   open: number;
@@ -135,9 +139,12 @@ export function replayable(chunks: readonly Buffer[]): boolean {
 class Target {
   servers: Server[] = [];
   state: TargetState = 'down';
+  lastError?: string;
+  readyAt?: number;
   internalPort?: number;
   service?: string;
   clientBytes = 0;
+  serverBytes = 0;
   lastActivityAt: number | null = null;
   accepted = 0;
   readonly open = new Set<Socket>();
@@ -155,8 +162,11 @@ class Target {
       port: this.port,
       service: this.service,
       state: this.state,
+      lastError: this.lastError,
+      readyAt: this.readyAt,
       internalPort: this.state === 'up' ? this.internalPort : undefined,
       clientBytes: this.clientBytes,
+      serverBytes: this.serverBytes,
       lastActivityAt: this.lastActivityAt,
       open: this.open.size,
       held: this.waiters.length,
@@ -173,7 +183,7 @@ class Target {
       return;
     }
     if (this.state === 'down' && !this.hub.wake(this.envId, this.key)) {
-      client.destroy();
+      this.reject(client);
       return;
     }
     this.hold(client);
@@ -181,7 +191,7 @@ class Target {
 
   private hold(client: Socket, carry?: Carry): void {
     if (this.waiters.length >= MAX_HELD) {
-      client.destroy();
+      this.reject(client);
       return;
     }
     // A paused socket buffers what the client sends (and TCP backpressure
@@ -192,12 +202,45 @@ class Target {
       carry,
       timer: setTimeout(() => {
         this.dropWaiter(waiter);
-        client.destroy();
+        this.lastError = 'Service startup exceeded the proxy wait deadline';
+        this.reject(client, carry);
       }, carry ? Math.max(0, carry.deadline - Date.now()) : HOLD_MS()),
     };
     waiter.timer.unref();
     client.once('close', () => this.dropWaiter(waiter));
     this.waiters.push(waiter);
+  }
+
+  /** Only a recognizable HTTP/1 request gets HTTP. Never inject into an
+   * established stream or a binary/TLS protocol. Bound fragmented/absent input. */
+  private reject(client: Socket, carry?: Carry): void {
+    if (client.destroyed) return;
+    let head = carry ? Buffer.concat(carry.chunks).subarray(0, 1024) : Buffer.alloc(0);
+    let done = false;
+    const finish = (http: boolean) => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      client.off('data', read);
+      if (!http) { client.destroy(); return; }
+      // No exception text, filesystem paths, or log contents on public origins.
+      const body = JSON.stringify({ error: 'RUNLY_SERVICE_UNAVAILABLE', message: 'The service could not become ready. Retry shortly; the operator can inspect runly ps and runly logs.' }) + '\n';
+      client.end(`HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\nCache-Control: no-store\r\nRetry-After: 2\r\nConnection: close\r\nContent-Length: ${Buffer.byteLength(body)}\r\n\r\n${body}`);
+      const close = setTimeout(() => client.destroy(), 1000);
+      close.unref();
+      client.once('close', () => clearTimeout(close));
+    };
+    const read = (chunk: Buffer) => {
+      head = Buffer.concat([head, chunk.subarray(0, 1024 - head.length)]);
+      if (/^(GET|HEAD|POST|PUT|DELETE|PATCH|OPTIONS|CONNECT|TRACE) [^\r\n]+ HTTP\/1\.[01]\r\n/.test(head.toString('latin1'))) finish(true);
+      else if (head.includes(10) || head.length >= 1024) finish(false);
+    };
+    const timer = setTimeout(() => finish(false), 250);
+    timer.unref();
+    client.once('close', () => { clearTimeout(timer); client.off('data', read); });
+    client.on('data', read);
+    if (head.length) read(Buffer.alloc(0));
+    if (!done) client.resume();
   }
 
   private dropWaiter(waiter: Waiter): void {
@@ -214,7 +257,7 @@ class Target {
       clearTimeout(w.timer);
       if (w.socket.destroyed) continue;
       if (this.state === 'up' && this.internalPort !== undefined) this.forward(w.socket, this.internalPort, w.carry);
-      else w.socket.destroy();
+      else this.reject(w.socket, w.carry);
     }
   }
 
@@ -281,6 +324,13 @@ class Target {
         delivered = true;
         if (!upstream.write(chunk)) client.pause();
       };
+      // SSE, downloads and server-initiated WebSocket frames are use too.
+      // Count bytes, not open sockets: an idle keep-alive must still sleep.
+      const onResponse = (chunk: Buffer) => {
+        this.serverBytes += chunk.length;
+        this.lastActivityAt = Date.now();
+        this.hub.noteActivity(this.envId, this.key);
+      };
       const onDrain = () => client.resume();
       const onEnd = () => {
         replay.ended = true;
@@ -292,6 +342,7 @@ class Target {
         client.off('end', onEnd);
         client.off('close', onClientClose);
         upstream.off('drain', onDrain);
+        upstream.off('data', onResponse);
         upstream.unpipe(client);
       };
       // The service went away before it said anything, and retrying is safe
@@ -318,6 +369,7 @@ class Target {
       client.on('data', onData);
       client.on('end', onEnd);
       client.on('close', onClientClose);
+      upstream.on('data', onResponse);
       upstream.pipe(client, { end: false });
       // Half-closes travel on (the service's FIN ends the client's side), and
       // a full close of either side ends the pair — unless the service closed
@@ -351,7 +403,8 @@ class Target {
   private refused(client: Socket, carry: Carry, reset = false): void {
     if (client.destroyed) return;
     if (Date.now() >= carry.deadline) {
-      client.destroy();
+      this.lastError = 'Service startup exceeded the proxy wait deadline';
+      this.reject(client, carry);
       return;
     }
     if (this.state === 'starting') {
@@ -360,7 +413,7 @@ class Target {
     }
     if (this.state === 'down') {
       if (this.hub.wake(this.envId, this.key)) this.hold(client, carry);
-      else client.destroy();
+      else this.reject(client, carry);
       return;
     }
     if (reset && ++carry.resets > MAX_UP_RESETS) {
@@ -455,7 +508,7 @@ export class ProxyHub {
     this.wakeHook = hook;
   }
 
-  /** Optional observer of client bytes (idle bookkeeping lives with the caller). */
+  /** Optional observer of bytes in either direction (idle bookkeeping lives with the caller). */
   setActivityHook(hook: ((envId: string, key: string) => void) | undefined): void {
     this.activityHook = hook;
   }
@@ -483,7 +536,7 @@ export class ProxyHub {
     if (t && (t.lastActivityAt === null || t.lastActivityAt < at)) t.lastActivityAt = at;
   }
 
-  /** The last client byte per port key of an environment (null = none yet). */
+  /** The last byte in either direction per port key of an environment (null = none yet). */
   activity(envId: string): Record<string, number | null> {
     const out: Record<string, number | null> = {};
     for (const t of this.targets.values()) if (t.envId === envId) out[t.key] = t.lastActivityAt;
@@ -536,6 +589,7 @@ export class ProxyHub {
     const target = new Target(envId, key, port, this);
     if (existing) {
       target.clientBytes = existing.clientBytes;
+      target.serverBytes = existing.serverBytes;
       target.lastActivityAt = existing.lastActivityAt;
       target.accepted = existing.accepted;
       target.state = existing.state;
@@ -571,6 +625,7 @@ export class ProxyHub {
     const t = this.targets.get(this.id(envId, key));
     if (!t) return;
     t.state = 'starting';
+    t.lastError = undefined;
     if (service) t.service = service;
   }
 
@@ -579,6 +634,8 @@ export class ProxyHub {
     const t = this.targets.get(this.id(envId, key));
     if (!t) return;
     t.state = 'up';
+    t.readyAt = Date.now();
+    t.lastError = undefined;
     t.internalPort = internalPort;
     this.reservedInternal.set(this.id(envId, key), internalPort);
     if (service) t.service = service;
@@ -586,11 +643,12 @@ export class ProxyHub {
   }
 
   /** Nothing is (or will soon be) behind env/key: held connections are closed. */
-  down(envId: string, key: string): void {
+  down(envId: string, key: string, error?: string): void {
     this.release(this.id(envId, key));
     const t = this.targets.get(this.id(envId, key));
     if (!t) return;
     t.state = 'down';
+    if (error) t.lastError = error;
     t.internalPort = undefined;
     t.flush();
   }
