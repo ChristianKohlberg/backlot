@@ -32,8 +32,7 @@
  *       two parallel `db new` copies are distinct and dropped; `db with`
  *       propagates its command's exit code and drops its copy (decision 0034)
  *   (d) capacity churn — a second stack whose one environment (decision
- *       0032) is held by a short-TTL holder while another queues on its
- *       expiry, lease expiries, and an idle stop -> wake-by-request cycle
+ *       0032) passes between explicit holders, and an idle stop -> wake cycle
  *       (`idle: 8s`, decision 0035) — the sweeper must keep reclaiming
  *   (d2) load budget — a second worktree of a stack declaring more than
  *       half the budget queues (plan says so, status shows it) and starts
@@ -50,6 +49,7 @@
  * see .github/workflows/soak.yml for the nightly.
  */
 import { spawn, execFile, execFileSync } from 'node:child_process';
+import { get as httpGet } from 'node:http';
 import {
   mkdtempSync, mkdirSync, writeFileSync, appendFileSync, readFileSync,
   rmSync, existsSync, readdirSync,
@@ -123,7 +123,7 @@ Object.assign(daemonEnv, {
   BACKLOT_GC_MS: '15000',
   BACKLOT_IDLE_TTL_MS: '45000',
   // Idle stops (decision 0035) come from stack B's own `idle: 8s`; stack A keeps
-  // the 10-minute default so its restart assertions are not raced by them.
+  // the five-minute default so its restart assertions are not raced by them.
   BACKLOT_TETHER: 'off', // the soak runs its own holders; never tie to a CLAUDE_PID it inherited
   // A small load budget (decision 0036) so the budget phase queues for real;
   // the machine gates are opened — a shared box's load must not decide the run.
@@ -179,8 +179,9 @@ const stats = {
   downUps: 0,
   dbCopies: 0,
   dbWithRuns: 0,
-  queuedAcquires: 0,
-  leaseExpiries: 0,
+  metricsSnapshots: 0,
+  holderHandoffs: 0,
+  leaseReleases: 0,
   quiesceRebinds: 0,
   idleWakes: 0,
   budgetQueued: 0,
@@ -290,6 +291,24 @@ async function fetchJson(url, timeoutMs = 3000) {
   const res = await fetch(url, { signal: AbortSignal.timeout(timeoutMs) });
   if (res.status !== 200) throw new Error(`${url} -> ${res.status}`);
   return res.json();
+}
+
+/** One new TCP connection: startup holds do not promise to replay an already
+ * answered keep-alive stream after its service stops. No retries hide failures. */
+function freshJson(url, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    const request = httpGet(url, { agent: false, signal: AbortSignal.timeout(timeoutMs) }, response => {
+      let body = '';
+      response.setEncoding('utf8');
+      response.on('data', chunk => { body += chunk; });
+      response.on('error', reject);
+      response.on('end', () => {
+        if (response.statusCode !== 200) { reject(new Error(`${url} -> ${response.statusCode}: ${body}`)); return; }
+        try { resolve(JSON.parse(body)); } catch (error) { reject(error); }
+      });
+    });
+    request.on('error', reject);
+  });
 }
 
 // ---------------------------------------------------------------- fixtures
@@ -550,17 +569,23 @@ async function phaseRestart() {
   appendFileSync(join(stackA, 'deps.lock'), `bump ${cycle} ${Math.floor(rand() * 1e9)}\n`);
   // Decision 0033: the public port is held across the restart, so traffic
   // that keeps coming while `up` stops and starts the service must be held
-  // and answered, never refused.
+  // and answered, never refused. Each request uses a fresh TCP connection;
+  // existing answered streams may close when their service restarts.
   let trafficOn = true;
   let answered = 0;
   let failed = 0;
+  const trafficErrors = [];
   const traffic = (async () => {
     while (trafficOn) {
       try {
-        await fetchJson(ctx.urls.web + '/health', 60_000);
+        await freshJson(ctx.urls.web + '/health', 60_000);
         answered++;
-      } catch {
+      } catch (error) {
         failed++;
+        if (trafficErrors.length < 10) trafficErrors.push({
+          message: String(error?.message ?? error), code: error?.code,
+          cause: error?.cause?.message, causeCode: error?.cause?.code,
+        });
       }
       await sleep(150);
     }
@@ -570,7 +595,7 @@ async function phaseRestart() {
   await traffic;
   stats.heldRequests += answered;
   stats.heldRequestFailures += failed;
-  must(failed === 0, 'restart', 'a request through the public port failed while up restarted the service (the proxy must hold it)', `${failed} of ${answered + failed} failed`);
+  must(failed === 0, 'restart', 'a request through the public port failed while up restarted the service (the proxy must hold it)', `${failed} of ${answered + failed} failed: ${JSON.stringify(trafficErrors)}`);
   const port = Number(new URL(String(full.body?.urls?.web ?? ctx.urls.web)).port);
   must(full.body?.urls?.web === ctx.urls.web && port >= 20000 && port <= 29999, 'restart',
     'the public URL moved across a restart, or lies outside the public block', `${ctx.urls.web} -> ${full.body?.urls?.web}`);
@@ -664,27 +689,27 @@ async function statusEnvs() {
   return s.body?.envs ?? [];
 }
 
-/** (d) Capacity churn on stack B: queueing, expiries, quiesce — the sweeper's beat. */
+/** (d) Capacity churn on stack B: holder handoffs, release, quiesce — the sweeper's beat. */
 async function phaseCapacity() {
   log(`phase capacity (cycle ${cycle})`);
-  // A short-TTL holder holds stack B's one environment (decision 0032); a
-  // second holder queues on its expiry.
-  const h1 = await cli(['up', '--holder', 'soak-h1', '--ttl', '0.07'], { cwd: stackB }); // ~4s
+  // Explicit release hands the worktree's single environment to another holder.
+  const h1 = await cli(['up', '--holder', 'soak-h1'], { cwd: stackB });
   must(h1.body?.state === 'hot', 'capacity', 'stack B holder failed to bind', h1.stdout.slice(0, 200));
   const t0 = Date.now();
+  await cli(['release', '--holder', 'soak-h1'], { cwd: stackB });
   const h3 = await cli(['up', '--holder', 'soak-h3'], { cwd: stackB, timeoutMs: 90_000 });
-  if (must(h3.body?.state === 'hot', 'capacity', 'queued holder never acquired the worktree\'s environment (waited past the expiry window)', h3.stdout.slice(0, 300))) {
-    stats.queuedAcquires++;
-    log(`  queued acquire served after ${Date.now() - t0}ms`);
+  if (must(h3.body?.state === 'hot', 'capacity', 'next holder never acquired the released worktree\'s environment', h3.stdout.slice(0, 300))) {
+    stats.holderHandoffs++;
+    log(`  holder handoff completed after ${Date.now() - t0}ms`);
   }
   await cli(['release', '--holder', 'soak-h3'], { cwd: stackB });
 
-  // The sweeper must drop the expired leases on its own.
+  // The explicit release must leave no holder behind.
   const cleared = await until(20_000, 1000, async () => {
     const envs = await statusEnvs();
     return envs.filter((e) => e.stack.startsWith('soak-b') && e.lease).length === 0;
   });
-  if (must(cleared, 'capacity', 'expired stack-B leases were never swept')) stats.leaseExpiries += 1;
+  if (must(cleared, 'capacity', 'stack-B release did not clear its holder')) stats.leaseReleases += 1;
 
   // Idle stop → wake by request (decision 0035): stack B's web declares
   // `idle: 8s`. Left alone it is stopped while lease, data and port stay; a
@@ -825,7 +850,7 @@ async function chaosStaleRoot() {
   const dir = join(stacksDir, `c-${++cSeq}`);
   writeStackMin(dir, 'soak-c');
   gitInit(dir);
-  const up = await cli(['up', '--ttl', '0.1'], { cwd: dir }); // ~6s lease
+  const up = await cli(['up'], { cwd: dir });
   if (!must(up.body?.state === 'hot', 'chaos', 'stale-root probe stack failed to bind', up.stdout.slice(0, 300))) {
     rmSync(dir, { recursive: true, force: true });
     return;
@@ -833,7 +858,7 @@ async function chaosStaleRoot() {
   const envId = up.body.envId;
   log(`chaos: deleting worktree ${dir} mid-lease (env ${envId})`);
   rmSync(dir, { recursive: true, force: true });
-  // Lease lapses in seconds; the sweeper must then see the missing stack root
+  // The sweeper must see the missing stack root
   // and reap the env — row AND directory — with no help from anyone.
   const reaped = await until(40_000, 1000, async () => {
     const gone = !(await statusEnvs()).some((e) => e.id === envId);
@@ -1055,8 +1080,9 @@ function printStats() {
   lines.push(`  down+up round trips    ${stats.downUps}`);
   lines.push(`  db copies (new+drop)   ${stats.dbCopies}`);
   lines.push(`  db with runs           ${stats.dbWithRuns}`);
-  lines.push(`  queued acquires        ${stats.queuedAcquires}`);
-  lines.push(`  lease expiries swept   ${stats.leaseExpiries}`);
+  lines.push(`  statistics snapshots   ${stats.metricsSnapshots}`);
+  lines.push(`  holder handoffs        ${stats.holderHandoffs}`);
+  lines.push(`  explicit releases      ${stats.leaseReleases}`);
   lines.push(`  idle stop -> wake      ${stats.idleWakes}`);
   lines.push(`  budget queue waits     ${stats.budgetQueued}`);
   lines.push(`  logs --until (0/124)   ${stats.logsUntil}`);
@@ -1112,6 +1138,25 @@ function attachDaemonEvidence() {
 
 // ---------------------------------------------------------------- main
 
+// Statistics are observed while the same daemon accumulates churn and survives
+// chaos. This must not wake services; the dedicated integration test checks idle.
+async function phaseStatistics() {
+  const result = await cli(['stats', '--all', '--since', '30m'], { cwd: stackA, quiet: true });
+  const report = result.body;
+  if (!must(result.code === 0 && Array.isArray(report?.series), 'metrics', 'stats failed to return history', result.stdout.slice(0, 300))) return;
+  must(report.recentOperations.length <= 200, 'metrics', 'operation history exceeded its cap');
+  must(report.collection.storageErrors === 0, 'metrics', 'statistics persistence failed', JSON.stringify(report.collection));
+  for (const metric of report.series) {
+    const values = ['count', 'total', 'min', 'max', 'p50', 'p95'].map((k) => metric[k]);
+    const finite = values.every((v) => Number.isFinite(v) && v >= 0);
+    must(finite && metric.count >= 1 && metric.min <= metric.p50 && metric.p50 <= metric.p95 && metric.p95 <= metric.max,
+      'metrics', 'invalid duration/counter aggregate', metric.name);
+    must(metric.total + 0.001 >= metric.min * metric.count && metric.total - 0.001 <= metric.max * metric.count,
+      'metrics', 'sum disagrees with observed extrema', metric.name);
+  }
+  stats.metricsSnapshots++;
+}
+
 async function main() {
   log(`soak: ${MINUTES} min, seed ${SEED}, node ${process.version}, ${process.platform}`);
   log(`soak: state dir ${stateDir}`);
@@ -1126,14 +1171,17 @@ async function main() {
       await maybeChaos();
       if (timeLeft() < 30_000) break;
       await phaseRestart(); // leaves the session lease up, deliberately
-      await maybeChaos();
       if (timeLeft() < 30_000) break;
       await phaseEnvExport(); // reads that session's environment
       if (timeLeft() < 45_000) break;
       await phaseDownAndDb(); // additive up / down + db copies on that lease
+      // These three phases share a lease. Chaos recovery may release it, so
+      // inject faults only after all of its consumers have finished.
+      await maybeChaos();
       if (timeLeft() < 45_000) break;
       await phaseCapacity();
       if (timeLeft() > 60_000) await phaseBudget();
+      await phaseStatistics();
       await cli(['release'], { cwd: stackA, quiet: true });
       await maybeChaos();
     }

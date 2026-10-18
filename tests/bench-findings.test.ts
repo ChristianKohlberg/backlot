@@ -244,7 +244,7 @@ datastores:
     expect((await fetch(retry.json.urls.api)).status).toBe(200);
   }, 120_000);
 
-  it('an UNLEASED environment whose service crash-loops is still recycled', async () => {
+  it('an unleased environment survives a service crash loop', async () => {
     const c = ctx({ BACKLOT_SWEEP_MS: '200' });
     const wt = c.worktree({
       'runly.yml': `name: crashy2
@@ -259,7 +259,11 @@ setTimeout(() => process.exit(3), 300);
     const up = await c.cli(['up', '--json'], wt);
     expect(up.code, up.stderr + up.stdout).toBe(0);
     expect((await c.cli(['release', '--json'], wt)).code).toBe(0);
-    expect(await waitFor(() => c.journal().allEnvs().length === 0, 30_000)).toBe(true);
+    expect(await waitFor(async () => {
+      const ps = await c.cli(['ps', '--json'], wt);
+      return ps.json.services.some((s: { state: string }) => s.state === 'failed');
+    }, 30_000)).toBe(true);
+    expect(c.journal().allEnvs().map(e => e.id)).toEqual([up.json.envId]);
   }, 90_000);
 });
 

@@ -21,11 +21,11 @@ describe('per-rule upkeep deadlines and live progress', () => {
   it('validates positive seconds and keeps existing rules valid', () => {
     const dir = tree();
     for (const timeout of [undefined, 0.1, 1200]) {
-      writeFileSync(join(dir, 'stack.yaml'), JSON.stringify({ name: 'timeout', services: { web: { run: 'true' } }, upkeep: [{ when: 'input', run: 'true', timeout }] }));
+      writeFileSync(join(dir, 'runly.yml'), JSON.stringify({ name: 'timeout', services: { web: { run: 'true' } }, upkeep: [{ when: 'input', run: 'true', timeout }] }));
       expect(loadStack(dir).manifest.upkeep?.[0].timeout).toBe(timeout);
     }
     for (const timeout of [0, -1, '1200']) {
-      writeFileSync(join(dir, 'stack.yaml'), JSON.stringify({ name: 'timeout', services: { web: { run: 'true' } }, upkeep: [{ when: 'input', run: 'true', timeout }] }));
+      writeFileSync(join(dir, 'runly.yml'), JSON.stringify({ name: 'timeout', services: { web: { run: 'true' } }, upkeep: [{ when: 'input', run: 'true', timeout }] }));
       expect(() => loadStack(dir)).toThrow(/invalid/);
     }
   });

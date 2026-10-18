@@ -37,7 +37,7 @@ createServer((q, s) => s.end('ok')).listen(Number(process.env.PORT), '127.0.0.1'
 `,
   );
   writeFileSync(
-    join(dir, 'stack.yaml'),
+    join(dir, 'runly.yml'),
     `name: slow-${name}
 services:
   web:

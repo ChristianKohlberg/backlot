@@ -4,15 +4,16 @@
  * Every service port of an environment has two numbers: the PUBLIC port, which
  * this module listens on (127.0.0.1 and ::1) for the environment's whole life,
  * and an INTERNAL port the service is started on, fresh at every start. Bytes
- * are piped between the two without looking at them — no HTTP awareness, so
- * WebSockets, gRPC, a database wire protocol all pass the same way.
+ * are forwarded unchanged, so WebSockets, gRPC and database wire protocols
+ * all pass through. Limited HTTP/1 recognition only controls safe retries
+ * and startup-error responses; this is not an HTTP request parser.
  *
  * What the indirection buys:
  * - the public port survives every restart (an `up` that rebuilt, reset-data,
  *   a quiesce and the next bind), so a URL handed out once stays good;
  * - a connection that arrives while its service is (re)starting is HELD,
  *   bounded, and forwarded once the service is ready, instead of being refused;
- * - client→server bytes and the time of the last of them are counted per
+ * - bytes in both directions and the time of the last of them are counted per
  *   environment and port — the activity signal idle detection reads (step 6 of
  *   the lifecycle work). runly's own readiness probes go to the internal port,
  *   so they never count.
@@ -23,6 +24,8 @@
  */
 import { createServer, connect, type Server, type Socket } from 'node:net';
 import { logEvent } from '../core/events.js';
+import { randomUUID } from 'node:crypto';
+import { recordMetric } from '../core/metrics.js';
 
 export type TargetState = 'down' | 'starting' | 'up';
 
@@ -32,11 +35,15 @@ export interface ProxyStats {
   /** The service currently behind it, when known. */
   service?: string;
   state: TargetState;
+  lastError?: string;
+  readyAt?: number;
   /** Where the service listens right now (diagnostics only — never hand it out). */
   internalPort?: number;
   /** Client→server bytes since the daemon started proxying this port. */
   clientBytes: number;
-  /** Epoch ms of the last client→server byte; null when none arrived yet. */
+  /** Server→client bytes since the daemon started proxying this port. */
+  serverBytes: number;
+  /** Epoch ms of the last byte in either direction; null before traffic. */
   lastActivityAt: number | null;
   /** Connections currently piped. */
   open: number;
@@ -53,7 +60,7 @@ export interface ProxyStats {
  * (closed). Returning false closes it at once, which is what a client saw
  * before the proxy existed: nothing listening.
  */
-export type WakeHook = (envId: string, key: string) => boolean;
+export type WakeHook = (envId: string, key: string, operationId?: string) => boolean;
 
 /** How long a connection may wait for its service to become ready. */
 export const HOLD_MS = (): number => Number(process.env.BACKLOT_PROXY_HOLD_MS ?? 90_000);
@@ -61,6 +68,8 @@ export const HOLD_MS = (): number => Number(process.env.BACKLOT_PROXY_HOLD_MS ??
 const MAX_HELD = 512;
 
 interface Waiter {
+  /** Updated when a public listener moves; timers belong to the new target. */
+  owner: Target;
   socket: Socket;
   timer: NodeJS.Timeout;
   /** A connection being retried after its service reset it: what it already sent, to replay. */
@@ -116,47 +125,105 @@ function dropCarry(carry: Carry): void {
 const MAX_UP_RESETS = 5;
 /** Relaunches one connection's delivered bytes may be carried to. */
 const MAX_REPLAYS = 1;
-/** HTTP methods that are safe to repeat (RFC 9110 §9.2.1/§9.2.2) — no side effect a second run could double. */
-const IDEMPOTENT = /^(GET|HEAD|OPTIONS) /;
-
 /**
- * May bytes a process already received be sent to the next one? Only when the
- * connection's first bytes are an HTTP request with a method that is safe to
- * repeat: the dead process may have acted on what it read (charged a card,
- * inserted a row) before it died, and a replay would act a second time. Any
- * other request — POST, PUT, PATCH, DELETE, a database or TLS wire protocol,
- * a first chunk too short to tell — is not replayed once delivered.
+ * Replay only one complete, bodyless HTTP/1 request with a safe method. Looking
+ * at the first method alone is insufficient: a GET may be followed by a
+ * pipelined POST, or carry a body that another parser treats as another request.
+ * Ambiguous framing, upgrades, partial headers and unknown protocols fail closed.
  */
 export function replayable(chunks: readonly Buffer[]): boolean {
-  const head = Buffer.concat(chunks.length > 1 ? chunks.slice(0, 4) : chunks).subarray(0, 8).toString('latin1');
-  return IDEMPOTENT.test(head);
+  const request = Buffer.concat(chunks).toString('latin1');
+  const end = request.indexOf('\r\n\r\n');
+  if (end < 0 || end + 4 !== request.length) return false;
+  const [line, ...headers] = request.slice(0, end).split('\r\n');
+  if (!/^(GET|HEAD|OPTIONS) [^\s]+ HTTP\/1\.[01]$/.test(line!)) return false;
+  let contentLength = false;
+  for (const header of headers) {
+    const match = /^([!#$%&'*+.^_`|~0-9A-Za-z-]+):[ \t]*([^\r\n]*)$/.exec(header);
+    if (!match) return false;
+    const name = match[1]!.toLowerCase();
+    if (name === 'transfer-encoding' || name === 'upgrade') return false;
+    if (name === 'content-length') {
+      if (contentLength || match[2]!.trim() !== '0') return false;
+      contentLength = true;
+    }
+  }
+  return true;
 }
+
+/** One measurement per accepted TCP connection, including all retries. */
+interface ConnectionMeasurement {
+  started: number;
+  /** One startup wait budget across holding, forwarding and retries. */
+  deadline: number;
+  firstByte: boolean;
+  rejected: boolean;
+  attempts: number;
+  operationId?: string;
+  holdStarted?: number;
+}
+const connectionMeasurements = new WeakMap<Socket, ConnectionMeasurement>();
 
 class Target {
   servers: Server[] = [];
   state: TargetState = 'down';
+  lastError?: string;
+  readyAt?: number;
   internalPort?: number;
   service?: string;
   clientBytes = 0;
+  serverBytes = 0;
   lastActivityAt: number | null = null;
   accepted = 0;
   readonly open = new Set<Socket>();
   waiters: Waiter[] = [];
+  private pendingClientBytes = 0;
+  private pendingServerBytes = 0;
+  private metricTimer?: NodeJS.Timeout;
+
+  private metric(name: string, value: number, reason?: string, operationId?: string): void {
+    recordMetric(name, value, {
+      stack: this.metricStack, envId: this.envId,
+      service: this.service ?? this.key,
+      // A listener inherits the async context of the bind that created it.
+      // Traffic hours later is not part of that operation (or datastore).
+      datastore: undefined, outcome: undefined, operationId, reason,
+    });
+  }
+
+  /** Chunk handlers only increment numbers. Disk aggregation runs at most every 5s. */
+  flushMetrics(): void {
+    if (this.pendingClientBytes) this.metric('proxy.client_bytes', this.pendingClientBytes);
+    if (this.pendingServerBytes) this.metric('proxy.server_bytes', this.pendingServerBytes);
+    this.pendingClientBytes = this.pendingServerBytes = 0;
+  }
+
+  private finishHold(client: Socket): void {
+    const m = connectionMeasurements.get(client);
+    if (m?.holdStarted === undefined) return;
+    this.metric('proxy.hold_ms', performance.now() - m.holdStarted, undefined, m.operationId);
+    m.holdStarted = undefined;
+  }
+
+  private metricStack?: string;
 
   constructor(
     readonly envId: string,
     readonly key: string,
     readonly port: number,
     private readonly hub: ProxyHub,
-  ) {}
+  ) { this.metricStack = hub.metricScope(envId); }
 
   stats(): ProxyStats {
     return {
       port: this.port,
       service: this.service,
       state: this.state,
+      lastError: this.lastError,
+      readyAt: this.readyAt,
       internalPort: this.state === 'up' ? this.internalPort : undefined,
       clientBytes: this.clientBytes,
+      serverBytes: this.serverBytes,
       lastActivityAt: this.lastActivityAt,
       open: this.open.size,
       held: this.waiters.length,
@@ -164,16 +231,41 @@ class Target {
     };
   }
 
+  private startMetricTimer(): void {
+    if (!this.metricTimer) {
+      this.metricTimer = setInterval(() => this.flushMetrics(), 5000);
+      this.metricTimer.unref();
+    }
+  }
+
+  private requestWake(client: Socket): boolean {
+    const m = connectionMeasurements.get(client);
+    const operationId = m?.operationId ?? randomUUID();
+    const requested = this.hub.wake(this.envId, this.key, operationId);
+    if (requested && m) m.operationId = operationId;
+    return requested;
+  }
+
   onConnection(client: Socket): void {
     this.accepted++;
+    this.metric('proxy.accepted', 1);
+    this.startMetricTimer();
+    const measurement: ConnectionMeasurement = { started: performance.now(), deadline: Date.now() + HOLD_MS(), firstByte: false, rejected: false, attempts: 0 };
+    connectionMeasurements.set(client, measurement);
+    client.once('close', () => {
+      this.finishHold(client);
+      this.metric('proxy.closed', 1, measurement.rejected ? 'rejected' : measurement.firstByte ? 'responded' : 'no_response', measurement.operationId);
+      this.flushMetrics();
+      connectionMeasurements.delete(client);
+    });
     // Never let a peer reset crash the daemon.
     client.on('error', () => client.destroy());
     if (this.state === 'up' && this.internalPort !== undefined) {
       this.forward(client, this.internalPort);
       return;
     }
-    if (this.state === 'down' && !this.hub.wake(this.envId, this.key)) {
-      client.destroy();
+    if (this.state === 'down' && !this.requestWake(client)) {
+      this.reject(client);
       return;
     }
     this.hold(client);
@@ -181,26 +273,71 @@ class Target {
 
   private hold(client: Socket, carry?: Carry): void {
     if (this.waiters.length >= MAX_HELD) {
-      client.destroy();
+      this.reject(client, carry, 'capacity');
       return;
     }
+    // A retry waiting for startup is held, no longer an open upstream pipe.
+    this.open.delete(client);
+    const measurement = connectionMeasurements.get(client);
+    if (measurement && measurement.holdStarted === undefined) measurement.holdStarted = performance.now();
     // A paused socket buffers what the client sends (and TCP backpressure
     // stops it beyond that), so nothing is lost while it waits.
     client.pause();
     const waiter: Waiter = {
+      owner: this,
       socket: client,
       carry,
       timer: setTimeout(() => {
-        this.dropWaiter(waiter);
-        client.destroy();
-      }, carry ? Math.max(0, carry.deadline - Date.now()) : HOLD_MS()),
+        waiter.owner.dropWaiter(waiter);
+        waiter.owner.lastError = 'Service startup exceeded the proxy wait deadline';
+        waiter.owner.reject(client, carry, 'timeout');
+      }, Math.max(0, (carry?.deadline ?? measurement?.deadline ?? Date.now() + HOLD_MS()) - Date.now())),
     };
     waiter.timer.unref();
-    client.once('close', () => this.dropWaiter(waiter));
+    client.once('close', () => waiter.owner.dropWaiter(waiter));
     this.waiters.push(waiter);
   }
 
+  /** Only a recognizable HTTP/1 request gets HTTP. Never inject into an
+   * established stream or a binary/TLS protocol. Bound fragmented/absent input. */
+  private reject(client: Socket, carry?: Carry, reason = 'unavailable'): void {
+    if (client.destroyed) return;
+    this.finishHold(client);
+    const measurement = connectionMeasurements.get(client);
+    if (measurement && !measurement.rejected) {
+      measurement.rejected = true;
+      this.metric('proxy.rejected', 1, reason, measurement.operationId);
+    }
+    let head = carry ? Buffer.concat(carry.chunks).subarray(0, 1024) : Buffer.alloc(0);
+    let done = false;
+    const finish = (http: boolean) => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      client.off('data', read);
+      if (!http) { client.destroy(); return; }
+      // No exception text, filesystem paths, or log contents on public origins.
+      const body = JSON.stringify({ error: 'RUNLY_SERVICE_UNAVAILABLE', message: 'The service could not become ready. Retry shortly; the operator can inspect runly ps and runly logs.' }) + '\n';
+      client.end(`HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\nCache-Control: no-store\r\nRetry-After: 2\r\nConnection: close\r\nContent-Length: ${Buffer.byteLength(body)}\r\n\r\n${body}`);
+      const close = setTimeout(() => client.destroy(), 1000);
+      close.unref();
+      client.once('close', () => clearTimeout(close));
+    };
+    const read = (chunk: Buffer) => {
+      head = Buffer.concat([head, chunk.subarray(0, 1024 - head.length)]);
+      if (/^(GET|HEAD|POST|PUT|DELETE|PATCH|OPTIONS|CONNECT|TRACE) [^\r\n]+ HTTP\/1\.[01]\r\n/.test(head.toString('latin1'))) finish(true);
+      else if (head.includes(10) || head.length >= 1024) finish(false);
+    };
+    const timer = setTimeout(() => finish(false), 250);
+    timer.unref();
+    client.once('close', () => { clearTimeout(timer); client.off('data', read); });
+    client.on('data', read);
+    if (head.length) read(Buffer.alloc(0));
+    if (!done) client.resume();
+  }
+
   private dropWaiter(waiter: Waiter): void {
+    this.finishHold(waiter.socket);
     clearTimeout(waiter.timer);
     const i = this.waiters.indexOf(waiter);
     if (i >= 0) this.waiters.splice(i, 1);
@@ -211,10 +348,11 @@ class Target {
     const waiters = this.waiters;
     this.waiters = [];
     for (const w of waiters) {
+      this.finishHold(w.socket);
       clearTimeout(w.timer);
       if (w.socket.destroyed) continue;
       if (this.state === 'up' && this.internalPort !== undefined) this.forward(w.socket, this.internalPort, w.carry);
-      else w.socket.destroy();
+      else this.reject(w.socket, w.carry);
     }
   }
 
@@ -229,17 +367,25 @@ class Target {
    * 0035) when that is safe:
    * - nothing of the client's reached the process (refused, or lost before
    *   the proxy wrote a byte upstream): always — it cannot have acted;
-   * - bytes reached it: only for an idempotent HTTP request (`replayable`),
+   * - bytes reached it: only for a complete, bodyless, single safe-method HTTP request (`replayable`),
    *   and only to ONE more process (`MAX_REPLAYS`).
    * Otherwise the client sees the close or reset, as it would without a proxy
    * (decision 0039, corrected in 0.18.1).
    */
   private forward(client: Socket, internalPort: number, carry?: Carry): void {
+    this.startMetricTimer(); // Transferred held sockets did not enter this target's onConnection.
+    const measurement = connectionMeasurements.get(client);
+    if (Date.now() >= (carry?.deadline ?? measurement?.deadline ?? Infinity)) {
+      this.lastError = 'Service startup exceeded the proxy wait deadline';
+      this.reject(client, carry, 'timeout');
+      return;
+    }
+    if (measurement && measurement.attempts++ > 0) this.metric('proxy.retry', 1, carry?.replays ? 'reset' : 'refused', measurement.operationId);
     if (!this.open.has(client)) {
       this.open.add(client);
       client.once('close', () => this.open.delete(client));
     }
-    const replay: Carry = carry ?? { chunks: [], bytes: 0, ended: false, resets: 0, replays: 0, deadline: Date.now() + HOLD_MS() };
+    const replay: Carry = carry ?? { chunks: [], bytes: 0, ended: false, resets: 0, replays: 0, deadline: measurement?.deadline ?? Date.now() + HOLD_MS() };
     if (!carry) client.once('close', () => dropCarry(replay));
     connectInternal(internalPort, (err, upstream) => {
       if (err || !upstream) {
@@ -265,6 +411,7 @@ class Target {
       const onData = (chunk: Buffer) => {
         // Count before forwarding.
         this.clientBytes += chunk.length;
+        this.pendingClientBytes += chunk.length;
         this.lastActivityAt = Date.now();
         this.hub.noteActivity(this.envId, this.key);
         if (!answered && retryable) {
@@ -281,6 +428,19 @@ class Target {
         delivered = true;
         if (!upstream.write(chunk)) client.pause();
       };
+      // SSE, downloads and server-initiated WebSocket frames are use too.
+      // Count bytes, not open sockets: an idle keep-alive must still sleep.
+      const onResponse = (chunk: Buffer) => {
+        this.serverBytes += chunk.length;
+        this.pendingServerBytes += chunk.length;
+        const measurement = connectionMeasurements.get(client);
+        if (measurement && !measurement.firstByte) {
+          measurement.firstByte = true;
+          this.metric('proxy.first_byte_ms', performance.now() - measurement.started, undefined, measurement.operationId);
+        }
+        this.lastActivityAt = Date.now();
+        this.hub.noteActivity(this.envId, this.key);
+      };
       const onDrain = () => client.resume();
       const onEnd = () => {
         replay.ended = true;
@@ -292,6 +452,7 @@ class Target {
         client.off('end', onEnd);
         client.off('close', onClientClose);
         upstream.off('drain', onDrain);
+        upstream.off('data', onResponse);
         upstream.unpipe(client);
       };
       // The service went away before it said anything, and retrying is safe
@@ -318,6 +479,7 @@ class Target {
       client.on('data', onData);
       client.on('end', onEnd);
       client.on('close', onClientClose);
+      upstream.on('data', onResponse);
       upstream.pipe(client, { end: false });
       // Half-closes travel on (the service's FIN ends the client's side), and
       // a full close of either side ends the pair — unless the service closed
@@ -351,7 +513,8 @@ class Target {
   private refused(client: Socket, carry: Carry, reset = false): void {
     if (client.destroyed) return;
     if (Date.now() >= carry.deadline) {
-      client.destroy();
+      this.lastError = 'Service startup exceeded the proxy wait deadline';
+      this.reject(client, carry, 'timeout');
       return;
     }
     if (this.state === 'starting') {
@@ -359,8 +522,8 @@ class Target {
       return;
     }
     if (this.state === 'down') {
-      if (this.hub.wake(this.envId, this.key)) this.hold(client, carry);
-      else client.destroy();
+      if (this.requestWake(client)) this.hold(client, carry);
+      else this.reject(client, carry);
       return;
     }
     if (reset && ++carry.resets > MAX_UP_RESETS) {
@@ -373,10 +536,13 @@ class Target {
       if (client.destroyed) return;
       if (this.state === 'up' && this.internalPort !== undefined) this.forward(client, this.internalPort, carry);
       else this.refused(client, carry);
-    }, 200).unref();
+    }, Math.min(200, Math.max(0, carry.deadline - Date.now()))).unref();
   }
 
   close(): void {
+    if (this.metricTimer) clearInterval(this.metricTimer);
+    this.metricTimer = undefined;
+    this.flushMetrics();
     for (const s of this.servers) s.close();
     this.servers = [];
     this.state = 'down';
@@ -436,6 +602,13 @@ function listenOn(server: Server, port: number, host: string): Promise<boolean> 
 
 export class ProxyHub {
   private targets = new Map<string, Target>();
+  private metricScopes = new Map<string, string>();
+
+  setMetricScope(envId: string, stack: string): void { this.metricScopes.set(envId, stack); }
+  metricScope(envId: string): string | undefined { return this.metricScopes.get(envId); }
+
+  /** Flush byte deltas before a stats snapshot without touching activity. */
+  flushMetrics(): void { for (const target of this.targets.values()) target.flushMetrics(); }
   /**
    * Internal ports handed to a start that is not `up` yet, by env/key. A port
    * is probed free when it is allocated, and the service binds it seconds
@@ -455,14 +628,14 @@ export class ProxyHub {
     this.wakeHook = hook;
   }
 
-  /** Optional observer of client bytes (idle bookkeeping lives with the caller). */
+  /** Optional observer of bytes in either direction (idle bookkeeping lives with the caller). */
   setActivityHook(hook: ((envId: string, key: string) => void) | undefined): void {
     this.activityHook = hook;
   }
 
-  wake(envId: string, key: string): boolean {
+  wake(envId: string, key: string, operationId?: string): boolean {
     try {
-      return this.wakeHook?.(envId, key) ?? false;
+      return this.wakeHook?.(envId, key, operationId) ?? false;
     } catch {
       return false;
     }
@@ -483,7 +656,7 @@ export class ProxyHub {
     if (t && (t.lastActivityAt === null || t.lastActivityAt < at)) t.lastActivityAt = at;
   }
 
-  /** The last client byte per port key of an environment (null = none yet). */
+  /** The last byte in either direction per port key of an environment (null = none yet). */
   activity(envId: string): Record<string, number | null> {
     const out: Record<string, number | null> = {};
     for (const t of this.targets.values()) if (t.envId === envId) out[t.key] = t.lastActivityAt;
@@ -536,6 +709,7 @@ export class ProxyHub {
     const target = new Target(envId, key, port, this);
     if (existing) {
       target.clientBytes = existing.clientBytes;
+      target.serverBytes = existing.serverBytes;
       target.lastActivityAt = existing.lastActivityAt;
       target.accepted = existing.accepted;
       target.state = existing.state;
@@ -558,7 +732,15 @@ export class ProxyHub {
     }
     if (existing) {
       // Move held connections too: they are waiting for the SERVICE, not the port.
-      target.waiters = existing.waiters;
+      // The new IPv4 listener may already have accepted clients while its
+      // IPv6 bind awaited. Keep those waiters as well as the transferred ones.
+      target.waiters.push(...existing.waiters);
+      for (const waiter of existing.waiters) {
+        waiter.owner = target;
+        // A reset connection was previously open, then held for a restart.
+        // Closing the old listener must not destroy the stream we just moved.
+        existing.open.delete(waiter.socket);
+      }
       existing.waiters = [];
       existing.close();
     }
@@ -571,6 +753,7 @@ export class ProxyHub {
     const t = this.targets.get(this.id(envId, key));
     if (!t) return;
     t.state = 'starting';
+    t.lastError = undefined;
     if (service) t.service = service;
   }
 
@@ -579,6 +762,8 @@ export class ProxyHub {
     const t = this.targets.get(this.id(envId, key));
     if (!t) return;
     t.state = 'up';
+    t.readyAt = Date.now();
+    t.lastError = undefined;
     t.internalPort = internalPort;
     this.reservedInternal.set(this.id(envId, key), internalPort);
     if (service) t.service = service;
@@ -586,11 +771,12 @@ export class ProxyHub {
   }
 
   /** Nothing is (or will soon be) behind env/key: held connections are closed. */
-  down(envId: string, key: string): void {
+  down(envId: string, key: string, error?: string): void {
     this.release(this.id(envId, key));
     const t = this.targets.get(this.id(envId, key));
     if (!t) return;
     t.state = 'down';
+    if (error) t.lastError = error;
     t.internalPort = undefined;
     t.flush();
   }
@@ -638,6 +824,7 @@ export class ProxyHub {
 
   /** Release every listener of an environment (teardown). */
   closeEnv(envId: string): void {
+    this.metricScopes.delete(envId);
     for (const [id, t] of this.targets) {
       if (t.envId === envId) {
         t.close();
@@ -651,6 +838,7 @@ export class ProxyHub {
     for (const t of this.targets.values()) t.close();
     this.targets.clear();
     this.reservedInternal.clear();
+    this.metricScopes.clear();
   }
 
   /** Stats by port key for one environment. */

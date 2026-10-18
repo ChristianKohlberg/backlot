@@ -73,7 +73,7 @@ function makeWt(name: string, body: string): string {
   const dir = mkdtempSync(join(tmpdir(), `runly-orph-${name}-`));
   writeFileSync(join(dir, 'server.mjs'), body);
   writeFileSync(
-    join(dir, 'stack.yaml'),
+    join(dir, 'runly.yml'),
     `name: ${name}
 services:
   web: { run: node server.mjs, port: web, env: { PORT: "{{ports.web}}" }, ready: { http: /, timeout: 20 } }

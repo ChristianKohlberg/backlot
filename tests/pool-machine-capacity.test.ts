@@ -1,32 +1,3 @@
-/**
- * The machine-wide pool cap: eviction, and a refusal that names the right knob
- * (issues #46 and #47).
- *
- * Reported from a 12-core / 31.3 GB host where `poolMax` and `poolMaxTotal` both
- * resolve to 6. Six environments existed across seven worktrees, every one of
- * them `state: warm, heat: cold, lease: null`, idle 2h–15h against a 30-minute
- * idle TTL. A seventh stack with ZERO environments of its own asked for a lease
- * and was refused `pool at capacity (6/6)` — indefinitely, while nothing ran.
- *
- * Two distinct defects sat in that one line:
- *
- * 1. Idle reclamation quiesces HEAT, not the environment. The row survives, and
- *    the row is what counts toward `poolMaxTotal` — so once a host holds as many
- *    worktrees as the heuristic allows, the machine-wide budget is permanently
- *    full. The ceiling measured history rather than load.
- * 2. The refusal printed the per-stack cap in both the ratio and the remedy.
- *    `(6/6)` was not even a count — it was `POOL_MAX` twice — and the advice it
- *    gave cannot clear a machine-wide block.
- *
- * The fix is eviction rather than simply not counting cold rows: the caps gate
- * environment CREATION only — rebinding an existing environment is never
- * capacity-checked — so the row count is what bounds worst-case concurrent load,
- * and excluding cold rows would leave nothing to stop N of them going hot at
- * once. Waiting can never clear a machine-wide block either, because releasing a
- * lease leaves the row behind; that is why the old fast-fail guard, which
- * deliberately treated a machine-wide block as "another stack will release",
- * burned the whole window on something provably hopeless.
- */
 import { describe, it, expect, afterAll } from 'vitest';
 import { execFile, execFileSync } from 'node:child_process';
 import { mkdtempSync, rmSync, writeFileSync, readFileSync, existsSync } from 'node:fs';
@@ -41,11 +12,6 @@ const dirs: string[] = [];
 
 afterAll(() => {
   for (const d of dirs) {
-    try {
-      process.kill(Number(readFileSync(join(d, 'daemon.pid'), 'utf8')), 'SIGKILL');
-    } catch {
-      /* not a state dir */
-    }
     disposeStateSync(d);
   }
 });
@@ -76,7 +42,7 @@ function ctx(opts: { total: number; idleTtlMs?: number; sweepMs?: number; stubbo
     const wt = mkdtempSync(join(tmpdir(), `runly-mcap-${name}-`));
     dirs.push(wt);
     writeFileSync(
-      join(wt, 'stack.yaml'),
+      join(wt, 'runly.yml'),
       // The cheapest manifest the schema allows (it requires at least one
       // service): a shell that announces readiness and idles. No port, no build,
       // no datastore — none of which capacity accounting counts.
@@ -119,152 +85,23 @@ function ctx(opts: { total: number; idleTtlMs?: number; sweepMs?: number; stubbo
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
-describe('a cold, unleased environment no longer holds a machine-wide slot forever', () => {
-  it('is evicted so a stack with zero environments can bind', async () => {
+describe('capacity preserves worktree environments', () => {
+  it.each([false, true])('refuses without deleting data (released=%s), then accepts explicit cleanup', async (released) => {
     const c = ctx({ total: 1 });
-    const a = c.stack('mcapa');
-    const b = c.stack('mcapb');
-
-    const upA = await c.cli(['up', '--json'], a);
-    expect(upA.code).toBe(0);
-    const envA = String(upA.json?.envId);
-    await c.cli(['release', '--json'], a);
-    await sleep(400); // past the idle TTL: now cold and unleased, as reported
-
-    // Stack B has NO environments of its own. Before the fix this was
-    // `pool at capacity (1/1)` forever, with nothing running anywhere.
-    const upB = await c.cli(['up', '--json'], b);
-    expect(upB.code, upB.stdout).toBe(0);
-    const envB = String(upB.json?.envId);
-    expect(envB).not.toBe(envA);
-
-    // The slot was returned for REAL — the row is gone, not merely uncounted.
-    // That is what keeps the ceiling meaningful: reuse is never capacity-checked,
-    // so an uncounted row could still be rebound hot with nothing to stop it.
-    const rows = c.journal().allEnvs();
-    expect(rows.map((r) => r.id)).toEqual([envB]);
-
-    // And it is on the record: an eviction deletes another stack's warm tree, so
-    // it must never be silent.
-    const evictions = c.events().filter((e) => e.kind === 'pool-evict');
-    expect(evictions.length).toBe(1);
-    expect(evictions[0]!.envId).toBe(envA);
-    expect(evictions[0]!.detail).toMatch(/unleased and idle/);
-  }, 120_000);
-
-  it('evicts an environment the sweeper has condemned but not yet quiesced', async () => {
-    // Found by driving the real thing rather than by a test: an environment
-    // released and abandoned is idle past IDLE_TTL — which is exactly what the
-    // sweeper quiesces — but it stays `hot` until the sweep actually runs, up to
-    // BACKLOT_SWEEP_MS later (15s by default). While eviction required `warm`,
-    // the caller was refused for that whole window, and refused with "waiting
-    // will not help" when the next sweep would in fact have freed a slot.
-    //
-    // The long sweep interval here is the point: it guarantees nothing has been
-    // quiesced, so the candidate is hot-but-condemned.
-    const c = ctx({ total: 1, idleTtlMs: 200, sweepMs: 60_000 });
-    const a = c.stack('mcaph');
-    const b = c.stack('mcapi');
-
-    const upA = await c.cli(['up', '--json'], a);
-    expect(upA.code).toBe(0);
-    await c.cli(['release', '--json'], a);
-    await sleep(400); // past the idle TTL, but no sweep will have run
-
-    // Still hot — the precondition this test exists for.
-    expect(c.journal().getEnv(String(upA.json?.envId))?.state).toBe('hot');
-
-    const upB = await c.cli(['up', '--json'], b);
-    expect(upB.code, upB.stdout).toBe(0);
-    expect(c.journal().allEnvs().map((r) => r.id)).toEqual([String(upB.json?.envId)]);
-    const evicted = c.events().filter((e) => e.kind === 'pool-evict');
-    expect(evicted.length).toBe(1);
-    // The record must say it took a hot one, or the next reader will think the
-    // `warm` restriction is still in force.
-    expect(evicted[0]!.detail).toMatch(/hot/);
-  }, 120_000);
-
-  it('waits out a quiesce in flight instead of refusing as if it were permanent', async () => {
-    // The CI failure this exists for. The idle quiesce runs under the ENVIRONMENT
-    // LOCK, which marks the environment `busy`, and decision 0021 deliberately
-    // keeps its mid-quiesce state as plain `hot`. So while the sweeper reclaims
-    // heat from the only candidate, that candidate is briefly unevictable — and
-    // the machine-wide refusal, whose whole claim is that waiting cannot help,
-    // fired on a condition that clears in milliseconds. It reproduced on the
-    // macOS runner, where teardown is slower (SIGTERM, then a verified SIGKILL).
-    //
-    // Made deterministic by a service that STALLS on SIGTERM: the quiesce cannot
-    // complete until the kill escalates, so it is reliably in flight while the
-    // second stack asks for a slot.
-    const c = ctx({ total: 1, idleTtlMs: 250, stubbornService: true });
-    const a = c.stack('mcapj');
-    const b = c.stack('mcapk');
-
-    const upA = await c.cli(['up', '--json'], a);
-    expect(upA.code).toBe(0);
-    await c.cli(['release', '--json'], a);
-    // Long enough for the sweeper to START quiescing, far too short for the
-    // stubborn service to have finished dying.
+    const a = c.stack('retain');
+    const b = c.stack('newcomer');
+    const up = await c.cli(['up', '--json'], a);
+    expect(up.code, up.stdout).toBe(0);
+    if (released) await c.cli(['release', '--json'], a);
     await sleep(600);
-
-    const upB = await c.cli(['up', '--json'], b);
-    // The contract: wait for the quiesce, then take the slot. Never an immediate
-    // "queueing cannot succeed" — that was a lie about a transient state.
-    expect(upB.code, upB.stdout).toBe(0);
-    expect(c.journal().allEnvs().map((r) => r.id)).toEqual([String(upB.json?.envId)]);
-  }, 120_000);
-
-  it('never evicts a LEASED environment, and says so in a second rather than a minute', async () => {
-    const c = ctx({ total: 1 });
-    const a = c.stack('mcapc');
-    const b = c.stack('mcapd');
-
-    // A live lease. The sweeper will still reclaim its HEAT (that is the
-    // documented quiesce), but the lease — and the row — survive.
-    const upA = await c.cli(['up', '--ttl', '10', '--json'], a);
-    expect(upA.code).toBe(0);
-    await sleep(400);
-
     const started = Date.now();
-    const upB = await c.cli(['up', '--json'], b);
-    const elapsed = Date.now() - started;
-    expect(upB.code).not.toBe(0);
-
-    const msg = c.errOf(upB);
-    // Names the cap that actually bound, and the knob that can move it.
-    expect(msg).toMatch(/MACHINE-WIDE/);
-    expect(msg).toContain('BACKLOT_POOL_MAX_TOTAL');
-    // Explains why the obvious remedy is not one: a release leaves the row.
-    expect(msg).toMatch(/Releasing a lease will not help/);
-    // Real counts, not the cap printed twice.
-    expect(msg).toMatch(/machine holds 1\/1/);
-    // Waiting cannot clear a machine-wide block, so it must not wait.
-    expect(elapsed).toBeLessThan(15_000);
-
-    // The lease is untouched: never take an environment somebody else holds.
-    expect(c.journal().leaseForEnv(String(upA.json?.envId))).toBeTruthy();
-    expect(c.events().filter((e) => e.kind === 'pool-evict')).toEqual([]);
-  }, 120_000);
-
-  it('evicts the least-recently-used cold environment, leaving a leased one alone', async () => {
-    const c = ctx({ total: 2 });
-    const a = c.stack('mcape'); // will be cold, and used FIRST (the LRU victim)
-    const b = c.stack('mcapf'); // will stay leased
-    const d = c.stack('mcapg'); // the newcomer
-
-    const upA = await c.cli(['up', '--json'], a);
-    await c.cli(['release', '--json'], a);
-    const upB = await c.cli(['up', '--ttl', '10', '--json'], b);
-    expect(upA.code).toBe(0);
-    expect(upB.code).toBe(0);
-    await sleep(400);
-
-    const upD = await c.cli(['up', '--json'], d);
-    expect(upD.code, upD.stdout).toBe(0);
-
-    const ids = c.journal().allEnvs().map((r) => r.id);
-    expect(ids).toContain(String(upB.json?.envId)); // the leased one survived
-    expect(ids).toContain(String(upD.json?.envId));
-    expect(ids).not.toContain(String(upA.json?.envId)); // the cold one paid
-  }, 120_000);
+    const refused = await c.cli(['up', '--json'], b);
+    expect(refused.code).not.toBe(0);
+    expect(c.errOf(refused)).toContain('BACKLOT_POOL_MAX_TOTAL');
+    expect(Date.now() - started).toBeLessThan(15_000);
+    expect(c.journal().allEnvs().map(r => r.id)).toEqual([String(up.json?.envId)]);
+    expect(c.events().filter(e => e.kind === 'pool-evict')).toEqual([]);
+    expect((await c.cli(['destroy', '--json'], a)).code).toBe(0);
+    expect((await c.cli(['up', '--json'], b)).code).toBe(0);
+  }, 60_000);
 });

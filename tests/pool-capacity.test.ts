@@ -37,7 +37,7 @@ function ctx() {
   dirs.push(stateDir, wt);
   writeFileSync(join(wt, 'srv.mjs'), `import{createServer}from'node:http';console.log('up');createServer((q,s)=>s.end('ok')).listen(Number(process.env.PORT), '127.0.0.1');\n`);
   writeFileSync(
-    join(wt, 'stack.yaml'),
+    join(wt, 'runly.yml'),
     `name: cap\nservices:\n  web: { run: node srv.mjs, port: web, env: { PORT: "{{ports.web}}" }, ready: { http: /, timeout: 20 } }\n`,
   );
   execFileSync('git', ['init', '-q'], { cwd: wt });
@@ -87,14 +87,14 @@ describe('pool capacity diagnostics', () => {
     expect(elapsed).toBeLessThan(15_000);
   }, 60_000);
 
-  it('still queues normally when a lease will expire inside the window', async () => {
+  it('requires release before another holder can acquire', async () => {
     const { cli } = ctx();
-    // A short-TTL session lease frees the env well inside the wait window, so
-    // a second holder must WAIT and succeed rather than fail fast.
-    await cli(['up', '--ttl', '0.05', '--json']); // 3s
-    const other = await cli(['up', '--holder', 'someone-else', '--json']);
-    expect(other.json?.state).toBe('hot');
-  }, 90_000);
+    expect((await cli(['up', '--json'])).json?.state).toBe('hot');
+    expect((await cli(['up', '--holder', 'someone-else', '--json'])).json?.error).toBeTruthy();
+    await cli(['release', '--json']);
+    expect((await cli(['up', '--holder', 'someone-else', '--json'])).json?.state).toBe('hot');
+  }, 60_000);
+
 });
 
 describe('the capacity queue is per-stack, and holders bypass it', () => {
@@ -111,7 +111,7 @@ describe('the capacity queue is per-stack, and holders bypass it', () => {
       dirs.push(wt);
       writeFileSync(join(wt, 'srv.mjs'), `import{createServer}from'node:http';console.log('up');createServer((q,s)=>s.end('ok')).listen(Number(process.env.PORT), '127.0.0.1');\n`);
       writeFileSync(
-        join(wt, 'stack.yaml'),
+        join(wt, 'runly.yml'),
         `name: ${name}\nservices:\n  web: { run: node srv.mjs, port: web, env: { PORT: "{{ports.web}}" }, ready: { http: /, timeout: 20 } }\n`,
       );
       execFileSync('git', ['init', '-q'], { cwd: wt });
@@ -159,51 +159,8 @@ describe('the capacity queue is per-stack, and holders bypass it', () => {
 
     // Fairness intact: the queued waiter is served once the lease lapses.
     const a2r = await a2;
-    expect(a2r.code, a2r.stdout).toBe(0);
-  }, 60_000);
-});
-
-describe('an expired-but-unswept lease cannot jump the queue', () => {
-  it('the holder bypass refuses a lapsed lease instead of resurrecting it', async () => {
-    // leaseForHolder does not filter on expiry; only the sweeper deletes
-    // lapsed leases. In the window between expiry and the sweep, a returning
-    // holder's queue bypass used to refresh the corpse for a full new TTL —
-    // jumping a waiter who was queued on precisely that expiry.
-    const stateDir = mkdtempSync(join(tmpdir(), 'runly-exp-'));
-    dirs.push(stateDir);
-    const wt = mkdtempSync(join(tmpdir(), 'runly-exp-wt-'));
-    dirs.push(wt);
-    writeFileSync(join(wt, 'srv.mjs'), `import{createServer}from'node:http';console.log('up');createServer((q,s)=>s.end('ok')).listen(Number(process.env.PORT), '127.0.0.1');\n`);
-    writeFileSync(
-      join(wt, 'stack.yaml'),
-      `name: exp\nservices:\n  web: { run: node srv.mjs, port: web, env: { PORT: "{{ports.web}}" }, ready: { http: /, timeout: 20 } }\n`,
-    );
-    execFileSync('git', ['init', '-q'], { cwd: wt });
-    const env = {
-      ...process.env,
-      BACKLOT_STATE_DIR: stateDir,
-      BACKLOT_POOL_MAX_TOTAL: '2',
-      BACKLOT_LEASE_TTL_MS: '1500',
-      BACKLOT_WAIT_MS: '30000',
-      BACKLOT_SWEEP_MS: '5000', // the sweep lag IS the window under test
-    };
-    const cli = (args: string[]) =>
-      new Promise<{ code: number; stdout: string; doneAt: number }>((resolve) => {
-        execFile(process.execPath, [CLI, ...args, '--json'], { cwd: wt, env }, (err, out) =>
-          resolve({ code: err ? ((err as { code?: number }).code ?? 1) : 0, stdout: String(out), doneAt: Date.now() }),
-        );
-      });
-
-    expect((await cli(['up'])).code).toBe(0); // holder A leases; TTL 1.5s
-    const waiter = cli(['up', '--holder', 'waiting-agent']); // queues on the expiry
-    await new Promise((r) => setTimeout(r, 2500)); // lease lapsed, sweep not yet run
-    const returning = cli(['up']); // holder A returns inside the window
-
-    const [w, ret] = await Promise.all([waiter, returning]);
-    expect(w.code, w.stdout).toBe(0);
-    expect(ret.code, ret.stdout).toBe(0);
-    // The waiter was first in line for the expiry; the returning holder's
-    // lapsed lease must not have been refreshed over it.
-    expect(w.doneAt, 'the queued waiter finished AFTER the returning holder — the lapsed lease was resurrected').toBeLessThan(ret.doneAt);
+    expect(a2r.code, a2r.stdout).not.toBe(0);
+    await cliIn(wtA, ['release']);
+    expect((await cliIn(wtA, ['up', '--holder', 'second-agent'])).code).toBe(0);
   }, 60_000);
 });

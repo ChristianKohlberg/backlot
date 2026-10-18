@@ -1,16 +1,16 @@
 ---
 name: runly
-description: Use runly to put a running, seeded, authenticated instance of the web app in front of you before inspecting behaviour, proving a change with the repo's own tests, or reproducing a bug. Use when the repo has a runly.yml at its root and the `runly` CLI is installed. Covers up/down, ctx --env for your tests, database copies (db with), ps, plan, logs, idle and wake, the session tether, and destroy.
+description: Use the runly CLI to start an existing stack, run tests, inspect logs, manage data and previews, or troubleshoot its environment. For creating or changing the manifest, use runly-setup.
 ---
 
 # runly
 
 runly runs the repo's app **in your worktree**, one environment per worktree,
-from the `runly.yml` at the repo root. A per-machine daemon supervises the
+from `runly.yml` or `runly.yaml` at the repo root. A per-machine daemon supervises the
 services and holds a stable public port per service. You get URLs, logins and
 connection strings; you run your own tests against them.
 
-Every verb takes `--json` (stdout is one JSON object). Exit codes: `0` ok,
+Every verb takes `--json` (one object; monitor emits one per snapshot). Exit codes: `0` ok,
 `1` work-error (your code: fix it), `2` env-error (the environment: run `up`
 again), `3` infra-error (something external, or version skew: act on the
 message), `64` usage. Branch on the class, not just the code.
@@ -27,7 +27,11 @@ runly down web           # stop one service (no name = all); lease, data and por
 
 **After an edit, run `runly up` again.** It runs the due upkeep and the builds
 and restarts only the services whose build output changed; a dev server without
-a `build:` keeps running and reloads itself. `--rebuild` forces every build.
+a `build:` keeps running and reloads itself. With named services, other running
+services are not built or restarted. Plain builds run each time; `build: {run, when}`
+can skip unchanged inputs only while its outputs remain intact. `--rebuild`
+bypasses that skip. Without declared outputs a built service always restarts;
+dependents do not restart merely because a dependency did.
 
 **Run your tests against it.** `ctx --env` (or `up --env`) prints
 `export KEY=value` lines:
@@ -48,7 +52,8 @@ name), drops it afterwards and exits with the command's code; runly's own
 failures say `runly db with:` on stderr (`--runly-exit 125` gives them a code of
 their own). Copies need no lease and run in parallel; don't
 start your own database container. `runly db new main` keeps one until
-`runly db drop <name>`. A datastore marked `copies_only` exists only this way:
+`runly db drop <name>`, worktree removal, or its configured holder's death.
+A datastore marked `copies_only` exists only this way:
 environments never get one and `ctx` does not list it.
 
 **See what runs.** `runly ps` (this worktree; `--all` for the box): each service's
@@ -94,21 +99,42 @@ the shared one to the others.
 
 ## How long it lives
 
-- **Under Claude Code you are tethered.** `up` and `db new` tie the environment
-  to your session (`CLAUDE_PID`). It lives as long as the session and is torn
-  down 60 s after the session ends. Nothing to renew; the summary says `held by
-  agent <pid>`. `BACKLOT_TETHER=off` (or `--ttl`) opts out.
-- **Elsewhere, use `--ttl <minutes>`** (default 30). Never
-  `BACKLOT_HOLDER_PID=$$ runly up`: each command runs in a fresh shell, so `$$`
-  is already dead and runly refuses it (exit 64).
-- **Idle services stop and wake.** A service with no runly verb and no client
-  byte for 10 minutes is stopped (`ps` says `idle`); its URL, data and lease
-  stay, and the next request starts it and waits until it is ready. Only verbs
-  that use the environment count (`up`, `exec`, `token`, `reset-data`); polling
-  `ps`, `ctx` or `logs` does not keep it warm.
-- **A deleted worktree takes its environment with it**, and an unleased one
-  nobody used for 24 hours goes too (`BACKLOT_UNLEASED_TTL`); its templates stay.
-- **Verbs work from any subdirectory** of the worktree.
+Environments belong to worktrees, independently of agent processes. After **5 minutes**
+without activity, managed services stop; data, configuration and public ports stay.
+Activity means bytes in either direction through any environment proxy port, or a
+verb that uses the environment (`up`, `exec`, `token`, `preview`, `reset-data`, `down`).
+Read-only commands and internal readiness probes do not count. The clock is shared
+across the environment, with per-service `idle:` overrides.
+
+New connections wake wanted services and their dependencies even after `release`,
+subject to the load budget. Explicitly downed or failed services require `up`.
+WebSocket messages, protocol heartbeats and server-sent events count as traffic;
+a silent open connection does not. Consequently an idle stop closes silent sockets:
+clients must reconnect. Run silent background work with `runly exec` (heartbeats
+while its child runs), or set `idle: never`. Shared appliances remain running.
+
+Agent death, disconnection, idle age and pool pressure never delete an environment.
+A confirmed missing worktree does; inaccessible paths and filesystem errors are not
+proof of deletion. Renaming a worktree removes its old path and therefore also
+triggers cleanup. Explicit `destroy` and `pool recycle` remain destructive.
+Environment leases never expire; `--ttl` is rejected outside `preview`. Public
+previews always expire (30 minutes by default, `preview --ttl <minutes>` to change
+it). Expiry closes public access, including open streams, but retains the lease
+and environment. A successful `up` renews an active preview for its configured TTL. Failed `up`
+calls and daemon restarts do not extend it. A successful `up` also reopens a
+previously enabled preview after automatic expiry, using its saved TTL. Explicit
+`preview stop`, `release`, or a forbidden-preview configuration clears that intent. `--holder-pid` on `up` is diagnostic metadata only; there is no
+agent-specific automatic tether. Required caller inputs lost on release or daemon
+restart must be supplied by a fresh `up` before services using them can wake.
+
+A full machine-wide environment cap refuses creation and names `BACKLOT_POOL_MAX_TOTAL`;
+raise the cap or explicitly destroy an unwanted environment. Load admission still
+bounds running services and builds. Failed starts retain data; retrying never
+implicitly runs `--pristine`.
+
+Standalone database copies retain their separate lifecycle: `db with` owns a copy
+for its command; `db new` can use an explicit process holder or the Claude ancestor
+tether. This does not control the application environment.
 
 ## Don't
 
@@ -120,9 +146,43 @@ the shared one to the others.
 - `runly update --force`: on a shared box it interrupts someone else's bind. If
   a verb fails with infra-error naming two versions, run `runly update`.
 - Preview without being asked: `runly preview <svc>` publishes an
-  unauthenticated URL. It lasts as long as the lease, across daemon restarts
-  (`ctx --json` `previewRestore` reports a re-publish that failed). End it with
-  `runly preview stop`.
+  unauthenticated URL (Tailscale is tailnet-only). Public access has its own
+  deadline; a restart restores it only if unexpired. End publication and disable
+  reopening with `runly preview stop`. Check `previewExpiresAt` and
+  `previewRestore` in `ctx --json`, and any `previewNotice` from `up`.
+
+## Measure before tuning
+
+Use runly stats --since 30m --json for this worktree's bounded history, or --all
+for the daemon. runly monitor --interval 2s --timeout 60 --json captures a bounded
+NDJSON observation window. Monitoring never keeps services active. Compare build
+skips/restarts, datastore bake/restore time, budget wait and wake duration before
+changing settings. Check sample counts and collection truncation/storage errors.
+Proxy first-byte timing is per TCP connection, not per HTTP request or WebSocket
+message. Budget figures are declared costs, not measured resource use.
+
+## Inputs, recovery and installation
+
+Supply a service's `env_from` variables in the shell running `up`; required
+ones must be present. Explicit `up` refreshes them, while `reset-data` preserves
+them. Values are memory-only and lost on release or daemon restart; run `up`
+with them again. Do not put secrets in the manifest or install them into the
+daemon unit.
+
+After a daemon restart, traffic, `exec` or `token` resumes wanted services
+without redoing builds; `up` reapplies the worktree. Read-only `ctx` and `ps`
+do not resume services. The proxy holds a request while starting; a startup
+failure before an HTTP response returns 503 with Retry-After. Inspect `runly ps`,
+`runly ctx --json`, `runly logs <svc>` and `runly logs --build`; local proxy
+diagnostics include `lastError` and `readyAt`. Established streams can disconnect;
+do not assume mutating requests are safe to retry.
+
+Install or upgrade with `npm i -g @theford/runly`, then `runly update` to load
+the installed build into the daemon. `update` does not download packages.
+For a checkout follow its install hint instead. Optional `runly daemon install`
+supervises the daemon with systemd/launchd. Its environment is captured at install
+time: reinstall after changing PATH or required daemon variables; use
+`--env NAME` for an additional variable. Caller `env_from` inputs stay excluded.
 
 ## Other verbs
 

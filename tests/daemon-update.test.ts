@@ -59,7 +59,7 @@ function ctx(opts: { service?: boolean } = {}) {
       `import{createServer}from'node:http';console.log('ready');createServer((q,s)=>s.end('ok')).listen(Number(process.env.PORT), '127.0.0.1');\n`,
     );
     writeFileSync(
-      join(wt, 'stack.yaml'),
+      join(wt, 'runly.yml'),
       `name: upd\n` +
         `services:\n  web: { run: node srv.mjs, port: web, env: { PORT: "{{ports.web}}" }, ready: { log: ready, timeout: 20 } }\n` +
         ``,
@@ -257,7 +257,7 @@ describe('runly update', () => {
     const { cli, stateDir } = ctx({ service: true });
     // Lease created by a 0.7.0-claiming CLI against a 0.7.0-claiming daemon, so
     // the bind itself is not blocked by the skew gate.
-    const up = await cli(['up', '--ttl', '10', '--json'], { fakeVersion: '0.7.0' });
+    const up = await cli(['up', '--json'], { fakeVersion: '0.7.0' });
     expect(up.code).toBe(0);
     const envId = String((up.json as { envId?: string }).envId ?? '');
     expect(envId).not.toBe('');

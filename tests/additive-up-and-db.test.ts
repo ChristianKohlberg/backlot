@@ -158,7 +158,7 @@ describe('up is additive, down stops just what it names', () => {
     const proxy = status.envs[0].proxy;
     expect(proxy.b.port).toBe(second.json.ports.b);
     expect(proxy.b.state).toBe('down');
-    await expect(fetch(`http://127.0.0.1:${second.json.ports.b}/`, { signal: AbortSignal.timeout(3000) })).rejects.toThrow();
+    expect((await fetch(`http://127.0.0.1:${second.json.ports.b}/`, { signal: AbortSignal.timeout(3000) })).status).toBe(503);
 
     // The lease's wish survives: a later bare `up` brings b back, a untouched.
     const back = await ctx.cli(['up', 'b', '--json'], wt);

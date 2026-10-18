@@ -40,7 +40,7 @@ function makeContext() {
 
 function makeStack(dir: string, stackYaml: string, files: Record<string, string>): void {
   for (const [name, content] of Object.entries(files)) writeFileSync(join(dir, name), content);
-  writeFileSync(join(dir, 'stack.yaml'), stackYaml);
+  writeFileSync(join(dir, 'runly.yml'), stackYaml);
   execFileSync('git', ['init', '-q'], { cwd: dir });
 }
 

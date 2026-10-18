@@ -16,7 +16,7 @@ const db = new DatabaseSync(process.argv[2]);db.exec('DROP TABLE IF EXISTS marke
 db.prepare('INSERT INTO marker VALUES (?)').run(process.argv[3]);db.close();\n`);
   writeFileSync(join(tree, 'server.mjs'), `import {createServer} from 'node:http';createServer((q,s)=>s.end('ready')).listen(Number(process.env.PORT),'127.0.0.1');\n`);
   const datastore = {driver:'sqlite',create:'node seed.mjs "{{ns}}" "{{preset}}"',template:true,presets:['dev','alternate'],default_preset:{session:'dev',run:'dev'}};
-  writeFileSync(join(tree, 'stack.yaml'), JSON.stringify({name:'preset-selection',services:{web:{run:'node server.mjs',port:'web',env:{PORT:'{{ports.web}}'},ready:{http:'/',timeout:10}}},datastores:{main:datastore,...(multi?{audit:datastore}:{})}}));
+  writeFileSync(join(tree, 'runly.yml'), JSON.stringify({name:'preset-selection',services:{web:{run:'node server.mjs',port:'web',env:{PORT:'{{ports.web}}'},ready:{http:'/',timeout:10}}},datastores:{main:datastore,...(multi?{audit:datastore}:{})}}));
   const env = {...process.env,BACKLOT_STATE_DIR:state,BACKLOT_POOL_MAX_TOTAL:'1'};
   const cli = (args:string[]) => new Promise<{code:number;json:any;stdout:string;stderr:string}>(resolve=>{
     execFile(process.execPath,[CLI,...args,'--json'],{cwd:tree,env,timeout:25000},(error,stdout,stderr)=>{
@@ -61,7 +61,7 @@ it('refuses --preset on an unsupported verb as a usage error without touching th
 it('creates an added datastore with its default and reloads only the one that is named',async()=>{const f=fixture();try{
   const first=await f.cli(['up','--preset','alternate']);expect(first.code,first.stdout).toBe(0);
   expect(first.json.bindDiagnostics.reloaded).toEqual(['main']);expect(first.json.datastores.main.preset).toBe('alternate');
-  const path=join(f.tree,'stack.yaml');const manifest=JSON.parse(readFileSync(path,'utf8'));manifest.datastores.audit=manifest.datastores.main;writeFileSync(path,JSON.stringify(manifest));
+  const path=join(f.tree,'runly.yml');const manifest=JSON.parse(readFileSync(path,'utf8'));manifest.datastores.audit=manifest.datastores.main;writeFileSync(path,JSON.stringify(manifest));
   f.mutate(first.json);
   const added=await f.cli(['up']);expect(added.code,added.stdout).toBe(0);
   expect(added.json.bindDiagnostics.reloaded).toEqual([]);
@@ -100,7 +100,7 @@ it('selects individual datastores and rejects ambiguous or duplicate choices',as
 },30000);
 
 it('treats an empty presets catalog like an omitted one',async()=>{const f=fixture();try{
-  const path=join(f.tree,'stack.yaml');const manifest=JSON.parse(readFileSync(path,'utf8'));manifest.datastores.main.presets=[];writeFileSync(path,JSON.stringify(manifest));
+  const path=join(f.tree,'runly.yml');const manifest=JSON.parse(readFileSync(path,'utf8'));manifest.datastores.main.presets=[];writeFileSync(path,JSON.stringify(manifest));
   const declared=await f.cli(['up']);expect(declared.code,declared.stdout).toBe(0);expect(f.value(declared.json)).toBe('dev');expect(declared.json.datastores.main.preset).toBe('dev');
   const bad=await f.cli(['up','--preset','alternate']);expect(bad.code,bad.stdout).toBe(1);expect(f.value(declared.json)).toBe('dev');
   await f.cli(['release']);
@@ -113,12 +113,12 @@ it('treats an empty presets catalog like an omitted one',async()=>{const f=fixtu
 
 
 it('rejects invalid declared defaults before allocating an environment',async()=>{const f=fixture();try{
-  const path=join(f.tree,'stack.yaml');const manifest=JSON.parse(readFileSync(path,'utf8'));manifest.datastores.main.default_preset.session='missing';writeFileSync(path,JSON.stringify(manifest));
+  const path=join(f.tree,'runly.yml');const manifest=JSON.parse(readFileSync(path,'utf8'));manifest.datastores.main.default_preset.session='missing';writeFileSync(path,JSON.stringify(manifest));
   const invalid=await f.cli(['up']);expect(invalid.code,invalid.stdout).toBe(1);expect((await f.cli(['status'])).json.envs).toHaveLength(0);
 }finally{await f.cleanup();}},30000);
 
 it('preserves manifest-declared defaults when the optional catalog is omitted',async()=>{const f=fixture();try{
-  const path=join(f.tree,'stack.yaml');const manifest=JSON.parse(readFileSync(path,'utf8'));delete manifest.datastores.main.presets;writeFileSync(path,JSON.stringify(manifest));
+  const path=join(f.tree,'runly.yml');const manifest=JSON.parse(readFileSync(path,'utf8'));delete manifest.datastores.main.presets;writeFileSync(path,JSON.stringify(manifest));
   const up=await f.cli(['up']);expect(up.code,up.stdout).toBe(0);expect(f.value(up.json)).toBe('dev');
   const bad=await f.cli(['up','--preset','alternate']);expect(bad.code,bad.stdout).toBe(1);expect(f.value(up.json)).toBe('dev');
 }finally{await f.cleanup();}},30000);
@@ -135,7 +135,7 @@ it('reports a completed preset restore even when a later datastore fails',async(
 it('keeps what the store holds for a fresh holder through an early upkeep failure and retry',async()=>{const f=fixture();try{
   const first=await f.cli(['up','--preset','alternate']);expect(first.code,first.stdout).toBe(0);
   await f.cli(['release']);
-  const path=join(f.tree,'stack.yaml');const manifest=JSON.parse(readFileSync(path,'utf8'));
+  const path=join(f.tree,'runly.yml');const manifest=JSON.parse(readFileSync(path,'utf8'));
   manifest.upkeep=[{when:'seed.mjs',run:'exit 1'}];writeFileSync(path,JSON.stringify(manifest));
   const failed=await f.cli(['up','--holder','next']);expect(failed.code,failed.stdout).toBe(1);
   const actual=await f.cli(['ctx','--holder','next']);expect(actual.json.datastores.main.preset).toBe('alternate');
@@ -147,7 +147,7 @@ it('keeps what the store holds for a fresh holder through an early upkeep failur
 
 it('does not remember a --preset whose bind failed: a pristine retry restores what the store held',async()=>{const f=fixture();try{
   const first=await f.cli(['up']);expect(first.code,first.stdout).toBe(0);
-  const path=join(f.tree,'stack.yaml');const manifest=JSON.parse(readFileSync(path,'utf8'));
+  const path=join(f.tree,'runly.yml');const manifest=JSON.parse(readFileSync(path,'utf8'));
   manifest.upkeep=[{when:'seed.mjs',run:'exit 1'}];writeFileSync(path,JSON.stringify(manifest));
   const failed=await f.cli(['up','--pristine','--preset','alternate']);expect(failed.code,failed.stdout).toBe(1);
   const pid=Number(readFileSync(join(f.state,'daemon.pid'),'utf8'));await f.cli(['daemon','stop']);
@@ -159,7 +159,7 @@ it('does not remember a --preset whose bind failed: a pristine retry restores wh
 }finally{await f.cleanup();}},30000);
 
 it('validates a reusing up, and keeps the data when the preset it holds leaves the catalog',async()=>{const f=fixture();try{
-  const path=join(f.tree,'stack.yaml');const manifest=JSON.parse(readFileSync(path,'utf8'));
+  const path=join(f.tree,'runly.yml');const manifest=JSON.parse(readFileSync(path,'utf8'));
   writeFileSync(join(f.tree,'content.txt'),'original');
   const first=await f.cli(['up','--preset','alternate']);expect(first.code,first.stdout).toBe(0);
   const projected=await f.cli(['up']);expect(projected.code,projected.stdout).toBe(0);expect(projected.json.bindDiagnostics.reuse).toBe('reused');

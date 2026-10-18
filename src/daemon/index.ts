@@ -34,7 +34,7 @@ async function dispatch(verb: string, args: Record<string, unknown>, emit: (phas
       return engine.up({
         cwd, holder, holderPid, callerEnv: args.callerEnv, presets: args.presets,
         hygiene: (args.hygiene as never) ?? undefined,
-        ttlMs: args.ttlMs ? Number(args.ttlMs) : undefined,
+        ttlMs: args.ttlMs !== undefined ? Number(args.ttlMs) : undefined,
         // [] (not undefined) so a bare `up` adds the default set — every
         // service; undefined is reserved for the internal reset-data rebind,
         // which adds nothing and never comes through this RPC.
@@ -99,7 +99,7 @@ async function dispatch(verb: string, args: Record<string, unknown>, emit: (phas
         cwd,
         String(args.service),
         holder,
-        args.ttlMs ? Number(args.ttlMs) : undefined,
+        args.ttlMs !== undefined ? Number(args.ttlMs) : undefined,
         args.httpsPort !== undefined ? Number(args.httpsPort) : undefined,
       );
     case 'preview-stop':
@@ -110,6 +110,8 @@ async function dispatch(verb: string, args: Record<string, unknown>, emit: (phas
       return engine.applianceStart(cwd, args.name ? String(args.name) : undefined);
     case 'appliance-stop':
       return engine.applianceStop(cwd, String(args.name));
+    case 'stats':
+      return engine.stats(cwd, Boolean(args.all), args.sinceMs === undefined ? undefined : Number(args.sinceMs));
     case 'status':
       return engine.status();
     case 'doctor':

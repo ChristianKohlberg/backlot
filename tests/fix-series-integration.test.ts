@@ -23,7 +23,7 @@ function fixture() {
     datastores: { main: { driver: 'sqlite', create: 'node seed.mjs "{{ns}}" "{{preset}}"', template: true, presets: ['dev', 'alternate'] } },
     preview: { forbidden: false },
   };
-  const save = () => writeFileSync(join(tree, 'stack.yaml'), JSON.stringify(manifest)); save();
+  const save = () => writeFileSync(join(tree, 'runly.yml'), JSON.stringify(manifest)); save();
   writeFileSync(join(tree, 'server.mjs'), "import{createServer}from'node:http';createServer((q,s)=>s.end('ok')).listen(Number(process.env.PORT),'127.0.0.1');\n");
   writeFileSync(join(tree, 'seed.mjs'), "import{DatabaseSync}from'node:sqlite';const d=new DatabaseSync(process.argv[2]);d.exec('CREATE TABLE marker(value TEXT)');d.prepare('INSERT INTO marker VALUES (?)').run(process.argv[3]);d.close();\n");
   const child = join(root, 'child.mjs'); const launcher = join(root, 'launcher.mjs'); const bin = join(root, 'cloudflared');
@@ -61,7 +61,7 @@ async function stopped(pids: number[]) {
 it('composes canonical ownership, selected preset, preview group and preserved deadline across content operations', async () => {
   const f = fixture();
   try {
-    const first = await f.cli(['up', '--ttl', '480m', '--preset', 'alternate']); expect(first.code, first.output).toBe(0);
+    const first = await f.cli(['up', '--preset', 'alternate']); expect(first.code, first.output).toBe(0);
     let deadline = first.data.lease.expiresAt;
     const check = (r: Awaited<ReturnType<typeof f.cli>>) => {
       expect(r.code, r.output).toBe(0); expect(r.data.envId).toBe(first.data.envId);
@@ -74,8 +74,8 @@ it('composes canonical ownership, selected preset, preview group and preserved d
     writeFileSync(join(f.tree, 'edit.txt'), 'projection');
     // A repeated up sets a new deadline (it is a fresh request for time);
     // nothing changed, so it keeps the services and the preview.
-    const projected = await f.cli(['up', '--ttl', '480m'], f.alias);
-    expect(projected.data.lease.expiresAt).toBeGreaterThanOrEqual(deadline); deadline = projected.data.lease.expiresAt;
+    const projected = await f.cli(['up'], f.alias);
+    expect(projected.data.lease.expiresAt).toBeNull(); deadline = projected.data.lease.expiresAt;
     check(projected); expect(projected.data.bindDiagnostics.reuse).toBe('reused');
     expect(members.every(alive)).toBe(true); expect(projected.data.previewUrls.web).toBe(publicUrl);
     check(await f.cli(['reset-data'], f.alias)); expect(members.every(alive)).toBe(true);
@@ -83,7 +83,7 @@ it('composes canonical ownership, selected preset, preview group and preserved d
     check(await f.cli(['reset-data'], f.alias));
     const db = new DatabaseSync(join(f.state, 'journal.db'), { readOnly: true });
     try {
-      expect(db.prepare('PRAGMA user_version').get()!.user_version).toBe(4);
+      expect(db.prepare('PRAGMA user_version').get()!.user_version).toBe(5);
       // Decision 0034: the preset is what the datastore holds (envs.presets),
       // not lease intent — a later up without --preset keeps it.
       const env = db.prepare('SELECT presets FROM envs WHERE id=?').get(first.data.envId)!;

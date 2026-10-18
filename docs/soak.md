@@ -28,9 +28,11 @@ fixture stacks in a dedicated temp `BACKLOT_STATE_DIR`, cycling continuously:
   service that has no `build:` (same pid), and an upkeep-trigger touch
   (`deps.lock`) + `up` must take the full bind: the upkeep marker appears in
   the worktree *and* the service comes back on the same URL with a new pid.
-  Requests sent to that URL throughout the restart must all be answered — the
+  Requests sent on fresh TCP connections throughout the restart must all be answered — the
   daemon's proxy holds them until the new process is ready (decision 0033) —
-  and the URL's port must stay inside the public block 20000–29999.
+  and the URL's port must stay inside the public block 20000–29999. Existing
+  answered keep-alive streams can close during restart; replaying their later
+  requests would violate the proxy's safety contract.
 - **Env export** — `runly ctx --env` must print parseable `RUNLY_*=value`
   lines, and the stack's own check, run with them outside runly, must pass.
 - **Down and database copies** — `down web` must keep the lease, the URL and
@@ -40,7 +42,7 @@ fixture stacks in a dedicated temp `BACKLOT_STATE_DIR`, cycling continuously:
   command's code and leave no copy behind (decision 0034). Convergence fails
   on any `db_copies` row left after shutdown.
 - **Capacity churn** — a second stack whose one environment (decision 0032) is
-  held by a short-TTL holder while a second holder queues on its expiry, plus an
+  handed between explicit holders while a second holder queues for release, plus an
   idle cycle (decision 0035): the stack's web declares `idle: 8s`, so left
   alone it must be stopped (`ps` says `idle`) while lease, data and port stay,
   and a request to its URL must be held, wake it and be answered. The sweeper
@@ -53,6 +55,9 @@ fixture stacks in a dedicated temp `BACKLOT_STATE_DIR`, cycling continuously:
 - **Logs** (decision 0038) — after every session `up`, `logs web --since up -f
   --until '<ready line>' --timeout 20` must exit 0 on the ready line, and a
   pattern that never comes must exit 124 at `--timeout 1`.
+- **Statistics** — every cycle reads `stats --all --since 30m`, checking bounded
+  recent operations, finite nonnegative aggregates, consistent duration extrema
+  and quantiles, and no metrics persistence errors.
 - **Chaos ticks (~every 2 min)** — `SIGKILL` the daemon (the next verb must
   auto-respawn and recover), `SIGSTOP`/`SIGCONT` for 60–90 s, and deleting a
   worktree mid-lease (the stale-root reap must remove the env row *and* its

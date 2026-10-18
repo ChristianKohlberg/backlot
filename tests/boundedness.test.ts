@@ -45,7 +45,7 @@ function mkStack(yaml: string, extraFiles: Record<string, string> = {}) {
   const stateDir = mkdtempSync(join(tmpdir(), 'runly-bnd-'));
   const wt = mkdtempSync(join(tmpdir(), 'runly-bnd-wt-'));
   dirs.push(stateDir, wt);
-  writeFileSync(join(wt, 'stack.yaml'), yaml);
+  writeFileSync(join(wt, 'runly.yml'), yaml);
   for (const [rel, content] of Object.entries(extraFiles)) writeFileSync(join(wt, rel), content);
   execFileSync('git', ['init', '-q'], { cwd: wt });
   const env = {

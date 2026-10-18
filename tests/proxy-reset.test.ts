@@ -11,7 +11,8 @@
  */
 import { describe, it, expect, afterEach } from 'vitest';
 import { createServer, connect, type Server, type Socket } from 'node:net';
-import { ProxyHub } from '../src/daemon/proxy.js';
+import { ProxyHub, PortInUse, replayable } from '../src/daemon/proxy.js';
+import { allocateInBlock } from '../src/core/ports.js';
 
 const open: Array<{ close: () => void }> = [];
 afterEach(() => {
@@ -36,12 +37,22 @@ function request(port: number, body = 'GET / HTTP/1.0\r\nHost: x\r\n\r\n'): Prom
 
 async function hub(): Promise<{ hub: ProxyHub; port: number }> {
   const h = new ProxyHub();
-  const probe = createServer();
-  const port = await listen(probe);
-  await new Promise<void>((r) => probe.close(() => r()));
-  await h.listen('env', 'web', port);
-  open.push({ close: () => h.closeAll() });
-  return { hub: h, port };
+  // Probe both loopback families, outside the outbound ephemeral range. A
+  // concurrent suite can still claim a probed port; retry that bind race only.
+  const taken = new Set<number>();
+  for (let attempt = 0; attempt < 20; attempt++) {
+    const port = await allocateInBlock({ lo: 15000, hi: 19999 }, taken);
+    if (port === undefined) break;
+    taken.add(port);
+    try {
+      await h.listen('env', 'web', port);
+      open.push({ close: () => h.closeAll() });
+      return { hub: h, port };
+    } catch (error) {
+      if (!(error instanceof PortInUse)) throw error;
+    }
+  }
+  throw new Error('No free dual-stack port for proxy fixture');
 }
 
 describe('the proxy retries a connection its service dropped before answering (B4)', () => {
@@ -180,5 +191,41 @@ describe('the proxy retries a connection its service dropped before answering (B
       s.end('ping');
     });
     expect(reply).toBe('echo:ping');
+  });
+});
+
+it('never replays a safe-method prefix followed by a pipelined mutation', async () => {
+  let mutations = 0;
+  const service = createServer(socket => {
+    socket.on('error', () => {});
+    socket.once('data', data => {
+      if (data.includes('POST /charge')) mutations++;
+      socket.resetAndDestroy();
+    });
+  });
+  const internal = await listen(service);
+  open.push({close: () => service.close()});
+  const {hub: h, port} = await hub();
+  h.up('env', 'web', internal, 'web');
+  await request(port, 'GET / HTTP/1.1\r\nHost: x\r\n\r\nPOST /charge HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n');
+  expect(mutations).toBe(1);
+});
+
+
+describe('replay eligibility uses the entire buffered request', () => {
+  it('accepts a complete bodyless request split across arbitrary TCP chunks', () => {
+    const request = 'GET / HTTP/1.1\r\nHost: local\r\nContent-Length: 0\r\n\r\n';
+    expect(replayable([...request].map(character => Buffer.from(character)))).toBe(true);
+  });
+  it.each([
+    'GET / HTTP/1.1\r\nHost: local\r\n',
+    'GET / HTTP/1.1\r\nContent-Length: 4\r\n\r\nbody',
+    'GET / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n',
+    'GET / HTTP/1.1\r\nUpgrade: websocket\r\n\r\n',
+    'GET / HTTP/1.1\r\nContent-Length: 0\r\nContent-Length: 10\r\n\r\n',
+    'GET / HTTP/1.1\r\n Header: folded\r\n\r\n',
+    'GET / HTTP/1.1\r\n\r\nPOST / HTTP/1.1\r\n\r\n',
+  ])('refuses incomplete, upgraded, framed or pipelined requests: %j', request => {
+    expect(replayable([Buffer.from(request)])).toBe(false);
   });
 });

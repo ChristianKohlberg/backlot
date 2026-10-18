@@ -17,7 +17,7 @@ writeFileSync(join(wt, 'server.mjs'), `import {createServer} from 'node:http';
 import {readFileSync} from 'node:fs';
 createServer((q,s)=>s.end(readFileSync('content','utf8'))).listen(Number(process.env.PORT),'127.0.0.1');`);
 writeFileSync(join(wt, 'content'), 'one');
-writeFileSync(join(wt, 'stack.yaml'), `name: diagnostics
+writeFileSync(join(wt, 'runly.yml'), `name: diagnostics
 caches: [.build]
 services:
   web:
@@ -58,7 +58,7 @@ afterAll(async () => {
 
 describe('request-local bind diagnostics', () => {
   it('explains a cold bind, a reuse and a rebind — the build runs on every one of them', async () => {
-    const cold = await context(['up', '--ttl', '5']);
+    const cold = await context(['up']);
     const d = cold.bindDiagnostics!;
     checkTimings(d);
     expect(d.reuse).toBe('rebound');
@@ -105,7 +105,7 @@ describe('request-local bind diagnostics', () => {
   });
 
   it('takes the full bind when an upkeep rule ran', async () => {
-    const manifest = join(wt, 'stack.yaml');
+    const manifest = join(wt, 'runly.yml');
     writeFileSync(manifest, readFileSync(manifest, 'utf8') + '\nupkeep:\n  - { when: content, run: "true" }\n');
     writeFileSync(join(wt, 'content'), 'fallback-four');
     const rebound = await context(['up']);

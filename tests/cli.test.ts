@@ -210,7 +210,7 @@ describe('the error taxonomy', () => {
 
 // ---------------------------------------------------------------------------
 
-describe('lease expiry (disposable leases, durable environments)', () => {
+describe('legacy TTL configuration cannot expire environment leases', () => {
   const ctx = makeContext({ BACKLOT_LEASE_TTL_MS: '1200', BACKLOT_SWEEP_MS: '300' });
   const wt = makeWorktree('hello-web');
   afterAll(async () => {
@@ -218,13 +218,13 @@ describe('lease expiry (disposable leases, durable environments)', () => {
     wt.drop();
   });
 
-  it('an abandoned lease lapses; the environment survives warm-hot in the pool', async () => {
+  it('an inactive lease and environment survive', async () => {
     const up = await ctx.cli(['up', '--json'], wt.dir);
     const envId = up.json!.envId;
     await new Promise((r) => setTimeout(r, 2500)); // agent disappears
     const status = (await ctx.cli(['status', '--json'], wt.dir)).json!;
     const env = (status.envs as Array<{ id: string; lease: unknown; state: string }>).find((e) => e.id === envId)!;
-    expect(env.lease).toBeNull(); // lease gone
+    expect(env.lease).not.toBeNull(); // lease retained
     expect(env.state).toBe('hot'); // environment untouched
     const again = await ctx.cli(['up', '--json'], wt.dir); // agent returns
     expect(again.json!.envId).toBe(envId); // same env, cheap rebind
@@ -273,12 +273,12 @@ describe('the multi-service topology (hello-multi)', () => {
     let urls = res.json!.urls as Record<string, string>;
     expect(urls.api).toBeDefined();
     expect(urls.web).toBeUndefined(); // filtered from ctx
-    await expect(fetch(webUrl)).rejects.toThrow(); // AND the process is down
+    expect((await fetch(webUrl)).status).toBe(503); // AND the process is down
 
     // A rebind keeps what the lease wants: reset-data must not resurrect web.
     res = await ctx.cli(['reset-data', '--json'], wt.dir);
     expect(res.exitCode, `stdout: ${res.stdout ?? ''}\nstderr: ${res.stderr ?? ''}`).toBe(0);
-    await expect(fetch(webUrl)).rejects.toThrow();
+    expect((await fetch(webUrl)).status).toBe(503);
 
     // `up web` — web depends_on api, so the closure pulls api back in and serves.
     res = await ctx.cli(['up', 'web', '--json'], wt.dir);
@@ -491,7 +491,7 @@ describe('logs for a silent service (BACKLOG P3, 2026-07-03)', () => {
   // .log file ever exists for it.
   const dir = mkdtempSync(join(tmpdir(), 'runly-wt-silent-'));
   writeFileSync(
-    join(dir, 'stack.yaml'),
+    join(dir, 'runly.yml'),
     `name: silent\nservices:\n  quiet:\n    run: sleep 300\n    ready: { cmd: "true", timeout: 20 }\n`,
   );
   execFileSync('git', ['init', '-q'], { cwd: dir });

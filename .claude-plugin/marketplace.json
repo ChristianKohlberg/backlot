@@ -1,14 +1,14 @@
 {
   "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
   "name": "runly",
-  "description": "Claude Code plugin for runly — the repo-aware environment broker that puts a running, seeded, provable instance of your web app in front of an agent.",
+  "description": "Claude Code plugin for runly \u2014 the repo-aware environment broker that puts a running, seeded, provable instance of your web app in front of an agent.",
   "owner": {
     "name": "ChristianKohlberg"
   },
   "plugins": [
     {
       "name": "runly",
-      "description": "Put a running, seeded, authenticated app in your worktree with runly: additive up/down, ctx --env for your own tests, database copies (db with), ps, plan and logs. Bundles the stack-agnostic runly skill.",
+      "description": "Operate environments with runly and configure manifests with runly-setup. Bundles both stack-agnostic skills.",
       "source": "./plugins/runly",
       "category": "productivity",
       "author": {

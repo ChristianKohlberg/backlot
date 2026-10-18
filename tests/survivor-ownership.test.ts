@@ -29,7 +29,7 @@ function inProcessStack(root: string, name: string) {
   writeFileSync(join(tree, 'server.mjs'), "import{createServer}from'node:http';createServer((q,s)=>s.end('alive')).listen(Number(process.env.PORT),'127.0.0.1');\n");
   writeFileSync(join(tree, 'seed.mjs'), "import{DatabaseSync}from'node:sqlite';const d=new DatabaseSync(process.argv[2]);d.exec('CREATE TABLE IF NOT EXISTS t(x)');d.close();\n");
   writeFileSync(join(tree, 'barrier.mjs'), "import{writeFileSync,existsSync}from'node:fs';import{join}from'node:path';const d=process.env.BACKLOT_TEST_GATE_DIR;writeFileSync(join(d,'entered'),'');const t=setInterval(()=>{if(existsSync(join(d,'release'))){clearInterval(t);process.exit(0)}},20);\n");
-  writeFileSync(join(tree, 'backlot.yml'), `name: ${name}
+  writeFileSync(join(tree, 'runly.yaml'), `name: ${name}
 services:
   web:
     run: node server.mjs
@@ -261,7 +261,7 @@ console.log(JSON.stringify({tagged:tagged.pid,untagged:untagged.pid}));
     }
   });
 
-  it('retains failed eviction ownership and releases it after confirmed cwd cleanup', async () => {
+  it('retains failed explicit recycle ownership and releases it after confirmed cwd cleanup', async () => {
     const root = realpathSync(mkdtempSync(join(tmpdir(), 'bl-eviction-survivors-')));
     const state = join(root, 'state');
     const saved = { ...process.env };
@@ -312,6 +312,7 @@ console.log(JSON.stringify({tagged:tagged.pid,untagged:untagged.pid}));
       if (!procScanSupported()) released.servicePids.cwd = cwdOnly;
       journal.saveEnv(released);
       await expect(engine.up({ cwd: other, holder: 'b' })).rejects.toThrow(/cap/);
+      await expect(engine.poolRecycle({ envId: first.envId, force: true })).rejects.toThrow(/unreaped/);
       const retained = journal.getEnv(first.envId)!;
       expect(retained.state).toBe('warm');
       expect(Object.values(retained.servicePids).map((r) => r.pid).sort()).toEqual([tagged.pid, cwdOnly.pid].sort());
@@ -333,6 +334,7 @@ console.log(JSON.stringify({tagged:tagged.pid,untagged:untagged.pid}));
       } else {
         for (const rec of blocked.values()) await killGroupVerified(rec.pid, rec.startTime);
       }
+      expect((await engine.poolRecycle({ envId: first.envId, force: true })).recycled).toEqual([first.envId]);
       const admitted = await engine.up({ cwd: other, holder: 'b' });
       expect(journal.getEnv(first.envId)).toBeUndefined();
       expect(existsSync(original.root)).toBe(false);
@@ -483,8 +485,8 @@ console.log(JSON.stringify({tagged:tagged.pid,untagged:untagged.pid}));
         else if (procScanSupported()) staleVerdicts.add(record.pid);
       }
       if (!procScanSupported()) journal.saveEnv(original);
-      const manifest = readFileSync(join(tree, 'backlot.yml'), 'utf8');
-      writeFileSync(join(tree, 'backlot.yml'), manifest.replace('create: node seed.mjs {{ns}}', 'create: "false"'));
+      const manifest = readFileSync(join(tree, 'runly.yaml'), 'utf8');
+      writeFileSync(join(tree, 'runly.yaml'), manifest.replace('create: node seed.mjs {{ns}}', 'create: "false"'));
       const refuse = () => expect(engine.up({ cwd: tree, holder: 'a', hygiene: 'reset-data' })).rejects.toMatchObject({
         message: expect.stringContaining('still has unreaped service processes'),
       });
@@ -500,7 +502,7 @@ console.log(JSON.stringify({tagged:tagged.pid,untagged:untagged.pid}));
         else expect(kill).toHaveBeenCalledWith(record.pid, record.startTime, undefined, undefined, expect.any(Function));
       }
       expect(Object.values(original.servicePids).filter((r) => !blocked.has(r.pid)).every((r) => !groupAlive(r.pid))).toBe(true);
-      await expect(fetch(first.urls.web.replace('localhost', '127.0.0.1'), { signal: AbortSignal.timeout(2000) })).rejects.toThrow();
+      expect((await fetch(first.urls.web.replace('localhost', '127.0.0.1'), { signal: AbortSignal.timeout(2000) })).status).toBe(503);
       await expect(engine.up({ cwd: other, holder: 'b' })).rejects.toMatchObject({ message: expect.stringMatching(/cap/) });
       blocked.delete(children[0]!.record.pid);
       await refuse();
@@ -509,7 +511,7 @@ console.log(JSON.stringify({tagged:tagged.pid,untagged:untagged.pid}));
       expect(readFileSync(original.datastoreNs.main)).toEqual(database);
       await expect(engine.up({ cwd: other, holder: 'b' })).rejects.toMatchObject({ message: expect.stringMatching(/cap/) });
       blocked.clear();
-      writeFileSync(join(tree, 'backlot.yml'), manifest);
+      writeFileSync(join(tree, 'runly.yaml'), manifest);
       const converted = await engine.up({ cwd: tree, holder: 'a', hygiene: 'reset-data' });
       expect(converted.envId).toBe(first.envId);
       expect(converted.state).toBe('hot');

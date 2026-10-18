@@ -37,7 +37,7 @@ function ctx(serviceRun: string, extraEnv: Record<string, string> = {}) {
   const wt = mkdtempSync(join(tmpdir(), 'runly-lu-wt-'));
   dirs.push(stateDir, wt);
   writeFileSync(
-    join(wt, 'stack.yaml'),
+    join(wt, 'runly.yml'),
     `name: lu\nservices:\n  web: { run: "${serviceRun}", ready: { log: "ready", timeout: 8 } }\n`,
   );
   execFileSync('git', ['init', '-q'], { cwd: wt });
@@ -120,7 +120,7 @@ describe('recycled environments are not operated on', () => {
     const wt = mkdtempSync(join(tmpdir(), 'runly-lu2-wt-'));
     dirs.push(stateDir, wt);
     writeFileSync(
-      join(wt, 'stack.yaml'),
+      join(wt, 'runly.yml'),
       `name: lu2\nservices:\n  web: { run: "echo ready; sleep 300", ready: { log: "ready", timeout: 8 } }\nauth:\n  token: "echo tok-{{role}}"\n`,
     );
     execFileSync('git', ['init', '-q'], { cwd: wt });

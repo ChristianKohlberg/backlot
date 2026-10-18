@@ -46,7 +46,7 @@ function ctx(extraEnv: Record<string, string> = {}) {
     `import{createServer}from'node:http';console.log('ready');createServer((q,s)=>s.end('ok')).listen(Number(process.env.PORT), '127.0.0.1');\n`,
   );
   writeFileSync(
-    join(wt, 'stack.yaml'),
+    join(wt, 'runly.yml'),
     `name: agentlease\nservices:\n  web: { run: node srv.mjs, port: web, env: { PORT: "{{ports.web}}" }, ready: { log: ready, timeout: 20 } }\n`,
   );
   execFileSync('git', ['init', '-q'], { cwd: wt });
@@ -108,55 +108,26 @@ function deadPid(): number {
   return pid;
 }
 
-describe('a bind whose holder is already dead is refused, not silently accepted (#41)', () => {
-  it('refuses --holder-pid naming a dead process and creates no lease', async () => {
-    const { cli, journal } = ctx();
+describe('up treats a holder PID as metadata', () => {
+  it.each([false, true])('accepts a dead PID without tying lifetime to it (env=%s)', async (viaEnv) => {
     const pid = deadPid();
     await waitFor(() => !alive(pid));
-
-    const res = await cli(['up', '--holder-pid', String(pid), '--json']);
-
-    // A usage error, not a bind failure: nothing about the environment is wrong.
-    expect(res.code, 'a dead-on-arrival lease must not be accepted').toBe(64);
-    // The message has to name the pattern that produces this, because the
-    // symptom people actually chase is an empty database.
-    expect(res.stderr).toMatch(/not a live process/);
-    expect(res.stderr).toMatch(/--ttl/);
-    // And crucially: no lease exists, so nothing is holding an env that the
-    // sweeper is about to free underneath its user.
-    expect(journal().allLeases().length).toBe(0);
-  }, 60_000);
-
-  it('refuses the same thing through BACKLOT_HOLDER_PID — the form agents actually use', async () => {
-    const pid = deadPid();
-    await waitFor(() => !alive(pid));
-    const { cli, journal } = ctx({ BACKLOT_HOLDER_PID: String(pid) });
-
-    const res = await cli(['up', '--json']);
-
-    expect(res.code).toBe(64);
-    // Name the source the caller used, or the message points at a flag they
-    // never typed.
-    expect(res.stderr).toMatch(/BACKLOT_HOLDER_PID/);
-    expect(journal().allLeases().length).toBe(0);
-  }, 60_000);
-
-  it('still accepts --ttl, the form that works from a fresh shell every time', async () => {
-    const { cli, journal } = ctx();
-    const up = await cli(['up', '--ttl', '45', '--json']);
-    expect(up.code).toBe(0);
-
-    const leases = journal().allLeases();
-    expect(leases.length).toBe(1);
-    // No holder pid at all, so there is nothing for the dead-holder sweep to
-    // act on: this lease lives for its stated time.
-    expect(leases[0]!.holderPid).toBeUndefined();
-    expect(leases[0]!.expiresAt - Date.now()).toBeGreaterThan(40 * 60_000);
-
-    // Several sweeps later it is still there — the whole point.
+    const { cli, journal } = ctx(viaEnv ? { BACKLOT_HOLDER_PID: String(pid) } : {});
+    const res = await cli(['up', ...(viaEnv ? [] : ['--holder-pid', String(pid)]), '--json']);
+    expect(res.code, res.stderr).toBe(0);
     await settle(1500);
-    expect(journal().allLeases().length, 'a TTL lease was reclaimed anyway').toBe(1);
-  }, 120_000);
+    expect(journal().allLeases()).toHaveLength(1);
+    expect(journal().allEnvs()).toHaveLength(1);
+  }, 60_000);
+
+  it('rejects the retired up TTL before creating an environment', async () => {
+    const { cli, journal } = ctx();
+    const result = await cli(['up', '--ttl', '45', '--json']);
+    expect(result.code).toBe(64);
+    expect(result.stderr).toContain('only for public previews');
+    expect(journal().allEnvs()).toHaveLength(0);
+  });
+
 });
 
 describe('pool recycle honours the environment it was given (#40)', () => {
@@ -166,7 +137,7 @@ describe('pool recycle honours the environment it was given (#40)', () => {
     // (decision 0032).
     const wt2 = mkdtempSync(join(tmpdir(), 'runly-agentlease-wt2-'));
     cleanups.push(() => rmSync(wt2, { recursive: true, force: true }));
-    for (const f of ['srv.mjs', 'stack.yaml']) writeFileSync(join(wt2, f), readFileSync(join(wt, f)));
+    for (const f of ['srv.mjs', 'runly.yml']) writeFileSync(join(wt2, f), readFileSync(join(wt, f)));
     execFileSync('git', ['init', '-q'], { cwd: wt2 });
     const a = await cli(['up', '--json']);
     expect(a.code).toBe(0);
@@ -245,7 +216,7 @@ describe('pool recycle honours the environment it was given (#40)', () => {
 
 describe('pool status states the conclusion instead of leaving it to be inferred (#40)', () => {
   it('marks a quiesced, unleased environment available', async () => {
-    const { cli, journal } = ctx({ BACKLOT_IDLE_TTL_MS: '1000' });
+    const { cli, journal } = ctx({ BACKLOT_SERVICE_IDLE_MS: '1000' });
     const up = await cli(['up', '--json']);
     const envId = String(up.json?.envId);
     await cli(['release', '--json']);
@@ -308,7 +279,7 @@ describe('token --raw prints what an Authorization header wants (#41, #39)', () 
   it('prints the bare token, and ctx advertises the supported path', async () => {
     const { cli, wt } = ctx();
     writeFileSync(
-      join(wt, 'stack.yaml'),
+      join(wt, 'runly.yml'),
       `name: agentlease\nservices:\n  web: { run: node srv.mjs, port: web, env: { PORT: "{{ports.web}}" }, ready: { log: ready, timeout: 20 } }\n` +
         `auth:\n  token: "printf tk_{{role}}"\n`,
     );
@@ -492,7 +463,7 @@ describe.runIf(procScanSupported())('teardown and quiesce reap what escaped the 
     // next bindAndStart meant its escapees held memory and PORTS for exactly
     // that long — and the next bind then failed with "port occupied by a
     // foreign process", which is what made the pool look wedged.
-    const { cli, stateDir, journal } = ctx({ BACKLOT_IDLE_TTL_MS: '1000' });
+    const { cli, stateDir, journal } = ctx({ BACKLOT_SERVICE_IDLE_MS: '1000' });
     const up = await cli(['up', '--json']);
     const envId = String(up.json?.envId);
     const envRoot = journal().getEnv(envId)!.root;

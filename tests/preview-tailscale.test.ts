@@ -108,7 +108,7 @@ function ctx(stackExtra: string, extraEnv: Record<string, string> = {}) {
     `import{createServer}from'node:http';console.log('ready');createServer((q,s)=>s.end('ok')).listen(Number(process.env.PORT), '127.0.0.1');\n`,
   );
   writeFileSync(
-    join(wt, 'stack.yaml'),
+    join(wt, 'runly.yml'),
     `name: tstest\nservices:\n  web: { run: node srv.mjs, port: web, env: { PORT: "{{ports.web}}" }, ready: { log: ready, timeout: 20 } }\n${stackExtra}`,
   );
   execFileSync('git', ['init', '-q'], { cwd: wt });
@@ -287,7 +287,8 @@ describe('the origin a publisher is aimed at', () => {
     expect((await cli(['preview', 'web', '--json'])).code).toBe(0);
     const urls = ((await cli(['ctx', '--json'])).json?.urls ?? {}) as Record<string, string>;
     const served = /^serve --https=20601 (\S+)$/m.exec(readFileSync(join(tsDir, 'calls.txt'), 'utf8'))?.[1];
-    expect(served).toBe(urls.web);
+    expect(served).not.toBe(urls.web); // public preview has a deadline-enforcing origin
+    expect((await fetch(served!)).status).toBe(200);
     expect(served).toMatch(/^http:\/\/localhost:\d+$/);
   });
 });
@@ -380,11 +381,11 @@ describe('a daemon restart re-publishes the preview', () => {
     expect(await goneWithin(before, 5000)).toBe(true);
     const serves = readFileSync(join(tsDir, 'calls.txt'), 'utf8').split('\n').filter((l) => l.startsWith('serve --https='));
     expect(serves).toHaveLength(2);
-    expect(serves[1]).toBe(serves[0]);
+    expect(serves[1]).toMatch(/^serve --https=20777 http:\/\/localhost:\d+$/); // origin can move; public address stays
     // The serve is aimed at the public port; the service was stopped by the
     // restart and wakes on the first request.
     const target = /http:\/\/localhost:(\d+)/.exec(serves[1]!)![1];
-    const res = await fetch(`http://127.0.0.1:${target}/`);
+    const res = await fetch(`http://localhost:${target}/`);
     expect(await res.text()).toBe('ok');
     const ev = readFileSync(join(stateDir, 'events.jsonl'), 'utf8');
     expect(ev).toMatch(/restored the preview of 'web' at https:\/\/box\.tail1234\.ts\.net:20777/);

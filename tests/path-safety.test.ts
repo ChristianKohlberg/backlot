@@ -1,7 +1,7 @@
 /**
  * Fleet review, security cluster.
  *
- * These are NOT a privilege boundary — a stack.yaml can already run arbitrary
+ * These are NOT a privilege boundary — a runly.yml can already run arbitrary
  * shell, so anyone who controls it owns the environment anyway. They matter
  * because an ACCIDENT ("cwd: ../sibling", a datastore key with a slash) used to
  * silently operate outside the environment tree or the state root instead of

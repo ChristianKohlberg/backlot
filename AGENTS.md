@@ -4,6 +4,20 @@ This file is the project's committed home for project-intrinsic agent knowledge:
 
 - Add durable project-specific notes here as they are discovered through real work.
 
+## Current lifecycle (decision 0046; supersedes older lifetime notes below)
+
+Environments belong to worktrees. Five minutes without environment-wide proxy bytes
+in either direction or using verbs stops managed services, preserving data/ports.
+Silent sockets are not activity; WebSocket/SSE traffic is. Traffic wakes wanted
+services even without a lease, through the load budget. Exec heartbeats adapt to
+short idle settings. Agent PID is metadata for `up`; default leases never expire.
+No automatic TTL, dead-agent, capacity or crash-loop deletion, and no automatic
+pristine retry. TTL exists only for public previews; environment leases never expire. Confirmed missing worktree
+(ENOENT/ENOTDIR) or explicit destroy/recycle removes the environment. Other stat
+errors retain it. DB copies keep their separate process/command lifetime.
+Schema 5 blocks destructive older daemons. `tests/proxy-activity.test.ts`, lifecycle,
+lease-liveness and pool-machine-capacity tests cover this contract.
+
 ## Build & test
 
 - Build: `npm run build` (cleans `dist/`, then compiles TypeScript; required before running tests)
@@ -110,7 +124,7 @@ lifetime rule is deliberately different ([decision 0027](docs/decisions/0027-lea
 A rebind, a restarting `up` or an idle quiesce restarts or stops services while the lease
 continues, and the tunnel **survives all of them**; ports are stable for an
 environment's lifetime, so it is aimed at the same place when the services return.
-It is reaped only when the lease ends (`release`, TTL lapse, dead holder, the
+It is reaped on its public-access deadline (decision 0047), when the lease ends (`release`, the
 sweeper's torn-row prune), at `teardownClaimed` (before `deleteEnv` drops the row
 that names it), at `shutdown()`, and in `recover()`.
 
@@ -158,11 +172,13 @@ adoption, retired templates, data-only rows, `artifacts/`) were removed in 0.19
 (decision 0042); `Journal` refuses a journal stamped below schema 4. Do not add a
 migration back for those shapes — point the user at 0.18.
 
-## Leases: `--ttl` is the agent form, `--holder-pid` is not (Claude Code tethers itself)
+## Leases and process metadata (decision 0046)
 
-Since 0.16 (decision 0035) a dead holder destroys the environment (`recycleOne(force)`) once `tetherGone` has seen it dead for `BACKLOT_TETHER_GRACE_MS`; `goneSince` is in memory, so a daemon restart restarts the grace. A live holder renews the lease. The CLI fills `holderPid` from `CLAUDE_PID` (`src/cli/tether.ts`) only when it is a live ANCESTOR — never trust the variable alone, it is inherited into unrelated trees. Tests must set `BACKLOT_TETHER_GRACE_MS=0` where they kill a holder and expect a prompt teardown.
-
-`--holder-pid` / `BACKLOT_HOLDER_PID` ties the environment to the named process, which only helps a caller that outlives the command. `BACKLOT_HOLDER_PID=$$` from an agent harness names an already-exited shell, so the lease is reclaimable on arrival: the sweeper's dead-holder rule frees the env, the next binder takes it, and the first caller is left looking at a different, unseeded store through the same URL. It presents as a stale seed template — the wrong subsystem entirely. Binds naming a dead pid are now refused (exit 64). See the lease bullet in `docs/architecture.md`.
+`up` defaults to a non-expiring lease (`NO_LEASE_EXPIRY` internally, `null` in public
+context/status). `up --ttl` is refused; legacy lease deadlines are retired on recovery. `--holder-pid` and
+`BACKLOT_HOLDER_PID` are diagnostic metadata for environments. No CLI auto-tether
+for `up`; no process death renewal or deletion. `db new` retains its separate
+process-scoped contract and Claude ancestor detection (`src/cli/tether.ts`).
 
 ## `up` is additive; a preset reloads one datastore; a database alone is a `runly db` copy
 
@@ -178,13 +194,13 @@ Decision 0034. Sharp edges:
 
 Decision 0036: `src/daemon/budget.ts` (`LoadBudget`). Every bind (`bindAndStart` wrapper) and every wake computes a `Need` via `needFor` and `admit`s it before building or starting anything; the reservation's build share is released after the build phase (`releaseBuild`), the rest in `finally`. Running services count through `committedRunning` (declared or default costs of every supervised pid). A new start path that skips `admit` silently overcommits the box. FIFO is deliberate (no overtaking); `check` is pure, `runly plan` uses it. In tests the machine gates (load, MemAvailable) are opened by `setup-env.ts` so a busy box cannot make an unrelated test queue.
 
-## Pool caps, and why the machine-wide one evicts
+## Pool caps retain data (decision 0046)
 
-`poolMaxTotal` (default 2 x cores in [4,64] with the budget on, the old `min(cores/2, memGB/4)` in [2,8] with it off) **gates `createEnv` only** — reuse is never capacity-checked, so it bounds environments held, not load. Idle reclamation takes heat, not the row, so cold environments used to hold machine-wide slots forever and lock out any new stack (#46). `evictForMachineCapacity` now gives up the least-recently-used cold env (unleased, not busy, idle past `idleTtlMs`, `hot` or `warm`) when — and only when — the machine-wide cap is the binding one. Do NOT re-restrict that to `warm`: the sweeper only quiesces every `BACKLOT_SWEEP_MS`, so an abandoned env is `hot` while already condemned, and requiring `warm` refused callers for a whole sweep interval while claiming waiting would not help (caught by driving it, not by a test — there is now one). It must run **outside the pool lock** (`poolLocked` is a non-reentrant promise chain and `recycleOne` takes it), and `claimForTeardown` re-validates, so a candidate leased in the gap is declined rather than stolen.
-
-The consequence worth remembering: **waiting can never clear a machine-wide block**, because a release leaves the row behind. `structuralCapacityBlock` therefore treats it as structural unless something is evictable or transient — the old code explicitly assumed the opposite ("another stack will release") and burned the full window (#47). `tests/pool-machine-capacity.test.ts` covers all of it.
-
-There is no data-only ceiling any more (decision 0034); every environment counts against `poolMaxTotal`.
+`poolMaxTotal` gates creation only and counts cold rows too. Capacity refuses with
+the actual cap and explicit cleanup/configuration remedy; never evict an existing
+worktree's data. Release and idle do not free rows. The load budget independently
+bounds running services/builds, including wake after release. Tests:
+`tests/pool-machine-capacity.test.ts`.
 
 ## Cleanup is by recorded reference, and doctor touches only what is provably runly's
 
@@ -199,18 +215,18 @@ Decision 0038. The supervisor's `LogWriter` (`src/core/logs.ts`) stamps whole li
 - **A template whose key matches is reused.** `@rebake-template` firing on a bind no longer rebakes: only `--pristine` calls `ds.rebake()` (this datastore's current-key markers only). A fired rule reloads the datastore only when `env.templates[ds]` is not the current ref (`staleTemplate` in `bindAndStartInner`). `destroy` keeps `worktrees/<stack>/` but forgets the upkeep rules without `outputs:` (`forgetRulesWithoutOutputs`, 0.19): a pool's `git clean` after destroy removes what they made, and the ledger cannot tell. A rule with `outputs:` reruns when one is missing. Do not reintroduce a rebake keyed on the environment's ledger — that was 90–110 s per `up` after a teardown.
 - **The template lock is readers-writer and two-level** (0.19): `withDatastoreLock(stack, ds, write)` takes the stack lock SHARED and then the `<stack>/<ds>` lock (shared or exclusive), so datastores of one stack bake and restore in parallel while `withBakeLock` (stack, exclusive — pruning) still excludes all of them. Every restore takes the read side; anything that drops or replaces a template takes the write side. The bake check is double-checked: the marker is tested without the write lock and again under it, so restores of an existing template never queue behind an exclusive check. A restore that failed rebakes only if the marker still carries the `nonce` it restored from (a sibling's rebake writes a new one), and drops its half-made target before every retry. A restore outside the lock is the B2 cascade (a sibling's rebake dropped the template mid-copy).
 - **Data and builds overlap on a full bind** (`Promise.allSettled`, both settle before an error is thrown; data error first). `trace.overlapped` records their wall times.
-- **A crash loop in a LEASED environment is not `degraded`.** The supervisor's `onDegraded(service, exit)` → `serviceFailed` records `failedServices` (memory only), stops the service under the env lock, and `ps`/`ctx`/wake/`resumeForVerb` honour it; `startServices` clears it. Only unleased environments are degraded and recycled (sweeper skips leased degraded rows).
+- **A crash loop never destroys an environment.** The supervisor's `onDegraded(service, exit)` → `serviceFailed` records `failedServices` (memory only), stops the service under the env lock, and `ps`/`ctx`/wake/`resumeForVerb` honour it; `startServices` clears it. This applies with or without a lease.
 - **Activity is only verbs that use the env** (`touch()` callers: exec, token, preview; binds and down set `lastUsedAt`). Never add `touch()` to a read-only verb.
 - **`db with`'s command is tagged `BACKLOT_DB_COPY`** and recorded on the copy row (`child`); `dropDbCopy` → `stopCopyUsers` first. `ensureDaemon` strips the tag so a daemon spawned from inside such a command does not inherit it.
-- **The proxy replays until the first byte back** (`Carry` in `proxy.ts`, 1 MB cap, 5 resets while `up`). Anything after the service answered is never retried.
+- **The proxy replays only a single complete, bodyless safe-method HTTP/1 request before the first byte back** (`Carry` in `proxy.ts`, 1 MB cap, 5 resets while `up`). Pipelined requests, upgrades and ambiguous framing are not replayable: a GET followed by a POST must never duplicate the POST after a reset. Anything after the service answered is never retried. Holds and refused-forward retries share the original connection deadline.
 - **`runly daemon install`** (`src/cli/daemon-unit.ts`): one unit per state root; `ensureDaemon` starts it only when it runs THIS build (`unitRunsThisBuild`), else spawns as before. `BACKLOT_SYSTEMCTL`/`BACKLOT_LAUNCHCTL` exist for tests; never let a test touch the real user manager.
 - `tests/bench-findings.test.ts` and `tests/proxy-reset.test.ts` are the regression tests.
 
-## exec runs in the CLI; idle unleased environments expire; the unit's environment is an allowlist (0.19)
+## exec runs in the CLI; the unit's environment is an allowlist (0.19)
 
-- **`exec` is the CLI's child** (decision 0040): `exec-env` resumes and touches the environment under the env lock and returns its variables; the CLI spawns the command (inherited stdio, the caller's env, `serviceTag(env, EXEC_SERVICE)`) and heartbeats `exec-touch` every minute. `scanTagged` skips `EXEC_SERVICE`, so no gc, recycle or shutdown reaps it — do not move exec back into the daemon or drop that skip. No deadline unless `BACKLOT_CMD_TIMEOUT_S` is set. `runBoundedIO` is gone; `token` splits streams through `runBounded`'s `onOutput`.
+- **`exec` is the CLI's child** (decision 0040): `exec-env` resumes and touches the environment under the env lock and returns its variables; the CLI spawns the command (inherited stdio, the caller's env, `serviceTag(env, EXEC_SERVICE)`) and heartbeats `exec-touch` at most every minute (faster for short idle settings). `scanTagged` skips `EXEC_SERVICE`, so no gc, recycle or shutdown reaps it — do not move exec back into the daemon or drop that skip. No deadline unless `BACKLOT_CMD_TIMEOUT_S` is set. `runBoundedIO` is gone; `token` splits streams through `runBounded`'s `onOutput`.
 - **`resumeForVerb` starts what a daemon restart stopped**, like a wake; only a failed bind (`failStreak > 0`) is refused. `bindFailures` (memory) feeds `ctx.lastUpFailed` and `ps.failedUps`; after a restart only the fact survives.
-- **`BACKLOT_UNLEASED_TTL`** (decision 0041, 24 h): the sweep recycles an unleased env whose `envActivityAt` is older; `worktrees/<stack>/` and templates stay.
+- **`BACKLOT_UNLEASED_TTL` is retired** (decision 0046): ignored; idle retains data.
 - **Unit environment** (decision 0043): `captureEnvironment` in `daemon-unit.ts` — `CAPTURE_EXACT`, `CAPTURE_PREFIXES`, `BACKLOT_*`, manifest `$NAME` references, `--env NAME`; never `NEVER_CAPTURE` or an `env_from` input. `commandFailure`/`environmentHint` (`util.ts`) turn a missing-tool failure into an env-error that says how to fix the unit. WorkingDirectory=/append: paths are never quoted (`systemdPath`).
 - `tests/regressions/v019-*.test.ts` are the regression tests, one per finding.
 
@@ -253,7 +269,7 @@ refuses older daemons, see the `JOURNAL_SCHEMA_VERSION` comment in `src/core/jou
 
 See [journal upgrade barrier](docs/architecture.md#journal-upgrade-barrier) for
 survivor group ownership and old-reader refusal;
-`tests/survivor-ownership.test.ts` covers failed eviction and group retry.
+`tests/survivor-ownership.test.ts` covers failed explicit recycling and group retry.
 
 ## Caller environment inputs
 
@@ -301,12 +317,13 @@ The repo doubles as its own Claude Code plugin marketplace (docs/config only —
 does not touch the CLI build). Layout:
 - `.claude-plugin/marketplace.json` — marketplace manifest at repo root.
 - `plugins/runly/.claude-plugin/plugin.json` — the plugin manifest; **bump its
-  `version` when the skill changes** (independent of `package.json`'s CLI version).
+  `version` when either skill changes** (independent of `package.json`'s CLI version).
 - `plugins/runly/skills/runly/SKILL.md` — the **upstream canonical** runly
-  skill. Keep it short, task-oriented and generic; never hardcode a consuming
-  repo's services or presets. It must not contradict `README.md`.
+  CLI usage skill. `plugins/runly/skills/runly-setup/SKILL.md` owns manifest setup.
+  Keep both task-oriented and generic; never hardcode a consuming repo's
+  services or presets. Neither should contradict `README.md`.
 
-runly is CLI-only: the plugin ships **only the skill — no `.mcp.json`.** Install
+runly is CLI-only: the plugin ships **only the two skills — no `.mcp.json`.** Install
 is `/plugin marketplace add ChristianKohlberg/backlot && /plugin install runly`.
 
 ## Docs
@@ -331,3 +348,42 @@ When updating this file, preserve this bar for all agents and keep entries conci
 - Restores read the database name from the MARKER (`parseBakedMarker(...).ns`), never recompute it: an adopted pre-0.20 template keeps its old name, and a bake whose name another marker holds appends a nonce. A bake never drops a database another marker names; retention and doctor remove such a marker without its database.
 - Retention and `pool doctor` share one classifier, `templateVerdicts` (`src/core/retention.ts`); change it there, not in one of them. `worktrees/<stack>/templates.json` (written at each restore) is a reference.
 - `leases.preview_restore` is written only by `setLeasePreviewRestore`, never by `saveLease` (a stale lease snapshot would erase it). Ending a preview on purpose must call `forgetPreview`; reaping a tunnel (shutdown, recover) must not. `tests/shared-templates.test.ts` and the restart block of `tests/preview-tailscale.test.ts` are the regression tests.
+
+## Public preview deadlines and proxy failures
+
+Every preview records an absolute `PreviewRestore.expiresAt` (default 30 minutes).
+`PreviewGate` is a private, expiring origin between publisher and public service
+proxy: it closes streams/listener at expiry independently of env locks and tunnel
+kill success. Never point publishers directly at service ports. Restart preserves
+the deadline; legacy records without it are revoked. Gate ports are ephemeral and
+can change on restart while a publisher's public URL remains stable. `PreviewRestore.ttlMs` records the publication duration. Successful `up` renews
+an active preview after binding under the env lock, updating both gate and journal;
+failed binds are not renewed. Automatic expiry retains `previewRestore` with its
+past deadline (`ctx.previewRestore.state=expired`); successful up republishes it
+under the existing env lock with its saved TTL. Explicit stop, release, forbidden
+configuration and removal of the published service clear intent. Never take a
+second env lock from the up epilogue. Republish failures report a preview notice
+and failed restore state without marking the successful bind failed. Expiry closes access before awaiting process cleanup.
+
+The TCP proxy holds startup connections, then forwards application bytes unchanged.
+Before a response begins, recognized HTTP/1 requests (including WS upgrades) get a
+generic 503 with Retry-After on failure/timeout. Binary/TLS/established streams never
+receive injected HTTP. Never expose raw exceptions/logs publicly. Local proxy stats
+carry `lastError` and `readyAt`; using `runly ps`, `ctx --json`, logs and daemon events
+provides diagnostics. Regression tests: preview-deadline, proxy-errors, proxy-reset.
+
+## Local measurements (decision 0049)
+
+stats/monitor never touch activity, admit work or wake services. Metrics store is
+bounded, local, best-effort and batched; flush after closing proxies at shutdown.
+Proxy callbacks must clear inherited bind metric context. Cold-wake operation IDs
+link the triggering connection to startup only; first-byte is connection-level,
+not HTTP request latency. Keep names/labels free of commands, URLs and payloads.
+Live budget values are declared costs. Persisted duration histogram estimates and
+daemon-life proxy counters have different reset/coverage semantics; expose both.
+See tests/metrics*.test.ts, proxy-metrics, proxy-metric-context and datastore-metrics.
+
+## SQLite template publication and monitoring audit
+
+- A SQLite template's final path is its success marker. Seed or adopt into a unique pending file, checkpoint any WAL/journal sidecars after seeding, and rename only after successful creation or copying. Failed or killed seeds must never publish a partial template. Retention must exclude pending files and sidecars from current-template ranking, then reclaim them after grace. `tests/datastore-drivers.test.ts` covers failed seeds, SIGKILL and committed WAL data.
+- Monitor output must obey stdout backpressure and remain cancellable while a consumer is not reading. Polling is sequential; timeout/signals also cancel a pending write. `tests/metrics-stress.test.ts` exercises actual unread subprocess pipes. Persisted metric buckets must satisfy histogram/count/range invariants before loading; cap eviction must not scan the whole history per observation.

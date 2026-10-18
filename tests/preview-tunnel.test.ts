@@ -93,7 +93,7 @@ describe('preview tunnels', () => {
     await cli(['preview', 'web', '--json']);
     const pid = tunnelPid(stateDir);
     writeFileSync(
-      join(wt, 'stack.yaml'),
+      join(wt, 'runly.yml'),
       `name: previewtest\nservices:\n  web: { run: node srv.mjs, port: frontend, env: { PORT: "{{ports.frontend}}" }, ready: { log: ready, timeout: 20 } }\n`,
     );
     const again = await cli(['up', '--json']);
@@ -189,11 +189,11 @@ describe('preview tunnels', () => {
     await cli(['up', '--json']);
     await cli(['preview', 'web', '--json']);
     const pid = tunnelPid(stateDir);
-    writeFileSync(join(wt, 'stack.yaml'), readFileSync(join(wt, 'stack.yaml'), 'utf8') + 'preview:\n  forbidden: true\n');
+    writeFileSync(join(wt, 'runly.yml'), readFileSync(join(wt, 'runly.yml'), 'utf8') + 'preview:\n  forbidden: true\n');
     const again = await cli(['up', '--json']);
     expect(again.code).toBe(0);
     expect(again.json?.previewUrls).toEqual({});
-    expect(String(again.json?.previewNotice)).toMatch(/work-error: stack.yaml now sets preview.forbidden/);
+    expect(String(again.json?.previewNotice)).toMatch(/work-error: runly.yml now sets preview.forbidden/);
     expect(await goneWithin(pid, 10_000)).toBe(true);
   });
 

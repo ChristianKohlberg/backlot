@@ -4,13 +4,16 @@
  * whether a function was called.
  */
 import { describe, it, expect, afterAll } from 'vitest';
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync, existsSync, readFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync, utimesSync, existsSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
+import { spawn } from 'node:child_process';
+import { pathToFileURL } from 'node:url';
+import { pruneTemplates } from '../src/core/retention.js';
 import { makeDatastore, type DsHandle } from '../src/drivers/datastores.js';
 import { runBounded } from '../src/core/exec.js';
-import { disposeStateSync } from './support/leaks.js';
+import { disposeStateSync, killUnder } from './support/leaks.js';
 
 const dirs: string[] = [];
 const mk = (p: string) => {
@@ -38,6 +41,8 @@ describe('sqlite: WAL sidecars must not survive a template restore', () => {
     writeFileSync(
       seed,
       `import { DatabaseSync } from 'node:sqlite';
+import { spawn } from 'node:child_process';
+import { pathToFileURL } from 'node:url';
 const db = new DatabaseSync(process.argv[2]);
 db.exec('DROP TABLE IF EXISTS rows');
 db.exec('CREATE TABLE rows (v TEXT)');
@@ -304,6 +309,8 @@ describe('rebake serializes with an in-flight bake/restore', () => {
     writeFileSync(
       seed,
       `import { DatabaseSync } from 'node:sqlite';
+import { spawn } from 'node:child_process';
+import { pathToFileURL } from 'node:url';
 await new Promise((r) => setTimeout(r, 600)); // a deliberately SLOW bake
 const db = new DatabaseSync(process.argv[2]);
 db.exec('CREATE TABLE t (v TEXT)');
@@ -322,4 +329,109 @@ db.close();`,
     const h2 = handle('rb-e2');
     await expect(ds.ensure(h2, 'dev', false, false)).resolves.toBeUndefined();
   }, 30_000);
+});
+
+
+describe('sqlite template publication', () => {
+  it('never trusts a partial bake after its owner is SIGKILLed', async () => {
+    const state = mk('runly-ds-crashed-bake-');
+    process.env.BACKLOT_STATE_DIR = state;
+    const h = handle('crashed-bake-e1');
+    const spec = { driver: 'sqlite', template: true,
+      create: 'if [ ! -f interrupted ]; then touch interrupted; printf partial > {{ns}}; touch started; sleep 30; else printf complete > {{ns}}; fi' };
+    const driver = pathToFileURL(join(import.meta.dirname, '../dist/drivers/datastores.js')).href;
+    const script = `import { makeDatastore } from ${JSON.stringify(driver)}; await makeDatastore('app', ${JSON.stringify(spec)}, 'crashed').ensure(${JSON.stringify(h)}, 'default', false, false);`;
+    const owner = spawn(process.execPath, ['--input-type=module', '-e', script], { env: { ...process.env, BACKLOT_STATE_DIR: state }, stdio: 'ignore' });
+    const exited = new Promise<void>((resolve, reject) => { owner.once('exit', () => resolve()); owner.once('error', reject); });
+    try {
+      const deadline = Date.now() + 5000;
+      while (!existsSync(join(h.cwd, 'started')) && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 10));
+      expect(existsSync(join(h.cwd, 'started'))).toBe(true);
+    } finally {
+      owner.kill('SIGKILL');
+      await exited;
+      await killUnder(state);
+    }
+    const ds = makeDatastore('app', spec as never, 'crashed');
+    expect(ds.templateBaked('default')).toBe(false);
+    await ds.ensure(h, 'default', false, false);
+    expect(readFileSync(ds.ns(h), 'utf8')).toBe('complete');
+  });
+
+  it('includes committed WAL data when the seed exits without closing SQLite', async () => {
+    process.env.BACKLOT_STATE_DIR = mk('runly-ds-seed-wal-');
+    const h = handle('wal-seed-e1');
+    writeFileSync(join(h.cwd, 'seed.mjs'), `import { DatabaseSync } from 'node:sqlite';
+import { spawn } from 'node:child_process';
+import { pathToFileURL } from 'node:url';
+const db = new DatabaseSync(process.argv[2]);
+db.exec("PRAGMA journal_mode=WAL; CREATE TABLE items(v TEXT); INSERT INTO items VALUES ('committed')");
+process.exit(0);
+`);
+    const ds = makeDatastore('app', { driver: 'sqlite', template: true, create: 'node seed.mjs {{ns}}' } as never, 'wal-seed');
+    await ds.ensure(h, 'default', false, false);
+    const db = new DatabaseSync(ds.ns(h));
+    try {
+      expect(db.prepare('SELECT v FROM items').all()).toEqual([{ v: 'committed' }]);
+    } finally {
+      db.close();
+    }
+  });
+
+  it('prunes crash-left pending bakes without replacing the last completed template', async () => {
+    const root = mk('runly-ds-pending-retention-');
+    const dir = join(root, 'stack');
+    mkdirSync(dir);
+    const complete = 'app-dev@1234.db';
+    const pending = 'app-dev@1234.db.42.abcd.pending';
+    // Model abandoned artifacts with explicit past mtimes. APFS timestamps
+    // can be fractionally ahead of Date.now(), legitimately keeping a freshly
+    // written file in grace even when graceMs is zero. Pending files remain
+    // newer than the completed template to exercise retention ranking.
+    const now = Date.now();
+    writeFileSync(join(dir, complete), 'complete');
+    utimesSync(join(dir, complete), new Date(now - 20_000), new Date(now - 20_000));
+    for (const suffix of ['', '-wal', '-shm', '-journal']) {
+      const file = join(dir, pending + suffix);
+      writeFileSync(file, 'incomplete');
+      utimesSync(file, new Date(now - 10_000), new Date(now - 10_000));
+    }
+    expect(await pruneTemplates({ templatesKeep: 1, templateGraceMs: 0 }, root)).toBe(4);
+    expect(readFileSync(join(dir, complete), 'utf8')).toBe('complete');
+  });
+
+  it('does not advertise an in-progress bake as a reusable template', async () => {
+    process.env.BACKLOT_STATE_DIR = mk('runly-ds-publishing-');
+    const h = handle('publishing-e1');
+    const ds = makeDatastore('app', {
+      driver: 'sqlite', template: true,
+      create: 'printf partial > {{ns}}; touch started; while [ ! -f proceed ]; do sleep 0.05; done; printf complete > {{ns}}',
+    } as never, 'publishing');
+    const bake = ds.ensure(h, 'default', false, false);
+    try {
+      const deadline = Date.now() + 5000;
+      while (!existsSync(join(h.cwd, 'started')) && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 5));
+      expect(existsSync(join(h.cwd, 'started'))).toBe(true);
+      expect(ds.templateBaked('default')).toBe(false);
+    } finally {
+      writeFileSync(join(h.cwd, 'proceed'), '');
+      await bake;
+    }
+    expect(ds.templateBaked('default')).toBe(true);
+    expect(readFileSync(ds.ns(h), 'utf8')).toBe('complete');
+  });
+
+  it('never restores a partial template left by a failed seed command', async () => {
+    process.env.BACKLOT_STATE_DIR = mk('runly-ds-partial-');
+    const h = handle('partial-e1');
+    const ds = makeDatastore('app', {
+      driver: 'sqlite', template: true,
+      create: 'if [ ! -f tried ]; then touch tried; printf partial > {{ns}}; exit 7; fi; printf complete > {{ns}}',
+    } as never, 'partial');
+    await expect(ds.ensure(h, 'default', false, false)).rejects.toThrow(/seed failed/);
+    expect(ds.templateBaked('default')).toBe(false);
+    await ds.ensure(h, 'default', false, false);
+    expect(readFileSync(ds.ns(h), 'utf8')).toBe('complete');
+    expect(ds.templateBaked('default')).toBe(true);
+  });
 });

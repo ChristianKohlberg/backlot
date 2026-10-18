@@ -79,7 +79,7 @@ createServer((q, s) => s.end('ok')).listen(Number(process.env.PORT), '127.0.0.1'
 `,
   );
   writeFileSync(
-    join(dir, 'stack.yaml'),
+    join(dir, 'runly.yml'),
     `name: ${name}\nservices:\n  web: { run: node server.mjs, port: web, env: { PORT: "{{ports.web}}" }, ready: { log: up, timeout: 20 } }\n`,
   );
   execFileSync('git', ['init', '-q'], { cwd: dir });
@@ -255,7 +255,7 @@ describe('env port-survivor: bind reaps tagged escapees instead of blocking', ()
   it.skipIf(!procScanSupported())(
     'reaps an escaped grandchild at quiesce, and the rebind still succeeds',
     async () => {
-      const ctx = makeContext({ BACKLOT_IDLE_TTL_MS: '500', BACKLOT_GC_MS: '999999999' });
+      const ctx = makeContext({ BACKLOT_SERVICE_IDLE_MS: '500', BACKLOT_GC_MS: '999999999' });
       ctxList.push(ctx.cleanup);
       const wt = mkdtempSync(join(tmpdir(), 'runly-surv-quiesce-'));
       dirList.push(wt);
@@ -273,7 +273,7 @@ setInterval(() => {}, 1e6);
 `,
       );
       writeFileSync(
-        join(wt, 'stack.yaml'),
+        join(wt, 'runly.yml'),
         `name: quiesce\nservices:\n  web: { run: node server.mjs, port: web, env: { PORT: "{{ports.web}}" }, ready: { log: up, timeout: 20 } }\n`,
       );
       execFileSync('git', ['init', '-q'], { cwd: wt });

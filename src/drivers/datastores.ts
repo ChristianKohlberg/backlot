@@ -18,6 +18,7 @@
  */
 import {
   copyFileSync,
+  renameSync,
   mkdirSync,
   statSync,
   utimesSync,
@@ -29,6 +30,7 @@ import {
   constants as fsConstants,
 } from 'node:fs';
 import { dirname, join } from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import { connect } from 'node:net';
 import { templatesRoot } from '../core/paths.js';
 import { recordNamespace } from '../core/namespaces.js';
@@ -36,6 +38,7 @@ import { sha256, template, BrokerError, commandFailure } from '../core/util.js';
 import { runBounded, DEFAULT_CMD_TIMEOUT_S } from '../core/exec.js';
 import { defaultPreset, type DatastoreSpec } from '../core/manifest.js';
 import { logEvent } from '../core/events.js';
+import { measureMetric, recordMetric, type MetricLabels } from '../core/metrics.js';
 
 /** Every preset a datastore can hold (its catalog, or the default alone). */
 function presetNames(spec: DatastoreSpec): string[] {
@@ -114,10 +117,17 @@ const sh = async (cmd: string, cwd: string, errCtx: string): Promise<void> => {
   if (r.code !== 0) throw commandFailure(errCtx, 'datastore', r.output);
 };
 
-/** Best-effort variant: failures are expected (clean-slate drops) and ignored. */
-const shQuiet = async (cmd: string, cwd: string): Promise<void> => {
-  await runBounded(cmd, cwd);
-};
+/** Quiet cleanup keeps its best-effort contract, but failed commands are not successful measurements. */
+async function measuredDrop(cmd: string, cwd: string, labels: MetricLabels): Promise<void> {
+  const start = performance.now();
+  let outcome = 'error';
+  try {
+    const result = await runBounded(cmd, cwd);
+    if (!result.timedOut && result.code === 0) outcome = 'success';
+  } finally {
+    recordMetric('datastore.drop_ms', performance.now() - start, { ...labels, outcome });
+  }
+}
 
 /**
  * In-process template locking (vetbill-1i49). All binds and copies flow
@@ -460,13 +470,18 @@ class SqliteDs implements DsDriver {
   }
 
   async ensure(h: DsHandle, preset: string, force: boolean, exists: boolean): Promise<void> {
+    const labels = { stack: this.stackId, envId: h.envId, datastore: this.name };
     mkdirSync(h.dataDir, { recursive: true });
     const dbPath = this.ns(h);
-    if (exists && !force && existsSync(dbPath)) return;
+    if (exists && !force && existsSync(dbPath)) {
+      recordMetric('datastore.namespace_reuse', 1, labels);
+      return;
+    }
     if (this.spec.template === true) {
       const slot = this.slots.resolve(preset);
       const tpl = this.slots.path(slot);
       mkdirSync(dirname(tpl), { recursive: true });
+      let bakedHere = false;
       // Serialize bake AND restore-copy against rebake, on the template's
       // dir key (the stack, or `<name>@shared` — decision 0044): rebake
       // deletes templates, so the copy below must not overlap one.
@@ -478,18 +493,46 @@ class SqliteDs implements DsDriver {
           await withDatastoreLock(slot.dir, this.name, true, async () => {
             if (existsSync(tpl)) return;
             recordTemplateRoot(slot.dir, h.cwd);
+            const pending = `${tpl}.${process.pid}.${Math.random().toString(36).slice(2)}.pending`;
             const adopt = this.slots.adoptable(slot);
             if (adopt) {
               try {
-                copyFileSync(adopt.full, tpl, fsConstants.COPYFILE_FICLONE);
-                utimesSync(tpl, new Date(), new Date(adopt.mtime));
+                copyFileSync(adopt.full, pending, fsConstants.COPYFILE_FICLONE);
+                utimesSync(pending, new Date(), new Date(adopt.mtime));
+                renameSync(pending, tpl);
                 logEvent({ level: 'info', kind: 'template', envId: h.envId, detail: `adopted template ${adopt.dir}/${slot.file} of '${this.name}' (${preset}) as the shared one — no bake` });
                 return;
               } catch {
-                rmSync(tpl, { force: true }); // retired meanwhile: bake instead
+                // A failed adoption never publishes a partially copied template.
+              } finally {
+                rmSync(pending, { force: true });
               }
             }
-            await this.runCreate(h.cwd, tpl, preset); // bake once
+            // The final path is the success marker. A failed seed (or daemon
+            // crash mid-seed) must never leave a partial database there for
+            // the next bind to trust. Publish only after the command succeeds.
+            try {
+              await measureMetric('datastore.template_bake_ms', labels, async () => {
+                await this.runCreate(h.cwd, pending, preset);
+                // A seed can exit successfully without closing its connection
+                // (process.exit), leaving committed pages only in the WAL.
+                // Recover/checkpoint before publishing a standalone db file.
+                if (['-wal', '-shm', '-journal'].some((suffix) => existsSync(pending + suffix))) {
+                  const db = new DatabaseSync(pending);
+                  try {
+                    const checkpoint = db.prepare('PRAGMA wal_checkpoint(TRUNCATE)').get();
+                    if (checkpoint?.busy !== 0) throw new BrokerError('work-error', `seed for '${this.name}' left SQLite in use — close all seed connections before the create command exits`, 'datastore');
+                  } finally {
+                    db.close();
+                  }
+                }
+                renameSync(pending, tpl);
+              });
+              bakedHere = true;
+            } finally {
+              rmSync(pending, { force: true });
+              dropSidecars(pending);
+            }
           });
         }
         // Restores share the lock: several copies at once, but never while a
@@ -501,16 +544,20 @@ class SqliteDs implements DsDriver {
           // leftover WAL from the previous lease would be replayed over the fresh
           // template — resurrecting the old lease's rows inside a supposedly reset
           // store, or corrupting it outright.
-          dropSidecars(dbPath);
-          copyFileSync(tpl, dbPath, fsConstants.COPYFILE_FICLONE); // restore = CoW clone where the fs supports it
+          if (!bakedHere) recordMetric('datastore.template_reuse', 1, labels);
+          await measureMetric('datastore.restore_ms', labels, async () => {
+            dropSidecars(dbPath);
+            copyFileSync(tpl, dbPath, fsConstants.COPYFILE_FICLONE); // CoW clone where supported
+          });
           return true;
         });
         if (copied) return;
+        recordMetric('datastore.restore_retry', 1, { ...labels, reason: 'template_missing' });
         if (attempt >= 2) throw new BrokerError('env-error', `template for '${this.name}' preset '${preset}' kept disappearing before it could be restored`, 'datastore');
       }
     } else {
       dropSidecars(dbPath);
-      await this.runCreate(h.cwd, dbPath, preset);
+      await measureMetric('datastore.create_ms', labels, () => this.runCreate(h.cwd, dbPath, preset));
     }
   }
 
@@ -519,9 +566,11 @@ class SqliteDs implements DsDriver {
   }
 
   async drop(h: DsHandle): Promise<void> {
-    const db = this.ns(h);
-    rmSync(db, { force: true });
-    dropSidecars(db); // an orphaned -wal outlives its database and poisons the next one
+    await measureMetric('datastore.drop_ms', { stack: this.stackId, envId: h.envId, datastore: this.name }, async () => {
+      const db = this.ns(h);
+      rmSync(db, { force: true });
+      dropSidecars(db); // an orphaned -wal outlives its database and poisons the next one
+    });
   }
   templateBaked(preset: string): boolean {
     return this.spec.template === true && existsSync(this.slots.path(this.slots.resolve(preset)));
@@ -535,7 +584,9 @@ class SqliteDs implements DsDriver {
     // serves other worktrees, and the bake that follows is private (0044).
     const priv = this.slots.shared;
     return withDatastoreLock(this.stackId, this.name, true, async () => {
-      for (const preset of presetNames(this.spec)) rmSync(join(templatesRoot(), this.stackId, this.slots.file(preset, priv)), { force: true });
+      await measureMetric('datastore.drop_ms', { stack: this.stackId, datastore: this.name, reason: 'template_invalidation' }, async () => {
+        for (const preset of presetNames(this.spec)) rmSync(join(templatesRoot(), this.stackId, this.slots.file(preset, priv)), { force: true });
+      });
     });
   }
 }
@@ -654,6 +705,7 @@ class CommandDs implements DsDriver {
   }
 
   async ensure(h: DsHandle, preset: string, force: boolean, exists: boolean): Promise<void> {
+    const labels = { stack: this.stackId, envId: h.envId, datastore: this.name };
     const nsE = this.ns(h);
     recordNamespace(nsE, this.stackId);
     if (this.spec.ephemeral) {
@@ -663,18 +715,21 @@ class CommandDs implements DsDriver {
         // For an ephemeral store the drop command IS the reset. Swallowing its
         // failure handed the caller an environment that reported reset-data
         // hygiene while still holding the previous lease's keys.
-        await sh(template(this.spec.drop, { ns: nsE }), h.cwd, `flush failed for ephemeral '${this.name}' — the store was NOT reset`);
+        await measureMetric('datastore.drop_ms', { ...labels, reason: 'reset' }, () => sh(template(this.spec.drop!, { ns: nsE }), h.cwd, `flush failed for ephemeral '${this.name}' — the store was NOT reset`));
       }
       if (!exists && this.spec.create) {
-        await sh(template(this.spec.create, { ns: nsE, preset }), h.cwd, `create failed for ephemeral '${this.name}'`);
+        await measureMetric('datastore.create_ms', labels, () => sh(template(this.spec.create!, { ns: nsE, preset }), h.cwd, `create failed for ephemeral '${this.name}'`));
       }
       return;
     }
-    if (exists && !force) return;
+    if (exists && !force) {
+      recordMetric('datastore.namespace_reuse', 1, labels);
+      return;
+    }
     if (!this.spec.create) throw new BrokerError('work-error', `datastore '${this.name}' has no create: command`, 'datastore');
     const create = this.spec.create; // narrowed copy for the closure below
     const ns = this.ns(h);
-    if (this.spec.drop) await shQuiet(template(this.spec.drop, { ns }), h.cwd); // clean slate, best-effort
+    if (this.spec.drop) await measuredDrop(template(this.spec.drop, { ns }), h.cwd, { ...labels, reason: 'clean_slate' });
     if (this.spec.template_restore) {
       // Where this restore reads from (decision 0044): this worktree's
       // private template, the shared one, or the stack's own. The lock is
@@ -684,6 +739,7 @@ class CommandDs implements DsDriver {
       const lockDir = slot.dir;
       const marker = this.slots.path(slot);
       mkdirSync(dirname(marker), { recursive: true });
+      let bakedHere = false;
       const bake = async (why?: string) => {
         // The database this marker names now, if any: a rebake reuses it
         // unless another marker names it too (an adopted template's other
@@ -699,8 +755,9 @@ class CommandDs implements DsDriver {
         recordNamespace(tpl, slot.dir);
         if (why) logEvent({ level: 'warn', kind: 'template', envId: h.envId, detail: `rebaking template ${tpl} of '${this.name}' (${preset}): ${why}` });
         recordTemplateRoot(slot.dir, h.cwd);
-        await shQuiet(this.spec.drop ? template(this.spec.drop, { ns: tpl }) : 'true', h.cwd);
-        await sh(template(create, { ns: tpl, preset }), h.cwd, `template bake failed for '${this.name}' preset '${preset}'${why ? ` (${why})` : ''}`);
+        if (this.spec.drop) await measuredDrop(template(this.spec.drop, { ns: tpl }), h.cwd, { ...labels, reason: 'template_clean_slate' });
+        await measureMetric('datastore.template_bake_ms', labels, () => sh(template(create, { ns: tpl, preset }), h.cwd, `template bake failed for '${this.name}' preset '${preset}'${why ? ` (${why})` : ''}`));
+        bakedHere = true;
         const baked: BakedMarker = {
           v: 1,
           ns: tpl,
@@ -747,10 +804,12 @@ class CommandDs implements DsDriver {
           // The marker names the database: an adopted or nonce-named template
           // is not where the current naming would put it.
           const tpl = parseBakedMarker(seen).ns || this.templateNs(slot, preset);
-          if (tried && this.spec.drop) await shQuiet(template(this.spec.drop, { ns }), h.cwd);
+          if (tried && this.spec.drop) await measuredDrop(template(this.spec.drop, { ns }), h.cwd, { ...labels, reason: 'restore_retry' });
+          if (!tried && !bakedHere) recordMetric('datastore.template_reuse', 1, labels);
+          if (tried) recordMetric('datastore.restore_retry', 1, labels);
           tried = true;
           try {
-            await sh(template(this.spec.template_restore!, { template: tpl, ns }), h.cwd, `template restore failed for '${this.name}' preset '${preset}'`);
+            await measureMetric('datastore.restore_ms', labels, () => sh(template(this.spec.template_restore!, { template: tpl, ns }), h.cwd, `template restore failed for '${this.name}' preset '${preset}'`));
             return { ok: true as const };
           } catch (err) {
             return { err: err as Error, seen };
@@ -803,7 +862,7 @@ class CommandDs implements DsDriver {
       }
       throw new BrokerError('env-error', `template for '${this.name}' preset '${preset}' kept disappearing before it could be restored`, 'datastore');
     } else {
-      await sh(template(this.spec.create, { ns, preset }), h.cwd, `seed failed for '${this.name}' preset '${preset}'`);
+      await measureMetric('datastore.create_ms', labels, () => sh(template(this.spec.create!, { ns, preset }), h.cwd, `seed failed for '${this.name}' preset '${preset}'`));
     }
   }
 
@@ -812,7 +871,7 @@ class CommandDs implements DsDriver {
   }
 
   async drop(h: DsHandle): Promise<void> {
-    if (this.spec.drop) await shQuiet(template(this.spec.drop, { ns: this.ns(h) }), h.cwd);
+    if (this.spec.drop) await measuredDrop(template(this.spec.drop, { ns: this.ns(h) }), h.cwd, { stack: this.stackId, envId: h.envId, datastore: this.name });
   }
   templateBaked(preset: string): boolean {
     return Boolean(this.spec.template_restore) && !this.spec.ephemeral && existsSync(this.slots.path(this.slots.resolve(preset)));
@@ -825,7 +884,7 @@ class CommandDs implements DsDriver {
     //
     // The drop command comes from the MANIFEST and is written to run in the
     // repo (it may invoke a repo-local script or a relative tool). Running it
-    // in templatesRoot() made it fail, and shQuiet swallows failures — so the
+    // in templatesRoot() made it fail, and best-effort cleanup swallows failures — so the
     // leak fix silently did nothing. Fall back only when no root is known.
     //
     // Exclusive on this datastore: waits out its in-flight bakes and restores.
@@ -857,7 +916,7 @@ class CommandDs implements DsDriver {
         // datastore's when its preset is one this datastore offers.
         const preset = f.slice(this.name.length + 1, -key.length);
         if (baked?.ds !== undefined ? baked.ds !== this.name : !catalog.has(preset)) continue;
-        if (baked?.drop && !hasOtherTemplateOwner(file, baked.ns)) await shQuiet(baked.drop, cwd ?? templatesRoot());
+        if (baked?.drop && !hasOtherTemplateOwner(file, baked.ns)) await measuredDrop(baked.drop, cwd ?? templatesRoot(), { stack: this.stackId, datastore: this.name, reason: 'template_invalidation' });
         rmSync(file, { force: true });
       }
     });

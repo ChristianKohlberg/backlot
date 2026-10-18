@@ -30,7 +30,7 @@ function fixture(quiesce = false) {
   mkdirSync(tree);
   mkdirSync(state);
   execFileSync('git', ['init', '-q'], { cwd: tree });
-  writeFileSync(join(tree, 'backlot.yml'), `name: previewgroup
+  writeFileSync(join(tree, 'runly.yaml'), `name: previewgroup
 services:
   web:
     run: node server.mjs

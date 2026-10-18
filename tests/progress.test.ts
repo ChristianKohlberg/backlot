@@ -25,7 +25,7 @@ createServer((q, s) => s.end('ok')).listen(Number(process.env.PORT), '127.0.0.1'
 `,
 );
 writeFileSync(
-  join(wt, 'stack.yaml'),
+  join(wt, 'runly.yml'),
   `name: prog
 services:
   web: { run: node server.mjs, port: web, env: { PORT: "{{ports.web}}" }, ready: { http: /, timeout: 20 } }

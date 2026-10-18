@@ -1,27 +1,29 @@
 # runly — Claude Code plugin
 
-Teaches [Claude Code](https://claude.com/claude-code) to drive
-[runly](https://github.com/ChristianKohlberg/backlot) against any repo that has a
-`runly.yml`. It bundles one thing: the **`runly` skill**, a short, stack-agnostic
-guide to starting the app in your worktree (`up`/`down`), running your own tests
-against it (`ctx --env`), database copies (`db with`), `ps`, `plan`, `logs`, idle
-and wake, the session tether and `destroy`.
+Two stack-agnostic skills for runly:
 
-runly is CLI-only, so the plugin ships only the skill: no MCP server and no
-`.mcp.json`. It needs the `runly` CLI on your `PATH` (`npm i -g runly`) and a
-`runly.yml` at the repo root.
+- **runly** operates an existing stack: services, tests, database copies, logs,
+  idle and wake, previews, recovery and cleanup.
+- **runly-setup** creates or edits runly.yml or runly.yaml: services, ports,
+  readiness, builds, upkeep, seeded data, caller inputs and validation. It also
+  recommends datastore/container topology, audits hidden cache costs, and provides
+  an initial monitoring plan to tune the setup from real usage.
+
+The plugin ships skills only, with no MCP server.
+Install the CLI with npm i -g @theford/runly, then run runly update after upgrades.
 
 ## Install
 
 This repository is also the plugin marketplace. In Claude Code:
 
-```
+~~~text
 /plugin marketplace add ChristianKohlberg/backlot
 /plugin install runly
-```
+~~~
 
-## The canonical skill
+## Canonical skills
 
-`skills/runly/SKILL.md` is the upstream runly skill. Keep it generic: never
-hardcode a consuming repo's services or presets. Bump `version` in
-`.claude-plugin/plugin.json` whenever the skill changes.
+[runly](skills/runly/SKILL.md) and [runly-setup](skills/runly-setup/SKILL.md)
+are the upstream skills. Keep both generic: never hardcode a consuming repo's
+services or presets. Bump version in .claude-plugin/plugin.json whenever either
+skill changes.

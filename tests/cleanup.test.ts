@@ -188,13 +188,13 @@ describe('automatic tether (decision 0035)', () => {
     expect(autoTether({ CLAUDE_PID: '999999999' })).toBeUndefined();
   });
 
-  it('a lease made under a CLAUDE_PID ancestor is tethered to it', async () => {
+  it('an environment does not automatically tether to a CLAUDE_PID ancestor', async () => {
     const c = makeCtx();
     ctxs.push(c);
     const wt = c.worktree({ 'runly.yml': `name: tether\nservices:\n  web: { run: node server.mjs, port: web, env: { PORT: "{{ports.web}}" }, ready: { http: /, timeout: 20 } }\n`, 'server.mjs': SERVER });
     // The test process is an ancestor of the CLI it spawns, like the claude process is of a Bash tool call.
     const up = await c.cli(['up', '--json'], wt, { CLAUDE_PID: String(process.pid), BACKLOT_TETHER: '' });
     expect(up.code, up.stderr + up.stdout).toBe(0);
-    expect(c.journal().allLeases()[0]!.holderPid).toBe(process.pid);
+    expect(c.journal().allLeases()[0]!.holderPid).toBeUndefined();
   }, 60_000);
 });
