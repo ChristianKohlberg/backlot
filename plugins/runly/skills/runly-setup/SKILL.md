@@ -27,8 +27,8 @@ Use runly.yml or runly.yaml at the stack root. Discovery searches upward;
 runly.yml wins when both exist. Maintain one manifest. backlot.yml and stack.yaml
 are no longer accepted.
 
-Use schema/runly.schema.json and README.md from the installed runly package for
-exact fields. A global npm install places them under the npm root -g directory,
+Use `schema/runly.schema.json` for exact fields and `docs/manifest.md` for their
+meaning (older installs keep the reference in README.md). A global npm install places them under the npm root -g directory,
 inside @theford/runly. The source repository also has docs/overview.md and examples.
 There is no init, validate or check verb. runly plan --json loads and validates
 the manifest and reports load admission; it does not prove the app boots.

@@ -12,7 +12,7 @@ it('packs a working CLI without stale adapter outputs from an older build', asyn
   const root = mkdtempSync(join(tmpdir(), 'backlot-pack-'));
   const repo = join(import.meta.dirname, '..');
   try {
-    for (const entry of ['package.json', 'package-lock.json', 'tsconfig.json', 'src', 'scripts', 'schema', 'README.md', 'LICENSE']) {
+    for (const entry of ['package.json', 'package-lock.json', 'tsconfig.json', 'src', 'scripts', 'schema', 'docs', 'README.md', 'LICENSE']) {
       cpSync(join(repo, entry), join(root, entry), { recursive: true });
     }
     symlinkSync(join(repo, 'node_modules'), join(root, 'node_modules'), 'dir');
@@ -28,6 +28,8 @@ it('packs a working CLI without stale adapter outputs from an older build', asyn
     expect(files.some((path: string) => path.startsWith('dist/mcp/'))).toBe(false);
     expect(files).toContain('dist/cli/index.js');
     expect(files).toContain('dist/daemon/index.js');
+    for (const guide of ['overview', 'operations', 'cli', 'manifest']) expect(files).toContain(`docs/${guide}.md`);
+    expect(files.some((path: string) => path.startsWith('docs/reviews/') || path.startsWith('docs/decisions/'))).toBe(false);
     await run('tar', ['-xzf', packed[0].filename], { cwd: root, timeout: 10_000, killSignal: 'SIGKILL' });
     const manifest = JSON.parse(readFileSync(join(root, 'package', 'package.json'), 'utf8'));
     expect(manifest.bin).toEqual({ runly: 'dist/cli/index.js', backlot: 'dist/cli/index.js' });

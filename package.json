@@ -28,6 +28,7 @@
   "files": [
     "dist",
     "schema",
+    "docs/*.md",
     "README.md",
     "LICENSE"
   ],

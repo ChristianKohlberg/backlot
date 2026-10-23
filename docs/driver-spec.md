@@ -23,7 +23,7 @@ remote drivers (morph, sprites, ssh) do the same over a connection.
 | `exec(env, cmd, opts)` | Run a command in the environment's worktree. Long-running service processes are started through this too; the **daemon** owns supervision policy, the driver owns the transport. Long remote operations must be submit-and-poll, never a held pipe (decision 0015). |
 | *(open)* | How a remote substrate reaches the caller's worktree. The git-sync transport this seam once assumed was removed with the source copy (decision 0032). |
 | `expose(env, port)` | A consumer-reachable URL for a port — how *this substrate* is reached at all, wired for every port at boot. Local: `http://localhost:<port>`. Remote: the provider's tunnel/proxy URL. Never public preview: publishing to the internet is opt-in per invocation and belongs to the preview seam below (decision 0027). |
-| `destroy(env)` | Irrevocably remove the environment. Safe by invariant 0011. |
+| `destroy(env)` | Irrevocably remove the environment. Destructive: private data may be unique. Require explicit teardown intent or confirmed worktree removal. |
 
 Optional capabilities (declared, engine degrades gracefully):
 
@@ -79,12 +79,15 @@ Each publisher turns the manifest's `preview` block into an address itself.
 | `start({envId, service, localUrl, logDir})` | Spawn a supervised, backlot-tagged tunnel and return `{url, pid}`. The adapter **owns the process until it returns a pid**: if it throws, it must already have killed it — nothing downstream can reap a tunnel whose pid was never recorded, and a live one is a public, unauthenticated URL nobody can name. |
 | `stop(rec)` | True **only** when the tunnel is confirmed gone; a false verdict keeps the caller's record, because a forgotten preview pid is a URL no one can ever reclaim. |
 
-The engine, not the adapter, owns the lifetime: the tunnel is journaled on the lease row
-and reaped when the *lease* ends, never when the services it publishes restart
-([decision 0027](decisions/0027-lease-scoped-public-preview.md)).
+The engine owns the deadline and journals the tunnel on the lease. `localUrl`
+must target its private expiry gate, never the service directly. Expiry closes
+that gate and open streams independently of tunnel cleanup or environment locks.
+Service restarts do not end publication; expiry, explicit stop and release do.
+Successful `up` can renew/reopen access; recovery restores only unexpired access.
+See [decision 0047](decisions/0047-public-preview-deadlines.md).
 
 ## What drivers never do
 
-Decide policy. Pool sizing, lease TTLs, the load budget, hygiene escalation, upkeep,
+Decide policy. Pool sizing, public-preview deadlines, the load budget, explicit data resets, upkeep,
 idle and teardown, and error classification are all engine concerns. A driver that
 wants policy is a design bug.

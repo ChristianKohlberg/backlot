@@ -1,172 +1,42 @@
-# Objections, taken seriously
+# Choosing Runly
 
-Three questions every skeptical engineer asks, in the order they ask them. Each
-gets the honest version: where the objection is *right*, and where it stops
-being right. runly was extracted from a hand-rolled harness that lived
-through every failure below — this page is that experience, not advocacy.
+## Why not copy source into each environment?
 
-## "Why not copy the source into each environment?"
+Services and builds run in your existing worktree, so they reuse its installed
+dependencies and compiler caches. Runly keeps only private data, logs and ports
+outside it. This avoids duplicate source trees and caches tied to the wrong path.
 
-runly did that once, and stopped ([decision 0032](decisions/0032-environments-run-in-the-callers-worktree.md)).
-Measured on the founding monorepo (35k tracked files, 1.07 GB of source), each
-environment tree weighed 2.0–2.6 GB: a full source copy (ext4 has no reflink, so
-copy-on-write fell back to a real copy) plus a second, cold set of caches — and those
-caches could never be borrowed from the worktree, because .NET (`project.assets.json`,
-`*.dgspec.json`, the CoreCompileInputs hash) and pnpm record the absolute path they
-were made at. Meanwhile the agent's own worktree, a persistent pool slot, already held
-warm caches from its earlier tasks. So environments now run **in** the worktree.
+The trade-off is that edits are immediately visible to running processes. Use
+separate worktrees for independent tasks or tests that need fixed source. Each
+worktree gets one environment.
 
-What the copy bought, and what became of it:
+Private data is not disposable by assumption: database mutations may exist only
+there. Idle preserves it; explicit destruction or worktree removal deletes it.
+Runly never deletes the source worktree.
 
-- **A frozen input for tests — given up.** The services run from the live worktree,
-  and an edit made while the tests run is visible to them. An agent that wants a fixed
-  input does not edit while its tests run, or runs them from a second worktree. (runly
-  runs no tests itself: the repo's own tests read `runly ctx --env`.)
-- **Two environments from one worktree — given up.** A worktree has exactly one
-  environment now; a second holder waits for it. Two environments building into one
-  worktree's `bin/` under each other's running services was the alternative, and the
-  owner chose against it. Parallel lanes need separate worktrees.
-- **Free abandonment — kept.** An environment's private directory (data, logs) still
-  never holds the only copy of anything, and runly never deletes the worktree, so a
-  reclaim needs no deliberation. Teardown checks the path before it deletes.
-- **Clean worktrees — given up.** Upkeep, builds and services write where they run. Ignore
-  your output (or declare it under `caches:`), or an upkeep trigger glob may match it.
-- **A build cache in runly — given up.** Builds run on every `up`; MSBuild, pnpm and
-  the Angular CLI decide what is current, which is what they are for, and runly
-  restarts only the services whose declared build output changed. A build may opt in
-  to being skipped while the files it reads are unchanged (`build: { run, when }`).
+## Why not run the commands directly?
 
-If those trade-offs matter more to you than a warm cache — many concurrent test
-lanes from one checkout, editing while tests run — give each lane its own worktree.
+For a small app, running its commands directly may be sufficient. Runly adds
+stable proxy URLs, readiness checks, isolated database copies, repeatable seed
+restores, idle/wake and local diagnostics. Your own commands still perform the
+builds and run the services.
 
-## "My agent just runs `dotnet run` and `ng serve` itself — just as good."
+Environment lifetime follows the worktree, not the agent process. An agent exit
+does not delete data; inactivity stops managed services. This matters when a
+human or a resumed session needs to inspect the same state later.
 
-For one agent, one task, one machine: it genuinely is. No manifest, no daemon,
-nothing new to trust. The claim fails at exactly the point of scale it is
-usually made to defend. What arrives, in order:
+## Where do containers fit?
 
-1. **The second agent.** `EADDRINUSE`. The documented agent responses are
-   editing the port config (harness noise in the diff), starting duplicate
-   servers on new ports, or killing the process that holds the port — which
-   belonged to the first agent. (See the receipts below: these are filed bugs,
-   not hypotheticals.)
-2. **The shared dev database.** Two agents seeding and mutating one database
-   produce each other's test failures — nondeterministic, non-local, blamed on
-   the code.
-3. **The crash.** An agent dies; its `dotnet` and `node` processes don't.
-   Nothing owns them, nothing records them, and a fleet manufactures orphans
-   daily. (runly spends real machinery here: process-group kills, pid
-   identity pinning, tag-based reclaim, and an environment tied to the agent's
-   session that goes when the session does — because even *with* supervision
-   this is hard.)
-4. **The cold start, every task.** Restore, build, seed — minutes per task,
-   because nothing durable outlives the task. runly's economy is that an
-   environment outlives its lease, its data restores from a template in
-   seconds, and an idle service wakes on the next request.
-5. **The raw error.** "Connection refused": my bug, stale deps, or the DB
-   server being down? A DIY agent burns its context debugging the environment.
-   runly's error taxonomy (work / env / infra) exists because each of those
-   demands a *different next action*.
-6. **The knowledge in prompts.** Ports, seeding, when migrations rerun —
-   re-taught per agent, drifting per agent. `runly.yml` is that knowledge as
-   one reviewed file, and the agent's protocol shrinks to "run verbs from your
-   worktree."
+Use containers when the app or its backing servers need them. Runly can start
+shared backing servers through appliances and run container commands as services.
+The manifest must still make process ownership, readiness and cleanup explicit.
+An appliance is shared infrastructure: idle and environment destruction do not
+stop it.
 
-The rhetorical key: open the manifest — `dotnet run` and `ng serve` are
-*literally in it*. runly is those commands plus the machinery every DIY
-setup grows anyway, grown once and tested, instead of half-grown per repo.
+Runly is useful when you want its worktree lifecycle, seed templates, disposable
+copies and traffic-triggered wake around those commands. If your existing setup
+already provides the behavior you need, adding another manager may not help.
 
-The question that decides it: **how many agents, how many tasks a day, and who
-reaps the processes when one dies?**
-
-## "Docker Compose does the same thing."
-
-Compose genuinely covers a piece of it: declarative topology, per-project
-isolation (`compose -p agent1` / `-p agent2`), networks, and file-sync into
-containers (`develop.watch`). For a fully containerized stack that is real
-overlap. The structural gaps:
-
-1. **Uncommitted code has no good path into a container.** Rebuild the image
-   per edit — minutes per iteration, no inner loop. Or bind-mount the worktree
-   in — which is worktree-hosting again (mid-run edits reach the running tests;
-   one worktree cannot back two differently-bound stacks), plus the
-   well-documented macOS bind-mount I/O tax on exactly the watcher-heavy dev
-   loops agents hammer, plus the `node_modules` inside-vs-outside volume
-   dance. runly runs commands in the worktree directly — no container, no
-   mount — and accepts the live-worktree semantics that come with that
-   ([decision 0032](decisions/0032-environments-run-in-the-callers-worktree.md)).
-2. **Compose has no leases.** No reclaim, no warm reuse, no idle stop:
-   nothing distinguishes an abandoned stack from a used one, and every fresh
-   `up` pays start + seed again. Containers restart from the *image* — the
-   incremental state that makes rebinds fast (compiler caches, `obj/`,
-   `.angular`) is exactly what an image does not carry, so it becomes
-   hand-managed volumes.
-3. **No data or lifecycle layer.** Presets, template restore, database copies,
-   `reset-data` mid-lease, idle stop and wake, hygiene escalation, a classified
-   error taxonomy —
-   compose has no concept of any of it (v2.30 added generic
-   `post_start`/`pre_stop` hooks; still no named data states, no
-   reset-to-baseline), so teams script it around compose.
-   That script *is* the hand-rolled harness, with compose as one ingredient.
-4. **Real dev loops are often host-native.** Debugger attachment, watch
-   performance, toolchain reality: the founding monorepo's loop is host
-   `dotnet` + `ng serve`, by choice. runly is process-first by decision —
-   services are commands, not containers.
-
-And they compose, literally: a service's `run:` may start a container, and
-appliances routinely `docker run` the database (runly's own mssql test
-does). Compose answers *how do my containers run*. runly answers *who gets
-which running, seeded instance, in what data state — and who cleans up when they
-vanish.* Building the second thing on top of the first is
-exactly the half-finished harness this project was extracted from.
-
-Honest concession: a fully containerized shop with disciplined `-p` projects,
-`develop.watch`, and seed/reset scripts covers perhaps half of this — for
-their one repo, permanently.
-
----
-
-## Receipts
-
-Every load-bearing claim above was verified against primary sources
-(2026-07-20) rather than asserted:
-
-- macOS bind-mount I/O: [docker/for-mac#1592](https://github.com/docker/for-mac/issues/1592)
-  (the multi-year tracking issue); Docker's own
-  [VirtioFS announcement](https://www.docker.com/blog/speed-boost-achievement-unlocked-on-docker-desktop-4-6-for-mac/)
-  claims the improvement and its docs still steer I/O-heavy paths to volumes.
-- The `node_modules` volume dance: the
-  [canonical StackOverflow thread](https://stackoverflow.com/questions/30043872/docker-compose-node-modules-not-present-in-a-volume-after-npm-install-succeeds)
-  and a decade of tutorials teaching the anonymous-volume exclude trick.
-- Compose capabilities: [project-name isolation](https://docs.docker.com/compose/how-tos/project-name/)
-  and [`develop.watch`](https://docs.docker.com/compose/how-tos/file-watch/)
-  (GA in v2.22) are real — the overlap above is stated at full strength.
-- Seeding as scripting, not a primitive: Docker's own
-  [pre-seeding guide](https://docs.docker.com/guides/pre-seeding/) routes it
-  through image entrypoint conventions.
-- Rebuild-per-edit as the anti-pattern: Docker's
-  [watch-mode announcement](https://www.docker.com/blog/docker-compose-experiment-sync-files-and-automatically-rebuild-services-with-watch-mode/)
-  names slow rebuilds as the adoption barrier its sync feature exists to fix.
-- Caches lost on container recreation:
-  [VS Code devcontainer performance guidance](https://code.visualstudio.com/remote/advancedcontainers/improve-performance)
-  prescribes the named-volume workaround.
-- Agents fighting over ports and leaking processes: filed against the agents
-  themselves — [claude-code#16198](https://github.com/anthropics/claude-code/issues/16198)
-  (orphaned dev server, days of runtime),
-  [claude-code#9780](https://github.com/anthropics/claude-code/issues/9780)
-  (duplicate servers on port conflicts), and
-  [Cursor forum reports](https://forum.cursor.com/t/1-7-11-canceling-or-killing-the-agent-console-leaves-zombie-processes/135168)
-  of zombie processes.
-- Hermeticity: [Google Testing Blog](https://testing.googleblog.com/2012/10/hermetic-servers.html)
-  and [Bazel's definition](https://bazel.build/basics/hermeticity). The
-  agent-specific mid-run-edit framing is our inference from that principle,
-  and is labeled as such above.
-- Per-worker database isolation as standard practice:
-  [Rails parallel testing](https://blog.appsignal.com/2022/03/16/the-perils-of-parallel-testing-in-ruby-on-rails.html)
-  creates `test-db-N` per worker for exactly this reason.
-
-The 2024–26 wave of agent-sandbox infrastructure (E2B, Daytona, Modal, Fly
-Sprites, Morph, Dagger's container-use) is the industry conceding the premise:
-agents need isolated, persistent, provable environments. Those products sell
-the *substrate*. runly is the repo-aware layer above it — see
-[architecture §14](architecture.md) for the landscape.
+See [the guide](overview.md), [manifest reference](manifest.md) and
+[operations](operations.md) for the actual contracts. Earlier comparisons are
+recorded in the [dated landscape review](reviews/2026-07-20-landscape.md).

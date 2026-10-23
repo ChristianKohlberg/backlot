@@ -1,6 +1,6 @@
 # 0027. Lease-scoped public preview is explicit, supervised, and separate from expose
 
-- Status: Accepted
+- Status: Public-access lifetime amended by [0047](0047-public-preview-deadlines.md); previews always expire.
 - Date: 2026-08
 - Context: agents and humans on the host can reach a leased service at
   `localhost`, but sharing that view with someone on another machine today means
