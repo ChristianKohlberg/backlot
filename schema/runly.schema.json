@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://raw.githubusercontent.com/ChristianKohlberg/backlot/main/schema/runly.schema.json",
+  "$id": "https://raw.githubusercontent.com/ChristianKohlberg/runly/main/schema/runly.schema.json",
   "title": "Runly stack manifest (runly.yml or runly.yaml)",
   "description": "What a repo declares so runly can run environments for it, in the worktree the manifest lives in. Everything {{...}} is injected by the engine (ports, public_ports, services.<svc>.url, datastores.<ds>.url/.ns). Policy (TTLs, pool caps, the load budget, substrates) never lives here.",
   "type": "object",

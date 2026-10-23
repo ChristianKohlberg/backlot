@@ -1,6 +1,6 @@
 # runly
 
-[![npm](https://img.shields.io/npm/v/@theford/runly)](https://www.npmjs.com/package/@theford/runly) [![ci](https://github.com/ChristianKohlberg/backlot/actions/workflows/ci.yml/badge.svg)](https://github.com/ChristianKohlberg/backlot/actions/workflows/ci.yml) [![release](https://img.shields.io/github/v/release/ChristianKohlberg/backlot)](https://github.com/ChristianKohlberg/backlot/releases)
+[![npm](https://img.shields.io/npm/v/@theford/runly)](https://www.npmjs.com/package/@theford/runly) [![ci](https://github.com/ChristianKohlberg/runly/actions/workflows/ci.yml/badge.svg)](https://github.com/ChristianKohlberg/runly/actions/workflows/ci.yml) [![release](https://img.shields.io/github/v/release/ChristianKohlberg/runly)](https://github.com/ChristianKohlberg/runly/releases)
 
 runly puts a running, seeded, authenticated instance of your web application in
 front of a coding agent or a human. It runs your repo's own commands in the
@@ -23,14 +23,14 @@ For Claude Code, install the bundled skills: **runly** for using the CLI and
 **runly-setup** for creating or editing the manifest:
 
 ```
-/plugin marketplace add ChristianKohlberg/backlot
+/plugin marketplace add ChristianKohlberg/runly
 /plugin install runly
 ```
 
 ## Quickstart
 
 ```bash
-git clone https://github.com/ChristianKohlberg/backlot && cd backlot
+git clone https://github.com/ChristianKohlberg/runly && cd runly
 npm ci && npm run build && npm link
 cd examples/hello-multi
 

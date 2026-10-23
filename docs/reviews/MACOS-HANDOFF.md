@@ -14,7 +14,7 @@ a web app in front of coding agents. Concepts: a warm **pool** of environments, 
 produce verdicts, **datastores** and **appliances**.
 
 ```bash
-gh repo clone ChristianKohlberg/backlot && cd backlot
+gh repo clone ChristianKohlberg/runly && cd runly
 npm install && npm run build && npm test
 ```
 

@@ -324,7 +324,7 @@ does not touch the CLI build). Layout:
   services or presets. Neither should contradict `README.md`.
 
 runly is CLI-only: the plugin ships **only the two skills — no `.mcp.json`.** Install
-is `/plugin marketplace add ChristianKohlberg/backlot && /plugin install runly`.
+is `/plugin marketplace add ChristianKohlberg/runly && /plugin install runly`.
 
 ## Docs
 
