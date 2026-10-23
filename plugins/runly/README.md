@@ -17,7 +17,7 @@ Install the CLI with npm i -g @theford/runly, then run runly update after upgrad
 This repository is also the plugin marketplace. In Claude Code:
 
 ~~~text
-/plugin marketplace add ChristianKohlberg/backlot
+/plugin marketplace add ChristianKohlberg/runly
 /plugin install runly
 ~~~
 

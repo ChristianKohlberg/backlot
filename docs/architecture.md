@@ -792,4 +792,4 @@ Angular + MSSQL monorepo, whose Playwright suite runs against a runly environmen
 The one unbuilt piece is a remote substrate driver (Morph, SSH): the daemon on the
 remote box, the CLI forwarding verbs to it, provider-side TTLs and `pool reconcile`
 adopting what the journal forgot. Release notes:
-[GitHub releases](https://github.com/ChristianKohlberg/backlot/releases).
+[GitHub releases](https://github.com/ChristianKohlberg/runly/releases).

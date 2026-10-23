@@ -163,7 +163,7 @@ export function unitPlan(root = stateRoot(), extraEnv: string[] = [], opts: { ca
       '# Written by `runly daemon install` (decision 0039). `runly daemon uninstall` removes it.',
       '[Unit]',
       `Description=runly daemon (state root ${root})`,
-      'Documentation=https://github.com/ChristianKohlberg/backlot/blob/main/docs/overview.md#the-daemon',
+      'Documentation=https://github.com/ChristianKohlberg/runly/blob/main/docs/overview.md#the-daemon',
       '',
       '[Service]',
       'Type=simple',

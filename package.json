@@ -55,11 +55,11 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/ChristianKohlberg/backlot.git"
+    "url": "git+https://github.com/ChristianKohlberg/runly.git"
   },
-  "homepage": "https://github.com/ChristianKohlberg/backlot#readme",
+  "homepage": "https://github.com/ChristianKohlberg/runly#readme",
   "bugs": {
-    "url": "https://github.com/ChristianKohlberg/backlot/issues"
+    "url": "https://github.com/ChristianKohlberg/runly/issues"
   },
   "author": "Christian Kohlberg"
 }
