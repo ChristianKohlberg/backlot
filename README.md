@@ -2,9 +2,17 @@
 
 [![npm](https://img.shields.io/npm/v/@theford/runly)](https://www.npmjs.com/package/@theford/runly) [![ci](https://github.com/ChristianKohlberg/runly/actions/workflows/ci.yml/badge.svg)](https://github.com/ChristianKohlberg/runly/actions/workflows/ci.yml) [![release](https://img.shields.io/github/v/release/ChristianKohlberg/runly)](https://github.com/ChristianKohlberg/runly/releases)
 
-Run your app's services with seeded databases and stable local URLs, one environment
-per worktree. Runly uses your existing commands and build tools. Idle services stop
-after five minutes and wake on traffic; their data stays.
+**Let your agents verify their work without getting in each other's way.**
+
+One agent restarts the app. Another resets the database. A third tests the wrong
+version—and starts fixing a problem it didn't create.
+
+Git worktrees separate your code. Runly extends that separation to the running
+application and its data. Each worktree gets its own app, data and URLs, so agents
+can build, test and demonstrate their changes independently.
+
+Idle services stop and wake when needed, while temporary public previews expire.
+More parallel work. Less interference. Less cleanup.
 
 ## Quickstart
 
@@ -16,7 +24,10 @@ mkdir runly-demo && cd runly-demo
 git init -q
 ```
 
-Save this as `server.mjs`:
+This tiny demo needs no dependencies. For an existing app, use its normal start
+command in the manifest—you do not need an extra server file.
+
+Save the demo as `server.mjs`:
 
 ```js
 import { createServer } from 'node:http';
@@ -40,18 +51,17 @@ services:
       http: /
 ```
 
-Start it and request its assigned URL:
+Start the app:
 
 ```sh
 runly up
-eval "$(runly ctx --env)"
-curl "$RUNLY_URL_WEB"
-runly logs web
 ```
 
-Edit `server.mjs`, then run `runly up` again. This example's build has no declared
-outputs, so it restarts the service on each `up`. For a real app, use its dev server
-or configure [build outputs](docs/manifest.md) to control restarts.
+Open the URL printed in your terminal. Edit `server.mjs`, then run `runly up`
+again to see your change.
+
+For your own app, see the [everyday guide](docs/overview.md) and
+[manifest reference](docs/manifest.md).
 
 `runly down` stops services and keeps data. `runly destroy` removes this worktree's
 Runly environment, including its databases; it never deletes your source files.
@@ -68,13 +78,28 @@ The second command restarts an older running daemon onto the installed version.
 
 ## Agent skills
 
-The plugin includes **runly** for CLI operation and **runly-setup** for manifest
-setup, datastore choices and initial tuning. In Claude Code:
+Use **runly-setup** to get started and **runly** to operate an existing setup.
+Install both in Claude Code:
 
 ```text
 /plugin marketplace add ChristianKohlberg/runly
 /plugin install runly
 ```
+
+Then ask your agent: “Use the runly-setup skill to configure this repository for
+parallel worktrees and verify the setup.” For everyday work, ask it to use the
+runly skill to start services, run tests or investigate failures.
+
+Runly needs a `runly.yaml` (or `runly.yml`) that matches your app and how you want
+to work. The setup skill guides your agent through the repository to recommend
+services and containers, isolated datastores and seed data, build/cache rules,
+and readiness checks—then test those choices. You can write the manifest yourself;
+the skill helps with the investigation and verification, beyond YAML syntax.
+
+**Review the setup with your agent.** Double-check which services you need, what
+data may be reset, what stays shared across worktrees, and whether the tests cover
+your workflow. Ask what was verified and what remains untested. Monitor the first
+few sessions to tune resource limits, caching and idle/wake behavior.
 
 ## Documentation
 

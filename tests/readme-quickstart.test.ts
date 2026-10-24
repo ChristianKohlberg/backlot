@@ -25,17 +25,18 @@ it('the README example starts, serves an edit after up, and preserves source on 
     req.on('error', reject);
   });
   try {
-    const up = await c.cli(['up', '--json'], wt);
+    const up = await c.cli(['up'], wt);
     expect(up.code, up.stdout + up.stderr).toBe(0);
-    expect(await request(up.json.urls.web)).toBe('Hello from Runly!\n');
-    const env = await c.cli(['ctx', '--env'], wt);
-    expect(env.code, env.stderr).toBe(0);
-    expect(env.stdout).toContain('export RUNLY_URL_WEB=');
+    const ctx = await c.cli(['ctx', '--json'], wt);
+    expect(ctx.code, ctx.stdout + ctx.stderr).toBe(0);
+    const url = ctx.json.urls.web;
+    expect(up.stdout).toContain(url);
+    expect(await request(url)).toBe('Hello from Runly!\n');
     const edited = server.replace('Hello from Runly!', 'Edited example');
     writeFileSync(join(wt, 'server.mjs'), edited);
     const again = await c.cli(['up', '--json'], wt);
     expect(again.code, again.stdout + again.stderr).toBe(0);
-    expect(again.json.urls.web).toBe(up.json.urls.web);
+    expect(again.json.urls.web).toBe(url);
     expect(await request(again.json.urls.web)).toBe('Edited example\n');
     expect((await c.cli(['logs', 'web'], wt)).code).toBe(0);
     expect((await c.cli(['down'], wt)).code).toBe(0);
