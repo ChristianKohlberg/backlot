@@ -35,6 +35,8 @@ import type { EnvState, Hygiene, LeaseKind, ServicePid } from './types.js';
 // destroys them on holder death, idle expiry or automatic capacity eviction.
 export const JOURNAL_SCHEMA_VERSION = 5;
 /** SQLite-safe sentinel for an explicitly non-expiring lease. Exposed as null in ctx. */
+/** The oldest stamp this build still opens (decision 0042); older journals are refused untouched. */
+export const OLDEST_READABLE_JOURNAL_SCHEMA = 4;
 export const NO_LEASE_EXPIRY = Number.MAX_SAFE_INTEGER;
 
 /**
@@ -247,9 +249,11 @@ export class Journal {
     // Journals older than schema 4 (runly before 0.16) carried data-only
     // environments, path-spelled stack identities and the projected worktree
     // copies whose migrations lived here until 0.18. They are gone: such a
-    // journal is refused untouched rather than half-read.
+    // journal is refused untouched rather than half-read (decision 0042).
+    // Schema 4 itself is still read: 4 -> 5 changes no table, only which daemons
+    // may open the file (decision 0046), so it is upgraded by the stamp below.
     const hasTables = this.db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'envs'").get() !== undefined;
-    if (hasTables && stamped < JOURNAL_SCHEMA_VERSION) {
+    if (hasTables && stamped < OLDEST_READABLE_JOURNAL_SCHEMA) {
       throw new BrokerError(
         'infra-error',
         `journal at ${path} has schema ${stamped}, older than this build reads (${JOURNAL_SCHEMA_VERSION}) — ` +
