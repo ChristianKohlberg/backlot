@@ -1,6 +1,6 @@
 # 0045. A daemon restart re-publishes the leases' previews
 
-- Status: Accepted
+- Status: Preview restoration amended by [0047](0047-public-preview-deadlines.md): restore only unexpired access; restart never extends its deadline.
 - Date: 2026-10
 - Amends: [0027](0027-lease-scoped-public-preview.md) — what crash recovery and
   `shutdown` do to a lease's preview; [0039](0039-teardown-keeps-templates-a-leased-environment-survives-a-crash-loop.md)

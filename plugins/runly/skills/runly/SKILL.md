@@ -190,4 +190,4 @@ time: reinstall after changing PATH or required daemon variables; use
 the worktree, on your terminal, with your environment plus the `ctx --env`
 variables; stopped services start first; its own exit code), `runly reset-data`, `runly status`, `runly doctor`,
 `runly appliance ls|start|stop`, `runly pool doctor [--fix]`,
-`runly update [--check]`. The README lists every verb and manifest field.
+`runly update [--check]`. The repository's `docs/cli.md` and `docs/manifest.md` contain the full references; the README links to them.

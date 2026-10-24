@@ -328,10 +328,10 @@ is `/plugin marketplace add ChristianKohlberg/runly && /plugin install runly`.
 
 ## Docs
 
-`README.md` is only the manifest and command reference plus a quickstart;
-`docs/overview.md` is the user guide (lifecycle, ports, testing, data, budget,
-previews, security); `docs/architecture.md` is the design and the configuration
-table. Describe current behaviour only — no upgrade notes or version history (git
+`README.md` is the npm quickstart and documentation entry point.
+`docs/overview.md` covers everyday behavior; `docs/operations.md` covers advanced
+operations and tuning. `docs/cli.md` and `docs/manifest.md` own the full references;
+`docs/architecture.md` owns design and machine configuration. Describe current behaviour only — no upgrade notes or version history (git
 and `docs/decisions/` keep it). `ctx --env` and `up --env` print `export` lines,
 so examples use `eval "$(runly ctx --env)" && <tests>`.
 

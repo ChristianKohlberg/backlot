@@ -1,6 +1,6 @@
 # 0010. Error taxonomy: work-error / env-error / infra-error
 
-- Status: Accepted
+- Status: Automatic recycling on env-error superseded by [0046](0046-worktree-owned-activity-lifecycle.md); failures retain data.
 
 ## Decision
 

@@ -1,6 +1,6 @@
 # 0033. The daemon holds every public port behind an L4 proxy; ports come from three disjoint blocks
 
-- Status: Accepted — amended by [0035](0035-services-idle-on-their-own-clock-and-wake-on-demand.md): the wake hook ("step 6") is installed — a connection to an idle-stopped service starts it; a refused connection during a crash restart is held
+- Status: Activity and wake amended by [0046](0046-worktree-owned-activity-lifecycle.md); preview gates and safe failures by [0047](0047-public-preview-deadlines.md); measurements by [0049](0049-local-statistics-and-monitor.md).
 - Date: 2026-10
 - Amends: [0031](0031-tailscale-preview-publisher.md) — derived tailnet ports move
   from 21000–21999 to the tunnel block

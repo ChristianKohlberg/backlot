@@ -66,14 +66,11 @@ There is no Run noun: runly executes no checks and gives no verdicts (decision
 
 ### The two inversions everything follows from
 
-**Environments are durable; leases are disposable.** The abandonment pathology is fixed
-structurally, not by reaping harder: when a lease lapses (agent crashed, human forgot),
-the environment stays with its worktree, its data and caches intact, and its services
-stop on their idle clocks. When the holder is a known process, its death tears the
-environment down instead ([decision 0035](decisions/0035-services-idle-on-their-own-clock-and-wake-on-demand.md)),
-so nothing keeps running *for nobody*.
+**Environments belong to worktrees.** Leases never expire, and agent death does
+not destroy data. Explicit release relinquishes ownership; inactivity stops
+managed services while preserving their data and ports (decision 0046).
 
-**Environments run in the worktree; ports never move.** The services build and run
+**Environments run in the worktree; proxy ports survive service restarts.** The services build and run
 in the caller's worktree, whose caches are already warm (.NET and pnpm caches embed
 absolute paths, so a copy elsewhere would start cold;
 [decision 0032](decisions/0032-environments-run-in-the-callers-worktree.md)). What
@@ -83,15 +80,11 @@ lifetime), its datastore namespaces and its logs.
 Stable ports are held, not just recorded ([decision 0033](decisions/0033-the-daemon-holds-public-ports-behind-an-l4-proxy.md)):
 the daemon listens on each environment's **public** ports (20000–29999) for the
 environment's life and pipes TCP to the **internal** port (30000–31999) the service
-was started on, fresh at each start. A connection that arrives while its service
-restarts is held until it is ready — also one the service accepted and dropped
-before its first byte back (a crash the supervisor has not seen yet, a restart
-under way): the proxy keeps what the client sent until the service answers and
-replays it, like a refused connect — but only when no process can have acted on
-it: nothing reached the process, or an idempotent HTTP request (`GET`/`HEAD`/`OPTIONS`)
-carried to one relaunch at most; a `POST` or a non-HTTP stream that reached a
-process is never replayed (decision 0039, corrected in 0.18.1); client bytes and the last activity time are
-counted per port (`proxy` in `ctx`/`status`), and readiness probes bypass the
+was started on, fresh at each start. New connections wait within one startup
+deadline. After delivered bytes, replay is limited to one complete, bodyless
+GET/HEAD/OPTIONS request before the first response; pipelines, upgrades and
+ambiguous framing are rejected. Already-answered streams are never replayed.
+Activity counts both directions; readiness probes bypass the
 proxy. Derived tailnet ports use a third block (32000–32767); all three sit below
 the OS ephemeral range. `src/daemon/proxy.ts` owns the proxy, `ensureProxies` in
 the engine owns holding and (only when a port cannot be held) moving them.
@@ -151,7 +144,7 @@ Local pools are convergence all the way down. Same verbs above the driver line.
   environment, and every holder in one worktree uses the same one.
 - **A per-machine daemon, auto-spawned by the CLI on first use** (the tmux/Docker
   pattern), speaking HTTP over a unix socket. The daemon exists because processes need
-  a parent: someone must supervise services, watch readiness, expire leases, and
+  a parent: someone must supervise services, watch readiness, expire public previews, and
   quiesce idle environments while no CLI is running. Verbs fired in parallel on a
   cold machine all race to spawn it; the singleton election keeps that safe (one
   wins, losers concede, their clients fall through to the winner), but fleets
@@ -168,21 +161,20 @@ Local pools are convergence all the way down. Same verbs above the driver line.
   A third, per-worktree lock serializes what writes into a worktree (upkeep, builds)
   between its one environment and `runly warm`, which can run with none;
   environment locks are always taken first. Different stacks bind in parallel; the
-  sweeper never expires or quiesces an environment with an operation in flight.
-- **Local even when compute is remote.** A Morph environment is a pool entry whose
-  driver executes over SSH. The consumer's machine is the brain; substrates are muscles.
+  sweeper never tears down or quiesces an environment with an operation in flight.
+- **Remote execution is a design target, not an implemented backend.** Current
+  services run locally in the caller's worktree.
 - **Disk is truth; daemon memory is a cache.** After a daemon crash or reboot, the next
   CLI call (or the supervising unit) respawns the daemon, which reconciles: recorded processes reaped (by pid
-  identity and tag), environments marked `warm`, public ports held again, leases past
-  their TTL ended, unfinished teardowns and copy drops retried. A restart is a non-event.
+  identity and tag), environments marked `warm`, public ports held again, and unfinished
+  teardowns/copy drops retried. Leases stay; only unexpired previews are restored.
 - **Team mode** (same daemon on a shared host, TCP + auth) is a possible future, not v1.
 
 ### Environment states
 
-`hot` (services up) → `warm` (services stopped, caches intact; reached when every
-service has idle-stopped) → recycled (`pristine` rebuild). Rebind from hot ≈ seconds;
-from warm ≈ start + ready-wait; pristine ≈ full provision (bounded by templates and
-shared caches, below).
+`hot` means services are up; `warm` means they are stopped while data remains.
+Wake returns a warm environment to service. Neither state implies deletion.
+`pristine` is an explicit data reset, not an automatic state transition.
 
 **Lifecycle** ([decision 0046](decisions/0046-worktree-owned-activity-lifecycle.md)).
 
@@ -366,8 +358,9 @@ build/start:
   that starts it and on every `warm`, in `depends_on` waves (one wave's builds at
   once; `builds: serial` or `build: { serial: true }` opt out); MSBuild, pnpm or the Angular CLI decide what is
   current. A `build: { run, when }` keeps its own ledger (decision 0038).
-- The ledger cannot see what happens to the worktree outside runly: a `node_modules`
-  deleted by hand is still "applied". `--pristine` clears the worktree ledger.
+- Declare upkeep `outputs:` so missing generated/install artifacts trigger a rerun.
+  Without outputs, unchanged triggers cannot detect deletion. `--pristine` clears
+  the ledger but also resets data; it is not a harmless install-repair command.
 - **Pool divergence is normal and harmless.** Idle worktrees are never touched by
   the daemon on its own initiative; staleness is bounded by one upkeep pass at next
   use, or by an explicit `runly warm`. Machine-global package stores
@@ -397,9 +390,8 @@ build/start:
   file name (pre-0.20) is adopted instead of baking — its marker is copied, naming the
   same database — and is then a duplicate retention collects (the database stays while
   another marker names it; a bake never drops a database another marker names).
-- Toolchain-level bumps (global.json, .nvmrc) are env-recycle events, not upkeep —
-  unless the repo manages toolchains declaratively (mise/asdf) via its own rule.
-  runly never installs SDKs on its own initiative.
+- Toolchain installation is the operator or manifest author's responsibility.
+  Updating an SDK does not require deleting environment data.
 
 ## 8. Data — presets, templates, hygiene
 
@@ -421,7 +413,7 @@ first bind; no presets or templates).
 | --- | --- | --- |
 | `reuse` | keep every datastore's data; a store named with `--preset` is reloaded alone (see [data](overview.md#data)) | human inspect loop |
 | `reset-data` | restore every datastore from its template, each with the preset it holds (or the one named), keep all build caches | agent verify loops (`up --reset-data` before the tests) |
-| `pristine` | fresh private state and data; every upkeep rule and every build re-run in the worktree (nothing there is deleted) | merge-grade proofs; auto-escalation |
+| `pristine` | fresh private state and data; every upkeep rule and every build re-run in the worktree (nothing there is deleted) | explicit fresh-data verification |
 
 Failed binds retain their data and require a new `up` to retry. No automatic pristine
 reset occurs. A service past its crash budget is stopped and reported failed, with
@@ -436,8 +428,8 @@ data after twenty minutes of debugging mutation.
 instant and authoritative; no PID-reparenting guesswork, no port-health inference.
 Readiness is probed (`http`, `log`, or command); declared `fatal_logs` markers fail a
 boot in seconds instead of polling a dead port to timeout. Session services restart
-with bounded backoff; flapping stops the service and reports it `failed` in a leased
-environment, and marks an unleased one degraded for the sweeper to recycle (decision 0039).
+with bounded backoff; flapping stops the service and reports it `failed`. The
+environment and its data remain, with or without a lease (decision 0046).
 A crash mid-bind fails the bind explicitly — never a silently wrong answer.
 
 Every failure is classified — the field an agent branches on mechanically:
@@ -445,14 +437,14 @@ Every failure is classified — the field an agent branches on mechanically:
 | Class | Meaning | Who acts |
 | --- | --- | --- |
 | `work-error` | the worktree's code is at fault (compile error, failing upkeep triggered by your change, a service that will not start) | the consumer fixes and runs `up` again |
-| `env-error` | the environment is at fault (stale cache, missing toolchain, flapping service) | runly auto-remediates by recycling |
+| `env-error` | the environment is at fault (stale cache, missing toolchain, flapping service) | the consumer inspects the diagnostic, fixes the cause and retries; data is retained |
 | `infra-error` | something external (backing DB down, registry unreachable) | actionable message; nobody's code is blamed |
 
 ## 10. Laptop reality
 
 - **Sleep is a coherent pause** locally: daemon, services, and backing containers freeze
   and thaw together. On wake the daemon detects the clock jump and **pardons the gap**
-  (every lease/idle deadline shifts by the sleep duration). There is no separate wake
+  (idle clocks are adjusted; public-preview deadlines are never extended). There is no separate wake
   grace because degradation is judged only by a service's restart budget, not by a
   post-boot health poll — a slept service simply resumes. Detection is
   platform-specific: on macOS the sweeper reads the **kernel's own record**
@@ -465,12 +457,8 @@ Every failure is classified — the field an agent branches on mechanically:
 - **Activity controls idle stop**, independently of leases. Traffic in either
   direction anywhere in the environment, using verbs, and exec heartbeats count.
   Read-only polling and mere process/socket existence do not.
-- **Remote is the mirror image**: the world keeps running (and billing) while the lid
-  is shut. Therefore remote environments always carry **provider-side TTLs** as the
-  backstop, and a long remote operation must be submit-and-poll, never a held SSH
-  pipe (decision 0015's remote half). Orphan discovery:
-  drivers tag instances so `pool reconcile` can adopt or reap what the journal forgot.
-  Local orphans cost RAM; remote orphans cost money — the asymmetry drives the design.
+- **Remote execution remains unimplemented.** Provider billing limits and remote
+  orphan reconciliation belong to a future substrate contract, not current CLI behavior.
 - **Locally, the same tagging rule applies to service processes.** Every supervised
   service is spawned carrying `BACKLOT_ENV_ID` / `BACKLOT_SERVICE` / `BACKLOT_STATE_ROOT`,
   inherited by every descendant. Pids alone are not ownership: a recorded pid may have
@@ -485,142 +473,9 @@ Every failure is classified — the field an agent branches on mechanically:
 
 ## 11. The consumer's interface
 
-The CLI **is** the API: every verb takes `--json`; stdout is data, stderr is human.
-
-```
-runly up [service...] [--preset [ds=]p]... [--reset-data|--pristine] [--rebuild]
-         [--holder-pid <pid>] [--env]   # lease; ADD services; upkeep + builds, restart what changed; --env: export lines
-runly plan [service...] [--rebuild]            # what up would build/start, its cost, starts now | would wait for X
-runly destroy                                  # tear down everything this worktree holds, now
-runly down [service...]                        # stop just these (none = all); lease, data, ports stay
-runly ctx [--env]                              # a summary; --json: the context blob (below); --env: export RUNLY_* lines
-runly ps [--all]                               # services and database copies (this worktree | server)
-runly db new <ds> [--preset p] | db with <ds> [--preset p] [--runly-exit N] -- <cmd...> | db ls [--all] | db drop <name>
-                                               # database copies outside any environment (decision 0034)
-runly warm                                     # due upkeep + builds in this worktree, no lease
-runly exec <cmd...>                            # the CLI runs it in the worktree with your env + the lease's RUNLY_* (decision 0040); its exit code
-runly logs [service...] [--lines N] [--since up|<dur>] [--grep re] [-f [--until re] [--timeout s]] [--build]
-                                               # interleaved, time-stamped service logs (decision 0038); --until (current process only): 0, --timeout: 124
-runly token [--role <r>] [--raw]               # mint a token via auth.token (role default admin)
-runly reset-data [--preset [ds=]p]... | release
-runly preview <service> [--ttl <minutes>] [--https-port N] | preview stop   # publish one service (below)
-runly status | doctor                          # daemon, environments, budget | health and drift
-runly appliance ls|start|stop [name]           # shared backing servers
-runly pool ls|recycle [<env-id>] [--force]|reconcile|gc|doctor [--fix]   # doctor: orphans, dry run unless --fix
-runly daemon stop                              # waits up to 60 s (BACKLOT_DAEMON_STOP_TIMEOUT_MS) until the daemon and its services are gone
-runly daemon install [--print] [--env NAME]... | uninstall   # supervise the daemon (systemd user unit / launchd agent), decisions 0039, 0043
-runly update [--check] [--force]               # run the INSTALLED build (below)
-runly --version
-# lease and copy verbs take --holder <name> (default: the caller's worktree, from any subdirectory of it)
-```
-
-**Version skew, and `update` (decision 0024).** The CLI spawns the daemon from its
-own `dist/`, so installing a new runly does not replace a daemon that is already
-running — it serves the old code for the rest of its life. The daemon therefore
-reports its version on `ping` (which the CLI already issues on every invocation),
-and a mismatch **refuses** every verb except `update`, `doctor` and `daemon stop`
-with `infra-error`. It refuses rather than warns because an old daemon ignores
-arguments it does not know instead of rejecting them: a new flag sent to an old
-daemon is silently dropped and the verb reports success (issue #41) — a wrong result
-that names the wrong subsystem.
-
-`runly update` restarts the daemon; the autospawn then brings up the installed
-build. **Leases survive**: services stop, environments go `warm`, and each holder's
-traffic, exec or token resumes wanted services; up reapplies upkeep and builds.
-A live lease is therefore reported rather than refused. What *is* refused
-is an in-flight operation (`busy` — the caller is waiting on it over this
-socket) and a downgrade (an older CLI restarting a newer daemon, the direction that
-can strand journal state); `--force` overrides either. runly never installs
-itself — it prints the upgrade command for the detected install.
-
-The journal stamps `PRAGMA user_version`, and a daemon **refuses to open a state
-root stamped newer than it understands** rather than reading a default where the
-newer build stored meaning.
-
-Every verb accepts `--json`. Exit codes: `0` ok · `1` work-error ·
-`2` env-error · `3` infra-error · `64` usage. On a failure the `--json` body is
-`{ok:false, error:{class,message,…}}`. A removed verb or flag exits 64 before the
-daemon is contacted, naming the decision that removed it and its replacement.
-
-**Progress.** The long verbs (`up`, `warm`, `reset-data`) stream bind
-phases (acquire → upkeep → datastore → build → start-and-ready, with an elapsed
-counter on upkeep rules, builds and readiness waits). The daemon sends these as
-newline-delimited `{type:"progress"}` frames ahead of the single `{type:"result"}` frame;
-the CLI renders them **to stderr**, so the `--json` stdout stays one clean object. Shown
-for an interactive terminal (a TTY) or with `--progress`; silent for a non-TTY/pipe/agent
-or with `--quiet`. Agents are unaffected by default. Where the time went is answered
-after the fact by the bind's own result: `up --json` and `reset-data --json` carry
-`bindDiagnostics` — `durationMs`, `phasesMs` (queue, prepare, appliances, upkeep, stop,
-data, build, ready, finalize), `reuse` (`reused` | `restarted` | `rebound`) with
-`restarted`, `started`, `reloaded` and the `reasons` for a full bind, upkeep counts, and
-per build its duration, whether it restarted its service and why. On a full bind the
-data and build phases overlap (decision 0039), each reported with its own wall time. No command output or
-caller input values appear in it.
-
-`ctx` returns one blob with everything a consumer needs: service URLs (stable per
-environment), public ports and the proxy's per-port counters, login credentials, a token-mint hook, datastore
-connection strings with the preset each datastore holds, each service's state
-(`running`, `stopped`, `down`), hygiene state, and recent service events. An agent holding this
-blob needs nothing else from runly. `ctx --env` prints the part a test command needs as
-`KEY=value` lines with stable names: `RUNLY_ENV_ID`, `RUNLY_PORT_<PORT>`,
-`RUNLY_URL_<SERVICE>`, `RUNLY_DATASTORE_<NAME>_URL`, `RUNLY_DATASTORE_<NAME>_PRESET`,
-`RUNLY_LOGIN_USER`, `RUNLY_LOGIN_PASSWORD` (names upper-cased, other characters as `_`; a value is
-single-quoted only when a shell needs it), each as an `export` line, so
-`eval "$(runly ctx --env)" && pnpm e2e` hands them to the test command. `up --env` prints
-the same lines after the bind, and `exec` sets the same variables. Without `--json` or
-`--env`, `up` and `ctx` print a short summary (services, URLs, datastores, login; a
-lease as `worktree lease (no expiry)`; after `up`, what started or
-restarted and the reasons for a full rebind; a failed last `up` from `lastUpFailed`).
-`status` and `destroy` print a summary too; `--json` is unchanged.
-
-**Database copies (decision 0034).** `runly db new <datastore>` restores a fresh
-copy from the environments' template (baking it if missing) and prints its name,
-url and preset; `runly db with <datastore> -- <cmd>` hands one to a command as
-`RUNLY_DB_URL` (and `RUNLY_DB_DATABASE`, the database's name on its server;
-`RUNLY_DB_COPY`/`RUNLY_DB_NAME`, the handle) and drops it when the command exits,
-with its exit code. The command runs under `watchdog.js`, which holds the read end
-of a pipe from the CLI: the kernel closes it however the CLI dies, and the
-watchdog then stops the command (SIGTERM, SIGKILL after 3 s) — Node has no
-PR_SET_PDEATHSIG. runly's own failures are marked (`runly db with:` on stderr, a
-`{"runlyDbWith":…}` line with `--json`) and exit 1/2/3 or `--runly-exit N`. A copy is a `db_copies` row — written as `creating` before the restore — that
-carries its holder (worktree; `--holder-pid`, or `db with`'s own CLI process) and
-its drop (the templated command and where to run it, or its directory under
-`<state>/dbs`). The sweeper (and recovery) drops a copy whose holder process is
-gone (the same `holderGone` check a lease gets), whose worktree is gone or now
-another stack, or whose creation or drop never finished; a failed drop stays on
-record with a backoff. `db with` runs its command with the copy's tag
-(`BACKLOT_DB_COPY`) and records its pid, start time and — without a terminal, where
-it gets its own process group — its group on the row (`child`); every drop stops
-what still runs against the copy first (the verified group or pid, and on Linux
-every tagged process), and a `db with` copy whose CLI died goes at the next sweep,
-without the tether grace (decision 0039). No TTL, no pool cap. `runly ps` lists services (state,
-public and internal port, pid, idle time, when it stops for idleness, RSS from the
-tagged processes; states `running`, `starting`, `idle`, `failed`, `stopped`, `down`) and
-copies, for the caller's worktree or `--all`. A datastore marked `copies_only` is never
-provisioned for an environment and exists only as copies (decision 0039).
-
-**Public preview (decision 0027).** `runly preview <service>` publishes one leased
-service through a preview **publisher** adapter (default: a Cloudflare quick tunnel via
-`cloudflared`, an env-error when absent) and reports the URL in `ctx.previewUrls`;
-`runly preview stop` ends it. It is opt-in per invocation and **scoped to the lease,
-not to the service incarnation** — a restarting `up`, a rebind or an idle quiesce leaves the
-tunnel up within the public-access deadline, while `release`, preview expiry
-and teardown reap it. Successful up renews an active deadline or reopens saved
-automatically expired publication; explicit preview stop clears that intent. `shutdown` and crash
-recovery reap the tunnel but not the publication: the lease row keeps what was
-published (`preview_restore`: service, URL, public port, publisher, the settings that
-pin its address, expiresAt and ttlMs), and `recover()` publishes it again only
-if unexpired, once the proxy holds the ports
-(decision 0045); a failure is an event and `ctx.previewRestore`. Exceptions and `previewNotice` reporting are defined by
-[preview reconciliation](decisions/0027-lease-scoped-public-preview.md).
-The URL is **public and unauthenticated** — see the
-[security model](overview.md#security-model).
-
-**Division of labor** (the bug-fix loop): the agent thinks, edits, greps, and commits
-in its own worktree with its own harness — runly is where the code *runs*, never
-where the agent *works*. Fast unit tests that need no system don't pay the broker tax
-at all. Agents use the CLI; there is no MCP server
-([decision 0029](decisions/0029-cli-only-agent-interface.md)).
+The [CLI reference](cli.md) lists commands and flags. See [operations](operations.md)
+for daemon supervision, database-copy operation, caller inputs, logs, previews and
+monitoring. Reads such as `ctx`, `ps` and `stats` never count as activity.
 
 ### Configuration
 
@@ -649,7 +504,7 @@ reads is ignored.
 | `BACKLOT_IDLE_TTL_MS` | `idleTtlMs` | Legacy heat-reporting threshold only; does not stop or delete environments |
 | `BACKLOT_UNLEASED_TTL` | `unleasedTtl` | Retired and ignored; inactivity never destroys environments |
 | `BACKLOT_WAIT_MS` | `waitMs` | 60 s — how long a bind waits for an environment held by another holder, or for a slot at the machine-wide cap |
-| `BACKLOT_HOLDER_PID` | — | the holder process for `up` and `db new` (as `--holder-pid`) |
+| `BACKLOT_HOLDER_PID` | — | diagnostic process metadata for `up`; process lifetime for `db new` (as `--holder-pid`) |
 | `BACKLOT_PORT_RANGE` | — | `20000-29999` — public ports |
 | `BACKLOT_INTERNAL_PORT_RANGE` | — | `30000-31999` — the ports services listen on |
 | `BACKLOT_TUNNEL_PORT_RANGE` | — | `32000-32767` — derived tailnet preview ports |
@@ -680,75 +535,10 @@ surfaced by `status` and `doctor`.
 
 ## 12. The manifest
 
-One file, `runly.yml`, at the repo root, validated by a published JSON Schema
-([`../schema/runly.schema.json`](../schema/runly.schema.json)). Everything `{{…}}` is
-injected by the engine — symbolic ports, datastore URLs, service URLs — which is what
-makes environments relocatable across substrates. Services are **commands, not
-containers**; backing infrastructure (a DB server) is externally run and probed.
-
-Every command in the manifest — service `run:`/`build:`, upkeep,
-datastore hooks — executes in the worktree under `sh`, which is **dash on Ubuntu and
-bash-running-as-sh on macOS**, the two platforms runly tests. Write POSIX sh
-only: a bashism (`[[`, arrays, `set -o pipefail`) can pass on one leg and fail
-on the other with the same runly.yml.
-
-```yaml
-name: myapp
-services:
-  api:
-    build: dotnet build backend/Host
-    outputs: [backend/Host/bin/**]        # `up` restarts api only when its build changed these
-    run:   dotnet run --no-build --project backend/Host
-    port:  api
-    env:
-      ASPNETCORE_URLS: http://localhost:{{ports.api}}
-      ConnectionStrings__Main: "{{datastores.main.url}}"
-    ready:      { http: /health, timeout: 300 }
-    fatal_logs: 'Unhandled exception|Build FAILED'
-  web:
-    build:                                # skipped while these files are unchanged (decision 0038)
-      run: pnpm exec ng build myapp
-      when: ["src/**", angular.json, pnpm-lock.yaml]
-    outputs: { paths: [dist/myapp], compare: content }   # restart only when the bytes changed
-    resources: { memory: 1G, cpu: 1, build: { memory: 3G, cpu: 4 } }   # the load budget (0036)
-    idle: 30m                             # stop after 30 idle minutes instead of 10 (0035)
-    run:   npx serve-dist dist/myapp --proxy /api={{services.api.url}}
-    port:  web
-    ready: { http: / }
-  worker:
-    run:   bundle exec sidekiq            # portless; no build:, so `up` keeps it running
-    ready: { log: "Booted" }
-datastores:
-  main:
-    driver: postgres
-    server: external
-    probe:  localhost:5432
-    create: bin/rails db:prepare db:seed  # or any repo command; {{preset}} {{ns}} available
-    presets: [dev, empty]
-    template: true
-    list:   psql -Atc "select datname from pg_database"   # only `runly pool doctor` reads it (0037)
-  cache:
-    driver: redis
-    ephemeral: true                       # reset-data = flush
-caches: [node_modules, "**/obj", .angular]   # output, not source; never an upkeep trigger
-sync:
-  include: [.env.local]                   # git-ignored, but an upkeep trigger may name it
-upkeep:
-  - { when: pnpm-lock.yaml, run: pnpm install --frozen-lockfile }
-  - { when: "glob(db/migrate/**)", run: bin/rails db:migrate }
-auth:
-  logins:                                 # one object, or a list; first = primary
-    - { user: qa-admin,    password: Demo!1234, role: admin, description: "all rights, all branches" }
-    - { user: qa-readonly, password: Demo!1234, description: "read-only, proves a denied write" }
-  token:  scripts/mint-token --role {{role}} --json
-preview:
-  publisher: cloudflare-quick             # which adapter `runly preview` publishes through
-  # forbidden: true                       # ...or refuse public preview outright (work-error)
-```
-
-What the manifest deliberately does **not** contain: pool sizes, TTLs, budget
-limits, substrate names. Those are engine policy and user config, never repo
-knowledge. Every field is listed in the [README](../README.md#manifest-reference).
+Use `runly.yml` or `runly.yaml`; `.yml` takes precedence when both exist.
+The [manifest reference](manifest.md) describes fields and template variables;
+[the schema](../schema/runly.schema.json) defines validation. Manifests describe
+the app. Machine-wide caps, load gates and state paths belong to configuration.
 
 ## 13. Driver seams
 
@@ -768,28 +558,9 @@ stores implement reset as flush.
 `stop(pid)` — how a leased service is published to the internet, deliberately *not* the
 substrate's `expose` (decision 0027).
 
-## 14. Landscape position
+## 14. Scope
 
-The 2025–26 agent-sandbox wave (E2B, Daytona, Modal, Fly Sprites, Morph) commoditized
-the **substrate** — warm, persistent, checkpointable compute — and validated this
-design's premises (persistence over ephemerality, checkpoint/restore as table stakes).
-None of them knows what makes a VM a *working instance of your app*: the seeded data,
-the auth story, the upkeep rules, the lifecycle. Dev-stack orchestrators (Tilt,
-Skaffold, Garden) own hot-deploy-to-Kubernetes, not leases or data states.
-By 2026 the wave consolidated: Gitpod rebranded to Ona and was acquired by OpenAI; Daytona pivoted to agent sandboxes; Neon's branch-per-agent Postgres sold to Databricks (~$1B) with most databases agent-created — data states validated as a category; kubernetes-sigs/agent-sandbox even ships literal SandboxWarmPool/SandboxClaim CRDs, cluster-side. A dated scored map lives in [reviews/2026-07-20-landscape.md](reviews/2026-07-20-landscape.md). Dagger's container-use is the nearest OSS neighbor (branch+worktree+container per
-agent, git as sync) but is per-task-ephemeral, local-only, and has no data
-layer.
-
-runly is the unowned layer between them: **the repo-aware environment broker** —
-buy the substrate, declare the stack, broker the environments.
-
-## 15. Status
-
-The local loop is complete: environments in the worktree, additive `up`/`down`, the
-port proxy with idle stop and wake, the tether, the load budget, database copies,
-cleanup, logs and three preview publishers, proven against the founding .NET +
-Angular + MSSQL monorepo, whose Playwright suite runs against a runly environment.
-The one unbuilt piece is a remote substrate driver (Morph, SSH): the daemon on the
-remote box, the CLI forwarding verbs to it, provider-side TTLs and `pool reconcile`
-adopting what the journal forgot. Release notes:
-[GitHub releases](https://github.com/ChristianKohlberg/runly/releases).
+Runly currently supervises local worktree processes. Remote substrate drivers
+remain a design target, not an available CLI feature. Historical comparisons
+are in the [dated landscape review](reviews/2026-07-20-landscape.md).
+Current releases are listed on [GitHub](https://github.com/ChristianKohlberg/runly/releases).

@@ -1,6 +1,6 @@
 # 0040. `runly exec` runs its command in the CLI; exec and token resume an environment a daemon restart stopped
 
-- Status: Accepted
+- Status: Exec heartbeat timing amended by [0046](0046-worktree-owned-activity-lifecycle.md): adapts to short idle settings.
 - Date: 2026-10
 - Amends: [0032](0032-environments-run-in-the-callers-worktree.md) — where
   `exec` runs; [0039](0039-teardown-keeps-templates-a-leased-environment-survives-a-crash-loop.md)

@@ -1,6 +1,6 @@
 # 0011. Environments hold nothing precious; outputs write back only explicitly
 
-- Status: Accepted — amended by [0032](0032-environments-run-in-the-callers-worktree.md): the invariant covers the environment's private state and runly never deletes the worktree; the write-back (`pull`, `--pull`) is removed because outputs are written in place; the manifest's top-level `outputs:` is ignored since `runly run` was removed
+- Status: Disposable-data assumption and write-back model superseded by [0032](0032-environments-run-in-the-callers-worktree.md) and [0046](0046-worktree-owned-activity-lifecycle.md); private data may be unique.
 
 ## Decision
 

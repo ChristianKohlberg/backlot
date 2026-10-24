@@ -1,6 +1,6 @@
 # 0041. An unleased environment nobody uses for 24 hours is torn down
 
-- Status: Accepted
+- Status: Automatic environment expiry superseded by [0046](0046-worktree-owned-activity-lifecycle.md). Upkeep output/ledger behavior remains applicable.
 - Date: 2026-10
 - Amends: [0035](0035-services-idle-on-their-own-clock-and-wake-on-demand.md)
   — how an environment ends; [0039](0039-teardown-keeps-templates-a-leased-environment-survives-a-crash-loop.md)
