@@ -438,6 +438,50 @@ describe('journal schema stamping', () => {
     }
   });
 
+  it('opens a schema-4 journal from 0.16-0.20 and stamps it forward (decision 0046)', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'runly-schema-4-'));
+    try {
+      const path = join(dir, 'journal.db');
+      new Journal(path);
+      const db = new DatabaseSync(path);
+      db.exec('PRAGMA user_version = 4'); // as every journal 0.16 to 0.20 wrote
+      db.close();
+      // 4 -> 5 changes no table, so refusing it stranded every machine upgrading
+      // from 0.20: the new daemon would not start and the old one was gone.
+      expect(() => new Journal(path)).not.toThrow();
+      const after = new DatabaseSync(path);
+      try {
+        expect((after.prepare('PRAGMA user_version').get() as { user_version: number }).user_version).toBe(
+          JOURNAL_SCHEMA_VERSION,
+        );
+      } finally {
+        after.close();
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('still refuses a schema-3 journal untouched (decision 0042)', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'runly-schema-3-'));
+    try {
+      const path = join(dir, 'journal.db');
+      new Journal(path);
+      const db = new DatabaseSync(path);
+      db.exec('PRAGMA user_version = 3');
+      db.close();
+      expect(() => new Journal(path)).toThrow(/upgrade through runly 0\.18 first/);
+      const after = new DatabaseSync(path);
+      try {
+        expect((after.prepare('PRAGMA user_version').get() as { user_version: number }).user_version).toBe(3);
+      } finally {
+        after.close();
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('refuses a pre-stamp journal: the migrations from before 0.16 are retired (decision 0042)', () => {
     const dir = mkdtempSync(join(tmpdir(), 'runly-schema-old-'));
     try {
