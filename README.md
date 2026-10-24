@@ -78,13 +78,28 @@ The second command restarts an older running daemon onto the installed version.
 
 ## Agent skills
 
-The plugin includes **runly** for CLI operation and **runly-setup** for manifest
-setup, datastore choices and initial tuning. In Claude Code:
+Use **runly-setup** to get started and **runly** to operate an existing setup.
+Install both in Claude Code:
 
 ```text
 /plugin marketplace add ChristianKohlberg/runly
 /plugin install runly
 ```
+
+Then ask your agent: “Use the runly-setup skill to configure this repository for
+parallel worktrees and verify the setup.” For everyday work, ask it to use the
+runly skill to start services, run tests or investigate failures.
+
+Runly needs a `runly.yaml` (or `runly.yml`) that matches your app and how you want
+to work. The setup skill guides your agent through the repository to recommend
+services and containers, isolated datastores and seed data, build/cache rules,
+and readiness checks—then test those choices. You can write the manifest yourself;
+the skill helps with the investigation and verification, beyond YAML syntax.
+
+**Review the setup with your agent.** Double-check which services you need, what
+data may be reset, what stays shared across worktrees, and whether the tests cover
+your workflow. Ask what was verified and what remains untested. Monitor the first
+few sessions to tune resource limits, caching and idle/wake behavior.
 
 ## Documentation
 
