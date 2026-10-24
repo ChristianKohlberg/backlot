@@ -2,9 +2,14 @@
 
 [![npm](https://img.shields.io/npm/v/@theford/runly)](https://www.npmjs.com/package/@theford/runly) [![ci](https://github.com/ChristianKohlberg/runly/actions/workflows/ci.yml/badge.svg)](https://github.com/ChristianKohlberg/runly/actions/workflows/ci.yml) [![release](https://img.shields.io/github/v/release/ChristianKohlberg/runly)](https://github.com/ChristianKohlberg/runly/releases)
 
-Run your app's services with seeded databases and stable local URLs, one environment
-per worktree. Runly uses your existing commands and build tools. Idle services stop
-after five minutes and wake on traffic; their data stays.
+**A working app for every coding task.**
+
+Working on several branches—or with several coding agents—shouldn't mean fighting
+over ports, mixing test data, or leaving servers running all day.
+
+Describe how your app starts once. Runly gives each working copy its own local URLs
+and data, stops idle services, and wakes them when needed. You and your agents can
+focus on changing and testing the app.
 
 ## Quickstart
 
@@ -16,7 +21,10 @@ mkdir runly-demo && cd runly-demo
 git init -q
 ```
 
-Save this as `server.mjs`:
+This tiny demo needs no dependencies. For an existing app, use its normal start
+command in the manifest—you do not need an extra server file.
+
+Save the demo as `server.mjs`:
 
 ```js
 import { createServer } from 'node:http';
@@ -40,18 +48,17 @@ services:
       http: /
 ```
 
-Start it and request its assigned URL:
+Start the app:
 
 ```sh
 runly up
-eval "$(runly ctx --env)"
-curl "$RUNLY_URL_WEB"
-runly logs web
 ```
 
-Edit `server.mjs`, then run `runly up` again. This example's build has no declared
-outputs, so it restarts the service on each `up`. For a real app, use its dev server
-or configure [build outputs](docs/manifest.md) to control restarts.
+Open the URL printed in your terminal. Edit `server.mjs`, then run `runly up`
+again to see your change.
+
+For your own app, see the [everyday guide](docs/overview.md) and
+[manifest reference](docs/manifest.md).
 
 `runly down` stops services and keeps data. `runly destroy` removes this worktree's
 Runly environment, including its databases; it never deletes your source files.
