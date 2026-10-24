@@ -2,14 +2,17 @@
 
 [![npm](https://img.shields.io/npm/v/@theford/runly)](https://www.npmjs.com/package/@theford/runly) [![ci](https://github.com/ChristianKohlberg/runly/actions/workflows/ci.yml/badge.svg)](https://github.com/ChristianKohlberg/runly/actions/workflows/ci.yml) [![release](https://img.shields.io/github/v/release/ChristianKohlberg/runly)](https://github.com/ChristianKohlberg/runly/releases)
 
-**A working app for every coding task.**
+**Let your agents verify their work without getting in each other's way.**
 
-Working on several branches—or with several coding agents—shouldn't mean fighting
-over ports, mixing test data, or leaving servers running all day.
+One agent restarts the app. Another resets the database. A third tests the wrong
+version—and starts fixing a problem it didn't create.
 
-Describe how your app starts once. Runly gives each working copy its own local URLs
-and data, stops idle services, and wakes them when needed. You and your agents can
-focus on changing and testing the app.
+Git worktrees separate your code. Runly extends that separation to the running
+application and its data. Each worktree gets its own app, data and URLs, so agents
+can build, test and demonstrate their changes independently.
+
+Idle services stop and wake when needed, while temporary public previews expire.
+More parallel work. Less interference. Less cleanup.
 
 ## Quickstart
 
